@@ -1,0 +1,12 @@
+[package]
+name = "optimus-prime"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "An independent accounting application written in Rust"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rust_decimal = "1.39"
+thiserror = "2"
