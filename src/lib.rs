@@ -248,6 +248,51 @@ fn required<'a>(value: &'a str, label: &str) -> Result<&'a str> {
 mod tests {
     use super::*;
     #[test]
+    fn posted_vouchers_survive_reopening_database() {
+        let path = std::env::temp_dir().join(format!(
+            "optimus-prime-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let company;
+        {
+            let mut db = Store::open(&path).unwrap();
+            company = db.create_company("Example").unwrap();
+            let cash = db.create_ledger(company, "Cash", Category::Asset).unwrap();
+            let equity = db
+                .create_ledger(company, "Capital", Category::Equity)
+                .unwrap();
+            db.post_voucher(
+                company,
+                "2026-10-30",
+                "",
+                &[
+                    Posting {
+                        ledger_id: cash,
+                        amount: 125,
+                    },
+                    Posting {
+                        ledger_id: equity,
+                        amount: -125,
+                    },
+                ],
+            )
+            .unwrap();
+        }
+        {
+            let db = Store::open(&path).unwrap();
+            let balances = db.balances(company).unwrap();
+            assert_eq!(balances.iter().map(|b| b.amount).sum::<i64>(), 0);
+            assert!(balances
+                .iter()
+                .any(|b| b.ledger.name == "Cash" && b.amount == 125));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
     fn amounts_are_exact() {
         assert_eq!(parse_amount("12.30").unwrap(), 1230);
         assert_eq!(parse_amount("0.01").unwrap(), 1);

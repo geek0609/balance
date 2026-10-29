@@ -1,11 +1,13 @@
 # Optimus Prime
 
-Optimus Prime is an independent, open-source Rust accounting application. Its long-term goal is to support established accounting workflows, beginning with a Windows desktop application and core accounting.
+Optimus Prime is an independent, open-source Rust accounting application for Windows. It is an early prototype, not a production accounting system; do not use it for statutory reporting or irreplaceable business records.
 
-This is an early prototype, not a production accounting system. Do not use it for statutory reporting or irreplaceable business records.
+## Running the prototype
+
+Install a Rust toolchain and run `cargo run` on Windows. The application stores its own SQLite database in the user's local application-data directory. Create a company, add at least two ledgers, then post a balanced two-line journal voucher and view the reports.
 
 ## Status
 
-See [the roadmap](docs/roadmap.md) for the staged work.
+The prototype supports company and ledger creation, simple journal vouchers, and all-time trial balance, profit and loss, and balance sheet summaries. Imports, opening balances, tax, voucher editing, and statutory reports are not implemented. See the [roadmap](docs/roadmap.md) for planned work.
 
 Licensed under Apache-2.0; see [LICENSE](LICENSE).
