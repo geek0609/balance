@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, RichText};
+use optimus_prime::contacts::LedgerProfile;
 use optimus_prime::exchange::ImportPlan;
 use optimus_prime::inventory::{
     format_quantity, line_amount, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine, StockItem,
@@ -28,6 +29,10 @@ struct App {
     ledger_group: Option<i64>,
     group_name: String,
     group_parent: Option<i64>,
+    profile_ledger: Option<i64>,
+    profile_selection: Option<i64>,
+    ledger_profile: LedgerProfile,
+    profile_original: LedgerProfile,
     lines: Vec<VoucherLine>,
     editing_voucher: Option<i64>,
     voucher_kind: VoucherKind,
@@ -108,6 +113,10 @@ impl App {
             ledger_group: None,
             group_name: String::new(),
             group_parent: None,
+            profile_ledger: None,
+            profile_selection: None,
+            ledger_profile: LedgerProfile::default(),
+            profile_original: LedgerProfile::default(),
             lines: vec![VoucherLine::new(true), VoucherLine::new(false)],
             editing_voucher: None,
             voucher_kind: VoucherKind::Journal,
@@ -164,6 +173,10 @@ impl App {
         self.register_ledger = None;
         self.ledger_group = None;
         self.group_parent = None;
+        self.profile_ledger = None;
+        self.profile_selection = None;
+        self.ledger_profile = LedgerProfile::default();
+        self.profile_original = LedgerProfile::default();
         self.import_preview = None;
         self.adjustment_item = None;
         self.stock_register_item = None;
@@ -182,10 +195,18 @@ impl App {
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
         ui.label("Create or select a company to work with.");
+        let profile_dirty =
+            self.profile_ledger.is_some() && self.ledger_profile != self.profile_original;
+        if profile_dirty {
+            ui.label("Save or discard unsaved ledger details before changing company.");
+        }
         ui.horizontal(|ui| {
             ui.label("Name");
             ui.text_edit_singleline(&mut self.company_name);
-            if ui.button("Create company").clicked() {
+            if ui
+                .add_enabled(!profile_dirty, egui::Button::new("Create company"))
+                .clicked()
+            {
                 match self.store.create_company(&self.company_name) {
                     Ok(id) => {
                         self.company = Some(id);
@@ -201,7 +222,13 @@ impl App {
             Ok(companies) => {
                 for company in companies {
                     if ui
-                        .selectable_label(self.company == Some(company.id), &company.name)
+                        .add_enabled(
+                            !profile_dirty,
+                            egui::Button::selectable(
+                                self.company == Some(company.id),
+                                &company.name,
+                            ),
+                        )
                         .clicked()
                     {
                         self.company = Some(company.id);
@@ -256,18 +283,147 @@ impl App {
             }
         }
         ui.separator();
-        match self.store.ledgers(company) {
-            Ok(ledgers) => {
-                for ledger in ledgers {
-                    let group = groups
-                        .iter()
-                        .find(|g| Some(g.id) == ledger.group_id)
-                        .map(|g| g.name.as_str())
-                        .unwrap_or(ledger.category.as_str());
-                    ui.label(format!("{}  —  {}", ledger.name, group));
+        let ledgers = match self.store.ledgers(company) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        {
+            for ledger in &ledgers {
+                let group = groups
+                    .iter()
+                    .find(|g| Some(g.id) == ledger.group_id)
+                    .map(|g| g.name.as_str())
+                    .unwrap_or(ledger.category.as_str());
+                ui.label(format!("{}  —  {}", ledger.name, group));
+            }
+        }
+        ui.separator();
+        ui.heading("Ledger details");
+        let dirty = self.profile_ledger.is_some() && self.ledger_profile != self.profile_original;
+        pick_account(
+            ui,
+            "profile-ledger",
+            "Ledger",
+            &ledgers,
+            &mut self.profile_selection,
+            false,
+        );
+        if ui
+            .add_enabled(
+                !dirty && self.profile_selection.is_some(),
+                egui::Button::new("Open details"),
+            )
+            .clicked()
+        {
+            if let Some(id) = self.profile_selection {
+                match self.store.ledger_profile(company, id) {
+                    Ok(profile) => {
+                        self.profile_ledger = Some(id);
+                        self.profile_original = profile.clone();
+                        self.ledger_profile = profile;
+                    }
+                    Err(e) => self.failure(e),
                 }
             }
-            Err(e) => self.failure(e),
+        }
+        if let Some(id) = self.profile_ledger {
+            let name = ledgers
+                .iter()
+                .find(|l| l.id == id)
+                .map(|l| l.name.as_str())
+                .unwrap_or("Unknown ledger");
+            ui.label(format!("Editing details for {name}"));
+            egui::Grid::new("ledger-details")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Mailing name");
+                    ui.text_edit_singleline(&mut self.ledger_profile.mailing_name);
+                    ui.end_row();
+                    ui.label("Address");
+                    ui.text_edit_multiline(&mut self.ledger_profile.address);
+                    ui.end_row();
+                    ui.label("Postal code");
+                    ui.text_edit_singleline(&mut self.ledger_profile.postal_code);
+                    ui.end_row();
+                    ui.label("Region / state");
+                    ui.text_edit_singleline(&mut self.ledger_profile.region);
+                    ui.end_row();
+                    ui.label("Country");
+                    ui.text_edit_singleline(&mut self.ledger_profile.country);
+                    ui.end_row();
+                    ui.label("Email");
+                    ui.text_edit_singleline(&mut self.ledger_profile.email);
+                    ui.end_row();
+                    ui.label("Email CC");
+                    ui.text_edit_singleline(&mut self.ledger_profile.email_cc);
+                    ui.end_row();
+                    ui.label("Phone");
+                    ui.text_edit_singleline(&mut self.ledger_profile.phone);
+                    ui.end_row();
+                    ui.label("Mobile");
+                    ui.text_edit_singleline(&mut self.ledger_profile.mobile);
+                    ui.end_row();
+                    ui.label("Tax ID");
+                    ui.text_edit_singleline(&mut self.ledger_profile.tax_id);
+                    ui.end_row();
+                    ui.label("Registration type");
+                    ui.text_edit_singleline(&mut self.ledger_profile.tax_registration_type);
+                    ui.end_row();
+                });
+            ui.horizontal(|ui| {
+                if ui.button("Save details").clicked() {
+                    match self
+                        .store
+                        .save_ledger_profile(company, id, &self.ledger_profile)
+                    {
+                        Ok(()) => {
+                            self.profile_original = self.ledger_profile.clone();
+                            self.message = "Ledger details saved".into();
+                        }
+                        Err(e) => self.failure(e),
+                    }
+                }
+                if ui.button("Discard changes").clicked() {
+                    self.ledger_profile = self.profile_original.clone();
+                }
+            });
+            if self.ledger_profile != self.profile_original {
+                ui.label("Unsaved ledger details");
+            }
+            egui::CollapsingHeader::new("Previous details")
+                .id_salt(("profile-revisions", id))
+                .show(ui, |ui| {
+                    match self.store.ledger_profile_revisions(company, id) {
+                        Ok(revisions) if revisions.is_empty() => {
+                            ui.label("No previous versions.");
+                        }
+                        Ok(revisions) => {
+                            for revision in revisions {
+                                ui.label(format!("Replaced at {} UTC", revision.changed_at));
+                                ui.label(format!(
+                                    "{}\n{}\n{} {} {}\n{} {}\n{} {}\n{} {}",
+                                    revision.profile.mailing_name,
+                                    revision.profile.address,
+                                    revision.profile.region,
+                                    revision.profile.postal_code,
+                                    revision.profile.country,
+                                    revision.profile.email,
+                                    revision.profile.email_cc,
+                                    revision.profile.phone,
+                                    revision.profile.mobile,
+                                    revision.profile.tax_id,
+                                    revision.profile.tax_registration_type
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                        }
+                    }
+                });
         }
         ui.separator();
         ui.heading("Account groups");
@@ -1266,7 +1422,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers and accounting vouchers. It does not import inventory, invoices, party details, opening balances, tax details or other unsupported fields.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details and accounting vouchers. It does not import inventory, invoices, party allocations, opening balances, statutory tax information or other unsupported fields.");
     }
 }
 fn pick_stock(

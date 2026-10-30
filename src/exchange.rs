@@ -1,5 +1,6 @@
 //! Import of a limited accounting XML interchange format.
 //! Unsupported or ambiguous data is reported before any database writes.
+use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
     Store, VoucherKind,
@@ -22,6 +23,7 @@ struct Account {
     name: String,
     group: String,
     category: Category,
+    profile: LedgerProfile,
 }
 #[derive(Debug, Clone)]
 struct Line {
@@ -207,6 +209,58 @@ fn check_language_names(node: Node<'_, '_>, name: &str, label: &str, issues: &mu
             issues.push(format!("{label}: alternate languages are not supported"));
         }
     }
+}
+fn profile_list_values(
+    node: Node<'_, '_>,
+    list_name: &str,
+    item_name: &str,
+    label: &str,
+    issues: &mut Vec<String>,
+) -> Vec<String> {
+    let lists: Vec<_> = node
+        .children()
+        .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case(list_name))
+        .collect();
+    if lists.len() > 1 {
+        issues.push(format!(
+            "{label}: multiple {list_name} lists are not supported"
+        ));
+    }
+    let mut values = Vec::new();
+    for list in lists {
+        for attr in list.attributes() {
+            if !attr.name().eq_ignore_ascii_case("TYPE")
+                || !attr.value().eq_ignore_ascii_case("String")
+            {
+                issues.push(format!(
+                    "{label}: attribute {} on {list_name} is not supported",
+                    attr.name()
+                ));
+            }
+        }
+        for child in list.children().filter(|n| n.is_element()) {
+            if !local_name(child).eq_ignore_ascii_case(item_name) {
+                if meaningful(child) {
+                    issues.push(format!(
+                        "{label}: field {} is not supported",
+                        local_name(child)
+                    ));
+                }
+                continue;
+            }
+            if child.children().any(|n| n.is_element()) || child.attributes().len() != 0 {
+                issues.push(format!("{label}: nested {item_name} is not supported"));
+                continue;
+            }
+            let text = child
+                .children()
+                .filter(|n| n.is_text())
+                .filter_map(|n| n.text())
+                .collect::<String>();
+            values.push(text.trim().to_owned());
+        }
+    }
+    values
 }
 fn decode(bytes: &[u8]) -> Result<String> {
     if bytes.len() > MAX_BYTES {
@@ -453,11 +507,55 @@ impl Store {
             };
             check_fields(
                 node,
-                &["NAME", "PARENT", "OPENINGBALANCE", "LANGUAGENAME.LIST"],
+                &[
+                    "NAME",
+                    "PARENT",
+                    "OPENINGBALANCE",
+                    "LANGUAGENAME.LIST",
+                    "MAILINGNAME.LIST",
+                    "ADDRESS.LIST",
+                    "PINCODE",
+                    "COUNTRYNAME",
+                    "LEDSTATENAME",
+                    "EMAIL",
+                    "EMAILCC",
+                    "LEDGERPHONE",
+                    "LEDGERMOBILE",
+                    "PARTYGSTIN",
+                    "GSTREGISTRATIONTYPE",
+                ],
                 &format!("Ledger {name}"),
                 &mut plan.issues,
             );
             check_language_names(node, &name, &format!("Ledger {name}"), &mut plan.issues);
+            let label = format!("Ledger {name}");
+            let mailing = profile_list_values(
+                node,
+                "MAILINGNAME.LIST",
+                "MAILINGNAME",
+                &label,
+                &mut plan.issues,
+            );
+            if mailing.len() > 1 {
+                plan.issues
+                    .push(format!("{label}: multiple mailing names are not supported"));
+            }
+            let address =
+                profile_list_values(node, "ADDRESS.LIST", "ADDRESS", &label, &mut plan.issues)
+                    .join("\n");
+            let profile = LedgerProfile {
+                mailing_name: mailing.first().cloned().unwrap_or_default(),
+                address,
+                postal_code: direct_text(node, "PINCODE").unwrap_or_default(),
+                country: direct_text(node, "COUNTRYNAME").unwrap_or_default(),
+                region: direct_text(node, "LEDSTATENAME").unwrap_or_default(),
+                email: direct_text(node, "EMAIL").unwrap_or_default(),
+                email_cc: direct_text(node, "EMAILCC").unwrap_or_default(),
+                phone: direct_text(node, "LEDGERPHONE").unwrap_or_default(),
+                mobile: direct_text(node, "LEDGERMOBILE").unwrap_or_default(),
+                tax_id: direct_text(node, "PARTYGSTIN").unwrap_or_default(),
+                tax_registration_type: direct_text(node, "GSTREGISTRATIONTYPE").unwrap_or_default(),
+            };
             if let Some(opening) = direct_text(node, "OPENINGBALANCE") {
                 if !opening.is_empty() && !matches!(xml_amount(&opening), Ok(0)) {
                     plan.issues
@@ -480,6 +578,7 @@ impl Store {
                 name,
                 group,
                 category,
+                profile,
             });
         }
         let mut references: HashSet<(String, String, String)> = self
@@ -706,6 +805,12 @@ impl Store {
             tx.execute(
                 "INSERT INTO ledgers(company_id, name, category, group_id) VALUES (?1, ?2, ?3, ?4)",
                 params![plan.company_id, account.name, category.as_str(), group_id],
+            )?;
+            insert_new_profile(
+                &tx,
+                plan.company_id,
+                tx.last_insert_rowid(),
+                &account.profile,
             )?;
         }
         for voucher in &plan.transactions {

@@ -6,6 +6,7 @@ use rusqlite::{params, Connection};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use std::{collections::HashMap, path::Path, str::FromStr};
 use thiserror::Error;
+pub mod contacts;
 pub mod exchange;
 pub mod inventory;
 
@@ -208,7 +209,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 6 {
+        if version > 7 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -272,6 +273,12 @@ impl Store {
             tx.execute_batch("CREATE TABLE invoice_settlements(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), invoice_id INTEGER NOT NULL REFERENCES invoices(id), voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), amount INTEGER NOT NULL CHECK(amount > 0));
                 CREATE INDEX settlements_invoice ON invoice_settlements(invoice_id, id);
                 PRAGMA user_version = 6;")?;
+        }
+        if version < 7 {
+            tx.execute_batch("CREATE TABLE ledger_profiles(ledger_id INTEGER PRIMARY KEY REFERENCES ledgers(id), company_id INTEGER NOT NULL REFERENCES companies(id), mailing_name TEXT NOT NULL, address TEXT NOT NULL, postal_code TEXT NOT NULL, country TEXT NOT NULL, region TEXT NOT NULL, email TEXT NOT NULL, email_cc TEXT NOT NULL, phone TEXT NOT NULL, mobile TEXT NOT NULL, tax_id TEXT NOT NULL, tax_registration_type TEXT NOT NULL);
+                CREATE TABLE ledger_profile_revisions(id INTEGER PRIMARY KEY, ledger_id INTEGER NOT NULL REFERENCES ledgers(id), company_id INTEGER NOT NULL REFERENCES companies(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, mailing_name TEXT NOT NULL, address TEXT NOT NULL, postal_code TEXT NOT NULL, country TEXT NOT NULL, region TEXT NOT NULL, email TEXT NOT NULL, email_cc TEXT NOT NULL, phone TEXT NOT NULL, mobile TEXT NOT NULL, tax_id TEXT NOT NULL, tax_registration_type TEXT NOT NULL);
+                CREATE INDEX ledger_profile_revisions_ledger ON ledger_profile_revisions(ledger_id, id);
+                PRAGMA user_version = 7;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1076,7 +1083,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
