@@ -47,6 +47,11 @@ struct StockGroupImport {
     metadata: SourceMetadata,
 }
 #[derive(Debug, Clone)]
+struct StockLocationImport {
+    name: String,
+    metadata: SourceMetadata,
+}
+#[derive(Debug, Clone)]
 struct Item {
     name: String,
     unit: String,
@@ -76,6 +81,8 @@ struct ImportedInvoiceLine {
     existing_item_id: Option<i64>,
     unit: String,
     precision: u8,
+    location: String,
+    existing_location_id: Option<i64>,
     quantity: i64,
     unit_price: i64,
 }
@@ -131,10 +138,12 @@ pub struct ImportPlan {
     existing_group_metadata: Vec<(i64, SourceMetadata)>,
     existing_unit_metadata: Vec<(i64, SourceMetadata)>,
     existing_stock_group_metadata: Vec<(i64, SourceMetadata)>,
+    existing_location_metadata: Vec<(i64, SourceMetadata)>,
     groups: Vec<Group>,
     accounts: Vec<Account>,
     units: Vec<Unit>,
     stock_groups: Vec<StockGroupImport>,
+    locations: Vec<StockLocationImport>,
     items: Vec<Item>,
     transactions: Vec<Transaction>,
     invoices: Vec<ImportedInvoice>,
@@ -165,6 +174,9 @@ impl ImportPlan {
     pub fn item_count(&self) -> usize {
         self.items.len()
     }
+    pub fn location_count(&self) -> usize {
+        self.locations.len()
+    }
     pub fn stock_opening_count(&self) -> usize {
         self.items.iter().filter(|i| i.opening.is_some()).count()
     }
@@ -180,8 +192,10 @@ impl ImportPlan {
                 || !self.existing_group_metadata.is_empty()
                 || !self.existing_unit_metadata.is_empty()
                 || !self.existing_stock_group_metadata.is_empty()
+                || !self.existing_location_metadata.is_empty()
                 || !self.units.is_empty()
                 || !self.stock_groups.is_empty()
+                || !self.locations.is_empty()
                 || !self.items.is_empty()
                 || !self.accounts.is_empty()
                 || !self.transactions.is_empty()
@@ -196,6 +210,7 @@ pub struct ImportCounts {
     pub invoices: usize,
     pub units: usize,
     pub stock_groups: usize,
+    pub locations: usize,
     pub items: usize,
 }
 
@@ -245,6 +260,7 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
         "UNIT",
         "STOCKGROUP",
         "STOCKITEM",
+        "GODOWN",
     ]
     .iter()
     .any(|tag| local_name(node).eq_ignore_ascii_case(tag));
@@ -609,6 +625,7 @@ fn parse_imported_invoice(
     metadata: SourceMetadata,
     ledgers: &HashMap<String, (Option<i64>, Category)>,
     items: &HashMap<String, (Option<i64>, String, u8)>,
+    locations: &HashMap<String, Option<i64>>,
     issues: &mut Vec<String>,
 ) -> Result<ImportedInvoice> {
     check_fields(
@@ -812,6 +829,7 @@ fn parse_imported_invoice(
                 "ACTUALQTY",
                 "BILLEDQTY",
                 "ACCOUNTINGALLOCATIONS.LIST",
+                "BATCHALLOCATIONS.LIST",
             ],
             label,
             issues,
@@ -890,6 +908,51 @@ fn parse_imported_invoice(
                 "item accounting allocation differs from the item amount".into(),
             ));
         }
+        let locations_in_line: Vec<_> = item_node
+            .children()
+            .filter(|n| {
+                n.is_element()
+                    && local_name(*n).eq_ignore_ascii_case("BATCHALLOCATIONS.LIST")
+                    && meaningful(*n)
+            })
+            .collect();
+        if locations_in_line.len() > 1 {
+            return Err(Error::Validation(
+                "multiple location or batch allocations are not supported".into(),
+            ));
+        }
+        let location = if let Some(location_node) = locations_in_line.first() {
+            let location_node = *location_node;
+            invoice_list_fields(
+                location_node,
+                &[
+                    "GODOWNNAME",
+                    "BATCHNAME",
+                    "ACTUALQTY",
+                    "BILLEDQTY",
+                    "AMOUNT",
+                ],
+                label,
+                issues,
+            );
+            if direct_text(location_node, "BATCHNAME").is_some_and(|value| !value.is_empty()) {
+                return Err(Error::Validation("named batches are not supported".into()));
+            }
+            if xml_stock_quantity(&invoice_field(location_node, "ACTUALQTY")?, unit)? != actual
+                || xml_stock_quantity(&invoice_field(location_node, "BILLEDQTY")?, unit)? != billed
+                || xml_amount(&invoice_field(location_node, "AMOUNT")?)? != expected
+            {
+                return Err(Error::Validation(
+                    "location allocation does not match the item".into(),
+                ));
+            }
+            invoice_field(location_node, "GODOWNNAME")?
+        } else {
+            "Main".into()
+        };
+        let existing_location_id = *locations.get(&normalized(&location)).ok_or_else(|| {
+            Error::Validation(format!("stock location {location} is unavailable"))
+        })?;
         invoice_side(allocation, "ISDEEMEDPOSITIVE", expected > 0)?;
         if trade
             .as_ref()
@@ -906,6 +969,8 @@ fn parse_imported_invoice(
             existing_item_id: *existing_item_id,
             unit: unit.clone(),
             precision: *precision,
+            location,
+            existing_location_id,
             quantity,
             unit_price,
         });
@@ -1007,6 +1072,24 @@ fn find_stock_item(conn: &Connection, company: i64, name: &str) -> Result<Option
     }
     Ok(found)
 }
+fn find_stock_location(conn: &Connection, company: i64, name: &str) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare("SELECT id, name FROM stock_locations WHERE company_id = ?1")?;
+    let mut found = None;
+    for row in stmt.query_map([company], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (id, candidate) = row?;
+        if normalized(&candidate) == normalized(name) {
+            if found.is_some() {
+                return Err(Error::Validation(format!(
+                    "Stock location {name} is ambiguous"
+                )));
+            }
+            found = Some(id);
+        }
+    }
+    Ok(found)
+}
 fn find_stock_unit(conn: &Connection, company: i64, symbol: &str) -> Result<Option<(i64, u8)>> {
     let mut stmt =
         conn.prepare("SELECT id, symbol, decimal_places FROM stock_units WHERE company_id = ?1")?;
@@ -1078,10 +1161,12 @@ impl Store {
             existing_group_metadata: Vec::new(),
             existing_unit_metadata: Vec::new(),
             existing_stock_group_metadata: Vec::new(),
+            existing_location_metadata: Vec::new(),
             groups: Vec::new(),
             accounts: Vec::new(),
             units: Vec::new(),
             stock_groups: Vec::new(),
+            locations: Vec::new(),
             items: Vec::new(),
             transactions: Vec::new(),
             invoices: Vec::new(),
@@ -1122,6 +1207,7 @@ impl Store {
                 "UNIT",
                 "STOCKGROUP",
                 "STOCKITEM",
+                "GODOWN",
             ]
             .iter()
             .any(|name| local_name(node).eq_ignore_ascii_case(name))
@@ -1533,6 +1619,67 @@ impl Store {
             }
             pending_stock_groups = unresolved;
         }
+        let existing_locations = self.stock_locations(company_id)?;
+        let mut known_locations = HashMap::<String, Option<i64>>::new();
+        for location in &existing_locations {
+            if known_locations
+                .insert(normalized(&location.name), Some(location.id))
+                .is_some()
+            {
+                plan.issues
+                    .push(format!("Stock location {} is ambiguous", location.name));
+            }
+        }
+        let mut input_locations = HashSet::new();
+        for node in doc.descendants().filter(|n| {
+            n.is_element()
+                && local_name(*n).eq_ignore_ascii_case("GODOWN")
+                && !n
+                    .ancestors()
+                    .any(|a| a.is_element() && local_name(a).eq_ignore_ascii_case("VOUCHER"))
+        }) {
+            let Some(name) = object_name(node) else {
+                plan.issues
+                    .push("A stock location has no unambiguous name".into());
+                continue;
+            };
+            let label = format!("Stock location {name}");
+            check_fields(
+                node,
+                &["NAME", "PARENT", "LANGUAGENAME.LIST"],
+                &label,
+                &mut plan.issues,
+            );
+            check_language_names(node, &name, &label, &mut plan.issues);
+            if !input_locations.insert(normalized(&name)) {
+                plan.issues.push(format!("{label}: duplicate name"));
+                continue;
+            }
+            let parent = direct_text(node, "PARENT").unwrap_or_default();
+            if normalized(&name) == "primary"
+                || (!parent.is_empty() && normalized(&parent) != "primary")
+            {
+                plan.issues.push(format!(
+                    "{label}: nested or root location records are not supported"
+                ));
+            }
+            let metadata = source_metadata(node, &label, &mut plan.issues);
+            register_metadata(
+                "stocklocation",
+                &label,
+                &metadata,
+                &mut seen_metadata,
+                &mut plan.issues,
+            );
+            if let Some(id) = known_locations.get(&normalized(&name)).copied().flatten() {
+                if !metadata.is_empty() {
+                    plan.existing_location_metadata.push((id, metadata));
+                }
+            } else {
+                known_locations.insert(normalized(&name), None);
+                plan.locations.push(StockLocationImport { name, metadata });
+            }
+        }
         let mut known_items = HashSet::<String>::new();
         for item in self.stock_items(company_id)? {
             if !known_items.insert(normalized(&item.name)) {
@@ -1718,6 +1865,7 @@ impl Store {
                     metadata,
                     &invoice_ledgers,
                     &invoice_items,
+                    &known_locations,
                     &mut plan.issues,
                 ) {
                     Ok(invoice) => {
@@ -1909,7 +2057,7 @@ impl Store {
         }
         for node in doc.descendants().filter(|n| {
             n.is_element()
-                && ["GODOWN", "VOUCHERTYPE", "STOCKCATEGORY"]
+                && ["VOUCHERTYPE", "STOCKCATEGORY"]
                     .iter()
                     .any(|tag| local_name(*n).eq_ignore_ascii_case(tag))
         }) {
@@ -1922,10 +2070,12 @@ impl Store {
             && plan.invoices.is_empty()
             && plan.units.is_empty()
             && plan.stock_groups.is_empty()
+            && plan.locations.is_empty()
             && plan.items.is_empty()
             && plan.existing_group_metadata.is_empty()
             && plan.existing_unit_metadata.is_empty()
             && plan.existing_stock_group_metadata.is_empty()
+            && plan.existing_location_metadata.is_empty()
             && plan.issues.is_empty()
         {
             plan.issues.push("No supported records were found".into());
@@ -1940,6 +2090,38 @@ impl Store {
             ));
         }
         let tx = self.conn.transaction()?;
+        for (id, metadata) in &plan.existing_location_metadata {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stock_locations WHERE id = ?1 AND company_id = ?2)",
+                params![id, plan.company_id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(Error::Validation(
+                    "A stock location changed since preview".into(),
+                ));
+            }
+            save_metadata(&tx, plan.company_id, "stocklocation", *id, metadata)?;
+        }
+        for location in &plan.locations {
+            if find_stock_location(&tx, plan.company_id, &location.name)?.is_some() {
+                return Err(Error::Validation(format!(
+                    "Stock location {} already exists",
+                    location.name
+                )));
+            }
+            tx.execute(
+                "INSERT INTO stock_locations(company_id, name) VALUES (?1, ?2)",
+                params![plan.company_id, location.name],
+            )?;
+            save_metadata(
+                &tx,
+                plan.company_id,
+                "stocklocation",
+                tx.last_insert_rowid(),
+                &location.metadata,
+            )?;
+        }
         for (id, metadata) in &plan.existing_unit_metadata {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM stock_units WHERE company_id = ?1 AND id = ?2)",
@@ -2227,7 +2409,25 @@ impl Store {
                 }
                 lines.push(InvoiceLine {
                     item_id,
-                    location_id: main_stock_location(&tx, plan.company_id)?,
+                    location_id: {
+                        let id = find_stock_location(&tx, plan.company_id, &line.location)?
+                            .ok_or_else(|| {
+                                Error::Validation(format!(
+                                    "Stock location {} is missing",
+                                    line.location
+                                ))
+                            })?;
+                        if line
+                            .existing_location_id
+                            .is_some_and(|previous| previous != id)
+                        {
+                            return Err(Error::Validation(format!(
+                                "Stock location {} changed since preview",
+                                line.location
+                            )));
+                        }
+                        id
+                    },
                     quantity: line.quantity,
                     unit_price: line.unit_price,
                 });
@@ -2276,6 +2476,7 @@ impl Store {
             invoices: plan.invoices.len(),
             units: plan.units.len(),
             stock_groups: plan.stock_groups.len(),
+            locations: plan.locations.len(),
             items: plan.items.len(),
         })
     }
