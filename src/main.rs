@@ -4,7 +4,7 @@ use balance::contacts::LedgerProfile;
 use balance::exchange::ImportPlan;
 use balance::inventory::{
     format_quantity, line_amount, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine,
-    StockItem, StockLocation,
+    SettlementAllocation, StockItem, StockLocation,
 };
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
@@ -113,7 +113,12 @@ struct App {
     settlement_date: String,
     settlement_reference: String,
     settlement_amount: String,
+    settlement_extra: Vec<SettlementLineForm>,
     message: String,
+}
+struct SettlementLineForm {
+    invoice: Option<i64>,
+    amount: String,
 }
 struct InvoiceLineForm {
     item: Option<i64>,
@@ -237,6 +242,7 @@ impl App {
             settlement_date: String::new(),
             settlement_reference: String::new(),
             settlement_amount: String::new(),
+            settlement_extra: Vec::new(),
             message: String::new(),
         }
     }
@@ -295,6 +301,7 @@ impl App {
         self.settlement_bank = None;
         self.settlement_reference.clear();
         self.settlement_amount.clear();
+        self.settlement_extra.clear();
     }
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
@@ -1826,6 +1833,7 @@ impl App {
         match self.store.invoices(company) {
             Ok(invoices) => {
                 ui.heading("Record a receipt or payment");
+                ui.small("Allocate one receipt or payment to one or more outstanding invoices of the same party and type.");
                 let selected = invoices
                     .iter()
                     .find(|invoice| Some(invoice.id) == self.settlement_invoice)
@@ -1876,26 +1884,93 @@ impl App {
                     ui.label("Amount");
                     ui.text_edit_singleline(&mut self.settlement_amount);
                 });
+                let mut remove_allocation = None;
+                for (index, line) in self.settlement_extra.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        let selected = invoices
+                            .iter()
+                            .find(|invoice| Some(invoice.id) == line.invoice)
+                            .map(|invoice| {
+                                format!(
+                                    "{} {} — {} ({})",
+                                    invoice.kind.as_str(),
+                                    invoice.reference,
+                                    invoice.party,
+                                    money(invoice.outstanding)
+                                )
+                            })
+                            .unwrap_or_else(|| "Select invoice".into());
+                        egui::ComboBox::from_id_salt(("settlement-extra", index))
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                for invoice in &invoices {
+                                    if invoice.outstanding > 0 {
+                                        ui.selectable_value(
+                                            &mut line.invoice,
+                                            Some(invoice.id),
+                                            format!(
+                                                "{} {} — {} ({})",
+                                                invoice.kind.as_str(),
+                                                invoice.reference,
+                                                invoice.party,
+                                                money(invoice.outstanding)
+                                            ),
+                                        );
+                                    }
+                                }
+                            });
+                        ui.label("Amount");
+                        ui.text_edit_singleline(&mut line.amount);
+                        if ui.button("Remove").clicked() {
+                            remove_allocation = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove_allocation {
+                    self.settlement_extra.remove(index);
+                }
+                if ui.button("Add invoice allocation").clicked() {
+                    self.settlement_extra.push(SettlementLineForm {
+                        invoice: None,
+                        amount: String::new(),
+                    });
+                }
                 if ui.button("Save receipt / payment").clicked() {
                     let result = (|| -> balance::Result<i64> {
-                        self.store.settle_invoice(
-                            company,
-                            self.settlement_invoice.ok_or_else(|| {
+                        let mut allocations = vec![SettlementAllocation {
+                            invoice_id: self.settlement_invoice.ok_or_else(|| {
                                 balance::Error::Validation("Select an invoice".into())
                             })?,
+                            amount: parse_amount(&self.settlement_amount)?,
+                        }];
+                        for line in &self.settlement_extra {
+                            allocations.push(SettlementAllocation {
+                                invoice_id: line.invoice.ok_or_else(|| {
+                                    balance::Error::Validation(
+                                        "Select an invoice for every allocation".into(),
+                                    )
+                                })?,
+                                amount: parse_amount(&line.amount)?,
+                            });
+                        }
+                        let (voucher, _) = self.store.settle_invoices(
+                            company,
                             self.settlement_bank.ok_or_else(|| {
                                 balance::Error::Validation("Select a cash or bank ledger".into())
                             })?,
                             &self.settlement_date,
                             &self.settlement_reference,
-                            parse_amount(&self.settlement_amount)?,
-                        )
+                            &allocations,
+                        )?;
+                        Ok(voucher)
                     })();
                     match result {
                         Ok(id) => {
-                            self.message = format!("Receipt / payment {id} saved");
+                            self.message = format!("Receipt / payment voucher {id} saved");
+                            self.settlement_invoice = None;
                             self.settlement_reference.clear();
                             self.settlement_amount.clear();
+                            self.settlement_extra.clear();
                         }
                         Err(e) => self.failure(e),
                     }

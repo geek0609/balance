@@ -246,7 +246,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=15).contains(&version) {
+    if !(1..=16).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -353,7 +353,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 15 {
+        if version > 16 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -482,6 +482,22 @@ impl Store {
                 CREATE TABLE stock_transfers(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), from_location_id INTEGER NOT NULL REFERENCES stock_locations(id), to_location_id INTEGER NOT NULL REFERENCES stock_locations(id), date TEXT NOT NULL, quantity INTEGER NOT NULL CHECK(quantity > 0), reason TEXT NOT NULL, CHECK(from_location_id != to_location_id));
                 CREATE INDEX stock_transfers_item ON stock_transfers(item_id, date);
                 PRAGMA user_version = 15;")?;
+        }
+        if version < 16 {
+            let ambiguous: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM invoice_settlements s LEFT JOIN invoices i ON i.id = s.invoice_id LEFT JOIN vouchers v ON v.id = s.voucher_id WHERE i.id IS NULL OR v.id IS NULL OR i.company_id != s.company_id OR v.company_id != s.company_id OR (SELECT count(*) FROM postings p WHERE p.voucher_id = s.voucher_id AND p.ledger_id != i.party_ledger_id) != 1 OR NOT EXISTS(SELECT 1 FROM postings p JOIN ledgers l ON l.id = p.ledger_id AND l.company_id = s.company_id WHERE p.voucher_id = s.voucher_id AND p.ledger_id != i.party_ledger_id))", [], |r| r.get(0))?;
+            if ambiguous {
+                return Err(Error::Validation(
+                    "Existing settlement bank ledger is ambiguous; database was not upgraded"
+                        .into(),
+                ));
+            }
+            tx.execute_batch("CREATE TABLE invoice_settlements_new(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), invoice_id INTEGER NOT NULL REFERENCES invoices(id), voucher_id INTEGER NOT NULL REFERENCES vouchers(id), bank_ledger_id INTEGER NOT NULL REFERENCES ledgers(id), amount INTEGER NOT NULL CHECK(amount > 0), UNIQUE(voucher_id, invoice_id));
+                INSERT INTO invoice_settlements_new(id, company_id, invoice_id, voucher_id, bank_ledger_id, amount)
+                    SELECT s.id, s.company_id, s.invoice_id, s.voucher_id, (SELECT p.ledger_id FROM postings p WHERE p.voucher_id = s.voucher_id AND p.ledger_id != i.party_ledger_id), s.amount FROM invoice_settlements s JOIN invoices i ON i.id = s.invoice_id;
+                DROP TABLE invoice_settlements;
+                ALTER TABLE invoice_settlements_new RENAME TO invoice_settlements;
+                CREATE INDEX settlements_invoice ON invoice_settlements(invoice_id, id);
+                PRAGMA user_version = 16;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1343,7 +1359,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
