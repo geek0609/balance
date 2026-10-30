@@ -208,7 +208,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 5 {
+        if version > 6 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -267,6 +267,11 @@ impl Store {
                 CREATE INDEX invoices_company ON invoices(company_id, id);
                 CREATE INDEX invoice_lines_invoice ON invoice_lines(invoice_id);
                 PRAGMA user_version = 5;")?;
+        }
+        if version < 6 {
+            tx.execute_batch("CREATE TABLE invoice_settlements(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), invoice_id INTEGER NOT NULL REFERENCES invoices(id), voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), amount INTEGER NOT NULL CHECK(amount > 0));
+                CREATE INDEX settlements_invoice ON invoice_settlements(invoice_id, id);
+                PRAGMA user_version = 6;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -511,13 +516,13 @@ impl Store {
         let tx = self.conn.transaction()?;
         check_ledgers(&tx, company_id, postings)?;
         let invoice_backed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2)",
             params![voucher_id, company_id],
             |r| r.get(0),
         )?;
         if invoice_backed {
             return Err(Error::Validation(
-                "Invoice postings cannot be edited from the voucher screen".into(),
+                "Invoice and settlement postings cannot be edited from the voucher screen".into(),
             ));
         }
         let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
@@ -1071,7 +1076,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

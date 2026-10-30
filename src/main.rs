@@ -61,6 +61,11 @@ struct App {
     invoice_tax_ledger: Option<i64>,
     invoice_tax_amount: String,
     invoice_lines: Vec<InvoiceLineForm>,
+    settlement_invoice: Option<i64>,
+    settlement_bank: Option<i64>,
+    settlement_date: String,
+    settlement_reference: String,
+    settlement_amount: String,
     message: String,
 }
 struct InvoiceLineForm {
@@ -136,6 +141,11 @@ impl App {
             invoice_tax_ledger: None,
             invoice_tax_amount: String::new(),
             invoice_lines: vec![InvoiceLineForm::new()],
+            settlement_invoice: None,
+            settlement_bank: None,
+            settlement_date: String::new(),
+            settlement_reference: String::new(),
+            settlement_amount: String::new(),
             message: String::new(),
         }
     }
@@ -164,6 +174,10 @@ impl App {
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_tax_amount.clear();
+        self.settlement_invoice = None;
+        self.settlement_bank = None;
+        self.settlement_reference.clear();
+        self.settlement_amount.clear();
     }
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
@@ -488,7 +502,7 @@ impl App {
                             self.message.clear();
                         }
                         if invoice_backed {
-                            ui.small("Invoice postings cannot yet be edited");
+                            ui.small("Linked invoice or settlement postings cannot yet be edited");
                         }
                     });
                     for p in &voucher.postings {
@@ -1042,14 +1056,94 @@ impl App {
         ui.heading("Invoices");
         match self.store.invoices(company) {
             Ok(invoices) => {
+                ui.heading("Record a receipt or payment");
+                let selected = invoices
+                    .iter()
+                    .find(|invoice| Some(invoice.id) == self.settlement_invoice)
+                    .map(|invoice| {
+                        format!(
+                            "{} {} — outstanding {}",
+                            invoice.kind.as_str(),
+                            invoice.reference,
+                            money(invoice.outstanding)
+                        )
+                    })
+                    .unwrap_or_else(|| "Select invoice".into());
+                egui::ComboBox::from_label("Invoice")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for invoice in &invoices {
+                            if invoice.outstanding > 0 {
+                                ui.selectable_value(
+                                    &mut self.settlement_invoice,
+                                    Some(invoice.id),
+                                    format!(
+                                        "{} {} — {} ({})",
+                                        invoice.kind.as_str(),
+                                        invoice.reference,
+                                        invoice.party,
+                                        money(invoice.outstanding)
+                                    ),
+                                );
+                            }
+                        }
+                    });
+                pick_account(
+                    ui,
+                    "settlement-bank",
+                    "Cash / bank ledger",
+                    &ledgers,
+                    &mut self.settlement_bank,
+                    false,
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Date");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settlement_date)
+                            .hint_text("YYYY-MM-DD"),
+                    );
+                    ui.label("Reference");
+                    ui.text_edit_singleline(&mut self.settlement_reference);
+                    ui.label("Amount");
+                    ui.text_edit_singleline(&mut self.settlement_amount);
+                });
+                if ui.button("Save receipt / payment").clicked() {
+                    let result = (|| -> optimus_prime::Result<i64> {
+                        self.store.settle_invoice(
+                            company,
+                            self.settlement_invoice.ok_or_else(|| {
+                                optimus_prime::Error::Validation("Select an invoice".into())
+                            })?,
+                            self.settlement_bank.ok_or_else(|| {
+                                optimus_prime::Error::Validation(
+                                    "Select a cash or bank ledger".into(),
+                                )
+                            })?,
+                            &self.settlement_date,
+                            &self.settlement_reference,
+                            parse_amount(&self.settlement_amount)?,
+                        )
+                    })();
+                    match result {
+                        Ok(id) => {
+                            self.message = format!("Receipt / payment {id} saved");
+                            self.settlement_reference.clear();
+                            self.settlement_amount.clear();
+                        }
+                        Err(e) => self.failure(e),
+                    }
+                }
+                ui.separator();
                 for invoice in invoices {
                     ui.strong(format!(
-                        "{}  {}  {}  {}  Total {}",
+                        "{}  {}  {}  {}  Total {}  Paid {}  Outstanding {}",
                         invoice.date,
                         invoice.kind.as_str(),
                         invoice.reference,
                         invoice.party,
-                        money(invoice.total)
+                        money(invoice.total),
+                        money(invoice.settled),
+                        money(invoice.outstanding)
                     ));
                     for line in invoice.lines {
                         ui.label(format!(
@@ -1063,6 +1157,23 @@ impl App {
                     }
                     if invoice.tax_amount > 0 {
                         ui.label(format!("  Tax: {}", format_amount(invoice.tax_amount)));
+                    }
+                    match self.store.invoice_settlements(company, invoice.id) {
+                        Ok(rows) => {
+                            for payment in rows {
+                                ui.label(format!(
+                                    "  {} — {} — {} — {} (voucher #{})",
+                                    payment.date,
+                                    payment.reference,
+                                    payment.bank_ledger,
+                                    format_amount(payment.amount),
+                                    payment.voucher_id
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                        }
                     }
                     ui.small(format!(
                         "Accounting voucher #{}; editing is not yet available",

@@ -88,7 +88,18 @@ pub struct InvoiceSummary {
     pub party: String,
     pub total: i128,
     pub tax_amount: i64,
+    pub settled: i128,
+    pub outstanding: i128,
     pub lines: Vec<InvoiceDetailLine>,
+}
+#[derive(Debug, Clone)]
+pub struct Settlement {
+    pub id: i64,
+    pub voucher_id: i64,
+    pub date: String,
+    pub reference: String,
+    pub amount: i64,
+    pub bank_ledger: String,
 }
 #[derive(Debug, Clone)]
 pub struct InvoiceDetailLine {
@@ -483,7 +494,7 @@ impl Store {
     }
     pub fn is_invoice_voucher(&self, company_id: i64, voucher_id: i64) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2)",
             params![company_id, voucher_id],
             |r| r.get(0),
         )?)
@@ -521,6 +532,15 @@ impl Store {
                 total += i128::from(line.amount);
                 lines.push(line);
             }
+            let mut settlement_stmt = self.conn.prepare(
+                "SELECT amount FROM invoice_settlements WHERE invoice_id = ?1 AND company_id = ?2",
+            )?;
+            let settlement_rows =
+                settlement_stmt.query_map(params![id, company_id], |r| r.get::<_, i64>(0))?;
+            let mut settled = 0_i128;
+            for amount in settlement_rows {
+                settled += i128::from(amount?);
+            }
             result.push(InvoiceSummary {
                 id,
                 voucher_id,
@@ -530,9 +550,115 @@ impl Store {
                 party,
                 total,
                 tax_amount: tax,
+                settled,
+                outstanding: total - settled,
                 lines,
             });
         }
         Ok(result)
+    }
+    /// Create and allocate a receipt or payment atomically to one invoice.
+    pub fn settle_invoice(
+        &mut self,
+        company_id: i64,
+        invoice_id: i64,
+        bank_ledger_id: i64,
+        date: &str,
+        reference: &str,
+        amount: i64,
+    ) -> Result<i64> {
+        let date = parse_date(date)?.format("%Y-%m-%d").to_string();
+        let reference = required(reference, "Settlement reference")?;
+        if amount <= 0 {
+            return Err(Error::Validation(
+                "Settlement amount must be positive".into(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        let (kind, party, invoice_date, tax): (String, i64, String, i64) = tx.query_row("SELECT i.kind, i.party_ledger_id, v.date, i.tax_amount FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
+        if parse_date(&date)? < parse_date(&invoice_date)? {
+            return Err(Error::Validation(
+                "Settlement date must not precede the invoice date".into(),
+            ));
+        }
+        if bank_ledger_id == party
+            || ledger_category(&tx, company_id, bank_ledger_id)? != Category::Asset
+        {
+            return Err(Error::Validation(
+                "Select a different asset ledger for cash or bank".into(),
+            ));
+        }
+        let kind = InvoiceKind::parse(&kind)?;
+        let mut subtotal = i128::from(tax);
+        let mut amounts = tx.prepare("SELECT amount FROM invoice_lines WHERE invoice_id = ?1")?;
+        for value in amounts.query_map([invoice_id], |r| r.get::<_, i64>(0))? {
+            subtotal += i128::from(value?);
+        }
+        drop(amounts);
+        let mut paid = 0_i128;
+        let mut previous = tx.prepare("SELECT s.amount, v.reference FROM invoice_settlements s JOIN vouchers v ON v.id = s.voucher_id WHERE s.invoice_id = ?1 AND s.company_id = ?2")?;
+        for row in previous.query_map(params![invoice_id, company_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (value, old_reference) = row?;
+            paid += i128::from(value);
+            if old_reference.trim().to_lowercase() == reference.to_lowercase() {
+                return Err(Error::Validation(
+                    "Settlement reference already exists for this invoice".into(),
+                ));
+            }
+        }
+        drop(previous);
+        if i128::from(amount) > subtotal - paid {
+            return Err(Error::Validation(
+                "Settlement exceeds the outstanding amount".into(),
+            ));
+        }
+        let direction = if kind == InvoiceKind::Sale { 1 } else { -1 };
+        let postings = [
+            Posting {
+                ledger_id: bank_ledger_id,
+                amount: direction * amount,
+            },
+            Posting {
+                ledger_id: party,
+                amount: -direction * amount,
+            },
+        ];
+        validate_voucher(&date, &postings)?;
+        check_ledgers(&tx, company_id, &postings)?;
+        let voucher_kind = if kind == InvoiceKind::Sale {
+            VoucherKind::Receipt
+        } else {
+            VoucherKind::Payment
+        };
+        tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, voucher_kind.as_str(), reference, date, format!("Settlement for invoice {invoice_id}")])?;
+        let voucher_id = tx.last_insert_rowid();
+        for posting in postings {
+            tx.execute(
+                "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
+                params![voucher_id, posting.ledger_id, posting.amount],
+            )?;
+        }
+        tx.execute("INSERT INTO invoice_settlements(company_id, invoice_id, voucher_id, amount) VALUES (?1, ?2, ?3, ?4)", params![company_id, invoice_id, voucher_id, amount])?;
+        let settlement_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(settlement_id)
+    }
+    pub fn invoice_settlements(&self, company_id: i64, invoice_id: i64) -> Result<Vec<Settlement>> {
+        let mut stmt = self.conn.prepare("SELECT s.id, s.voucher_id, v.date, v.reference, s.amount, l.name FROM invoice_settlements s JOIN vouchers v ON v.id = s.voucher_id JOIN postings p ON p.voucher_id = v.id JOIN ledgers l ON l.id = p.ledger_id JOIN invoices i ON i.id = s.invoice_id WHERE s.company_id = ?1 AND s.invoice_id = ?2 AND p.ledger_id != i.party_ledger_id ORDER BY v.date, s.id")?;
+        let rows = stmt
+            .query_map(params![company_id, invoice_id], |r| {
+                Ok(Settlement {
+                    id: r.get(0)?,
+                    voucher_id: r.get(1)?,
+                    date: r.get(2)?,
+                    reference: r.get(3)?,
+                    amount: r.get(4)?,
+                    bank_ledger: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 }
