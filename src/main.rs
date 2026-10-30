@@ -3,7 +3,8 @@
 use balance::contacts::LedgerProfile;
 use balance::exchange::ImportPlan;
 use balance::inventory::{
-    format_quantity, line_amount, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine, StockItem,
+    format_quantity, line_amount, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine,
+    StockItem, StockLocation,
 };
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
@@ -74,6 +75,15 @@ struct App {
     unit_decimals: u8,
     stock_group_name: String,
     stock_group_parent: Option<i64>,
+    stock_location_name: String,
+    stock_balance_location: Option<i64>,
+    adjustment_location: Option<i64>,
+    transfer_item: Option<i64>,
+    transfer_from: Option<i64>,
+    transfer_to: Option<i64>,
+    transfer_date: String,
+    transfer_quantity: String,
+    transfer_reason: String,
     stock_as_of: String,
     stock_register_item: Option<i64>,
     stock_register_from: String,
@@ -104,6 +114,7 @@ struct App {
 }
 struct InvoiceLineForm {
     item: Option<i64>,
+    location: Option<i64>,
     quantity: String,
     price: String,
 }
@@ -111,6 +122,7 @@ impl InvoiceLineForm {
     fn new() -> Self {
         Self {
             item: None,
+            location: None,
             quantity: String::new(),
             price: String::new(),
         }
@@ -184,6 +196,15 @@ impl App {
             unit_decimals: 0,
             stock_group_name: String::new(),
             stock_group_parent: None,
+            stock_location_name: String::new(),
+            stock_balance_location: None,
+            adjustment_location: None,
+            transfer_item: None,
+            transfer_from: None,
+            transfer_to: None,
+            transfer_date: String::new(),
+            transfer_quantity: String::new(),
+            transfer_reason: String::new(),
             stock_as_of: String::new(),
             stock_register_item: None,
             stock_register_from: String::new(),
@@ -245,6 +266,14 @@ impl App {
         self.stock_edit_group = None;
         self.stock_edit_description.clear();
         self.stock_group_parent = None;
+        self.stock_balance_location = None;
+        self.adjustment_location = None;
+        self.transfer_item = None;
+        self.transfer_from = None;
+        self.transfer_to = None;
+        self.transfer_date.clear();
+        self.transfer_quantity.clear();
+        self.transfer_reason.clear();
         self.stock_register_item = None;
         self.invoice_party = None;
         self.invoice_trade = None;
@@ -1019,6 +1048,20 @@ impl App {
         );
     }
     fn stock_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        let locations = match self.store.stock_locations(company) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        let main_location = locations.iter().find(|l| l.name == "Main").map(|l| l.id);
+        if self.adjustment_location.is_none() {
+            self.adjustment_location = main_location;
+        }
+        if self.transfer_from.is_none() {
+            self.transfer_from = main_location;
+        }
         let units = match self.store.stock_units(company) {
             Ok(v) => v,
             Err(e) => {
@@ -1103,6 +1146,25 @@ impl App {
                         self.stock_creation_group = Some(id);
                         self.stock_group_name.clear();
                         self.message = "Stock group created".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        });
+        ui.separator();
+        ui.heading("Stock locations");
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            ui.text_edit_singleline(&mut self.stock_location_name);
+            if ui.button("Create location").clicked() {
+                match self
+                    .store
+                    .create_stock_location(company, &self.stock_location_name)
+                {
+                    Ok(id) => {
+                        self.stock_location_name.clear();
+                        self.transfer_to = Some(id);
+                        self.message = "Stock location created".into();
                     }
                     Err(e) => self.failure(e),
                 }
@@ -1288,6 +1350,14 @@ impl App {
             &items,
             &mut self.adjustment_item,
         );
+        pick_location(
+            ui,
+            "adjustment-location",
+            "Location",
+            &locations,
+            &mut self.adjustment_location,
+            false,
+        );
         ui.horizontal(|ui| {
             ui.label("Date");
             ui.add(egui::TextEdit::singleline(&mut self.adjustment_date).hint_text("YYYY-MM-DD"));
@@ -1319,9 +1389,12 @@ impl App {
                         "Quantity must be greater than zero".into(),
                     ));
                 }
-                self.store.adjust_stock(
+                self.store.adjust_stock_at(
                     company,
                     item,
+                    self.adjustment_location.ok_or_else(|| {
+                        balance::Error::Validation("Select a stock location".into())
+                    })?,
                     &self.adjustment_date,
                     if self.adjustment_increase { qty } else { -qty },
                     &self.adjustment_reason,
@@ -1337,17 +1410,106 @@ impl App {
             }
         }
         ui.separator();
+        ui.heading("Transfer stock");
+        ui.label("Transfers change location quantities only and do not create accounting entries. Negative location balances are allowed.");
+        pick_stock(ui, "transfer-item", "Item", &items, &mut self.transfer_item);
+        ui.horizontal(|ui| {
+            pick_location(
+                ui,
+                "transfer-from",
+                "From",
+                &locations,
+                &mut self.transfer_from,
+                false,
+            );
+            pick_location(
+                ui,
+                "transfer-to",
+                "To",
+                &locations,
+                &mut self.transfer_to,
+                false,
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Date");
+            ui.add(egui::TextEdit::singleline(&mut self.transfer_date).hint_text("YYYY-MM-DD"));
+            ui.label("Quantity");
+            ui.text_edit_singleline(&mut self.transfer_quantity);
+            ui.label("Reason");
+            ui.text_edit_singleline(&mut self.transfer_reason);
+        });
+        if ui.button("Save transfer").clicked() {
+            let result = (|| -> balance::Result<i64> {
+                self.store.transfer_stock(
+                    company,
+                    self.transfer_item
+                        .ok_or_else(|| balance::Error::Validation("Select a stock item".into()))?,
+                    self.transfer_from.ok_or_else(|| {
+                        balance::Error::Validation("Select a source location".into())
+                    })?,
+                    self.transfer_to.ok_or_else(|| {
+                        balance::Error::Validation("Select a destination location".into())
+                    })?,
+                    &self.transfer_date,
+                    parse_quantity(&self.transfer_quantity)?,
+                    &self.transfer_reason,
+                )
+            })();
+            match result {
+                Ok(_) => {
+                    self.transfer_quantity.clear();
+                    self.transfer_reason.clear();
+                    self.message = "Stock transfer saved".into();
+                }
+                Err(e) => self.failure(e),
+            }
+        }
+        egui::CollapsingHeader::new("Stock transfer history").show(ui, |ui| {
+            match self.store.stock_transfers(company) {
+                Ok(transfers) => {
+                    for transfer in transfers {
+                        ui.label(format!(
+                            "{}: {} {} {} from {} to {} — {}",
+                            transfer.date,
+                            transfer.item,
+                            format_quantity(i128::from(transfer.quantity)),
+                            transfer.unit,
+                            transfer.from,
+                            transfer.to,
+                            transfer.reason
+                        ));
+                    }
+                }
+                Err(e) => {
+                    ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                }
+            }
+        });
+        ui.separator();
         ui.heading("Stock quantities");
         ui.horizontal(|ui| {
             ui.label("As of (optional)");
             ui.add(egui::TextEdit::singleline(&mut self.stock_as_of).hint_text("YYYY-MM-DD"));
         });
+        pick_location(
+            ui,
+            "balance-location",
+            "Location",
+            &locations,
+            &mut self.stock_balance_location,
+            true,
+        );
         let end = if self.stock_as_of.trim().is_empty() {
             None
         } else {
             Some(self.stock_as_of.trim())
         };
-        match self.store.stock_balances(company, end) {
+        let balances = match self.stock_balance_location {
+            Some(location) => self.store.stock_location_balances(company, location, end),
+            None => self.store.stock_balances(company, end),
+        };
+        match balances {
             Ok(balances) => {
                 for balance in balances {
                     ui.label(format!(
@@ -1367,6 +1529,7 @@ impl App {
         );
         ui.separator();
         ui.heading("Stock activity");
+        ui.small("The location filter above also applies to stock activity; transfers are shown when a location is selected.");
         pick_stock(
             ui,
             "stock-register-item",
@@ -1399,7 +1562,10 @@ impl App {
             } else {
                 Some(self.stock_register_to.trim())
             };
-            match self.store.stock_register(company, item, from, to) {
+            match self
+                .store
+                .stock_register_at(company, item, self.stock_balance_location, from, to)
+            {
                 Ok(register) => {
                     ui.label(format!(
                         "Opening: {} {}",
@@ -1446,6 +1612,19 @@ impl App {
                 return;
             }
         };
+        let locations = match self.store.stock_locations(company) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        let main_location = locations.iter().find(|l| l.name == "Main").map(|l| l.id);
+        for line in &mut self.invoice_lines {
+            if line.location.is_none() {
+                line.location = main_location;
+            }
+        }
         let ledgers = match self.store.ledgers(company) {
             Ok(v) => v,
             Err(e) => {
@@ -1508,6 +1687,14 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(format!("{}.", index + 1));
                 pick_stock(ui, ("invoice-item", index), "Item", &items, &mut line.item);
+                pick_location(
+                    ui,
+                    ("invoice-location", index),
+                    "Location",
+                    &locations,
+                    &mut line.location,
+                    false,
+                );
                 ui.add(
                     egui::TextEdit::singleline(&mut line.quantity)
                         .hint_text("Quantity")
@@ -1563,6 +1750,9 @@ impl App {
                     })?;
                     lines.push(InvoiceLine {
                         item_id,
+                        location_id: line.location.ok_or_else(|| {
+                            balance::Error::Validation("Select a location for every line".into())
+                        })?,
                         quantity: parse_quantity(&line.quantity)?,
                         unit_price: parse_amount(&line.price)?,
                     });
@@ -1748,6 +1938,7 @@ impl App {
                                     .into_iter()
                                     .map(|line| InvoiceLineForm {
                                         item: Some(line.item_id),
+                                        location: Some(line.location_id),
                                         quantity: format_quantity(i128::from(line.quantity)),
                                         price: format_amount(line.unit_price),
                                     })
@@ -1768,8 +1959,9 @@ impl App {
                     }
                     for line in invoice.lines {
                         ui.label(format!(
-                            "  {}: {} {} × {} = {}",
+                            "  {} at {}: {} {} × {} = {}",
                             line.item,
+                            line.location,
                             format_quantity(i128::from(line.quantity)),
                             line.unit,
                             format_amount(line.unit_price),
@@ -1833,8 +2025,9 @@ impl App {
                                         }
                                         for line in revision.lines {
                                             ui.label(format!(
-                                                "  {}: {} {} × {} = {}",
+                                                "  {} at {}: {} {} × {} = {}",
                                                 line.item,
+                                                line.location,
                                                 format_quantity(i128::from(line.quantity)),
                                                 line.unit,
                                                 format_amount(line.unit_price),
@@ -2188,6 +2381,35 @@ impl App {
         }
         ui.small("If backup creation fails, an incomplete file may remain at the selected path.");
     }
+}
+fn pick_location(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    label: &str,
+    locations: &[StockLocation],
+    selected: &mut Option<i64>,
+    all: bool,
+) {
+    ui.label(label);
+    let text = locations
+        .iter()
+        .find(|location| Some(location.id) == *selected)
+        .map(|location| location.name.as_str())
+        .unwrap_or(if all {
+            "All locations"
+        } else {
+            "Select location"
+        });
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            if all {
+                ui.selectable_value(selected, None, "All locations");
+            }
+            for location in locations {
+                ui.selectable_value(selected, Some(location.id), &location.name);
+            }
+        });
 }
 fn pick_stock(
     ui: &mut egui::Ui,

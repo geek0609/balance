@@ -237,7 +237,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 14 {
+        if version > 15 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -354,6 +354,19 @@ impl Store {
                 ALTER TABLE invoice_revisions ADD COLUMN credit_days INTEGER CHECK(credit_days BETWEEN 0 AND 4294967295);
                 PRAGMA user_version = 14;")?;
         }
+        if version < 15 {
+            tx.execute_batch("CREATE TABLE stock_locations(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), name TEXT NOT NULL, UNIQUE(company_id, name));
+                INSERT INTO stock_locations(company_id, name) SELECT id, 'Main' FROM companies;
+                ALTER TABLE stock_adjustments ADD COLUMN location_id INTEGER REFERENCES stock_locations(id);
+                ALTER TABLE invoice_lines ADD COLUMN location_id INTEGER REFERENCES stock_locations(id);
+                ALTER TABLE invoice_revision_lines ADD COLUMN location_id INTEGER REFERENCES stock_locations(id);
+                UPDATE stock_adjustments SET location_id = (SELECT id FROM stock_locations WHERE company_id = stock_adjustments.company_id AND name = 'Main');
+                UPDATE invoice_lines SET location_id = (SELECT sl.id FROM invoices i JOIN stock_locations sl ON sl.company_id = i.company_id AND sl.name = 'Main' WHERE i.id = invoice_lines.invoice_id);
+                UPDATE invoice_revision_lines SET location_id = (SELECT sl.id FROM invoice_revisions r JOIN stock_locations sl ON sl.company_id = r.company_id AND sl.name = 'Main' WHERE r.id = invoice_revision_lines.revision_id);
+                CREATE TABLE stock_transfers(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), from_location_id INTEGER NOT NULL REFERENCES stock_locations(id), to_location_id INTEGER NOT NULL REFERENCES stock_locations(id), date TEXT NOT NULL, quantity INTEGER NOT NULL CHECK(quantity > 0), reason TEXT NOT NULL, CHECK(from_location_id != to_location_id));
+                CREATE INDEX stock_transfers_item ON stock_transfers(item_id, date);
+                PRAGMA user_version = 15;")?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
@@ -364,6 +377,7 @@ impl Store {
         let id = tx.last_insert_rowid();
         seed_groups(&tx, id)?;
         inventory::seed_stock_groups(&tx, id)?;
+        inventory::seed_stock_locations(&tx, id)?;
         tx.commit()?;
         Ok(id)
     }
@@ -1213,7 +1227,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

@@ -3,7 +3,7 @@
 use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_item_on_connection, insert_invoice_on_connection,
-    line_amount, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine,
+    line_amount, main_stock_location, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine,
 };
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
@@ -2076,7 +2076,8 @@ impl Store {
                     .opening_date
                     .as_deref()
                     .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
-                tx.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason) VALUES (?1, ?2, ?3, ?4, 'Imported opening quantity')", params![plan.company_id, item_id, date, quantity])?;
+                let location = main_stock_location(&tx, plan.company_id)?;
+                tx.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id) VALUES (?1, ?2, ?3, ?4, 'Imported opening quantity', ?5)", params![plan.company_id, item_id, date, quantity, location])?;
             }
         }
         for voucher in &plan.transactions {
@@ -2194,6 +2195,7 @@ impl Store {
                 }
                 lines.push(InvoiceLine {
                     item_id,
+                    location_id: main_stock_location(&tx, plan.company_id)?,
                     quantity: line.quantity,
                     unit_price: line.unit_price,
                 });
