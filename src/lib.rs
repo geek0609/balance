@@ -7,6 +7,7 @@ use rust_decimal::{prelude::ToPrimitive, Decimal};
 use std::{collections::HashMap, path::Path, str::FromStr};
 use thiserror::Error;
 pub mod exchange;
+pub mod inventory;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -207,7 +208,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 4 {
+        if version > 5 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -255,6 +256,17 @@ impl Store {
                 ALTER TABLE voucher_revisions ADD COLUMN reference TEXT NOT NULL DEFAULT '';
                 PRAGMA user_version = 4;",
             )?;
+        }
+        if version < 5 {
+            tx.execute_batch("CREATE TABLE stock_items(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), name TEXT NOT NULL, unit TEXT NOT NULL, UNIQUE(company_id, name));
+                CREATE TABLE stock_adjustments(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), date TEXT NOT NULL, quantity INTEGER NOT NULL CHECK(quantity != 0), reason TEXT NOT NULL);
+                CREATE TABLE invoices(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), kind TEXT NOT NULL CHECK(kind IN ('Sale', 'Purchase')), party_ledger_id INTEGER NOT NULL REFERENCES ledgers(id), trade_ledger_id INTEGER NOT NULL REFERENCES ledgers(id), tax_ledger_id INTEGER REFERENCES ledgers(id), tax_amount INTEGER NOT NULL CHECK(tax_amount >= 0));
+                CREATE TABLE invoice_lines(id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES invoices(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), quantity INTEGER NOT NULL CHECK(quantity > 0), unit_price INTEGER NOT NULL CHECK(unit_price >= 0), amount INTEGER NOT NULL CHECK(amount >= 0));
+                CREATE INDEX stock_items_company ON stock_items(company_id, name);
+                CREATE INDEX stock_adjustments_item ON stock_adjustments(item_id, date);
+                CREATE INDEX invoices_company ON invoices(company_id, id);
+                CREATE INDEX invoice_lines_invoice ON invoice_lines(invoice_id);
+                PRAGMA user_version = 5;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -498,6 +510,16 @@ impl Store {
         let date = validate_voucher(date, postings)?;
         let tx = self.conn.transaction()?;
         check_ledgers(&tx, company_id, postings)?;
+        let invoice_backed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2)",
+            params![voucher_id, company_id],
+            |r| r.get(0),
+        )?;
+        if invoice_backed {
+            return Err(Error::Validation(
+                "Invoice postings cannot be edited from the voucher screen".into(),
+            ));
+        }
         let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
         if saved != 1 {
             return Err(Error::Validation(
@@ -1049,7 +1071,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
