@@ -133,7 +133,7 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
             }
             for attribute in child.attributes() {
                 if !attribute.name().eq_ignore_ascii_case("TYPE")
-                    || !["String", "Date", "Number", "Logical"]
+                    || !["String", "Date", "Number", "Logical", "Amount"]
                         .iter()
                         .any(|v| attribute.value().eq_ignore_ascii_case(v))
                 {
@@ -148,6 +148,10 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
     for attribute in node.attributes() {
         if !attribute.name().eq_ignore_ascii_case("NAME")
             && !attribute.name().eq_ignore_ascii_case("ACTION")
+            && !(attribute.name().eq_ignore_ascii_case("TYPE")
+                && ["String", "Date", "Number", "Logical", "Amount"]
+                    .iter()
+                    .any(|v| attribute.value().eq_ignore_ascii_case(v)))
             && !attribute.value().trim().is_empty()
         {
             issues.push(format!(
@@ -162,6 +166,45 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
     {
         if !action.value().eq_ignore_ascii_case("create") && !action.value().is_empty() {
             issues.push(format!("{label}: only new records can be imported"));
+        }
+    }
+}
+fn check_language_names(node: Node<'_, '_>, name: &str, label: &str, issues: &mut Vec<String>) {
+    let lists: Vec<_> = node
+        .children()
+        .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("LANGUAGENAME.LIST"))
+        .collect();
+    if lists.len() > 1 {
+        issues.push(format!(
+            "{label}: multiple language name lists are not supported"
+        ));
+    }
+    for list in lists {
+        check_fields(list, &["NAME.LIST", "LANGUAGEID"], label, issues);
+        let name_lists: Vec<_> = list
+            .children()
+            .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("NAME.LIST"))
+            .collect();
+        if name_lists.len() != 1 {
+            issues.push(format!("{label}: name list is ambiguous"));
+            continue;
+        }
+        let names = name_lists[0];
+        for attr in names.attributes() {
+            if !attr.name().eq_ignore_ascii_case("TYPE")
+                || !attr.value().eq_ignore_ascii_case("String")
+            {
+                issues.push(format!("{label}: name list attribute is not supported"));
+            }
+        }
+        check_fields(names, &["NAME"], label, issues);
+        if direct_text(names, "NAME").as_deref() != Some(name) {
+            issues.push(format!(
+                "{label}: aliases or alternate names are not supported"
+            ));
+        }
+        if direct_text(list, "LANGUAGEID").is_some_and(|id| !id.is_empty() && id != "1033") {
+            issues.push(format!("{label}: alternate languages are not supported"));
         }
     }
 }
@@ -328,10 +371,11 @@ impl Store {
             };
             check_fields(
                 node,
-                &["NAME", "PARENT"],
+                &["NAME", "PARENT", "LANGUAGENAME.LIST"],
                 &format!("Group {name}"),
                 &mut plan.issues,
             );
+            check_language_names(node, &name, &format!("Group {name}"), &mut plan.issues);
             let parent = direct_text(node, "PARENT").unwrap_or_default();
             if let Some(existing) = existing_groups
                 .iter()
@@ -409,10 +453,11 @@ impl Store {
             };
             check_fields(
                 node,
-                &["NAME", "PARENT", "OPENINGBALANCE"],
+                &["NAME", "PARENT", "OPENINGBALANCE", "LANGUAGENAME.LIST"],
                 &format!("Ledger {name}"),
                 &mut plan.issues,
             );
+            check_language_names(node, &name, &format!("Ledger {name}"), &mut plan.issues);
             if let Some(opening) = direct_text(node, "OPENINGBALANCE") {
                 if !opening.is_empty() && !matches!(xml_amount(&opening), Ok(0)) {
                     plan.issues
