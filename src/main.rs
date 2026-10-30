@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use balance::banking::{parse_signed_amount, StatementPlan};
+use balance::banking::{parse_signed_amount, BankEntry, StatementPlan};
 use balance::contacts::LedgerProfile;
 use balance::exchange::ImportPlan;
 use balance::inventory::{
@@ -2600,7 +2600,7 @@ impl App {
         let selected_posting = self
             .bank_posting
             .filter(|id| report.entries.iter().any(|entry| entry.posting_id == *id));
-        self.bank_statement_page(ui, company, ledger, selected_posting);
+        self.bank_statement_page(ui, company, ledger, selected_posting, &report.entries);
         let Some(entry) = report
             .entries
             .iter()
@@ -2694,6 +2694,7 @@ impl App {
         company: i64,
         ledger: i64,
         posting: Option<i64>,
+        book_entries: &[BankEntry],
     ) {
         ui.separator();
         ui.heading("Statement entries");
@@ -2794,7 +2795,7 @@ impl App {
                 }
             }
         });
-        ui.small("CSV columns: id,date,description,amount. Dates use YYYY-MM-DD; deposits are positive and withdrawals negative. IDs must be unique for this ledger. Matching requires the exact amount and a statement date on or after the voucher date.");
+        ui.small("CSV columns: id,date,description,amount. Dates use YYYY-MM-DD; deposits are positive and withdrawals negative. IDs must be unique for this ledger. Matching requires the exact amount and a statement date on or after the voucher date. A unique candidate is a suggestion; check its details before matching.");
         ui.horizontal(|ui| {
             ui.label("CSV file");
             if ui
@@ -2894,6 +2895,7 @@ impl App {
                     "Description",
                     "Amount",
                     "Matched posting",
+                    "Candidates",
                 ] {
                     ui.strong(title);
                 }
@@ -2914,6 +2916,23 @@ impl App {
                             .map(|id| id.to_string())
                             .unwrap_or_else(|| "—".into()),
                     );
+                    let candidates = if entry.matched_posting.is_none() {
+                        book_entries
+                            .iter()
+                            .filter(|book| {
+                                book.cleared_on.is_none()
+                                    && book.amount == entry.amount
+                                    && book.date <= entry.date
+                            })
+                            .count()
+                    } else {
+                        0
+                    };
+                    ui.label(if entry.matched_posting.is_some() {
+                        "—".into()
+                    } else {
+                        candidates.to_string()
+                    });
                     ui.end_row();
                 }
             });
@@ -2923,6 +2942,23 @@ impl App {
         else {
             return;
         };
+        if entry.matched_posting.is_none() {
+            let mut candidates = book_entries.iter().filter(|book| {
+                book.cleared_on.is_none() && book.amount == entry.amount && book.date <= entry.date
+            });
+            if let Some(candidate) = candidates.next() {
+                if candidates.next().is_none()
+                    && ui
+                        .button(format!(
+                            "Select candidate posting {} (voucher {})",
+                            candidate.posting_id, candidate.voucher_id
+                        ))
+                        .clicked()
+                {
+                    self.bank_posting = Some(candidate.posting_id);
+                }
+            }
+        }
         ui.horizontal(|ui| {
             ui.label("Match reason");
             ui.text_edit_singleline(&mut self.bank_match_reason);
