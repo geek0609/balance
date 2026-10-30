@@ -44,6 +44,9 @@ struct App {
     stock_name: String,
     stock_unit: String,
     stock_as_of: String,
+    stock_register_item: Option<i64>,
+    stock_register_from: String,
+    stock_register_to: String,
     adjustment_item: Option<i64>,
     adjustment_date: String,
     adjustment_quantity: String,
@@ -116,6 +119,9 @@ impl App {
             stock_name: String::new(),
             stock_unit: String::new(),
             stock_as_of: String::new(),
+            stock_register_item: None,
+            stock_register_from: String::new(),
+            stock_register_to: String::new(),
             adjustment_item: None,
             adjustment_date: String::new(),
             adjustment_quantity: String::new(),
@@ -150,6 +156,7 @@ impl App {
         self.group_parent = None;
         self.import_preview = None;
         self.adjustment_item = None;
+        self.stock_register_item = None;
         self.invoice_party = None;
         self.invoice_trade = None;
         self.invoice_tax_ledger = None;
@@ -816,6 +823,73 @@ impl App {
         ui.small(
             "Quantities may be negative. Stock valuation and cost of goods are not calculated.",
         );
+        ui.separator();
+        ui.heading("Stock activity");
+        pick_stock(
+            ui,
+            "stock-register-item",
+            "Item",
+            &items,
+            &mut self.stock_register_item,
+        );
+        ui.horizontal(|ui| {
+            ui.label("From");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.stock_register_from)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+            ui.label("To");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.stock_register_to)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+        });
+        if let Some(item) = self.stock_register_item {
+            let from = if self.stock_register_from.trim().is_empty() {
+                None
+            } else {
+                Some(self.stock_register_from.trim())
+            };
+            let to = if self.stock_register_to.trim().is_empty() {
+                None
+            } else {
+                Some(self.stock_register_to.trim())
+            };
+            match self.store.stock_register(company, item, from, to) {
+                Ok(register) => {
+                    ui.label(format!(
+                        "Opening: {} {}",
+                        format_quantity(register.opening_quantity),
+                        register.item.unit
+                    ));
+                    egui::Grid::new("stock-activity")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for h in ["Date", "Movement", "Change", "Balance"] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for movement in register.movements {
+                                ui.label(movement.date);
+                                ui.label(movement.description);
+                                ui.label(format_quantity(i128::from(movement.quantity)));
+                                ui.label(format_quantity(movement.running_quantity));
+                                ui.end_row();
+                            }
+                        });
+                    ui.label(format!(
+                        "Closing: {} {}",
+                        format_quantity(register.closing_quantity),
+                        register.item.unit
+                    ));
+                }
+                Err(e) => {
+                    ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                }
+            }
+        }
     }
     fn invoice_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Sales and purchase invoices");

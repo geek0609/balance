@@ -19,6 +19,20 @@ pub struct StockBalance {
     pub item: StockItem,
     pub quantity: i128,
 }
+#[derive(Debug, Clone)]
+pub struct StockMovement {
+    pub date: String,
+    pub description: String,
+    pub quantity: i64,
+    pub running_quantity: i128,
+}
+#[derive(Debug, Clone)]
+pub struct StockRegister {
+    pub item: StockItem,
+    pub opening_quantity: i128,
+    pub movements: Vec<StockMovement>,
+    pub closing_quantity: i128,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvoiceKind {
     Sale,
@@ -241,6 +255,100 @@ impl Store {
                 item,
             })
             .collect())
+    }
+    /// Quantity movements ordered by date; a date range includes both boundaries.
+    pub fn stock_register(
+        &self,
+        company_id: i64,
+        item_id: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<StockRegister> {
+        let start = start.map(parse_date).transpose()?;
+        let end = end.map(parse_date).transpose()?;
+        if matches!((start, end), (Some(a), Some(b)) if a > b) {
+            return Err(Error::Validation(
+                "The start date must not be after the end date".into(),
+            ));
+        }
+        let item = self
+            .stock_items(company_id)?
+            .into_iter()
+            .find(|i| i.id == item_id)
+            .ok_or_else(|| {
+                Error::Validation("Stock item not found in the selected company".into())
+            })?;
+        let mut raw = Vec::<(chrono::NaiveDate, u8, i64, String, i64)>::new();
+        let mut stmt = self.conn.prepare("SELECT id, date, quantity, reason FROM stock_adjustments WHERE company_id = ?1 AND item_id = ?2")?;
+        let rows = stmt.query_map(params![company_id, item_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, date, qty, reason) = row?;
+            raw.push((
+                parse_date(&date)?,
+                0,
+                id,
+                format!("Adjustment: {reason}"),
+                qty,
+            ));
+        }
+        let mut stmt = self.conn.prepare("SELECT l.id, v.date, i.kind, v.reference, l.quantity FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND l.item_id = ?2")?;
+        let rows = stmt.query_map(params![company_id, item_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, date, kind, reference, qty) = row?;
+            let kind = InvoiceKind::parse(&kind)?;
+            raw.push((
+                parse_date(&date)?,
+                1,
+                id,
+                format!("{}: {}", kind.as_str(), reference),
+                if kind == InvoiceKind::Purchase {
+                    qty
+                } else {
+                    -qty
+                },
+            ));
+        }
+        raw.sort_by_key(|(date, kind, id, _, _)| (*date, *kind, *id));
+        let mut opening = 0_i128;
+        let mut running = 0_i128;
+        let mut movements = Vec::new();
+        for (date, _, _, description, quantity) in raw {
+            if end.is_some_and(|v| date > v) {
+                continue;
+            }
+            running += i128::from(quantity);
+            if start.is_some_and(|v| date < v) {
+                opening = running;
+            } else {
+                movements.push(StockMovement {
+                    date: date.format("%Y-%m-%d").to_string(),
+                    description,
+                    quantity,
+                    running_quantity: running,
+                });
+            }
+        }
+        Ok(StockRegister {
+            item,
+            opening_quantity: opening,
+            movements,
+            closing_quantity: running,
+        })
     }
     /// Atomically creates the invoice, stock movements and balanced voucher.
     pub fn create_invoice(&mut self, company_id: i64, draft: &InvoiceDraft) -> Result<i64> {
