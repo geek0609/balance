@@ -8,6 +8,19 @@ Balance is an open-source accounting and business-management application written
 
 On Windows, install a Rust toolchain and run `cargo run`. Balance stores a SQLite database in the user's local application-data directory. Create a company, create ledgers in account groups, and enter balanced vouchers. The application is licensed under [Apache-2.0](LICENSE).
 
+## Feature status at a glance
+
+| Area | Available now | Planned coverage |
+| --- | --- | --- |
+| Company and accounts | Company selection, account groups, ledgers, profiles and opening balances | Company groups, periods, consolidation and richer masters |
+| Accounting and reports | Balanced vouchers and basic financial reports | Full voucher workflows, analysis, budgeting and audit |
+| Sales and purchasing | Basic item invoices and single-invoice settlements | Orders, fulfilment, returns, pricing and complete billing |
+| Inventory | Units, groups, items and quantity movements | Valuation, locations, tracking and manufacturing |
+| Tax and payroll | Manual invoice tax amount | Jurisdiction-specific tax and payroll workflows |
+| Banking | Payment and receipt vouchers | Statements, reconciliation, instruments and integrations |
+| Data exchange | Restricted XML import and database snapshots | Guided migration, reconciliation, restore and APIs |
+| Administration | Single-user local prototype | Permissions, security, concurrent access and recovery |
+
 ## Available in the prototype
 
 These capabilities are implemented at a basic level; their coverage, usability and correctness still need comprehensive verification.
@@ -36,6 +49,7 @@ The roadmap covers the breadth required for a mature, full-featured accounting a
 - Company profiles, addresses, contact details, financial years, books start dates and configurable accounting periods.
 - Multiple companies, company groups, consolidation, inter-company transactions, branch management and separate registrations.
 - Company-specific features, numbering, currency, units, defaults, document series and accounting preferences.
+- Financial-year transitions, opening a new period, splitting or archiving historical company data and carrying forward balances with reconciliation.
 - Opening balances for accounts, inventory, bills and other masters; reconciliation of opening differences; year-end closing, rollover and period locks.
 
 ### Chart of accounts and accounting
@@ -46,6 +60,7 @@ The roadmap covers the breadth required for a mature, full-featured accounting a
 - Configurable voucher types, numbering schemes and series, references, attachments, narration, approval, editing, reversal and cancellation.
 - Multi-line entries, allocations, account reconciliation, error correction, exception handling and complete audit trails.
 - Cost centres and categories, cost allocation, job and project costing, budgets, scenarios, projections, variance analysis and cash-flow planning.
+- Account and transaction-level controls, configurable entry validation, correction workflows and period-wise comparisons.
 - Multiple currencies, exchange rates, foreign-currency transactions, revaluation and exchange gain or loss.
 
 ### Sales, purchasing and invoicing
@@ -73,6 +88,7 @@ The roadmap covers the breadth required for a mature, full-featured accounting a
 - Opening stock, stock valuation methods, cost tracking, additional purchase costs, cost of goods, gross profit and integrated accounting.
 - Reorder levels, reorder quantities, stock ageing, negative-stock controls, availability and demand analysis.
 - Bills of materials, production, consumption, by-products, manufacturing journals, job work, material in/out and job costing.
+- Order-wise stock reservations, tracking of goods in transit and allocation of stock across locations and documents.
 - Inventory-only and accounting-linked transactions, separate inventory and accounting finalisation, and complete stock history.
 
 ### Taxation and statutory workflows
@@ -99,6 +115,7 @@ The roadmap covers the breadth required for a mature, full-featured accounting a
 - Stock summary, movement, valuation, ageing, warehouse, batch, reorder, production and cost reports.
 - Tax, payroll, audit, budget, cost-centre and management reports, with date ranges, drill-down, comparison, filtering and saved views.
 - Custom report layouts, printing and export; verification, anomaly detection and reconciliation tools.
+- Comparative and period-wise reporting, detailed and condensed views, configurable columns and drill-through from summaries to underlying entries.
 
 ### Data migration, exchange and integrations
 
@@ -121,6 +138,7 @@ The roadmap covers the breadth required for a mature, full-featured accounting a
 - Fast keyboard-first workflows, shortcuts, accessible navigation, search, context help, guided setup and consistent error handling.
 - Localisation, multilingual entry and reports, configurable dates, numbers, currencies and units.
 - Custom fields, forms, reports, document templates, automation and a documented extension system.
+- Configurable printing and sharing preferences, reusable document layouts, data-entry defaults and user-specific display settings.
 - Stable Windows releases, installation and updates; portable core and support for additional desktop platforms where validated.
 - Automated and manual verification, representative migration fixtures, performance testing, documentation and a clear compatibility matrix.
 
