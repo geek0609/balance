@@ -8,6 +8,7 @@ enum Page {
     Company,
     Ledger,
     Voucher,
+    Register,
     Reports,
 }
 struct App {
@@ -23,6 +24,9 @@ struct App {
     narration: String,
     report_from: String,
     report_to: String,
+    register_ledger: Option<i64>,
+    register_from: String,
+    register_to: String,
     message: String,
 }
 struct VoucherLine {
@@ -54,6 +58,9 @@ impl App {
             narration: String::new(),
             report_from: String::new(),
             report_to: String::new(),
+            register_ledger: None,
+            register_from: String::new(),
+            register_to: String::new(),
             message: String::new(),
         }
     }
@@ -65,6 +72,10 @@ impl App {
         self.editing_voucher = None;
         self.narration.clear();
     }
+    fn reset_company_forms(&mut self) {
+        self.clear_voucher();
+        self.register_ledger = None;
+    }
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
         ui.label("Create or select a company to work with.");
@@ -75,7 +86,7 @@ impl App {
                 match self.store.create_company(&self.company_name) {
                     Ok(id) => {
                         self.company = Some(id);
-                        self.clear_voucher();
+                        self.reset_company_forms();
                         self.company_name.clear();
                         self.message = "Company created".into();
                     }
@@ -91,7 +102,7 @@ impl App {
                         .clicked()
                     {
                         self.company = Some(company.id);
-                        self.clear_voucher();
+                        self.reset_company_forms();
                         self.message.clear();
                     }
                 }
@@ -400,6 +411,101 @@ impl App {
         ));
         ui.small("The balance sheet includes cumulative profit through the end date. Opening balances, tax, and statutory adjustments are not implemented.");
     }
+    fn register_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.heading("Ledger activity");
+        let ledgers = match self.store.ledgers(company) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        let name = ledgers
+            .iter()
+            .find(|l| Some(l.id) == self.register_ledger)
+            .map(|l| l.name.as_str())
+            .unwrap_or("Select ledger");
+        egui::ComboBox::from_label("Ledger")
+            .selected_text(name)
+            .show_ui(ui, |ui| {
+                for ledger in &ledgers {
+                    ui.selectable_value(&mut self.register_ledger, Some(ledger.id), &ledger.name);
+                }
+            });
+        ui.horizontal(|ui| {
+            ui.label("From");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.register_from)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+            ui.label("To");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.register_to)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+        });
+        let Some(ledger) = self.register_ledger else {
+            ui.label("Select a ledger to view its entries.");
+            return;
+        };
+        let from = if self.register_from.trim().is_empty() {
+            None
+        } else {
+            Some(self.register_from.trim())
+        };
+        let to = if self.register_to.trim().is_empty() {
+            None
+        } else {
+            Some(self.register_to.trim())
+        };
+        let register = match self.store.ledger_register(company, ledger, from, to) {
+            Ok(v) => v,
+            Err(e) => {
+                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                return;
+            }
+        };
+        ui.label(format!(
+            "Opening balance: {}",
+            money(register.opening_balance)
+        ));
+        egui::Grid::new("ledger-register")
+            .striped(true)
+            .show(ui, |ui| {
+                for h in ["Date", "Voucher", "Narration", "Debit", "Credit", "Balance"] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for entry in register.entries {
+                    ui.label(entry.date);
+                    ui.label(entry.voucher_id.to_string());
+                    ui.label(entry.narration);
+                    ui.label(if entry.amount > 0 {
+                        format_amount(entry.amount)
+                    } else {
+                        "—".into()
+                    });
+                    ui.label(if entry.amount < 0 {
+                        format_amount(entry.amount)
+                            .trim_start_matches('-')
+                            .to_string()
+                    } else {
+                        "—".into()
+                    });
+                    ui.label(money(entry.running_balance));
+                    ui.end_row();
+                }
+            });
+        ui.label(format!(
+            "Closing balance: {}",
+            money(register.closing_balance)
+        ));
+        ui.small(
+            "Debit balances are positive; credit balances are negative. Boundaries are inclusive.",
+        );
+    }
 }
 fn money(value: i128) -> String {
     let n = value.unsigned_abs();
@@ -424,6 +530,7 @@ impl eframe::App for App {
                 ("Companies", Page::Company),
                 ("Ledgers", Page::Ledger),
                 ("Voucher", Page::Voucher),
+                ("Ledger activity", Page::Register),
                 ("Reports", Page::Reports),
             ] {
                 if ui.selectable_label(self.page == page, label).clicked() {
@@ -450,6 +557,7 @@ impl eframe::App for App {
                     Page::Company => {}
                     Page::Ledger => self.ledger_page(ui, company),
                     Page::Voucher => self.voucher_page(ui, company),
+                    Page::Register => self.register_page(ui, company),
                     Page::Reports => self.reports_page(ui, company),
                 }
             });

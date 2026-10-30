@@ -80,6 +80,22 @@ pub struct VoucherRevision {
     pub voucher: Voucher,
 }
 #[derive(Debug, Clone)]
+pub struct LedgerEntry {
+    pub voucher_id: i64,
+    pub date: String,
+    pub narration: String,
+    pub amount: i64,
+    /// Debit-minus-credit balance immediately after this posting.
+    pub running_balance: i128,
+}
+#[derive(Debug, Clone)]
+pub struct LedgerRegister {
+    pub ledger: Ledger,
+    pub opening_balance: i128,
+    pub entries: Vec<LedgerEntry>,
+    pub closing_balance: i128,
+}
+#[derive(Debug, Clone)]
 pub struct Balance {
     pub ledger: Ledger,
     /// Debit minus credit, in hundredths.
@@ -350,6 +366,56 @@ impl Store {
     pub fn balances(&self, company_id: i64) -> Result<Vec<Balance>> {
         self.balances_in_period(company_id, None, None)
     }
+    /// Entries in date and voucher order, including a calculated opening balance.
+    pub fn ledger_register(
+        &self,
+        company_id: i64,
+        ledger_id: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<LedgerRegister> {
+        let start = start.map(parse_date).transpose()?;
+        let end = end.map(parse_date).transpose()?;
+        if matches!((start, end), (Some(a), Some(b)) if a > b) {
+            return Err(Error::Validation(
+                "The start date must not be after the end date".into(),
+            ));
+        }
+        let ledger = self
+            .ledgers(company_id)?
+            .into_iter()
+            .find(|l| l.id == ledger_id)
+            .ok_or_else(|| Error::Validation("Ledger not found in the selected company".into()))?;
+        let mut opening_balance = 0_i128;
+        let mut running = 0_i128;
+        let mut entries = Vec::new();
+        for voucher in self.vouchers(company_id)?.into_iter().rev() {
+            let date = parse_date(&voucher.date)?;
+            if end.is_some_and(|v| date > v) {
+                continue;
+            }
+            for posting in voucher.postings.iter().filter(|p| p.ledger_id == ledger_id) {
+                running += i128::from(posting.amount);
+                if start.is_some_and(|v| date < v) {
+                    opening_balance = running;
+                } else {
+                    entries.push(LedgerEntry {
+                        voucher_id: voucher.id,
+                        date: voucher.date.clone(),
+                        narration: voucher.narration.clone(),
+                        amount: posting.amount,
+                        running_balance: running,
+                    });
+                }
+            }
+        }
+        Ok(LedgerRegister {
+            ledger,
+            opening_balance,
+            entries,
+            closing_balance: running,
+        })
+    }
     /// Return debit-minus-credit balances for an inclusive date range.
     pub fn balances_in_period(
         &self,
@@ -474,6 +540,63 @@ fn required<'a>(value: &'a str, label: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ledger_register_tracks_opening_running_and_closing_balances() {
+        let mut db = Store::memory().unwrap();
+        let company = db.create_company("Example").unwrap();
+        let other = db.create_company("Other").unwrap();
+        let cash = db.create_ledger(company, "Cash", Category::Asset).unwrap();
+        let equity = db
+            .create_ledger(company, "Capital", Category::Equity)
+            .unwrap();
+        for (date, amount) in [
+            ("2026-03-01", 50),
+            ("2026-01-01", 100),
+            ("2026-02-01", -30),
+            ("2026-04-01", 25),
+        ] {
+            db.post_voucher(
+                company,
+                date,
+                date,
+                &[
+                    Posting {
+                        ledger_id: cash,
+                        amount,
+                    },
+                    Posting {
+                        ledger_id: equity,
+                        amount: -amount,
+                    },
+                ],
+            )
+            .unwrap();
+        }
+        let register = db
+            .ledger_register(company, cash, Some("2026-02-01"), Some("2026-03-31"))
+            .unwrap();
+        assert_eq!(register.opening_balance, 100);
+        assert_eq!(register.entries.len(), 2);
+        assert_eq!(
+            (
+                register.entries[0].date.as_str(),
+                register.entries[0].running_balance
+            ),
+            ("2026-02-01", 70)
+        );
+        assert_eq!(
+            (
+                register.entries[1].date.as_str(),
+                register.entries[1].running_balance
+            ),
+            ("2026-03-01", 120)
+        );
+        assert_eq!(register.closing_balance, 120);
+        assert!(db.ledger_register(other, cash, None, None).is_err());
+        assert!(db
+            .ledger_register(company, cash, Some("2026-03-01"), Some("2026-02-01"))
+            .is_err());
+    }
     #[test]
     fn upgrades_existing_database_and_retains_prior_voucher_versions() {
         let conn = Connection::open_in_memory().unwrap();
