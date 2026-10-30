@@ -1,6 +1,6 @@
-# Optimus Prime
+# Balance
 
-Optimus Prime is an independent, open-source Rust accounting application for Windows. It is an early prototype, not a production accounting system; do not use it for statutory reporting or irreplaceable business records.
+Balance is an independent, open-source Rust accounting application for Windows. It is an early prototype, not a production accounting system; do not use it for statutory reporting or irreplaceable business records.
 
 ## Running the prototype
 

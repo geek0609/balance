@@ -1301,7 +1301,7 @@ mod tests {
     #[test]
     fn posted_vouchers_survive_reopening_database() {
         let path = std::env::temp_dir().join(format!(
-            "optimus-prime-test-{}-{}.db",
+            "balance-test-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -1,12 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{self, Color32, RichText};
-use optimus_prime::contacts::LedgerProfile;
-use optimus_prime::exchange::ImportPlan;
-use optimus_prime::inventory::{
+use balance::contacts::LedgerProfile;
+use balance::exchange::ImportPlan;
+use balance::inventory::{
     format_quantity, line_amount, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine, StockItem,
 };
-use optimus_prime::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
+use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
+use eframe::egui::{self, Color32, RichText};
 
 #[derive(PartialEq)]
 enum Page {
@@ -290,9 +290,7 @@ impl App {
                 Some(group) => self
                     .store
                     .create_ledger_in_group(company, &self.ledger_name, group),
-                None => Err(optimus_prime::Error::Validation(
-                    "Select an account group".into(),
-                )),
+                None => Err(balance::Error::Validation("Select an account group".into())),
             };
             match result {
                 Ok(_) => {
@@ -373,10 +371,10 @@ impl App {
                 });
         });
         if ui.button("Save opening balance").clicked() {
-            let result = (|| -> optimus_prime::Result<i64> {
+            let result = (|| -> balance::Result<i64> {
                 let ledger = self
                     .opening_ledger
-                    .ok_or_else(|| optimus_prime::Error::Validation("Select a ledger".into()))?;
+                    .ok_or_else(|| balance::Error::Validation("Select a ledger".into()))?;
                 let amount = parse_amount(&self.opening_amount)?;
                 self.store.set_opening_balance(
                     company,
@@ -661,15 +659,15 @@ impl App {
             self.message.clear();
         }
         if submit {
-            let result = (|| -> optimus_prime::Result<i64> {
+            let result = (|| -> balance::Result<i64> {
                 let mut postings = Vec::with_capacity(self.lines.len());
                 for line in &self.lines {
                     let ledger_id = line.ledger.ok_or_else(|| {
-                        optimus_prime::Error::Validation("Select a ledger for each line".into())
+                        balance::Error::Validation("Select a ledger for each line".into())
                     })?;
                     let amount = parse_amount(&line.amount)?;
                     if amount == 0 {
-                        return Err(optimus_prime::Error::Validation(
+                        return Err(balance::Error::Validation(
                             "Amounts must be greater than zero".into(),
                         ));
                     }
@@ -1028,13 +1026,13 @@ impl App {
             ui.text_edit_singleline(&mut self.adjustment_reason);
         });
         if ui.button("Save adjustment").clicked() {
-            let result = (|| -> optimus_prime::Result<i64> {
-                let item = self.adjustment_item.ok_or_else(|| {
-                    optimus_prime::Error::Validation("Select a stock item".into())
-                })?;
+            let result = (|| -> balance::Result<i64> {
+                let item = self
+                    .adjustment_item
+                    .ok_or_else(|| balance::Error::Validation("Select a stock item".into()))?;
                 let qty = parse_quantity(&self.adjustment_quantity)?;
                 if qty == 0 {
-                    return Err(optimus_prime::Error::Validation(
+                    return Err(balance::Error::Validation(
                         "Quantity must be greater than zero".into(),
                     ));
                 }
@@ -1264,11 +1262,11 @@ impl App {
             self.invoice_tax_ledger = None;
         }
         if ui.button("Save invoice").clicked() {
-            let result = (|| -> optimus_prime::Result<i64> {
+            let result = (|| -> balance::Result<i64> {
                 let mut lines = Vec::new();
                 for line in &self.invoice_lines {
                     let item_id = line.item.ok_or_else(|| {
-                        optimus_prime::Error::Validation("Select an item for every line".into())
+                        balance::Error::Validation("Select an item for every line".into())
                     })?;
                     lines.push(InvoiceLine {
                         item_id,
@@ -1287,10 +1285,10 @@ impl App {
                     reference: self.invoice_reference.clone(),
                     narration: self.invoice_narration.clone(),
                     party_ledger_id: self.invoice_party.ok_or_else(|| {
-                        optimus_prime::Error::Validation("Select a party ledger".into())
+                        balance::Error::Validation("Select a party ledger".into())
                     })?,
                     trade_ledger_id: self.invoice_trade.ok_or_else(|| {
-                        optimus_prime::Error::Validation("Select a sales or purchase ledger".into())
+                        balance::Error::Validation("Select a sales or purchase ledger".into())
                     })?,
                     tax_ledger_id: self.invoice_tax_ledger,
                     tax_amount,
@@ -1372,16 +1370,14 @@ impl App {
                     ui.text_edit_singleline(&mut self.settlement_amount);
                 });
                 if ui.button("Save receipt / payment").clicked() {
-                    let result = (|| -> optimus_prime::Result<i64> {
+                    let result = (|| -> balance::Result<i64> {
                         self.store.settle_invoice(
                             company,
                             self.settlement_invoice.ok_or_else(|| {
-                                optimus_prime::Error::Validation("Select an invoice".into())
+                                balance::Error::Validation("Select an invoice".into())
                             })?,
                             self.settlement_bank.ok_or_else(|| {
-                                optimus_prime::Error::Validation(
-                                    "Select a cash or bank ledger".into(),
-                                )
+                                balance::Error::Validation("Select a cash or bank ledger".into())
                             })?,
                             &self.settlement_date,
                             &self.settlement_reference,
@@ -1553,26 +1549,22 @@ impl App {
         });
         if ui.button("Preview file").clicked() {
             self.import_preview = None;
-            let result = (|| -> optimus_prime::Result<ImportPlan> {
+            let result = (|| -> balance::Result<ImportPlan> {
                 let path = std::path::Path::new(self.import_path.trim());
-                let metadata = std::fs::metadata(path).map_err(|e| {
-                    optimus_prime::Error::Validation(format!("Cannot read file: {e}"))
-                })?;
+                let metadata = std::fs::metadata(path)
+                    .map_err(|e| balance::Error::Validation(format!("Cannot read file: {e}")))?;
                 if !metadata.is_file() || metadata.len() > 50 * 1024 * 1024 {
-                    return Err(optimus_prime::Error::Validation(
+                    return Err(balance::Error::Validation(
                         "Choose a file no larger than 50 MiB".into(),
                     ));
                 }
                 use std::io::Read;
-                let file = std::fs::File::open(path).map_err(|e| {
-                    optimus_prime::Error::Validation(format!("Cannot read file: {e}"))
-                })?;
+                let file = std::fs::File::open(path)
+                    .map_err(|e| balance::Error::Validation(format!("Cannot read file: {e}")))?;
                 let mut bytes = Vec::new();
                 file.take(50 * 1024 * 1024 + 1)
                     .read_to_end(&mut bytes)
-                    .map_err(|e| {
-                        optimus_prime::Error::Validation(format!("Cannot read file: {e}"))
-                    })?;
+                    .map_err(|e| balance::Error::Validation(format!("Cannot read file: {e}")))?;
                 self.store.preview_xml_import_with_opening_date(
                     company,
                     &bytes,
@@ -1711,7 +1703,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(RichText::new("Optimus Prime").color(Color32::from_rgb(30, 75, 115)));
+                ui.heading(RichText::new("Balance").color(Color32::from_rgb(30, 75, 115)));
                 ui.label("Early accounting prototype");
             });
         });
@@ -1768,12 +1760,12 @@ impl eframe::App for App {
     }
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dirs = directories::ProjectDirs::from("org", "Optimus Prime", "Optimus Prime")
+    let dirs = directories::ProjectDirs::from("org", "Balance", "Balance")
         .ok_or("Cannot find application data directory")?;
     std::fs::create_dir_all(dirs.data_local_dir())?;
-    let store = Store::open(dirs.data_local_dir().join("optimus-prime.db"))?;
+    let store = Store::open(dirs.data_local_dir().join("balance.db"))?;
     eframe::run_native(
-        "Optimus Prime",
+        "Balance",
         eframe::NativeOptions::default(),
         Box::new(move |_| Ok(Box::new(App::new(store)))),
     )?;
