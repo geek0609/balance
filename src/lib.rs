@@ -67,6 +67,13 @@ pub struct Posting {
     pub amount: i64,
 }
 #[derive(Debug, Clone)]
+pub struct Voucher {
+    pub id: i64,
+    pub date: String,
+    pub narration: String,
+    pub postings: Vec<Posting>,
+}
+#[derive(Debug, Clone)]
 pub struct Balance {
     pub ledger: Ledger,
     /// Debit minus credit, in hundredths.
@@ -171,36 +178,16 @@ impl Store {
         narration: &str,
         postings: &[Posting],
     ) -> Result<i64> {
-        NaiveDate::parse_from_str(date, "%Y-%m-%d")
-            .map_err(|_| Error::Validation("Date must be a valid YYYY-MM-DD date".into()))?;
-        if postings.len() < 2 || postings.iter().any(|p| p.amount == 0) {
-            return Err(Error::Validation(
-                "A voucher requires at least two non-zero postings".into(),
-            ));
-        }
-        let total = postings
-            .iter()
-            .try_fold(0_i64, |sum, p| sum.checked_add(p.amount))
-            .ok_or_else(|| Error::Validation("Voucher total is too large".into()))?;
-        if total != 0 {
-            return Err(Error::Validation("Debits and credits must balance".into()));
-        }
+        let date = validate_voucher(date, postings)?;
         let tx = self.conn.transaction()?;
-        for p in postings {
-            let found: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM ledgers WHERE id = ?1 AND company_id = ?2)",
-                params![p.ledger_id, company_id],
-                |r| r.get(0),
-            )?;
-            if !found {
-                return Err(Error::Validation(
-                    "Every ledger must belong to the selected company".into(),
-                ));
-            }
-        }
+        check_ledgers(&tx, company_id, postings)?;
         tx.execute(
             "INSERT INTO vouchers(company_id, date, narration) VALUES (?1, ?2, ?3)",
-            params![company_id, date, narration.trim()],
+            params![
+                company_id,
+                date.format("%Y-%m-%d").to_string(),
+                narration.trim()
+            ],
         )?;
         let id = tx.last_insert_rowid();
         for p in postings {
@@ -211,6 +198,70 @@ impl Store {
         }
         tx.commit()?;
         Ok(id)
+    }
+    /// Replace a voucher and its postings in one transaction.
+    pub fn update_voucher(
+        &mut self,
+        company_id: i64,
+        voucher_id: i64,
+        date: &str,
+        narration: &str,
+        postings: &[Posting],
+    ) -> Result<()> {
+        let date = validate_voucher(date, postings)?;
+        let tx = self.conn.transaction()?;
+        check_ledgers(&tx, company_id, postings)?;
+        let changed = tx.execute(
+            "UPDATE vouchers SET date = ?1, narration = ?2 WHERE id = ?3 AND company_id = ?4",
+            params![
+                date.format("%Y-%m-%d").to_string(),
+                narration.trim(),
+                voucher_id,
+                company_id
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::Validation(
+                "Voucher not found in the selected company".into(),
+            ));
+        }
+        tx.execute("DELETE FROM postings WHERE voucher_id = ?1", [voucher_id])?;
+        for p in postings {
+            tx.execute(
+                "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
+                params![voucher_id, p.ledger_id, p.amount],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Read only vouchers belonging to the given company, newest first.
+    pub fn vouchers(&self, company_id: i64) -> Result<Vec<Voucher>> {
+        let mut stmt = self.conn.prepare("SELECT id, date, narration FROM vouchers WHERE company_id = ?1 ORDER BY date DESC, id DESC")?;
+        let rows = stmt
+            .query_map([company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<(i64, String, String)>>>()?;
+        let mut postings_stmt = self
+            .conn
+            .prepare("SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
+        let mut vouchers = Vec::with_capacity(rows.len());
+        for (id, date, narration) in rows {
+            let postings = postings_stmt
+                .query_map([id], |r| {
+                    Ok(Posting {
+                        ledger_id: r.get(0)?,
+                        amount: r.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            vouchers.push(Voucher {
+                id,
+                date,
+                narration,
+                postings,
+            });
+        }
+        Ok(vouchers)
     }
     pub fn balances(&self, company_id: i64) -> Result<Vec<Balance>> {
         let ledgers = self.ledgers(company_id)?;
@@ -235,6 +286,42 @@ impl Store {
             .collect())
     }
 }
+fn validate_voucher(date: &str, postings: &[Posting]) -> Result<NaiveDate> {
+    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|_| Error::Validation("Date must be a valid YYYY-MM-DD date".into()))?;
+    if postings.len() < 2 || postings.iter().any(|p| p.amount == 0) {
+        return Err(Error::Validation(
+            "A voucher requires at least two non-zero postings".into(),
+        ));
+    }
+    if !postings
+        .iter()
+        .any(|p| p.ledger_id != postings[0].ledger_id)
+    {
+        return Err(Error::Validation(
+            "A voucher requires at least two different ledgers".into(),
+        ));
+    }
+    if postings.iter().map(|p| i128::from(p.amount)).sum::<i128>() != 0 {
+        return Err(Error::Validation("Debits and credits must balance".into()));
+    }
+    Ok(date)
+}
+fn check_ledgers(conn: &Connection, company_id: i64, postings: &[Posting]) -> Result<()> {
+    for p in postings {
+        let found: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ledgers WHERE id = ?1 AND company_id = ?2)",
+            params![p.ledger_id, company_id],
+            |r| r.get(0),
+        )?;
+        if !found {
+            return Err(Error::Validation(
+                "Every ledger must belong to the selected company".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 fn required<'a>(value: &'a str, label: &str) -> Result<&'a str> {
     let value = value.trim();
     if value.is_empty() {
@@ -247,6 +334,99 @@ fn required<'a>(value: &'a str, label: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn voucher_history_and_edits_are_scoped_and_atomic() {
+        let mut db = Store::memory().unwrap();
+        let a = db.create_company("A").unwrap();
+        let b = db.create_company("B").unwrap();
+        let cash = db.create_ledger(a, "Cash", Category::Asset).unwrap();
+        let income = db.create_ledger(a, "Income", Category::Income).unwrap();
+        let other = db.create_ledger(b, "Other", Category::Asset).unwrap();
+        let original = [
+            Posting {
+                ledger_id: cash,
+                amount: 500,
+            },
+            Posting {
+                ledger_id: income,
+                amount: -500,
+            },
+        ];
+        let id = db.post_voucher(a, "2026-1-2", "first", &original).unwrap();
+        assert_eq!(db.vouchers(a).unwrap()[0].date, "2026-01-02");
+        assert!(db.vouchers(b).unwrap().is_empty());
+        assert!(db
+            .update_voucher(b, id, "2026-01-03", "wrong company", &original)
+            .is_err());
+        assert!(db
+            .update_voucher(
+                a,
+                id,
+                "2026-01-03",
+                "bad",
+                &[
+                    Posting {
+                        ledger_id: cash,
+                        amount: 700
+                    },
+                    Posting {
+                        ledger_id: other,
+                        amount: -700
+                    }
+                ]
+            )
+            .is_err());
+        let saved = db.vouchers(a).unwrap();
+        assert_eq!(saved[0].narration, "first");
+        assert_eq!(saved[0].postings[0].amount, 500);
+        db.update_voucher(
+            a,
+            id,
+            "2026-01-03",
+            "corrected",
+            &[
+                Posting {
+                    ledger_id: cash,
+                    amount: 700,
+                },
+                Posting {
+                    ledger_id: income,
+                    amount: -700,
+                },
+            ],
+        )
+        .unwrap();
+        let saved = db.vouchers(a).unwrap();
+        assert_eq!(saved[0].date, "2026-01-03");
+        assert_eq!(saved[0].narration, "corrected");
+        assert_eq!(saved[0].postings[0].amount, 700);
+        assert_eq!(
+            db.balances(a)
+                .unwrap()
+                .iter()
+                .find(|b| b.ledger.id == cash)
+                .unwrap()
+                .amount,
+            700
+        );
+        assert!(db
+            .post_voucher(
+                a,
+                "2026-01-04",
+                "",
+                &[
+                    Posting {
+                        ledger_id: cash,
+                        amount: 50
+                    },
+                    Posting {
+                        ledger_id: cash,
+                        amount: -50
+                    }
+                ]
+            )
+            .is_err());
+    }
     #[test]
     fn posted_vouchers_survive_reopening_database() {
         let path = std::env::temp_dir().join(format!(

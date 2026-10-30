@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, RichText};
-use optimus_prime::{format_amount, parse_amount, Category, Ledger, Posting, Store};
+use optimus_prime::{format_amount, parse_amount, Category, Posting, Store};
 
 #[derive(PartialEq)]
 enum Page {
@@ -17,12 +17,25 @@ struct App {
     company_name: String,
     ledger_name: String,
     category: Category,
-    debit: Option<i64>,
-    credit: Option<i64>,
-    amount: String,
+    lines: Vec<VoucherLine>,
+    editing_voucher: Option<i64>,
     date: String,
     narration: String,
     message: String,
+}
+struct VoucherLine {
+    ledger: Option<i64>,
+    debit: bool,
+    amount: String,
+}
+impl VoucherLine {
+    fn new(debit: bool) -> Self {
+        Self {
+            ledger: None,
+            debit,
+            amount: String::new(),
+        }
+    }
 }
 impl App {
     fn new(store: Store) -> Self {
@@ -33,9 +46,8 @@ impl App {
             company_name: String::new(),
             ledger_name: String::new(),
             category: Category::Asset,
-            debit: None,
-            credit: None,
-            amount: String::new(),
+            lines: vec![VoucherLine::new(true), VoucherLine::new(false)],
+            editing_voucher: None,
             date: String::new(),
             narration: String::new(),
             message: String::new(),
@@ -43,6 +55,11 @@ impl App {
     }
     fn failure(&mut self, e: impl std::fmt::Display) {
         self.message = e.to_string();
+    }
+    fn clear_voucher(&mut self) {
+        self.lines = vec![VoucherLine::new(true), VoucherLine::new(false)];
+        self.editing_voucher = None;
+        self.narration.clear();
     }
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
@@ -54,6 +71,7 @@ impl App {
                 match self.store.create_company(&self.company_name) {
                     Ok(id) => {
                         self.company = Some(id);
+                        self.clear_voucher();
                         self.company_name.clear();
                         self.message = "Company created".into();
                     }
@@ -69,8 +87,7 @@ impl App {
                         .clicked()
                     {
                         self.company = Some(company.id);
-                        self.debit = None;
-                        self.credit = None;
+                        self.clear_voucher();
                         self.message.clear();
                     }
                 }
@@ -114,8 +131,13 @@ impl App {
         }
     }
     fn voucher_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Journal voucher");
-        ui.label("Enter one debit and one credit. Amounts use two decimal places.");
+        ui.heading(match self.editing_voucher {
+            Some(id) => format!("Edit voucher {id}"),
+            None => "Journal voucher".into(),
+        });
+        ui.label(
+            "Enter at least two lines. Debits and credits must balance. Press Ctrl+Enter to save.",
+        );
         let ledgers = match self.store.ledgers(company) {
             Ok(v) => v,
             Err(e) => {
@@ -127,59 +149,149 @@ impl App {
             ui.label("Date (YYYY-MM-DD)");
             ui.text_edit_singleline(&mut self.date);
         });
-        ledger_picker(ui, "Debit", &ledgers, &mut self.debit);
-        ledger_picker(ui, "Credit", &ledgers, &mut self.credit);
-        ui.horizontal(|ui| {
-            ui.label("Amount");
-            ui.text_edit_singleline(&mut self.amount);
-        });
+        let mut remove = None;
+        for (index, line) in self.lines.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{}.", index + 1));
+                egui::ComboBox::from_id_salt(("voucher-ledger", index))
+                    .selected_text(
+                        ledgers
+                            .iter()
+                            .find(|l| Some(l.id) == line.ledger)
+                            .map(|l| l.name.as_str())
+                            .unwrap_or("Select ledger"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for ledger in &ledgers {
+                            ui.selectable_value(&mut line.ledger, Some(ledger.id), &ledger.name);
+                        }
+                    });
+                egui::ComboBox::from_id_salt(("voucher-side", index))
+                    .selected_text(if line.debit { "Debit" } else { "Credit" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut line.debit, true, "Debit");
+                        ui.selectable_value(&mut line.debit, false, "Credit");
+                    });
+                ui.add(
+                    egui::TextEdit::singleline(&mut line.amount)
+                        .hint_text("Amount")
+                        .desired_width(110.0),
+                );
+                if ui.button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            if self.lines.len() > 2 {
+                self.lines.remove(index);
+            } else {
+                self.message = "A voucher requires at least two lines".into();
+            }
+        }
+        if ui.button("Add line").clicked() {
+            self.lines.push(VoucherLine::new(true));
+        }
         ui.horizontal(|ui| {
             ui.label("Narration");
             ui.text_edit_singleline(&mut self.narration);
         });
-        if ui.button("Post voucher").clicked() {
+        let submit = ui
+            .button(if self.editing_voucher.is_some() {
+                "Save changes"
+            } else {
+                "Post voucher"
+            })
+            .clicked()
+            || ui.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Enter));
+        if self.editing_voucher.is_some() && ui.button("Cancel edit").clicked() {
+            self.clear_voucher();
+            self.message.clear();
+        }
+        if submit {
             let result = (|| -> optimus_prime::Result<i64> {
-                let debit = self.debit.ok_or_else(|| {
-                    optimus_prime::Error::Validation("Select a debit ledger".into())
-                })?;
-                let credit = self.credit.ok_or_else(|| {
-                    optimus_prime::Error::Validation("Select a credit ledger".into())
-                })?;
-                if debit == credit {
-                    return Err(optimus_prime::Error::Validation(
-                        "Choose different ledgers".into(),
-                    ));
+                let mut postings = Vec::with_capacity(self.lines.len());
+                for line in &self.lines {
+                    let ledger_id = line.ledger.ok_or_else(|| {
+                        optimus_prime::Error::Validation("Select a ledger for each line".into())
+                    })?;
+                    let amount = parse_amount(&line.amount)?;
+                    if amount == 0 {
+                        return Err(optimus_prime::Error::Validation(
+                            "Amounts must be greater than zero".into(),
+                        ));
+                    }
+                    postings.push(Posting {
+                        ledger_id,
+                        amount: if line.debit { amount } else { -amount },
+                    });
                 }
-                let amount = parse_amount(&self.amount)?;
-                if amount == 0 {
-                    return Err(optimus_prime::Error::Validation(
-                        "Amount must be greater than zero".into(),
-                    ));
+                if let Some(id) = self.editing_voucher {
+                    self.store.update_voucher(
+                        company,
+                        id,
+                        &self.date,
+                        &self.narration,
+                        &postings,
+                    )?;
+                    Ok(id)
+                } else {
+                    self.store
+                        .post_voucher(company, &self.date, &self.narration, &postings)
                 }
-                self.store.post_voucher(
-                    company,
-                    &self.date,
-                    &self.narration,
-                    &[
-                        Posting {
-                            ledger_id: debit,
-                            amount,
-                        },
-                        Posting {
-                            ledger_id: credit,
-                            amount: -amount,
-                        },
-                    ],
-                )
             })();
             match result {
                 Ok(id) => {
-                    self.message = format!("Voucher {id} posted");
-                    self.amount.clear();
-                    self.narration.clear();
+                    self.message = format!("Voucher {id} saved");
+                    self.clear_voucher();
                 }
                 Err(e) => self.failure(e),
             }
+        }
+        ui.separator();
+        ui.heading("Voucher history");
+        match self.store.vouchers(company) {
+            Ok(vouchers) => {
+                for voucher in vouchers {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{}  #{}  {}",
+                            voucher.date, voucher.id, voucher.narration
+                        ));
+                        if ui.button("Edit").clicked() {
+                            self.editing_voucher = Some(voucher.id);
+                            self.date = voucher.date.clone();
+                            self.narration = voucher.narration.clone();
+                            self.lines = voucher
+                                .postings
+                                .iter()
+                                .map(|p| VoucherLine {
+                                    ledger: Some(p.ledger_id),
+                                    debit: p.amount > 0,
+                                    amount: format_amount(p.amount)
+                                        .trim_start_matches('-')
+                                        .to_owned(),
+                                })
+                                .collect();
+                            self.message.clear();
+                        }
+                    });
+                    for p in &voucher.postings {
+                        let name = ledgers
+                            .iter()
+                            .find(|l| l.id == p.ledger_id)
+                            .map(|l| l.name.as_str())
+                            .unwrap_or("Unknown ledger");
+                        ui.label(format!(
+                            "  {}  {}  {}",
+                            name,
+                            if p.amount > 0 { "Dr" } else { "Cr" },
+                            format_amount(p.amount).trim_start_matches('-')
+                        ));
+                    }
+                }
+            }
+            Err(e) => self.failure(e),
         }
     }
     fn reports_page(&mut self, ui: &mut egui::Ui, company: i64) {
@@ -242,20 +354,6 @@ fn money(value: i128) -> String {
         n % 100
     )
 }
-fn ledger_picker(ui: &mut egui::Ui, label: &str, ledgers: &[Ledger], selected: &mut Option<i64>) {
-    let text = ledgers
-        .iter()
-        .find(|l| Some(l.id) == *selected)
-        .map(|l| l.name.as_str())
-        .unwrap_or("Select ledger");
-    egui::ComboBox::from_label(label)
-        .selected_text(text)
-        .show_ui(ui, |ui| {
-            for ledger in ledgers {
-                ui.selectable_value(selected, Some(ledger.id), &ledger.name);
-            }
-        });
-}
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
@@ -279,24 +377,26 @@ impl eframe::App for App {
             }
         });
         egui::CentralPanel::default().show(ctx, |ui| {
-            if !self.message.is_empty() {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), &self.message);
-                ui.separator();
-            }
-            if self.page == Page::Company {
-                self.company_page(ui);
-                return;
-            }
-            let Some(company) = self.company else {
-                ui.label("Select a company first.");
-                return;
-            };
-            match self.page {
-                Page::Company => {}
-                Page::Ledger => self.ledger_page(ui, company),
-                Page::Voucher => self.voucher_page(ui, company),
-                Page::Reports => self.reports_page(ui, company),
-            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if !self.message.is_empty() {
+                    ui.colored_label(Color32::from_rgb(155, 55, 35), &self.message);
+                    ui.separator();
+                }
+                if self.page == Page::Company {
+                    self.company_page(ui);
+                    return;
+                }
+                let Some(company) = self.company else {
+                    ui.label("Select a company first.");
+                    return;
+                };
+                match self.page {
+                    Page::Company => {}
+                    Page::Ledger => self.ledger_page(ui, company),
+                    Page::Voucher => self.voucher_page(ui, company),
+                    Page::Reports => self.reports_page(ui, company),
+                }
+            });
         });
     }
 }
