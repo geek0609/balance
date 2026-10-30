@@ -33,6 +33,10 @@ struct App {
     profile_selection: Option<i64>,
     ledger_profile: LedgerProfile,
     profile_original: LedgerProfile,
+    opening_ledger: Option<i64>,
+    opening_date: String,
+    opening_amount: String,
+    opening_debit: bool,
     lines: Vec<VoucherLine>,
     editing_voucher: Option<i64>,
     voucher_kind: VoucherKind,
@@ -45,6 +49,7 @@ struct App {
     register_from: String,
     register_to: String,
     import_path: String,
+    import_opening_date: String,
     import_preview: Option<ImportPlan>,
     stock_name: String,
     stock_unit: String,
@@ -117,6 +122,10 @@ impl App {
             profile_selection: None,
             ledger_profile: LedgerProfile::default(),
             profile_original: LedgerProfile::default(),
+            opening_ledger: None,
+            opening_date: String::new(),
+            opening_amount: String::new(),
+            opening_debit: true,
             lines: vec![VoucherLine::new(true), VoucherLine::new(false)],
             editing_voucher: None,
             voucher_kind: VoucherKind::Journal,
@@ -129,6 +138,7 @@ impl App {
             register_from: String::new(),
             register_to: String::new(),
             import_path: String::new(),
+            import_opening_date: String::new(),
             import_preview: None,
             stock_name: String::new(),
             stock_unit: String::new(),
@@ -177,6 +187,9 @@ impl App {
         self.profile_selection = None;
         self.ledger_profile = LedgerProfile::default();
         self.profile_original = LedgerProfile::default();
+        self.opening_ledger = None;
+        self.opening_date.clear();
+        self.opening_amount.clear();
         self.import_preview = None;
         self.adjustment_item = None;
         self.stock_register_item = None;
@@ -300,6 +313,77 @@ impl App {
                 ui.label(format!("{}  —  {}", ledger.name, group));
             }
         }
+        ui.separator();
+        ui.heading("Opening balances");
+        ui.label("Each opening balance is offset against the opening difference account. Reconcile the difference as other opening balances are entered.");
+        let previous_opening_ledger = self.opening_ledger;
+        pick_account(
+            ui,
+            "opening-ledger",
+            "Ledger",
+            &ledgers,
+            &mut self.opening_ledger,
+            false,
+        );
+        if previous_opening_ledger != self.opening_ledger {
+            self.opening_date.clear();
+            self.opening_amount.clear();
+        }
+        if ui.button("Load existing opening balance").clicked() {
+            if let Some(id) = self.opening_ledger {
+                match self.store.opening_balance(company, id) {
+                    Ok(Some(value)) => {
+                        self.opening_date = value.date;
+                        self.opening_debit = value.amount > 0;
+                        self.opening_amount = format_amount(value.amount)
+                            .trim_start_matches('-')
+                            .to_owned();
+                    }
+                    Ok(None) => {
+                        self.opening_date.clear();
+                        self.opening_amount.clear();
+                        self.opening_debit = true;
+                        self.message = "No opening balance recorded for this ledger".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("Date");
+            ui.add(egui::TextEdit::singleline(&mut self.opening_date).hint_text("YYYY-MM-DD"));
+            ui.label("Amount");
+            ui.text_edit_singleline(&mut self.opening_amount);
+            egui::ComboBox::from_id_salt("opening-side")
+                .selected_text(if self.opening_debit {
+                    "Debit"
+                } else {
+                    "Credit"
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.opening_debit, true, "Debit");
+                    ui.selectable_value(&mut self.opening_debit, false, "Credit");
+                });
+        });
+        if ui.button("Save opening balance").clicked() {
+            let result = (|| -> optimus_prime::Result<i64> {
+                let ledger = self
+                    .opening_ledger
+                    .ok_or_else(|| optimus_prime::Error::Validation("Select a ledger".into()))?;
+                let amount = parse_amount(&self.opening_amount)?;
+                self.store.set_opening_balance(
+                    company,
+                    ledger,
+                    &self.opening_date,
+                    if self.opening_debit { amount } else { -amount },
+                )
+            })();
+            match result {
+                Ok(id) => self.message = format!("Opening balance saved (voucher {id})"),
+                Err(e) => self.failure(e),
+            }
+        }
+        ui.small("Opening balances must be non-zero. Clearing one is not yet supported.");
         ui.separator();
         ui.heading("Ledger details");
         let dirty = self.profile_ledger.is_some() && self.ledger_profile != self.profile_original;
@@ -658,7 +742,7 @@ impl App {
                             self.message.clear();
                         }
                         if invoice_backed {
-                            ui.small("Linked invoice or settlement postings cannot yet be edited");
+                            ui.small("Linked postings cannot be edited here");
                         }
                     });
                     for p in &voucher.postings {
@@ -1352,6 +1436,18 @@ impl App {
                 self.import_preview = None;
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Opening date (if included)");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.import_opening_date)
+                        .hint_text("YYYY-MM-DD"),
+                )
+                .changed()
+            {
+                self.import_preview = None;
+            }
+        });
         if ui.button("Preview file").clicked() {
             self.import_preview = None;
             let result = (|| -> optimus_prime::Result<ImportPlan> {
@@ -1374,7 +1470,11 @@ impl App {
                     .map_err(|e| {
                         optimus_prime::Error::Validation(format!("Cannot read file: {e}"))
                     })?;
-                self.store.preview_xml_import(company, &bytes)
+                self.store.preview_xml_import_with_opening_date(
+                    company,
+                    &bytes,
+                    Some(&self.import_opening_date),
+                )
             })();
             match result {
                 Ok(plan) => {
@@ -1386,9 +1486,10 @@ impl App {
         }
         if let Some(plan) = &self.import_preview {
             ui.label(format!(
-                "Preview: {} new groups, {} new ledgers, {} vouchers",
+                "Preview: {} new groups, {} new ledgers, {} opening balances, {} vouchers",
                 plan.group_count(),
                 plan.ledger_count(),
+                plan.opening_count(),
                 plan.voucher_count()
             ));
             if plan.issues().is_empty() {
@@ -1422,7 +1523,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details and accounting vouchers. It does not import inventory, invoices, party allocations, opening balances, statutory tax information or other unsupported fields.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and accounting vouchers. It does not import inventory, invoices, party allocations, statutory tax information or other unsupported fields.");
     }
 }
 fn pick_stock(

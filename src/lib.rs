@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod contacts;
 pub mod exchange;
 pub mod inventory;
+pub mod opening;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -209,7 +210,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 7 {
+        if version > 8 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -279,6 +280,11 @@ impl Store {
                 CREATE TABLE ledger_profile_revisions(id INTEGER PRIMARY KEY, ledger_id INTEGER NOT NULL REFERENCES ledgers(id), company_id INTEGER NOT NULL REFERENCES companies(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, mailing_name TEXT NOT NULL, address TEXT NOT NULL, postal_code TEXT NOT NULL, country TEXT NOT NULL, region TEXT NOT NULL, email TEXT NOT NULL, email_cc TEXT NOT NULL, phone TEXT NOT NULL, mobile TEXT NOT NULL, tax_id TEXT NOT NULL, tax_registration_type TEXT NOT NULL);
                 CREATE INDEX ledger_profile_revisions_ledger ON ledger_profile_revisions(ledger_id, id);
                 PRAGMA user_version = 7;")?;
+        }
+        if version < 8 {
+            tx.execute_batch("CREATE TABLE company_controls(company_id INTEGER PRIMARY KEY REFERENCES companies(id), opening_difference_ledger_id INTEGER NOT NULL UNIQUE REFERENCES ledgers(id));
+                CREATE TABLE opening_balances(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), date TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount != 0), UNIQUE(company_id, ledger_id));
+                PRAGMA user_version = 8;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -432,6 +438,7 @@ impl Store {
         let date = validate_voucher(date, postings)?;
         let tx = self.conn.transaction()?;
         check_ledgers(&tx, company_id, postings)?;
+        opening::check_no_control_postings(&tx, company_id, postings)?;
         tx.execute(
             "INSERT INTO vouchers(company_id, date, narration, kind, reference) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -522,14 +529,15 @@ impl Store {
         let date = validate_voucher(date, postings)?;
         let tx = self.conn.transaction()?;
         check_ledgers(&tx, company_id, postings)?;
+        opening::check_no_control_postings(&tx, company_id, postings)?;
         let invoice_backed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2)",
             params![voucher_id, company_id],
             |r| r.get(0),
         )?;
         if invoice_backed {
             return Err(Error::Validation(
-                "Invoice and settlement postings cannot be edited from the voucher screen".into(),
+                "Linked postings cannot be edited from the voucher screen".into(),
             ));
         }
         let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
@@ -1083,7 +1091,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

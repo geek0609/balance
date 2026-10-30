@@ -24,6 +24,7 @@ struct Account {
     group: String,
     category: Category,
     profile: LedgerProfile,
+    opening: Option<i64>,
 }
 #[derive(Debug, Clone)]
 struct Line {
@@ -43,6 +44,7 @@ struct Transaction {
 #[derive(Debug, Clone)]
 pub struct ImportPlan {
     company_id: i64,
+    opening_date: Option<String>,
     groups: Vec<Group>,
     accounts: Vec<Account>,
     transactions: Vec<Transaction>,
@@ -57,6 +59,9 @@ impl ImportPlan {
     }
     pub fn voucher_count(&self) -> usize {
         self.transactions.len()
+    }
+    pub fn opening_count(&self) -> usize {
+        self.accounts.iter().filter(|a| a.opening.is_some()).count()
     }
     pub fn company_id(&self) -> i64 {
         self.company_id
@@ -366,6 +371,14 @@ fn find_ledger(conn: &Connection, company: i64, name: &str) -> Result<Option<i64
 
 impl Store {
     pub fn preview_xml_import(&self, company_id: i64, bytes: &[u8]) -> Result<ImportPlan> {
+        self.preview_xml_import_with_opening_date(company_id, bytes, None)
+    }
+    pub fn preview_xml_import_with_opening_date(
+        &self,
+        company_id: i64,
+        bytes: &[u8],
+        opening_date: Option<&str>,
+    ) -> Result<ImportPlan> {
         if !self.companies()?.iter().any(|c| c.id == company_id) {
             return Err(Error::Validation("Select an existing company".into()));
         }
@@ -380,6 +393,10 @@ impl Store {
         .map_err(|e| Error::Validation(format!("Cannot read XML: {e}")))?;
         let mut plan = ImportPlan {
             company_id,
+            opening_date: opening_date
+                .filter(|s| !s.trim().is_empty())
+                .map(xml_date)
+                .transpose()?,
             groups: Vec::new(),
             accounts: Vec::new(),
             transactions: Vec::new(),
@@ -556,12 +573,24 @@ impl Store {
                 tax_id: direct_text(node, "PARTYGSTIN").unwrap_or_default(),
                 tax_registration_type: direct_text(node, "GSTREGISTRATIONTYPE").unwrap_or_default(),
             };
-            if let Some(opening) = direct_text(node, "OPENINGBALANCE") {
-                if !opening.is_empty() && !matches!(xml_amount(&opening), Ok(0)) {
-                    plan.issues
-                        .push(format!("Ledger {name}: opening balances are not supported"));
-                }
-            }
+            let opening = match direct_text(node, "OPENINGBALANCE").filter(|s| !s.is_empty()) {
+                Some(value) => match xml_amount(&value) {
+                    Ok(0) => None,
+                    Ok(amount) => {
+                        if plan.opening_date.is_none() {
+                            plan.issues
+                                .push(format!("Ledger {name}: provide an opening date"));
+                        }
+                        Some(amount)
+                    }
+                    Err(_) => {
+                        plan.issues
+                            .push(format!("Ledger {name}: opening balance is invalid"));
+                        None
+                    }
+                },
+                None => None,
+            };
             let group = direct_text(node, "PARENT").unwrap_or_default();
             let category = match known_groups.get(&normalized(&group)) {
                 Some(category) => *category,
@@ -579,6 +608,7 @@ impl Store {
                 group,
                 category,
                 profile,
+                opening,
             });
         }
         let mut references: HashSet<(String, String, String)> = self
@@ -812,6 +842,23 @@ impl Store {
                 tx.last_insert_rowid(),
                 &account.profile,
             )?;
+            if let Some(amount) = account.opening {
+                let ledger_id =
+                    find_ledger(&tx, plan.company_id, &account.name)?.ok_or_else(|| {
+                        Error::Validation(format!("Ledger {} is missing", account.name))
+                    })?;
+                let date = plan
+                    .opening_date
+                    .as_deref()
+                    .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
+                crate::opening::save_opening_in_transaction(
+                    &tx,
+                    plan.company_id,
+                    ledger_id,
+                    date,
+                    amount,
+                )?;
+            }
         }
         for voucher in &plan.transactions {
             let mut stmt =
@@ -854,6 +901,7 @@ impl Store {
             }
             validate_voucher(&voucher.date, &postings)?;
             check_ledgers(&tx, plan.company_id, &postings)?;
+            crate::opening::check_no_control_postings(&tx, plan.company_id, &postings)?;
             tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![plan.company_id, voucher.kind.as_str(), voucher.reference, voucher.date, voucher.narration])?;
             let id = tx.last_insert_rowid();
             for posting in postings {
