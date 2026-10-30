@@ -82,6 +82,37 @@ pub struct MatchEvent {
     pub posting_id: i64,
     pub reason: String,
 }
+#[derive(Debug, Clone)]
+pub struct StatementOpening {
+    pub start_date: String,
+    pub amount: i64,
+}
+#[derive(Debug, Clone)]
+pub struct StatementBalance {
+    pub opening: StatementOpening,
+    pub movement_total: i128,
+    pub ending_balance: i128,
+    pub entry_count: usize,
+}
+#[derive(Debug, Clone)]
+pub struct StatementOpeningEvent {
+    pub changed_at: String,
+    pub previous_date: Option<String>,
+    pub previous_amount: Option<i64>,
+    pub new_date: Option<String>,
+    pub new_amount: Option<i64>,
+    pub reason: String,
+}
+pub fn parse_signed_amount(value: &str) -> Result<i64> {
+    let value = value.trim();
+    if let Some(number) = value.strip_prefix('-') {
+        parse_amount(number)?
+            .checked_neg()
+            .ok_or_else(|| Error::Validation("Amount is too large".into()))
+    } else {
+        parse_amount(value.strip_prefix('+').unwrap_or(value))
+    }
+}
 
 pub(crate) fn ensure_no_bank_clearance(
     conn: &Connection,
@@ -165,6 +196,99 @@ fn record_clearance(
 }
 
 impl Store {
+    pub fn statement_opening(&self, company: i64, ledger: i64) -> Result<Option<StatementOpening>> {
+        asset_ledger(&self.conn, company, ledger)?;
+        Ok(self.conn.query_row("SELECT start_date, amount FROM bank_statement_openings WHERE company_id = ?1 AND ledger_id = ?2", params![company, ledger], |r| Ok(StatementOpening { start_date: r.get(0)?, amount: r.get(1)? })).optional()?)
+    }
+    /// Save or remove the balance immediately before the start of the selected date.
+    pub fn set_statement_opening(
+        &mut self,
+        company: i64,
+        ledger: i64,
+        opening: Option<(&str, i64)>,
+        reason: &str,
+    ) -> Result<()> {
+        let reason = required(reason, "Reason")?;
+        let next = opening
+            .map(|(date, amount)| -> Result<_> {
+                Ok((parse_date(date)?.format("%Y-%m-%d").to_string(), amount))
+            })
+            .transpose()?;
+        let tx = self.conn.transaction()?;
+        asset_ledger(&tx, company, ledger)?;
+        let previous: Option<(String, i64)> = tx.query_row("SELECT start_date, amount FROM bank_statement_openings WHERE company_id = ?1 AND ledger_id = ?2", params![company, ledger], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        if previous == next {
+            return Err(Error::Validation(
+                "Statement opening has not changed".into(),
+            ));
+        }
+        tx.execute("INSERT INTO bank_statement_opening_events(company_id, ledger_id, previous_date, previous_amount, new_date, new_amount, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![company, ledger, previous.as_ref().map(|v| &v.0), previous.as_ref().map(|v| v.1), next.as_ref().map(|v| &v.0), next.as_ref().map(|v| v.1), reason])?;
+        if let Some((date, amount)) = next {
+            tx.execute("INSERT INTO bank_statement_openings(company_id, ledger_id, start_date, amount) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(company_id, ledger_id) DO UPDATE SET start_date = excluded.start_date, amount = excluded.amount", params![company, ledger, date, amount])?;
+        } else {
+            tx.execute(
+                "DELETE FROM bank_statement_openings WHERE company_id = ?1 AND ledger_id = ?2",
+                params![company, ledger],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn statement_balance(
+        &self,
+        company: i64,
+        ledger: i64,
+        as_of: &str,
+    ) -> Result<Option<StatementBalance>> {
+        let end = parse_date(as_of)?;
+        let Some(opening) = self.statement_opening(company, ledger)? else {
+            return Ok(None);
+        };
+        let start = parse_date(&opening.start_date)?;
+        if end < start {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare("SELECT date, amount FROM bank_statement_entries WHERE company_id = ?1 AND ledger_id = ?2")?;
+        let mut movement_total = 0_i128;
+        let mut entry_count = 0_usize;
+        for row in stmt.query_map(params![company, ledger], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (date, amount) = row?;
+            let date = parse_date(&date)?;
+            if date >= start && date <= end {
+                movement_total += i128::from(amount);
+                entry_count += 1;
+            }
+        }
+        Ok(Some(StatementBalance {
+            ending_balance: i128::from(opening.amount) + movement_total,
+            opening,
+            movement_total,
+            entry_count,
+        }))
+    }
+    pub fn statement_opening_events(
+        &self,
+        company: i64,
+        ledger: i64,
+    ) -> Result<Vec<StatementOpeningEvent>> {
+        asset_ledger(&self.conn, company, ledger)?;
+        let mut stmt = self.conn.prepare("SELECT changed_at, previous_date, previous_amount, new_date, new_amount, reason FROM bank_statement_opening_events WHERE company_id = ?1 AND ledger_id = ?2 ORDER BY id DESC")?;
+        let rows = stmt
+            .query_map(params![company, ledger], |r| {
+                Ok(StatementOpeningEvent {
+                    changed_at: r.get(0)?,
+                    previous_date: r.get(1)?,
+                    previous_amount: r.get(2)?,
+                    new_date: r.get(3)?,
+                    new_amount: r.get(4)?,
+                    reason: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
     /// Preview a strict CSV with id,date,description,amount columns.
     pub fn preview_bank_statement(
         &self,

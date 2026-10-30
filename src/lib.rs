@@ -247,7 +247,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=20).contains(&version) {
+    if !(1..=21).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -345,6 +345,8 @@ impl Store {
             "invoice_adjustments",
             "invoice_revision_adjustments",
             "stock_batches",
+            "bank_statement_openings",
+            "bank_statement_opening_events",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -362,7 +364,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 20 {
+        if version > 21 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -536,6 +538,12 @@ impl Store {
                 ALTER TABLE stock_transfers ADD COLUMN batch_id INTEGER REFERENCES stock_batches(id);
                 CREATE INDEX stock_batches_item ON stock_batches(company_id, item_id, name);
                 PRAGMA user_version = 20;")?;
+        }
+        if version < 21 {
+            tx.execute_batch("CREATE TABLE bank_statement_openings(company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), start_date TEXT NOT NULL, amount INTEGER NOT NULL, PRIMARY KEY(company_id, ledger_id));
+                CREATE TABLE bank_statement_opening_events(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), previous_date TEXT, previous_amount INTEGER, new_date TEXT, new_amount INTEGER, reason TEXT NOT NULL, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE INDEX bank_statement_opening_events_ledger ON bank_statement_opening_events(company_id, ledger_id, id);
+                PRAGMA user_version = 21;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1398,7 +1406,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use balance::banking::StatementPlan;
+use balance::banking::{parse_signed_amount, StatementPlan};
 use balance::contacts::LedgerProfile;
 use balance::exchange::ImportPlan;
 use balance::inventory::{
@@ -69,6 +69,9 @@ struct App {
     bank_csv_preview: Option<StatementPlan>,
     bank_statement_selection: Option<i64>,
     bank_match_reason: String,
+    bank_opening_date: String,
+    bank_opening_amount: String,
+    bank_opening_reason: String,
     import_path: String,
     import_opening_date: String,
     backup_path: String,
@@ -222,6 +225,9 @@ impl App {
             bank_csv_preview: None,
             bank_statement_selection: None,
             bank_match_reason: String::new(),
+            bank_opening_date: String::new(),
+            bank_opening_amount: String::new(),
+            bank_opening_reason: String::new(),
             import_path: String::new(),
             import_opening_date: String::new(),
             backup_path: String::new(),
@@ -315,6 +321,9 @@ impl App {
         self.bank_csv_preview = None;
         self.bank_statement_selection = None;
         self.bank_match_reason.clear();
+        self.bank_opening_date.clear();
+        self.bank_opening_amount.clear();
+        self.bank_opening_reason.clear();
         self.opening_date.clear();
         self.opening_amount.clear();
         self.import_preview = None;
@@ -2515,6 +2524,9 @@ impl App {
             self.bank_posting = None;
             self.bank_csv_preview = None;
             self.bank_statement_selection = None;
+            self.bank_opening_date.clear();
+            self.bank_opening_amount.clear();
+            self.bank_opening_reason.clear();
         }
         ui.horizontal(|ui| {
             ui.label("As of");
@@ -2541,6 +2553,23 @@ impl App {
             money(report.cleared_balance),
             money(report.uncleared)
         ));
+        match self
+            .store
+            .statement_balance(company, ledger, &self.bank_as_of)
+        {
+            Ok(Some(statement)) => ui.label(format!(
+                "Imported statement balance: {}    Book less statement: {} ({} entries since {})",
+                money(statement.ending_balance),
+                money(report.book_balance - statement.ending_balance),
+                statement.entry_count,
+                statement.opening.start_date
+            )),
+            Ok(None) => ui.label(
+                "No statement balance is available for this date; set an opening balance first.",
+            ),
+            Err(e) => ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string()),
+        };
+        ui.small("The statement balance uses only imported entries and the entered opening; verify coverage against the bank. It is not independently verified.");
         ui.small("Balances are debit minus credit. Past reports use the current clearance dates; revisions do not reconstruct past states.");
         egui::Grid::new("bank-postings")
             .striped(true)
@@ -2668,6 +2697,103 @@ impl App {
     ) {
         ui.separator();
         ui.heading("Statement entries");
+        ui.label("Set the balance immediately before the start date; imported entries on that date are included. Positive is a debit balance, negative a credit balance.");
+        let opening = match self.store.statement_opening(company, ledger) {
+            Ok(opening) => opening,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        if let Some(current) = &opening {
+            ui.label(format!(
+                "Current opening before {}: {}",
+                current.start_date,
+                format_amount(current.amount)
+            ));
+            if ui.button("Load current statement opening").clicked() {
+                self.bank_opening_date = current.start_date.clone();
+                self.bank_opening_amount = format_amount(current.amount);
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("Start date");
+            ui.add(egui::TextEdit::singleline(&mut self.bank_opening_date).hint_text("YYYY-MM-DD"));
+            ui.label("Opening amount");
+            ui.text_edit_singleline(&mut self.bank_opening_amount);
+            ui.label("Reason");
+            ui.text_edit_singleline(&mut self.bank_opening_reason);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Save statement opening").clicked() {
+                let result = (|| -> balance::Result<()> {
+                    let amount = parse_signed_amount(&self.bank_opening_amount)?;
+                    self.store.set_statement_opening(
+                        company,
+                        ledger,
+                        Some((&self.bank_opening_date, amount)),
+                        &self.bank_opening_reason,
+                    )
+                })();
+                match result {
+                    Ok(()) => {
+                        self.bank_opening_reason.clear();
+                        self.message = "Statement opening saved".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+            if ui
+                .add_enabled(
+                    opening.is_some(),
+                    egui::Button::new("Remove statement opening"),
+                )
+                .clicked()
+            {
+                match self.store.set_statement_opening(
+                    company,
+                    ledger,
+                    None,
+                    &self.bank_opening_reason,
+                ) {
+                    Ok(()) => {
+                        self.bank_opening_date.clear();
+                        self.bank_opening_amount.clear();
+                        self.bank_opening_reason.clear();
+                        self.message = "Statement opening removed".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        });
+        egui::CollapsingHeader::new("Statement opening history").show(ui, |ui| {
+            match self.store.statement_opening_events(company, ledger) {
+                Ok(events) if events.is_empty() => {
+                    ui.label("No opening changes.");
+                }
+                Ok(events) => {
+                    for event in events {
+                        let previous = event
+                            .previous_date
+                            .zip(event.previous_amount)
+                            .map(|(date, amount)| format!("{date}: {}", format_amount(amount)))
+                            .unwrap_or_else(|| "none".into());
+                        let next = event
+                            .new_date
+                            .zip(event.new_amount)
+                            .map(|(date, amount)| format!("{date}: {}", format_amount(amount)))
+                            .unwrap_or_else(|| "none".into());
+                        ui.label(format!(
+                            "{} UTC — {} → {} — {}",
+                            event.changed_at, previous, next, event.reason
+                        ));
+                    }
+                }
+                Err(e) => {
+                    ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                }
+            }
+        });
         ui.small("CSV columns: id,date,description,amount. Dates use YYYY-MM-DD; deposits are positive and withdrawals negative. IDs must be unique for this ledger. Matching requires the exact amount and a statement date on or after the voucher date.");
         ui.horizontal(|ui| {
             ui.label("CSV file");
