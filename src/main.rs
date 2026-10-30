@@ -1371,13 +1371,29 @@ impl App {
                             as_of,
                         ) {
                             Ok(qty) => {
-                                ui.label(format!(
+                                let expired = as_of
+                                    .and_then(|date| {
+                                        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+                                    })
+                                    .zip(batch.expires_on.as_deref().and_then(|date| {
+                                        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+                                    }))
+                                    .is_some_and(|(date, expiry)| date > expiry);
+                                let text = format!(
                                     "{} — quantity {} — manufactured {} — expires {}",
                                     batch.name,
                                     format_quantity(qty),
                                     batch.manufactured_on.as_deref().unwrap_or("—"),
                                     batch.expires_on.as_deref().unwrap_or("—")
-                                ));
+                                );
+                                if expired {
+                                    ui.colored_label(
+                                        Color32::from_rgb(155, 55, 35),
+                                        format!("{text} — expired as of selected date"),
+                                    );
+                                } else {
+                                    ui.label(text);
+                                }
                             }
                             Err(e) => {
                                 ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
