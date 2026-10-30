@@ -16,6 +16,49 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A voucher classification. Tax and stock effects are not inferred from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoucherKind {
+    Journal,
+    Payment,
+    Receipt,
+    Transfer,
+    Sales,
+    Purchase,
+    CreditNote,
+    DebitNote,
+}
+impl VoucherKind {
+    pub const ALL: [Self; 8] = [
+        Self::Journal,
+        Self::Payment,
+        Self::Receipt,
+        Self::Transfer,
+        Self::Sales,
+        Self::Purchase,
+        Self::CreditNote,
+        Self::DebitNote,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Journal => "Journal",
+            Self::Payment => "Payment",
+            Self::Receipt => "Receipt",
+            Self::Transfer => "Transfer",
+            Self::Sales => "Sales",
+            Self::Purchase => "Purchase",
+            Self::CreditNote => "Credit note",
+            Self::DebitNote => "Debit note",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|v| v.as_str() == value)
+            .ok_or_else(|| Error::Validation("Unknown voucher type".into()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
     Asset,
@@ -69,6 +112,7 @@ pub struct Posting {
 #[derive(Debug, Clone)]
 pub struct Voucher {
     pub id: i64,
+    pub kind: VoucherKind,
     pub date: String,
     pub narration: String,
     pub postings: Vec<Posting>,
@@ -153,7 +197,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 1 {
+        if version > 2 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -171,6 +215,13 @@ impl Store {
             CREATE INDEX postings_voucher ON postings(voucher_id);
             CREATE INDEX revisions_voucher ON voucher_revisions(voucher_id, id);
             PRAGMA user_version = 1;")?;
+        }
+        if version < 2 {
+            tx.execute_batch(
+                "ALTER TABLE vouchers ADD COLUMN kind TEXT NOT NULL DEFAULT 'Journal';
+                ALTER TABLE voucher_revisions ADD COLUMN kind TEXT NOT NULL DEFAULT 'Journal';
+                PRAGMA user_version = 2;",
+            )?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -229,15 +280,26 @@ impl Store {
         narration: &str,
         postings: &[Posting],
     ) -> Result<i64> {
+        self.post_typed_voucher(company_id, VoucherKind::Journal, date, narration, postings)
+    }
+    pub fn post_typed_voucher(
+        &mut self,
+        company_id: i64,
+        kind: VoucherKind,
+        date: &str,
+        narration: &str,
+        postings: &[Posting],
+    ) -> Result<i64> {
         let date = validate_voucher(date, postings)?;
         let tx = self.conn.transaction()?;
         check_ledgers(&tx, company_id, postings)?;
         tx.execute(
-            "INSERT INTO vouchers(company_id, date, narration) VALUES (?1, ?2, ?3)",
+            "INSERT INTO vouchers(company_id, date, narration, kind) VALUES (?1, ?2, ?3, ?4)",
             params![
                 company_id,
                 date.format("%Y-%m-%d").to_string(),
-                narration.trim()
+                narration.trim(),
+                kind.as_str()
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -259,10 +321,41 @@ impl Store {
         narration: &str,
         postings: &[Posting],
     ) -> Result<()> {
+        let kind: String = self
+            .conn
+            .query_row(
+                "SELECT kind FROM vouchers WHERE id = ?1 AND company_id = ?2",
+                params![voucher_id, company_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::Validation("Voucher not found in the selected company".into())
+                }
+                other => Error::Database(other),
+            })?;
+        self.update_typed_voucher(
+            company_id,
+            voucher_id,
+            VoucherKind::parse(&kind)?,
+            date,
+            narration,
+            postings,
+        )
+    }
+    pub fn update_typed_voucher(
+        &mut self,
+        company_id: i64,
+        voucher_id: i64,
+        kind: VoucherKind,
+        date: &str,
+        narration: &str,
+        postings: &[Posting],
+    ) -> Result<()> {
         let date = validate_voucher(date, postings)?;
         let tx = self.conn.transaction()?;
         check_ledgers(&tx, company_id, postings)?;
-        let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration) SELECT id, company_id, date, narration FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
+        let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind) SELECT id, company_id, date, narration, kind FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
         if saved != 1 {
             return Err(Error::Validation(
                 "Voucher not found in the selected company".into(),
@@ -271,12 +364,13 @@ impl Store {
         let revision_id = tx.last_insert_rowid();
         tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![revision_id, voucher_id])?;
         let changed = tx.execute(
-            "UPDATE vouchers SET date = ?1, narration = ?2 WHERE id = ?3 AND company_id = ?4",
+            "UPDATE vouchers SET date = ?1, narration = ?2, kind = ?5 WHERE id = ?3 AND company_id = ?4",
             params![
                 date.format("%Y-%m-%d").to_string(),
                 narration.trim(),
                 voucher_id,
-                company_id
+                company_id,
+                kind.as_str()
             ],
         )?;
         if changed != 1 {
@@ -296,15 +390,17 @@ impl Store {
     }
     /// Read only vouchers belonging to the given company, newest first.
     pub fn vouchers(&self, company_id: i64) -> Result<Vec<Voucher>> {
-        let mut stmt = self.conn.prepare("SELECT id, date, narration FROM vouchers WHERE company_id = ?1 ORDER BY date DESC, id DESC")?;
+        let mut stmt = self.conn.prepare("SELECT id, date, narration, kind FROM vouchers WHERE company_id = ?1 ORDER BY date DESC, id DESC")?;
         let rows = stmt
-            .query_map([company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<rusqlite::Result<Vec<(i64, String, String)>>>()?;
+            .query_map([company_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<(i64, String, String, String)>>>()?;
         let mut postings_stmt = self
             .conn
             .prepare("SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
         let mut vouchers = Vec::with_capacity(rows.len());
-        for (id, date, narration) in rows {
+        for (id, date, narration, kind) in rows {
             let postings = postings_stmt
                 .query_map([id], |r| {
                     Ok(Posting {
@@ -315,6 +411,7 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             vouchers.push(Voucher {
                 id,
+                kind: VoucherKind::parse(&kind)?,
                 date,
                 narration,
                 postings,
@@ -332,17 +429,17 @@ impl Store {
         company_id: i64,
         voucher_id: i64,
     ) -> Result<Vec<VoucherRevision>> {
-        let mut stmt = self.conn.prepare("SELECT id, changed_at, date, narration FROM voucher_revisions WHERE company_id = ?1 AND voucher_id = ?2 ORDER BY id DESC")?;
+        let mut stmt = self.conn.prepare("SELECT id, changed_at, date, narration, kind FROM voucher_revisions WHERE company_id = ?1 AND voucher_id = ?2 ORDER BY id DESC")?;
         let rows = stmt
             .query_map(params![company_id, voucher_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
-            .collect::<rusqlite::Result<Vec<(i64, String, String, String)>>>()?;
+            .collect::<rusqlite::Result<Vec<(i64, String, String, String, String)>>>()?;
         let mut posting_stmt = self.conn.prepare(
             "SELECT ledger_id, amount FROM revision_postings WHERE revision_id = ?1 ORDER BY id",
         )?;
         let mut revisions = Vec::with_capacity(rows.len());
-        for (revision_id, changed_at, date, narration) in rows {
+        for (revision_id, changed_at, date, narration, kind) in rows {
             let postings = posting_stmt
                 .query_map([revision_id], |r| {
                     Ok(Posting {
@@ -355,6 +452,7 @@ impl Store {
                 changed_at,
                 voucher: Voucher {
                     id: voucher_id,
+                    kind: VoucherKind::parse(&kind)?,
                     date,
                     narration,
                     postings,
@@ -541,6 +639,51 @@ fn required<'a>(value: &'a str, label: &str) -> Result<&'a str> {
 mod tests {
     use super::*;
     #[test]
+    fn voucher_kind_survives_edits_and_is_recorded_in_revisions() {
+        let mut db = Store::memory().unwrap();
+        let company = db.create_company("Example").unwrap();
+        let cash = db.create_ledger(company, "Cash", Category::Asset).unwrap();
+        let income = db
+            .create_ledger(company, "Income", Category::Income)
+            .unwrap();
+        let postings = [
+            Posting {
+                ledger_id: cash,
+                amount: 100,
+            },
+            Posting {
+                ledger_id: income,
+                amount: -100,
+            },
+        ];
+        let id = db
+            .post_typed_voucher(
+                company,
+                VoucherKind::Sales,
+                "2026-01-01",
+                "first",
+                &postings,
+            )
+            .unwrap();
+        db.update_voucher(company, id, "2026-01-02", "second", &postings)
+            .unwrap();
+        assert_eq!(db.vouchers(company).unwrap()[0].kind, VoucherKind::Sales);
+        db.update_typed_voucher(
+            company,
+            id,
+            VoucherKind::Receipt,
+            "2026-01-02",
+            "third",
+            &postings,
+        )
+        .unwrap();
+        assert_eq!(db.vouchers(company).unwrap()[0].kind, VoucherKind::Receipt);
+        assert_eq!(
+            db.voucher_revisions(company, id).unwrap()[0].voucher.kind,
+            VoucherKind::Sales
+        );
+    }
+    #[test]
     fn ledger_register_tracks_opening_running_and_closing_balances() {
         let mut db = Store::memory().unwrap();
         let company = db.create_company("Example").unwrap();
@@ -656,7 +799,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

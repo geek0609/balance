@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, RichText};
-use optimus_prime::{format_amount, parse_amount, Category, Posting, Store};
+use optimus_prime::{format_amount, parse_amount, Category, Posting, Store, VoucherKind};
 
 #[derive(PartialEq)]
 enum Page {
@@ -20,6 +20,7 @@ struct App {
     category: Category,
     lines: Vec<VoucherLine>,
     editing_voucher: Option<i64>,
+    voucher_kind: VoucherKind,
     date: String,
     narration: String,
     report_from: String,
@@ -54,6 +55,7 @@ impl App {
             category: Category::Asset,
             lines: vec![VoucherLine::new(true), VoucherLine::new(false)],
             editing_voucher: None,
+            voucher_kind: VoucherKind::Journal,
             date: String::new(),
             narration: String::new(),
             report_from: String::new(),
@@ -70,6 +72,7 @@ impl App {
     fn clear_voucher(&mut self) {
         self.lines = vec![VoucherLine::new(true), VoucherLine::new(false)];
         self.editing_voucher = None;
+        self.voucher_kind = VoucherKind::Journal;
         self.narration.clear();
     }
     fn reset_company_forms(&mut self) {
@@ -153,6 +156,14 @@ impl App {
         ui.label(
             "Enter at least two lines. Debits and credits must balance. Press Ctrl+Enter to save.",
         );
+        egui::ComboBox::from_label("Type")
+            .selected_text(self.voucher_kind.as_str())
+            .show_ui(ui, |ui| {
+                for kind in VoucherKind::ALL {
+                    ui.selectable_value(&mut self.voucher_kind, kind, kind.as_str());
+                }
+            });
+        ui.small("Type is a classification; inventory and tax are not calculated automatically.");
         let ledgers = match self.store.ledgers(company) {
             Ok(v) => v,
             Err(e) => {
@@ -242,17 +253,23 @@ impl App {
                     });
                 }
                 if let Some(id) = self.editing_voucher {
-                    self.store.update_voucher(
+                    self.store.update_typed_voucher(
                         company,
                         id,
+                        self.voucher_kind,
                         &self.date,
                         &self.narration,
                         &postings,
                     )?;
                     Ok(id)
                 } else {
-                    self.store
-                        .post_voucher(company, &self.date, &self.narration, &postings)
+                    self.store.post_typed_voucher(
+                        company,
+                        self.voucher_kind,
+                        &self.date,
+                        &self.narration,
+                        &postings,
+                    )
                 }
             })();
             match result {
@@ -273,8 +290,10 @@ impl App {
                             "{}  #{}  {}",
                             voucher.date, voucher.id, voucher.narration
                         ));
+                        ui.label(voucher.kind.as_str());
                         if ui.button("Edit").clicked() {
                             self.editing_voucher = Some(voucher.id);
+                            self.voucher_kind = voucher.kind;
                             self.date = voucher.date.clone();
                             self.narration = voucher.narration.clone();
                             self.lines = voucher
@@ -314,9 +333,10 @@ impl App {
                                 Ok(revisions) => {
                                     for revision in revisions {
                                         ui.label(format!(
-                                            "Replaced at {} UTC • {} • {}",
+                                            "Replaced at {} UTC • {} • {} • {}",
                                             revision.changed_at,
                                             revision.voucher.date,
+                                            revision.voucher.kind.as_str(),
                                             revision.voucher.narration
                                         ));
                                         for p in revision.voucher.postings {
