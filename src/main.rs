@@ -1654,6 +1654,8 @@ impl App {
             Ok(rows) => {
                 let mut receivable = 0_i128;
                 let mut payable = 0_i128;
+                let mut receivable_age = [0_i128; 4];
+                let mut payable_age = [0_i128; 4];
                 egui::Grid::new("outstanding").striped(true).show(ui, |ui| {
                     for title in [
                         "Type",
@@ -1669,10 +1671,18 @@ impl App {
                     }
                     ui.end_row();
                     for row in rows {
+                        let bucket = match row.age_days {
+                            0..=30 => 0,
+                            31..=60 => 1,
+                            61..=90 => 2,
+                            _ => 3,
+                        };
                         if row.kind == InvoiceKind::Sale {
                             receivable += row.outstanding;
+                            receivable_age[bucket] += row.outstanding;
                         } else {
                             payable += row.outstanding;
+                            payable_age[bucket] += row.outstanding;
                         }
                         ui.label(row.kind.as_str());
                         ui.label(row.party);
@@ -1690,6 +1700,26 @@ impl App {
                     money(receivable),
                     money(payable)
                 ));
+                ui.heading("Age from invoice date");
+                egui::Grid::new("outstanding-age")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for title in ["", "0–30 days", "31–60 days", "61–90 days", "Over 90 days"]
+                        {
+                            ui.strong(title);
+                        }
+                        ui.end_row();
+                        ui.label("Receivable");
+                        for amount in receivable_age {
+                            ui.label(money(amount));
+                        }
+                        ui.end_row();
+                        ui.label("Payable");
+                        for amount in payable_age {
+                            ui.label(money(amount));
+                        }
+                        ui.end_row();
+                    });
             }
             Err(e) => {
                 ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
