@@ -19,6 +19,7 @@ enum Page {
     Invoice,
     Backup,
     DayBook,
+    Outstanding,
     Reports,
 }
 struct App {
@@ -54,6 +55,7 @@ struct App {
     day_to: String,
     day_kind: Option<VoucherKind>,
     day_search: String,
+    outstanding_date: String,
     import_path: String,
     import_opening_date: String,
     backup_path: String,
@@ -149,6 +151,7 @@ impl App {
             day_to: String::new(),
             day_kind: None,
             day_search: String::new(),
+            outstanding_date: String::new(),
             import_path: String::new(),
             import_opening_date: String::new(),
             backup_path: String::new(),
@@ -1629,6 +1632,70 @@ impl App {
         }
         ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and accounting vouchers. It does not import inventory, invoices, party allocations, statutory tax information or other unsupported fields.");
     }
+    fn outstanding_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.heading("Outstanding invoices");
+        ui.label("Age is measured from the invoice date. Due dates, credit notes and unallocated payments are not included.");
+        ui.horizontal(|ui| {
+            ui.label("As of");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.outstanding_date)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(120.0),
+            );
+        });
+        if self.outstanding_date.trim().is_empty() {
+            ui.label("Enter an as-of date.");
+            return;
+        }
+        match self
+            .store
+            .outstanding_invoices(company, &self.outstanding_date)
+        {
+            Ok(rows) => {
+                let mut receivable = 0_i128;
+                let mut payable = 0_i128;
+                egui::Grid::new("outstanding").striped(true).show(ui, |ui| {
+                    for title in [
+                        "Type",
+                        "Party",
+                        "Date",
+                        "Reference",
+                        "Total",
+                        "Settled",
+                        "Outstanding",
+                        "Age (days)",
+                    ] {
+                        ui.strong(title);
+                    }
+                    ui.end_row();
+                    for row in rows {
+                        if row.kind == InvoiceKind::Sale {
+                            receivable += row.outstanding;
+                        } else {
+                            payable += row.outstanding;
+                        }
+                        ui.label(row.kind.as_str());
+                        ui.label(row.party);
+                        ui.label(row.date);
+                        ui.label(row.reference);
+                        ui.label(money(row.total));
+                        ui.label(money(row.settled));
+                        ui.label(money(row.outstanding));
+                        ui.label(row.age_days.to_string());
+                        ui.end_row();
+                    }
+                });
+                ui.label(format!(
+                    "Receivable: {}    Payable: {}",
+                    money(receivable),
+                    money(payable)
+                ));
+            }
+            Err(e) => {
+                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+            }
+        }
+    }
     fn day_book_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Day book");
         ui.horizontal(|ui| {
@@ -1798,6 +1865,7 @@ impl eframe::App for App {
                 ("Voucher", Page::Voucher),
                 ("Ledger activity", Page::Register),
                 ("Day book", Page::DayBook),
+                ("Outstanding", Page::Outstanding),
                 ("Stock", Page::Stock),
                 ("Invoices", Page::Invoice),
                 ("Import XML", Page::Import),
@@ -1834,6 +1902,7 @@ impl eframe::App for App {
                     Page::Voucher => self.voucher_page(ui, company),
                     Page::Register => self.register_page(ui, company),
                     Page::DayBook => self.day_book_page(ui, company),
+                    Page::Outstanding => self.outstanding_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),
                     Page::Invoice => self.invoice_page(ui, company),
                     Page::Import => self.import_page(ui, company),

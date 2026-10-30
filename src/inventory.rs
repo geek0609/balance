@@ -115,6 +115,19 @@ pub struct InvoiceRevision {
     pub lines: Vec<InvoiceDetailLine>,
 }
 #[derive(Debug, Clone)]
+pub struct OutstandingInvoice {
+    pub invoice_id: i64,
+    pub kind: InvoiceKind,
+    pub date: String,
+    pub reference: String,
+    pub party: String,
+    pub total: i128,
+    pub settled: i128,
+    pub outstanding: i128,
+    /// Days since the invoice date, not days past a payment due date.
+    pub age_days: i64,
+}
+#[derive(Debug, Clone)]
 pub struct InvoiceDetailLine {
     pub item: String,
     pub unit: String,
@@ -846,5 +859,55 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+    /// Unsettled invoices at the end of the requested date. Payments posted
+    /// after that date do not affect the historical outstanding amount.
+    pub fn outstanding_invoices(
+        &self,
+        company_id: i64,
+        as_of: &str,
+    ) -> Result<Vec<OutstandingInvoice>> {
+        let end = parse_date(as_of)?;
+        let mut result = Vec::new();
+        for invoice in self.invoices(company_id)? {
+            let date = parse_date(&invoice.date)?;
+            if date > end {
+                continue;
+            }
+            let mut settled = 0_i128;
+            for settlement in self.invoice_settlements(company_id, invoice.id)? {
+                if parse_date(&settlement.date)? <= end {
+                    settled += i128::from(settlement.amount);
+                }
+            }
+            let outstanding = invoice.total - settled;
+            if outstanding < 0 {
+                return Err(Error::Validation(
+                    "Invoice settlements exceed its total".into(),
+                ));
+            }
+            if outstanding == 0 {
+                continue;
+            }
+            result.push(OutstandingInvoice {
+                invoice_id: invoice.id,
+                kind: invoice.kind,
+                date: invoice.date,
+                reference: invoice.reference,
+                party: invoice.party,
+                total: invoice.total,
+                settled,
+                outstanding,
+                age_days: (end - date).num_days(),
+            });
+        }
+        result.sort_by(|a, b| {
+            a.party
+                .to_lowercase()
+                .cmp(&b.party.to_lowercase())
+                .then_with(|| a.date.cmp(&b.date))
+                .then_with(|| a.invoice_id.cmp(&b.invoice_id))
+        });
+        Ok(result)
     }
 }
