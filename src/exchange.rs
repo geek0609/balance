@@ -3,8 +3,8 @@
 use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
-    find_stock_batch, insert_invoice_on_connection, line_amount, main_stock_location,
-    parse_quantity, InvoiceAdjustment, InvoiceDraft, InvoiceKind, InvoiceLine,
+    find_stock_batch, insert_invoice_on_connection, line_amount, parse_quantity, InvoiceAdjustment,
+    InvoiceDraft, InvoiceKind, InvoiceLine,
 };
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
@@ -58,8 +58,16 @@ struct Item {
     unit_precision: u8,
     group: String,
     description: String,
-    opening: Option<i64>,
+    openings: Vec<StockOpening>,
     metadata: SourceMetadata,
+}
+#[derive(Debug, Clone)]
+struct StockOpening {
+    location: String,
+    existing_location_id: Option<i64>,
+    batch: Option<String>,
+    manufactured_on: Option<String>,
+    quantity: i64,
 }
 #[derive(Debug, Clone)]
 struct Line {
@@ -180,7 +188,11 @@ impl ImportPlan {
         self.locations.len()
     }
     pub fn stock_opening_count(&self) -> usize {
-        self.items.iter().filter(|i| i.opening.is_some()).count()
+        self.items
+            .iter()
+            .flat_map(|i| &i.openings)
+            .filter(|opening| opening.quantity != 0)
+            .count()
     }
     pub fn company_id(&self) -> i64 {
         self.company_id
@@ -287,10 +299,20 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
                 issues.push(format!("{label}: nested field {tag} is not supported"));
             }
             for attribute in child.attributes() {
+                let typed_rate = ["RATE", "OPENINGRATE"]
+                    .iter()
+                    .any(|v| tag.eq_ignore_ascii_case(v))
+                    && attribute.value().eq_ignore_ascii_case("Rate");
+                let typed_quantity = ["OPENINGBALANCE", "ACTUALQTY", "BILLEDQTY"]
+                    .iter()
+                    .any(|v| tag.eq_ignore_ascii_case(v))
+                    && attribute.value().eq_ignore_ascii_case("Quantity");
                 if !attribute.name().eq_ignore_ascii_case("TYPE")
-                    || !["String", "Date", "Number", "Logical", "Amount"]
-                        .iter()
-                        .any(|v| attribute.value().eq_ignore_ascii_case(v))
+                    || !(typed_rate
+                        || typed_quantity
+                        || ["String", "Date", "Number", "Logical", "Amount"]
+                            .iter()
+                            .any(|v| attribute.value().eq_ignore_ascii_case(v)))
                 {
                     issues.push(format!(
                         "{label}: attribute {} on {tag} is not supported",
@@ -589,6 +611,17 @@ fn xml_stock_quantity(value: &str, unit: &str) -> Result<i64> {
     } else {
         parse_quantity(number)
     }
+}
+fn unvalued_opening_rate(value: &str, unit: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    let (number, suffix) = value
+        .split_once('/')
+        .map_or((value, None), |(n, u)| (n, Some(u)));
+    suffix.is_none_or(|suffix| normalized(suffix) == normalized(unit))
+        && matches!(parse_amount(number), Ok(0))
 }
 fn invoice_field(node: Node<'_, '_>, field: &str) -> Result<String> {
     direct_text(node, field)
@@ -1718,6 +1751,7 @@ impl Store {
                     "OPENINGBALANCE",
                     "OPENINGRATE",
                     "OPENINGVALUE",
+                    "BATCHALLOCATIONS.LIST",
                 ],
                 &label,
                 &mut plan.issues,
@@ -1755,28 +1789,17 @@ impl Store {
             if !known_items.insert(normalized(&name)) {
                 plan.issues.push(format!("{label}: duplicate name"));
             }
-            for field in ["OPENINGRATE", "OPENINGVALUE"] {
-                if let Some(value) = direct_text(node, field) {
-                    if !value.is_empty() && !matches!(xml_amount(&value), Ok(0)) {
-                        plan.issues
-                            .push(format!("{label}: opening valuation is not supported"));
-                    }
-                }
+            if direct_text(node, "OPENINGVALUE")
+                .is_some_and(|v| !v.is_empty() && !matches!(xml_amount(&v), Ok(0)))
+                || direct_text(node, "OPENINGRATE")
+                    .is_some_and(|v| !unvalued_opening_rate(&v, &unit))
+            {
+                plan.issues
+                    .push(format!("{label}: opening valuation is not supported"));
             }
-            let opening = match direct_text(node, "OPENINGBALANCE").filter(|v| !v.is_empty()) {
+            let top_opening = match direct_text(node, "OPENINGBALANCE").filter(|v| !v.is_empty()) {
                 Some(value) => match xml_stock_quantity(&value, &unit) {
-                    Ok(0) => None,
-                    Ok(qty) => {
-                        if qty % 10_i64.pow(u32::from(3 - precision)) != 0 {
-                            plan.issues
-                                .push(format!("{label}: opening quantity exceeds unit precision"));
-                        }
-                        if plan.opening_date.is_none() {
-                            plan.issues
-                                .push(format!("{label}: provide an opening date"));
-                        }
-                        Some(qty)
-                    }
+                    Ok(quantity) => Some(quantity),
                     Err(_) => {
                         plan.issues.push(format!(
                             "{label}: opening quantity is invalid or uses another unit"
@@ -1786,13 +1809,162 @@ impl Store {
                 },
                 None => None,
             };
+            let allocations: Vec<_> = node
+                .children()
+                .filter(|n| {
+                    n.is_element()
+                        && local_name(*n).eq_ignore_ascii_case("BATCHALLOCATIONS.LIST")
+                        && meaningful(*n)
+                })
+                .collect();
+            let mut openings = Vec::new();
+            let mut batch_dates = HashMap::<String, Option<String>>::new();
+            for allocation in &allocations {
+                invoice_list_fields(
+                    *allocation,
+                    &[
+                        "NAME",
+                        "BATCHNAME",
+                        "GODOWNNAME",
+                        "MFDON",
+                        "OPENINGBALANCE",
+                        "OPENINGVALUE",
+                        "OPENINGRATE",
+                    ],
+                    &label,
+                    &mut plan.issues,
+                );
+                let first = direct_text(*allocation, "NAME").filter(|v| !v.is_empty());
+                let second = direct_text(*allocation, "BATCHNAME").filter(|v| !v.is_empty());
+                if first
+                    .as_ref()
+                    .zip(second.as_ref())
+                    .is_some_and(|(a, b)| a != b)
+                {
+                    plan.issues.push(format!("{label}: batch names conflict"));
+                }
+                let batch = second.or(first);
+                let location = direct_text(*allocation, "GODOWNNAME")
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_default();
+                let existing_location_id = match known_locations.get(&normalized(&location)) {
+                    Some(id) => *id,
+                    None => {
+                        plan.issues
+                            .push(format!("{label}: stock location {location} is unavailable"));
+                        None
+                    }
+                };
+                if direct_text(*allocation, "OPENINGVALUE")
+                    .is_some_and(|v| !v.is_empty() && !matches!(xml_amount(&v), Ok(0)))
+                    || direct_text(*allocation, "OPENINGRATE")
+                        .is_some_and(|v| !unvalued_opening_rate(&v, &unit))
+                {
+                    plan.issues
+                        .push(format!("{label}: batch opening valuation is not supported"));
+                }
+                let manufactured = match direct_text(*allocation, "MFDON").filter(|v| !v.is_empty())
+                {
+                    Some(value) => match xml_date(&value) {
+                        Ok(date) => Some(date),
+                        Err(_) => {
+                            plan.issues
+                                .push(format!("{label}: invalid batch manufacture date"));
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                if batch.is_none() && manufactured.is_some() {
+                    plan.issues
+                        .push(format!("{label}: batch date requires a batch name"));
+                }
+                if let Some(batch) = &batch {
+                    let key = normalized(batch);
+                    let entry = batch_dates
+                        .entry(key)
+                        .or_insert_with(|| manufactured.clone());
+                    if entry.is_some() && manufactured.is_some() && *entry != manufactured {
+                        plan.issues
+                            .push(format!("{label}: batch manufacture dates conflict"));
+                    }
+                    if entry.is_none() {
+                        *entry = manufactured.clone();
+                    }
+                }
+                let quantity =
+                    match direct_text(*allocation, "OPENINGBALANCE").filter(|v| !v.is_empty()) {
+                        Some(value) => match xml_stock_quantity(&value, &unit) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                plan.issues
+                                    .push(format!("{label}: invalid batch opening quantity"));
+                                0
+                            }
+                        },
+                        None => {
+                            plan.issues
+                                .push(format!("{label}: batch opening quantity is required"));
+                            0
+                        }
+                    };
+                openings.push(StockOpening {
+                    location,
+                    existing_location_id,
+                    batch,
+                    manufactured_on: manufactured,
+                    quantity,
+                });
+            }
+            for opening in &mut openings {
+                if let Some(batch) = &opening.batch {
+                    opening.manufactured_on =
+                        batch_dates.get(&normalized(batch)).cloned().flatten();
+                }
+            }
+            if allocations.is_empty() {
+                if let Some(quantity) = top_opening.filter(|quantity| *quantity != 0) {
+                    let existing_location_id = known_locations.get("main").copied().flatten();
+                    if !known_locations.contains_key("main") {
+                        plan.issues
+                            .push(format!("{label}: default stock location is missing"));
+                    }
+                    openings.push(StockOpening {
+                        location: "Main".into(),
+                        existing_location_id,
+                        batch: None,
+                        manufactured_on: None,
+                        quantity,
+                    });
+                }
+            } else {
+                let sum: i128 = openings
+                    .iter()
+                    .map(|opening| i128::from(opening.quantity))
+                    .sum();
+                if top_opening.map(i128::from) != Some(sum) {
+                    plan.issues.push(format!(
+                        "{label}: batch quantities do not match the opening quantity"
+                    ));
+                }
+            }
+            for opening in &openings {
+                if opening.quantity % 10_i64.pow(u32::from(3 - precision)) != 0 {
+                    plan.issues
+                        .push(format!("{label}: opening quantity exceeds unit precision"));
+                }
+                if opening.quantity != 0 && plan.opening_date.is_none() {
+                    plan.issues
+                        .push(format!("{label}: provide an opening date"));
+                }
+            }
             plan.items.push(Item {
                 name,
                 unit,
                 unit_precision: precision,
                 group,
                 description: direct_text(node, "DESCRIPTION").unwrap_or_default(),
-                opening,
+                openings,
                 metadata,
             });
         }
@@ -2284,6 +2456,7 @@ impl Store {
                 )?;
             }
         }
+        let mut created_batches = HashMap::<(i64, String), i64>::new();
         for item in &plan.items {
             let (unit_id, precision) = find_stock_unit(&tx, plan.company_id, &item.unit)?
                 .ok_or_else(|| Error::Validation(format!("Unit {} is missing", item.unit)))?;
@@ -2306,14 +2479,48 @@ impl Store {
                 &item.description,
             )?;
             save_metadata(&tx, plan.company_id, "stockitem", item_id, &item.metadata)?;
-            if let Some(quantity) = item.opening {
-                check_quantity_precision(&tx, plan.company_id, item_id, quantity)?;
-                let date = plan
-                    .opening_date
-                    .as_deref()
-                    .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
-                let location = main_stock_location(&tx, plan.company_id)?;
-                tx.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id) VALUES (?1, ?2, ?3, ?4, 'Imported opening quantity', ?5)", params![plan.company_id, item_id, date, quantity, location])?;
+            for opening in &item.openings {
+                let location = find_stock_location(&tx, plan.company_id, &opening.location)?
+                    .ok_or_else(|| {
+                        Error::Validation(format!("Stock location {} is missing", opening.location))
+                    })?;
+                if opening
+                    .existing_location_id
+                    .is_some_and(|expected| expected != location)
+                {
+                    return Err(Error::Validation(format!(
+                        "Stock location {} changed since preview",
+                        opening.location
+                    )));
+                }
+                let batch = if let Some(name) = &opening.batch {
+                    let key = (item_id, normalized(name));
+                    let id = if let Some(id) = created_batches.get(&key) {
+                        *id
+                    } else {
+                        let id = create_stock_batch_on_connection(
+                            &tx,
+                            plan.company_id,
+                            item_id,
+                            name,
+                            opening.manufactured_on.as_deref(),
+                            None,
+                        )?;
+                        created_batches.insert(key, id);
+                        id
+                    };
+                    Some(id)
+                } else {
+                    None
+                };
+                if opening.quantity != 0 {
+                    check_quantity_precision(&tx, plan.company_id, item_id, opening.quantity)?;
+                    let date = plan
+                        .opening_date
+                        .as_deref()
+                        .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
+                    tx.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id, batch_id) VALUES (?1, ?2, ?3, ?4, 'Imported opening quantity', ?5, ?6)", params![plan.company_id, item_id, date, opening.quantity, location, batch])?;
+                }
             }
         }
         for voucher in &plan.transactions {
@@ -2368,7 +2575,6 @@ impl Store {
                 )?;
             }
         }
-        let mut created_batches = HashMap::<(i64, String), i64>::new();
         for invoice in &plan.invoices {
             let voucher_kind = if invoice.kind == InvoiceKind::Sale {
                 VoucherKind::Sales

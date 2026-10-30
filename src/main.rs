@@ -2487,7 +2487,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, unvalued stock items and a restricted form of item invoice. Invoices require one matching new bill reference and one trade ledger; additional ledger postings become unclassified charges or deductions. One location and batch allocation per item is supported; newly imported batches have no manufacture or expiry dates. Tax details, batch dates, nested locations, other bill allocations, valued opening stock and other unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, unvalued stock items and a restricted form of item invoice. Unvalued opening quantities can be allocated by location and batch, including manufacture dates. Invoices require one matching new bill reference and one trade ledger; additional ledger postings become unclassified charges or deductions. Only one location and batch allocation per invoice item is supported. Tax details, expiry dates, invoice batch dates, nested locations, other bill allocations, valued opening stock and other unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Bank clearance");
