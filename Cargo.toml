@@ -9,6 +9,7 @@ description = "An independent accounting application written in Rust"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 directories = "6"
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"] }
+roxmltree = "0.21"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rust_decimal = "1.39"
 thiserror = "2"

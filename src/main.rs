@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, RichText};
+use optimus_prime::exchange::ImportPlan;
 use optimus_prime::{format_amount, parse_amount, Category, Posting, Store, VoucherKind};
 
 #[derive(PartialEq)]
@@ -9,6 +10,7 @@ enum Page {
     Ledger,
     Voucher,
     Register,
+    Import,
     Reports,
 }
 struct App {
@@ -32,6 +34,8 @@ struct App {
     register_ledger: Option<i64>,
     register_from: String,
     register_to: String,
+    import_path: String,
+    import_preview: Option<ImportPlan>,
     message: String,
 }
 struct VoucherLine {
@@ -71,6 +75,8 @@ impl App {
             register_ledger: None,
             register_from: String::new(),
             register_to: String::new(),
+            import_path: String::new(),
+            import_preview: None,
             message: String::new(),
         }
     }
@@ -89,6 +95,7 @@ impl App {
         self.register_ledger = None;
         self.ledger_group = None;
         self.group_parent = None;
+        self.import_preview = None;
     }
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
@@ -623,6 +630,90 @@ impl App {
             "Debit balances are positive; credit balances are negative. Boundaries are inclusive.",
         );
     }
+    fn import_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.heading("Import accounting XML");
+        ui.label("Preview a file before importing. Only supported, complete records can be imported; no changes are made if any issue is found.");
+        ui.horizontal(|ui| {
+            ui.label("File path");
+            if ui
+                .add(egui::TextEdit::singleline(&mut self.import_path).desired_width(420.0))
+                .changed()
+            {
+                self.import_preview = None;
+            }
+        });
+        if ui.button("Preview file").clicked() {
+            self.import_preview = None;
+            let result = (|| -> optimus_prime::Result<ImportPlan> {
+                let path = std::path::Path::new(self.import_path.trim());
+                let metadata = std::fs::metadata(path).map_err(|e| {
+                    optimus_prime::Error::Validation(format!("Cannot read file: {e}"))
+                })?;
+                if !metadata.is_file() || metadata.len() > 50 * 1024 * 1024 {
+                    return Err(optimus_prime::Error::Validation(
+                        "Choose a file no larger than 50 MiB".into(),
+                    ));
+                }
+                use std::io::Read;
+                let file = std::fs::File::open(path).map_err(|e| {
+                    optimus_prime::Error::Validation(format!("Cannot read file: {e}"))
+                })?;
+                let mut bytes = Vec::new();
+                file.take(50 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| {
+                        optimus_prime::Error::Validation(format!("Cannot read file: {e}"))
+                    })?;
+                self.store.preview_xml_import(company, &bytes)
+            })();
+            match result {
+                Ok(plan) => {
+                    self.import_preview = Some(plan);
+                    self.message.clear();
+                }
+                Err(e) => self.failure(e),
+            }
+        }
+        if let Some(plan) = &self.import_preview {
+            ui.label(format!(
+                "Preview: {} new groups, {} new ledgers, {} vouchers",
+                plan.group_count(),
+                plan.ledger_count(),
+                plan.voucher_count()
+            ));
+            if plan.issues().is_empty() {
+                ui.label("Preview found no issues. Review the limitations below before importing.");
+            } else {
+                ui.colored_label(
+                    Color32::from_rgb(155, 55, 35),
+                    format!("{} issue(s) prevent import:", plan.issues().len()),
+                );
+                for issue in plan.issues().iter().take(100) {
+                    ui.label(issue);
+                }
+                if plan.issues().len() > 100 {
+                    ui.label("Additional issues are not shown.");
+                }
+            }
+            let can_apply = plan.company_id() == company && plan.can_apply();
+            if ui
+                .add_enabled(can_apply, egui::Button::new("Import previewed records"))
+                .clicked()
+            {
+                match self.store.apply_xml_import(plan) {
+                    Ok(counts) => {
+                        self.message = format!(
+                            "Imported {} groups, {} ledgers and {} vouchers",
+                            counts.groups, counts.ledgers, counts.vouchers
+                        );
+                        self.import_preview = None;
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        }
+        ui.small("This initial importer handles simple groups, ledgers and accounting vouchers. It does not import inventory, invoices, party details, opening balances, tax details or other unsupported fields.");
+    }
 }
 fn money(value: i128) -> String {
     let n = value.unsigned_abs();
@@ -648,6 +739,7 @@ impl eframe::App for App {
                 ("Ledgers", Page::Ledger),
                 ("Voucher", Page::Voucher),
                 ("Ledger activity", Page::Register),
+                ("Import XML", Page::Import),
                 ("Reports", Page::Reports),
             ] {
                 if ui.selectable_label(self.page == page, label).clicked() {
@@ -675,6 +767,7 @@ impl eframe::App for App {
                     Page::Ledger => self.ledger_page(ui, company),
                     Page::Voucher => self.voucher_page(ui, company),
                     Page::Register => self.register_page(ui, company),
+                    Page::Import => self.import_page(ui, company),
                     Page::Reports => self.reports_page(ui, company),
                 }
             });

@@ -6,6 +6,7 @@ use rusqlite::{params, Connection};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use std::{collections::HashMap, path::Path, str::FromStr};
 use thiserror::Error;
+pub mod exchange;
 
 #[derive(Debug, Error)]
 pub enum Error {
