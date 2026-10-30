@@ -231,7 +231,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 8 {
+        if version > 9 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -306,6 +306,12 @@ impl Store {
             tx.execute_batch("CREATE TABLE company_controls(company_id INTEGER PRIMARY KEY REFERENCES companies(id), opening_difference_ledger_id INTEGER NOT NULL UNIQUE REFERENCES ledgers(id));
                 CREATE TABLE opening_balances(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), date TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount != 0), UNIQUE(company_id, ledger_id));
                 PRAGMA user_version = 8;")?;
+        }
+        if version < 9 {
+            tx.execute_batch("CREATE TABLE invoice_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), invoice_id INTEGER NOT NULL REFERENCES invoices(id), voucher_revision_id INTEGER NOT NULL REFERENCES voucher_revisions(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, kind TEXT NOT NULL, party_ledger_id INTEGER NOT NULL REFERENCES ledgers(id), trade_ledger_id INTEGER NOT NULL REFERENCES ledgers(id), tax_ledger_id INTEGER REFERENCES ledgers(id), tax_amount INTEGER NOT NULL);
+                CREATE TABLE invoice_revision_lines(id INTEGER PRIMARY KEY, revision_id INTEGER NOT NULL REFERENCES invoice_revisions(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), quantity INTEGER NOT NULL, unit_price INTEGER NOT NULL, amount INTEGER NOT NULL);
+                CREATE INDEX invoice_revisions_invoice ON invoice_revisions(invoice_id, id);
+                PRAGMA user_version = 9;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1112,7 +1118,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

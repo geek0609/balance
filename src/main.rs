@@ -73,6 +73,7 @@ struct App {
     invoice_tax_ledger: Option<i64>,
     invoice_tax_amount: String,
     invoice_lines: Vec<InvoiceLineForm>,
+    editing_invoice: Option<i64>,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
     settlement_date: String,
@@ -163,6 +164,7 @@ impl App {
             invoice_tax_ledger: None,
             invoice_tax_amount: String::new(),
             invoice_lines: vec![InvoiceLineForm::new()],
+            editing_invoice: None,
             settlement_invoice: None,
             settlement_bank: None,
             settlement_date: String::new(),
@@ -200,6 +202,7 @@ impl App {
         self.invoice_trade = None;
         self.invoice_tax_ledger = None;
         self.invoice_lines = vec![InvoiceLineForm::new()];
+        self.editing_invoice = None;
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_tax_amount.clear();
@@ -211,10 +214,11 @@ impl App {
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
         ui.label("Create or select a company to work with.");
-        let profile_dirty =
-            self.profile_ledger.is_some() && self.ledger_profile != self.profile_original;
+        let profile_dirty = (self.profile_ledger.is_some()
+            && self.ledger_profile != self.profile_original)
+            || self.editing_invoice.is_some();
         if profile_dirty {
-            ui.label("Save or discard unsaved ledger details before changing company.");
+            ui.label("Save or discard the current edits before changing company.");
         }
         ui.horizontal(|ui| {
             ui.label("Name");
@@ -1149,7 +1153,10 @@ impl App {
         }
     }
     fn invoice_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Sales and purchase invoices");
+        ui.heading(match self.editing_invoice {
+            Some(id) => format!("Edit invoice {id}"),
+            None => "Sales and purchase invoices".into(),
+        });
         ui.label("Save an invoice to create its accounting voucher and stock movements together. Prices are per unit; each line rounds to two decimal places.");
         let items = match self.store.stock_items(company) {
             Ok(v) => v,
@@ -1248,6 +1255,14 @@ impl App {
             ui.label("Narration");
             ui.text_edit_singleline(&mut self.invoice_narration);
         });
+        if self.editing_invoice.is_some() && ui.button("Cancel invoice edit").clicked() {
+            self.editing_invoice = None;
+            self.invoice_reference.clear();
+            self.invoice_narration.clear();
+            self.invoice_lines = vec![InvoiceLineForm::new()];
+            self.invoice_tax_amount.clear();
+            self.invoice_tax_ledger = None;
+        }
         if ui.button("Save invoice").clicked() {
             let result = (|| -> optimus_prime::Result<i64> {
                 let mut lines = Vec::new();
@@ -1281,7 +1296,12 @@ impl App {
                     tax_amount,
                     lines,
                 };
-                self.store.create_invoice(company, &draft)
+                if let Some(id) = self.editing_invoice {
+                    self.store.update_invoice(company, id, &draft)?;
+                    Ok(id)
+                } else {
+                    self.store.create_invoice(company, &draft)
+                }
             })();
             match result {
                 Ok(id) => {
@@ -1291,6 +1311,7 @@ impl App {
                     self.invoice_lines = vec![InvoiceLineForm::new()];
                     self.invoice_tax_amount.clear();
                     self.invoice_tax_ledger = None;
+                    self.editing_invoice = None;
                 }
                 Err(e) => self.failure(e),
             }
@@ -1388,6 +1409,45 @@ impl App {
                         money(invoice.settled),
                         money(invoice.outstanding)
                     ));
+                    if ui
+                        .add_enabled(
+                            invoice.settled == 0 && self.editing_invoice.is_none(),
+                            egui::Button::new("Edit invoice"),
+                        )
+                        .clicked()
+                    {
+                        match self.store.invoice_draft(company, invoice.id) {
+                            Ok(draft) => {
+                                self.editing_invoice = Some(invoice.id);
+                                self.invoice_kind = draft.kind;
+                                self.invoice_date = draft.date;
+                                self.invoice_reference = draft.reference;
+                                self.invoice_narration = draft.narration;
+                                self.invoice_party = Some(draft.party_ledger_id);
+                                self.invoice_trade = Some(draft.trade_ledger_id);
+                                self.invoice_tax_ledger = draft.tax_ledger_id;
+                                self.invoice_tax_amount = if draft.tax_amount == 0 {
+                                    String::new()
+                                } else {
+                                    format_amount(draft.tax_amount)
+                                };
+                                self.invoice_lines = draft
+                                    .lines
+                                    .into_iter()
+                                    .map(|line| InvoiceLineForm {
+                                        item: Some(line.item_id),
+                                        quantity: format_quantity(i128::from(line.quantity)),
+                                        price: format_amount(line.unit_price),
+                                    })
+                                    .collect();
+                                self.message = "Invoice loaded for editing".into();
+                            }
+                            Err(e) => self.failure(e),
+                        }
+                    }
+                    if invoice.settled != 0 {
+                        ui.small("Invoices with receipts or payments cannot yet be edited.");
+                    }
                     for line in invoice.lines {
                         ui.label(format!(
                             "  {}: {} {} × {} = {}",
@@ -1418,10 +1478,50 @@ impl App {
                             ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
                         }
                     }
-                    ui.small(format!(
-                        "Accounting voucher #{}; editing is not yet available",
-                        invoice.voucher_id
-                    ));
+                    ui.small(format!("Accounting voucher #{}", invoice.voucher_id));
+                    egui::CollapsingHeader::new("Previous invoice versions")
+                        .id_salt(("invoice-revisions", invoice.id))
+                        .show(ui, |ui| {
+                            match self.store.invoice_revisions(company, invoice.id) {
+                                Ok(revisions) if revisions.is_empty() => {
+                                    ui.label("No previous versions.");
+                                }
+                                Ok(revisions) => {
+                                    for revision in revisions {
+                                        ui.label(format!(
+                                            "Replaced at {} UTC • {} • {} • {} • {}",
+                                            revision.changed_at,
+                                            revision.date,
+                                            revision.kind.as_str(),
+                                            revision.reference,
+                                            revision.party
+                                        ));
+                                        ui.label(format!(
+                                            "Ledger: {} • {} • Tax: {}",
+                                            revision.trade,
+                                            revision.tax_ledger.unwrap_or_default(),
+                                            format_amount(revision.tax_amount)
+                                        ));
+                                        if !revision.narration.is_empty() {
+                                            ui.label(revision.narration);
+                                        }
+                                        for line in revision.lines {
+                                            ui.label(format!(
+                                                "  {}: {} {} × {} = {}",
+                                                line.item,
+                                                format_quantity(i128::from(line.quantity)),
+                                                line.unit,
+                                                format_amount(line.unit_price),
+                                                format_amount(line.amount)
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                                }
+                            }
+                        });
                 }
             }
             Err(e) => self.failure(e),

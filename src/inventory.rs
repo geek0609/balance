@@ -102,6 +102,19 @@ pub struct Settlement {
     pub bank_ledger: String,
 }
 #[derive(Debug, Clone)]
+pub struct InvoiceRevision {
+    pub changed_at: String,
+    pub date: String,
+    pub kind: InvoiceKind,
+    pub reference: String,
+    pub narration: String,
+    pub party: String,
+    pub trade: String,
+    pub tax_ledger: Option<String>,
+    pub tax_amount: i64,
+    pub lines: Vec<InvoiceDetailLine>,
+}
+#[derive(Debug, Clone)]
 pub struct InvoiceDetailLine {
     pub item: String,
     pub unit: String,
@@ -144,6 +157,161 @@ pub fn line_amount(quantity: i64, unit_price: i64) -> Result<i64> {
     }
     let amount = (i128::from(quantity) * i128::from(unit_price) + 500) / 1000;
     i64::try_from(amount).map_err(|_| Error::Validation("Invoice line amount is too large".into()))
+}
+struct PreparedInvoice {
+    date: String,
+    reference: String,
+    postings: Vec<Posting>,
+    amounts: Vec<i64>,
+}
+fn prepare_invoice(
+    conn: &Connection,
+    company_id: i64,
+    draft: &InvoiceDraft,
+    excluding: Option<i64>,
+) -> Result<PreparedInvoice> {
+    let date = parse_date(&draft.date)?.format("%Y-%m-%d").to_string();
+    let reference = required(&draft.reference, "Invoice reference")?.to_owned();
+    if draft.lines.is_empty() {
+        return Err(Error::Validation(
+            "An invoice needs at least one item".into(),
+        ));
+    }
+    if draft.tax_amount < 0
+        || (draft.tax_amount > 0 && draft.tax_ledger_id.is_none())
+        || (draft.tax_amount == 0 && draft.tax_ledger_id.is_some())
+    {
+        return Err(Error::Validation(
+            "Choose a tax ledger exactly when a positive tax amount is entered".into(),
+        ));
+    }
+    if draft.party_ledger_id == draft.trade_ledger_id
+        || draft
+            .tax_ledger_id
+            .is_some_and(|id| id == draft.party_ledger_id || id == draft.trade_ledger_id)
+    {
+        return Err(Error::Validation(
+            "Party, trade and tax ledgers must be different".into(),
+        ));
+    }
+    let party = ledger_category(conn, company_id, draft.party_ledger_id)?;
+    let trade = ledger_category(conn, company_id, draft.trade_ledger_id)?;
+    if !matches!(party, Category::Asset | Category::Liability) {
+        return Err(Error::Validation(
+            "The party ledger must be an asset or liability".into(),
+        ));
+    }
+    if (draft.kind == InvoiceKind::Sale && trade != Category::Income)
+        || (draft.kind == InvoiceKind::Purchase
+            && !matches!(trade, Category::Expense | Category::Asset))
+    {
+        return Err(Error::Validation(
+            "The trade ledger has an incompatible category".into(),
+        ));
+    }
+    if let Some(id) = draft.tax_ledger_id {
+        if !matches!(
+            ledger_category(conn, company_id, id)?,
+            Category::Asset | Category::Liability
+        ) {
+            return Err(Error::Validation(
+                "The tax ledger must be an asset or liability".into(),
+            ));
+        }
+    }
+    let mut stmt = conn.prepare("SELECT v.reference FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3 AND (?4 IS NULL OR i.id != ?4)")?;
+    for existing in stmt.query_map(
+        params![
+            company_id,
+            draft.kind.as_str(),
+            draft.party_ledger_id,
+            excluding
+        ],
+        |r| r.get::<_, String>(0),
+    )? {
+        if existing?.trim().to_lowercase() == reference.to_lowercase() {
+            return Err(Error::Validation(
+                "An invoice with this type, party and reference already exists".into(),
+            ));
+        }
+    }
+    let mut amounts = Vec::with_capacity(draft.lines.len());
+    let mut subtotal = 0_i128;
+    for line in &draft.lines {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stock_items WHERE id = ?1 AND company_id = ?2)",
+            params![line.item_id, company_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::Validation(
+                "Every item must belong to the selected company".into(),
+            ));
+        }
+        let amount = line_amount(line.quantity, line.unit_price)?;
+        subtotal += i128::from(amount);
+        amounts.push(amount);
+    }
+    let subtotal = i64::try_from(subtotal)
+        .map_err(|_| Error::Validation("Invoice amount is too large".into()))?;
+    let total = subtotal
+        .checked_add(draft.tax_amount)
+        .ok_or_else(|| Error::Validation("Invoice amount is too large".into()))?;
+    if total == 0 {
+        return Err(Error::Validation(
+            "Invoice amount must be greater than zero".into(),
+        ));
+    }
+    let direction = if draft.kind == InvoiceKind::Sale {
+        1
+    } else {
+        -1
+    };
+    let mut postings = vec![Posting {
+        ledger_id: draft.party_ledger_id,
+        amount: direction * total,
+    }];
+    if subtotal != 0 {
+        postings.push(Posting {
+            ledger_id: draft.trade_ledger_id,
+            amount: -direction * subtotal,
+        });
+    }
+    if let Some(tax_id) = draft.tax_ledger_id {
+        postings.push(Posting {
+            ledger_id: tax_id,
+            amount: -direction * draft.tax_amount,
+        });
+    }
+    validate_voucher(&date, &postings)?;
+    check_ledgers(conn, company_id, &postings)?;
+    crate::opening::check_no_control_postings(conn, company_id, &postings)?;
+    Ok(PreparedInvoice {
+        date,
+        reference,
+        postings,
+        amounts,
+    })
+}
+fn write_postings(conn: &Connection, voucher: i64, postings: &[Posting]) -> Result<()> {
+    for posting in postings {
+        conn.execute(
+            "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
+            params![voucher, posting.ledger_id, posting.amount],
+        )?;
+    }
+    Ok(())
+}
+fn write_invoice_lines(
+    conn: &Connection,
+    invoice: i64,
+    lines: &[InvoiceLine],
+    amounts: &[i64],
+) -> Result<()> {
+    for (line, amount) in lines.iter().zip(amounts) {
+        conn.execute("INSERT INTO invoice_lines(invoice_id, item_id, quantity, unit_price, amount) VALUES (?1, ?2, ?3, ?4, ?5)", params![invoice, line.item_id, line.quantity, line.unit_price, amount])?;
+    }
+    Ok(())
 }
 fn ledger_category(conn: &Connection, company_id: i64, ledger_id: i64) -> Result<Category> {
     let value: String = conn
@@ -363,134 +531,89 @@ impl Store {
     }
     /// Atomically creates the invoice, stock movements and balanced voucher.
     pub fn create_invoice(&mut self, company_id: i64, draft: &InvoiceDraft) -> Result<i64> {
-        let date = parse_date(&draft.date)?.format("%Y-%m-%d").to_string();
-        let reference = required(&draft.reference, "Invoice reference")?;
-        if draft.lines.is_empty() {
-            return Err(Error::Validation(
-                "An invoice needs at least one item".into(),
-            ));
-        }
-        if draft.tax_amount < 0
-            || (draft.tax_amount > 0 && draft.tax_ledger_id.is_none())
-            || (draft.tax_amount == 0 && draft.tax_ledger_id.is_some())
-        {
-            return Err(Error::Validation(
-                "Choose a tax ledger exactly when a positive tax amount is entered".into(),
-            ));
-        }
-        if draft.party_ledger_id == draft.trade_ledger_id
-            || draft
-                .tax_ledger_id
-                .is_some_and(|id| id == draft.party_ledger_id || id == draft.trade_ledger_id)
-        {
-            return Err(Error::Validation(
-                "Party, trade and tax ledgers must be different".into(),
-            ));
-        }
         let tx = self.conn.transaction()?;
-        let party = ledger_category(&tx, company_id, draft.party_ledger_id)?;
-        let trade = ledger_category(&tx, company_id, draft.trade_ledger_id)?;
-        if !matches!(party, Category::Asset | Category::Liability) {
-            return Err(Error::Validation(
-                "The party ledger must be an asset or liability".into(),
-            ));
-        }
-        if (draft.kind == InvoiceKind::Sale && trade != Category::Income)
-            || (draft.kind == InvoiceKind::Purchase
-                && !matches!(trade, Category::Expense | Category::Asset))
-        {
-            return Err(Error::Validation(
-                "The trade ledger has an incompatible category".into(),
-            ));
-        }
-        if let Some(id) = draft.tax_ledger_id {
-            if !matches!(
-                ledger_category(&tx, company_id, id)?,
-                Category::Asset | Category::Liability
-            ) {
-                return Err(Error::Validation(
-                    "The tax ledger must be an asset or liability".into(),
-                ));
-            }
-        }
-        let mut stmt = tx.prepare("SELECT v.reference FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3")?;
-        let refs = stmt.query_map(
-            params![company_id, draft.kind.as_str(), draft.party_ledger_id],
-            |r| r.get::<_, String>(0),
-        )?;
-        for existing in refs {
-            if existing?.trim().to_lowercase() == reference.to_lowercase() {
-                return Err(Error::Validation(
-                    "An invoice with this type, party and reference already exists".into(),
-                ));
-            }
-        }
-        drop(stmt);
-        let mut amounts = Vec::with_capacity(draft.lines.len());
-        let mut subtotal = 0_i128;
-        for line in &draft.lines {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM stock_items WHERE id = ?1 AND company_id = ?2)",
-                params![line.item_id, company_id],
-                |r| r.get(0),
-            )?;
-            if !exists {
-                return Err(Error::Validation(
-                    "Every item must belong to the selected company".into(),
-                ));
-            }
-            let amount = line_amount(line.quantity, line.unit_price)?;
-            subtotal += i128::from(amount);
-            amounts.push(amount);
-        }
-        let subtotal = i64::try_from(subtotal)
-            .map_err(|_| Error::Validation("Invoice amount is too large".into()))?;
-        let total = subtotal
-            .checked_add(draft.tax_amount)
-            .ok_or_else(|| Error::Validation("Invoice amount is too large".into()))?;
-        if total == 0 {
-            return Err(Error::Validation(
-                "Invoice amount must be greater than zero".into(),
-            ));
-        }
-        let direction = if draft.kind == InvoiceKind::Sale {
-            1
-        } else {
-            -1
-        };
-        let mut postings = vec![Posting {
-            ledger_id: draft.party_ledger_id,
-            amount: direction * total,
-        }];
-        if subtotal != 0 {
-            postings.push(Posting {
-                ledger_id: draft.trade_ledger_id,
-                amount: -direction * subtotal,
-            });
-        }
-        if let Some(tax_id) = draft.tax_ledger_id {
-            postings.push(Posting {
-                ledger_id: tax_id,
-                amount: -direction * draft.tax_amount,
-            });
-        }
-        validate_voucher(&date, &postings)?;
-        check_ledgers(&tx, company_id, &postings)?;
-        tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, draft.kind.voucher_kind().as_str(), reference, date, draft.narration.trim()])?;
+        let prepared = prepare_invoice(&tx, company_id, draft, None)?;
+        tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim()])?;
         let voucher_id = tx.last_insert_rowid();
-        for p in &postings {
-            tx.execute(
-                "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-                params![voucher_id, p.ledger_id, p.amount],
-            )?;
-        }
+        write_postings(&tx, voucher_id, &prepared.postings)?;
         tx.execute("INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![company_id, voucher_id, draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount])?;
         let invoice_id = tx.last_insert_rowid();
-        for (line, amount) in draft.lines.iter().zip(amounts) {
-            tx.execute("INSERT INTO invoice_lines(invoice_id, item_id, quantity, unit_price, amount) VALUES (?1, ?2, ?3, ?4, ?5)", params![invoice_id, line.item_id, line.quantity, line.unit_price, amount])?;
-        }
+        write_invoice_lines(&tx, invoice_id, &draft.lines, &prepared.amounts)?;
         tx.commit()?;
         Ok(invoice_id)
+    }
+    /// Return a complete editable draft, scoped to the company.
+    pub fn invoice_draft(&self, company_id: i64, invoice_id: i64) -> Result<InvoiceDraft> {
+        let (kind, date, reference, narration, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount): (String, String, String, String, i64, i64, Option<i64>, i64) = self.conn.query_row("SELECT i.kind, v.date, v.reference, v.narration, i.party_ledger_id, i.trade_ledger_id, i.tax_ledger_id, i.tax_amount FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
+        let mut stmt = self.conn.prepare("SELECT item_id, quantity, unit_price FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+        let lines = stmt
+            .query_map([invoice_id], |r| {
+                Ok(InvoiceLine {
+                    item_id: r.get(0)?,
+                    quantity: r.get(1)?,
+                    unit_price: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(InvoiceDraft {
+            kind: InvoiceKind::parse(&kind)?,
+            date,
+            reference,
+            narration,
+            party_ledger_id,
+            trade_ledger_id,
+            tax_ledger_id,
+            tax_amount,
+            lines,
+        })
+    }
+    /// Atomically replace an unsettled invoice, preserving both prior versions.
+    pub fn update_invoice(
+        &mut self,
+        company_id: i64,
+        invoice_id: i64,
+        draft: &InvoiceDraft,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let voucher_id: i64 = tx
+            .query_row(
+                "SELECT voucher_id FROM invoices WHERE id = ?1 AND company_id = ?2",
+                params![invoice_id, company_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::Validation("Invoice not found in the selected company".into())
+                }
+                other => Error::Database(other),
+            })?;
+        let settled: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND invoice_id = ?2)", params![company_id, invoice_id], |r| r.get(0))?;
+        if settled {
+            return Err(Error::Validation(
+                "An invoice with receipts or payments cannot yet be edited".into(),
+            ));
+        }
+        let prepared = prepare_invoice(&tx, company_id, draft, Some(invoice_id))?;
+        let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
+        if saved != 1 {
+            return Err(Error::Validation("Associated voucher not found".into()));
+        }
+        let voucher_revision = tx.last_insert_rowid();
+        tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![voucher_revision, voucher_id])?;
+        tx.execute("INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount) SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount FROM invoices WHERE id = ?2 AND company_id = ?3", params![voucher_revision, invoice_id, company_id])?;
+        let revision_id = tx.last_insert_rowid();
+        tx.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount) SELECT ?1, item_id, quantity, unit_price, amount FROM invoice_lines WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
+        tx.execute("UPDATE vouchers SET kind = ?1, reference = ?2, date = ?3, narration = ?4 WHERE id = ?5 AND company_id = ?6", params![draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim(), voucher_id, company_id])?;
+        tx.execute("UPDATE invoices SET kind = ?1, party_ledger_id = ?2, trade_ledger_id = ?3, tax_ledger_id = ?4, tax_amount = ?5 WHERE id = ?6 AND company_id = ?7", params![draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount, invoice_id, company_id])?;
+        tx.execute("DELETE FROM postings WHERE voucher_id = ?1", [voucher_id])?;
+        tx.execute(
+            "DELETE FROM invoice_lines WHERE invoice_id = ?1",
+            [invoice_id],
+        )?;
+        write_postings(&tx, voucher_id, &prepared.postings)?;
+        write_invoice_lines(&tx, invoice_id, &draft.lines, &prepared.amounts)?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn is_invoice_voucher(&self, company_id: i64, voucher_id: i64) -> Result<bool> {
         Ok(self.conn.query_row(
@@ -498,6 +621,69 @@ impl Store {
             params![company_id, voucher_id],
             |r| r.get(0),
         )?)
+    }
+    pub fn invoice_revisions(
+        &self,
+        company_id: i64,
+        invoice_id: i64,
+    ) -> Result<Vec<InvoiceRevision>> {
+        let mut stmt = self.conn.prepare("SELECT r.id, r.changed_at, r.kind, v.date, v.reference, v.narration, p.name, t.name, x.name, r.tax_amount FROM invoice_revisions r JOIN voucher_revisions v ON v.id = r.voucher_revision_id JOIN ledgers p ON p.id = r.party_ledger_id JOIN ledgers t ON t.id = r.trade_ledger_id LEFT JOIN ledgers x ON x.id = r.tax_ledger_id WHERE r.company_id = ?1 AND r.invoice_id = ?2 ORDER BY r.id DESC")?;
+        let rows = stmt
+            .query_map(params![company_id, invoice_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, i64>(9)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut result = Vec::new();
+        for (
+            id,
+            changed_at,
+            kind,
+            date,
+            reference,
+            narration,
+            party,
+            trade,
+            tax_ledger,
+            tax_amount,
+        ) in rows
+        {
+            let mut items = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount FROM invoice_revision_lines l JOIN stock_items s ON s.id = l.item_id WHERE l.revision_id = ?1 ORDER BY l.id")?;
+            let lines = items
+                .query_map([id], |r| {
+                    Ok(InvoiceDetailLine {
+                        item: r.get(0)?,
+                        unit: r.get(1)?,
+                        quantity: r.get(2)?,
+                        unit_price: r.get(3)?,
+                        amount: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            result.push(InvoiceRevision {
+                changed_at,
+                date,
+                kind: InvoiceKind::parse(&kind)?,
+                reference,
+                narration,
+                party,
+                trade,
+                tax_ledger,
+                tax_amount,
+                lines,
+            });
+        }
+        Ok(result)
     }
     pub fn invoices(&self, company_id: i64) -> Result<Vec<InvoiceSummary>> {
         let mut stmt = self.conn.prepare("SELECT i.id, i.voucher_id, i.kind, v.date, v.reference, l.name, i.tax_amount FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1 ORDER BY v.date DESC, i.id DESC")?;
