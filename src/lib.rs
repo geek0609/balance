@@ -121,6 +121,7 @@ pub struct Posting {
 pub struct Voucher {
     pub id: i64,
     pub kind: VoucherKind,
+    pub reference: String,
     pub date: String,
     pub narration: String,
     pub postings: Vec<Posting>,
@@ -205,7 +206,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 3 {
+        if version > 4 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -246,6 +247,13 @@ impl Store {
                 tx.execute("UPDATE ledgers SET group_id = (SELECT id FROM account_groups WHERE company_id = ?1 AND name = ledgers.category) WHERE company_id = ?1", [company])?;
             }
             tx.execute_batch("PRAGMA user_version = 3;")?;
+        }
+        if version < 4 {
+            tx.execute_batch(
+                "ALTER TABLE vouchers ADD COLUMN reference TEXT NOT NULL DEFAULT '';
+                ALTER TABLE voucher_revisions ADD COLUMN reference TEXT NOT NULL DEFAULT '';
+                PRAGMA user_version = 4;",
+            )?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -385,16 +393,28 @@ impl Store {
         narration: &str,
         postings: &[Posting],
     ) -> Result<i64> {
+        self.post_voucher_with_reference(company_id, kind, "", date, narration, postings)
+    }
+    pub fn post_voucher_with_reference(
+        &mut self,
+        company_id: i64,
+        kind: VoucherKind,
+        reference: &str,
+        date: &str,
+        narration: &str,
+        postings: &[Posting],
+    ) -> Result<i64> {
         let date = validate_voucher(date, postings)?;
         let tx = self.conn.transaction()?;
         check_ledgers(&tx, company_id, postings)?;
         tx.execute(
-            "INSERT INTO vouchers(company_id, date, narration, kind) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO vouchers(company_id, date, narration, kind, reference) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 company_id,
                 date.format("%Y-%m-%d").to_string(),
                 narration.trim(),
-                kind.as_str()
+                kind.as_str(),
+                reference.trim()
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -447,10 +467,37 @@ impl Store {
         narration: &str,
         postings: &[Posting],
     ) -> Result<()> {
+        let reference: String = self
+            .conn
+            .query_row(
+                "SELECT reference FROM vouchers WHERE id = ?1 AND company_id = ?2",
+                params![voucher_id, company_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::Validation("Voucher not found in the selected company".into())
+                }
+                other => Error::Database(other),
+            })?;
+        self.update_voucher_with_reference(
+            company_id, voucher_id, kind, &reference, date, narration, postings,
+        )
+    }
+    pub fn update_voucher_with_reference(
+        &mut self,
+        company_id: i64,
+        voucher_id: i64,
+        kind: VoucherKind,
+        reference: &str,
+        date: &str,
+        narration: &str,
+        postings: &[Posting],
+    ) -> Result<()> {
         let date = validate_voucher(date, postings)?;
         let tx = self.conn.transaction()?;
         check_ledgers(&tx, company_id, postings)?;
-        let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind) SELECT id, company_id, date, narration, kind FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
+        let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
         if saved != 1 {
             return Err(Error::Validation(
                 "Voucher not found in the selected company".into(),
@@ -459,13 +506,14 @@ impl Store {
         let revision_id = tx.last_insert_rowid();
         tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![revision_id, voucher_id])?;
         let changed = tx.execute(
-            "UPDATE vouchers SET date = ?1, narration = ?2, kind = ?5 WHERE id = ?3 AND company_id = ?4",
+            "UPDATE vouchers SET date = ?1, narration = ?2, kind = ?5, reference = ?6 WHERE id = ?3 AND company_id = ?4",
             params![
                 date.format("%Y-%m-%d").to_string(),
                 narration.trim(),
                 voucher_id,
                 company_id,
-                kind.as_str()
+                kind.as_str(),
+                reference.trim()
             ],
         )?;
         if changed != 1 {
@@ -485,17 +533,17 @@ impl Store {
     }
     /// Read only vouchers belonging to the given company, newest first.
     pub fn vouchers(&self, company_id: i64) -> Result<Vec<Voucher>> {
-        let mut stmt = self.conn.prepare("SELECT id, date, narration, kind FROM vouchers WHERE company_id = ?1 ORDER BY date DESC, id DESC")?;
+        let mut stmt = self.conn.prepare("SELECT id, date, narration, kind, reference FROM vouchers WHERE company_id = ?1 ORDER BY date DESC, id DESC")?;
         let rows = stmt
             .query_map([company_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
-            .collect::<rusqlite::Result<Vec<(i64, String, String, String)>>>()?;
+            .collect::<rusqlite::Result<Vec<(i64, String, String, String, String)>>>()?;
         let mut postings_stmt = self
             .conn
             .prepare("SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
         let mut vouchers = Vec::with_capacity(rows.len());
-        for (id, date, narration, kind) in rows {
+        for (id, date, narration, kind, reference) in rows {
             let postings = postings_stmt
                 .query_map([id], |r| {
                     Ok(Posting {
@@ -507,6 +555,7 @@ impl Store {
             vouchers.push(Voucher {
                 id,
                 kind: VoucherKind::parse(&kind)?,
+                reference,
                 date,
                 narration,
                 postings,
@@ -524,17 +573,24 @@ impl Store {
         company_id: i64,
         voucher_id: i64,
     ) -> Result<Vec<VoucherRevision>> {
-        let mut stmt = self.conn.prepare("SELECT id, changed_at, date, narration, kind FROM voucher_revisions WHERE company_id = ?1 AND voucher_id = ?2 ORDER BY id DESC")?;
+        let mut stmt = self.conn.prepare("SELECT id, changed_at, date, narration, kind, reference FROM voucher_revisions WHERE company_id = ?1 AND voucher_id = ?2 ORDER BY id DESC")?;
         let rows = stmt
             .query_map(params![company_id, voucher_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })?
-            .collect::<rusqlite::Result<Vec<(i64, String, String, String, String)>>>()?;
+            .collect::<rusqlite::Result<Vec<(i64, String, String, String, String, String)>>>()?;
         let mut posting_stmt = self.conn.prepare(
             "SELECT ledger_id, amount FROM revision_postings WHERE revision_id = ?1 ORDER BY id",
         )?;
         let mut revisions = Vec::with_capacity(rows.len());
-        for (revision_id, changed_at, date, narration, kind) in rows {
+        for (revision_id, changed_at, date, narration, kind, reference) in rows {
             let postings = posting_stmt
                 .query_map([revision_id], |r| {
                     Ok(Posting {
@@ -548,6 +604,7 @@ impl Store {
                 voucher: Voucher {
                     id: voucher_id,
                     kind: VoucherKind::parse(&kind)?,
+                    reference,
                     date,
                     narration,
                     postings,
@@ -991,7 +1048,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

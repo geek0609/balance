@@ -24,6 +24,7 @@ struct App {
     lines: Vec<VoucherLine>,
     editing_voucher: Option<i64>,
     voucher_kind: VoucherKind,
+    voucher_reference: String,
     date: String,
     narration: String,
     report_from: String,
@@ -62,6 +63,7 @@ impl App {
             lines: vec![VoucherLine::new(true), VoucherLine::new(false)],
             editing_voucher: None,
             voucher_kind: VoucherKind::Journal,
+            voucher_reference: String::new(),
             date: String::new(),
             narration: String::new(),
             report_from: String::new(),
@@ -79,6 +81,7 @@ impl App {
         self.lines = vec![VoucherLine::new(true), VoucherLine::new(false)];
         self.editing_voucher = None;
         self.voucher_kind = VoucherKind::Journal;
+        self.voucher_reference.clear();
         self.narration.clear();
     }
     fn reset_company_forms(&mut self) {
@@ -259,6 +262,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Date (YYYY-MM-DD)");
             ui.text_edit_singleline(&mut self.date);
+            ui.label("Reference / number");
+            ui.text_edit_singleline(&mut self.voucher_reference);
         });
         let mut remove = None;
         for (index, line) in self.lines.iter_mut().enumerate() {
@@ -338,19 +343,21 @@ impl App {
                     });
                 }
                 if let Some(id) = self.editing_voucher {
-                    self.store.update_typed_voucher(
+                    self.store.update_voucher_with_reference(
                         company,
                         id,
                         self.voucher_kind,
+                        &self.voucher_reference,
                         &self.date,
                         &self.narration,
                         &postings,
                     )?;
                     Ok(id)
                 } else {
-                    self.store.post_typed_voucher(
+                    self.store.post_voucher_with_reference(
                         company,
                         self.voucher_kind,
+                        &self.voucher_reference,
                         &self.date,
                         &self.narration,
                         &postings,
@@ -376,9 +383,13 @@ impl App {
                             voucher.date, voucher.id, voucher.narration
                         ));
                         ui.label(voucher.kind.as_str());
+                        if !voucher.reference.is_empty() {
+                            ui.label(format!("Ref: {}", voucher.reference));
+                        }
                         if ui.button("Edit").clicked() {
                             self.editing_voucher = Some(voucher.id);
                             self.voucher_kind = voucher.kind;
+                            self.voucher_reference = voucher.reference.clone();
                             self.date = voucher.date.clone();
                             self.narration = voucher.narration.clone();
                             self.lines = voucher
@@ -418,10 +429,11 @@ impl App {
                                 Ok(revisions) => {
                                     for revision in revisions {
                                         ui.label(format!(
-                                            "Replaced at {} UTC • {} • {} • {}",
+                                            "Replaced at {} UTC • {} • {} • {} • {}",
                                             revision.changed_at,
                                             revision.voucher.date,
                                             revision.voucher.kind.as_str(),
+                                            revision.voucher.reference,
                                             revision.voucher.narration
                                         ));
                                         for p in revision.voucher.postings {
