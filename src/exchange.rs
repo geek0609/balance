@@ -7,7 +7,7 @@ use crate::{
 };
 use chrono::NaiveDate;
 use roxmltree::{Document, Node, ParsingOptions};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 
 const MAX_BYTES: usize = 50 * 1024 * 1024;
@@ -17,6 +17,7 @@ struct Group {
     name: String,
     parent: String,
     category: Category,
+    metadata: SourceMetadata,
 }
 #[derive(Debug, Clone)]
 struct Account {
@@ -25,6 +26,7 @@ struct Account {
     category: Category,
     profile: LedgerProfile,
     opening: Option<i64>,
+    metadata: SourceMetadata,
 }
 #[derive(Debug, Clone)]
 struct Line {
@@ -38,6 +40,29 @@ struct Transaction {
     date: String,
     narration: String,
     lines: Vec<Line>,
+    metadata: SourceMetadata,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SourceMetadata {
+    guid: String,
+    remote_id: String,
+    master_id: String,
+    alteration_id: String,
+}
+impl SourceMetadata {
+    fn is_empty(&self) -> bool {
+        self.guid.is_empty()
+            && self.remote_id.is_empty()
+            && self.master_id.is_empty()
+            && self.alteration_id.is_empty()
+    }
+    fn identities(&self) -> [(&'static str, &str); 3] {
+        [
+            ("guid", &self.guid),
+            ("remote", &self.remote_id),
+            ("master", &self.master_id),
+        ]
+    }
 }
 
 /// An immutable preview. Only previews without issues can be applied.
@@ -45,6 +70,7 @@ struct Transaction {
 pub struct ImportPlan {
     company_id: i64,
     opening_date: Option<String>,
+    existing_group_metadata: Vec<(i64, SourceMetadata)>,
     groups: Vec<Group>,
     accounts: Vec<Account>,
     transactions: Vec<Transaction>,
@@ -72,6 +98,7 @@ impl ImportPlan {
     pub fn can_apply(&self) -> bool {
         self.issues.is_empty()
             && (!self.groups.is_empty()
+                || !self.existing_group_metadata.is_empty()
                 || !self.accounts.is_empty()
                 || !self.transactions.is_empty())
     }
@@ -122,9 +149,16 @@ fn meaningful(node: Node<'_, '_>) -> bool {
 }
 fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut Vec<String>) {
     let mut singletons = HashSet::new();
+    let record = ["GROUP", "LEDGER", "VOUCHER"]
+        .iter()
+        .any(|tag| local_name(node).eq_ignore_ascii_case(tag));
     for child in node.children().filter(|n| n.is_element()) {
         let tag = local_name(child);
-        if !allowed.iter().any(|a| tag.eq_ignore_ascii_case(a)) && meaningful(child) {
+        let metadata = record
+            && ["GUID", "REMOTEID", "MASTERID", "ALTERID"]
+                .iter()
+                .any(|a| tag.eq_ignore_ascii_case(a));
+        if !allowed.iter().any(|a| tag.eq_ignore_ascii_case(a)) && !metadata && meaningful(child) {
             issues.push(format!("{label}: field {tag} is not supported"));
         }
         if !tag.to_ascii_uppercase().ends_with(".LIST")
@@ -132,7 +166,7 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
         {
             issues.push(format!("{label}: field {tag} occurs more than once"));
         }
-        if allowed.iter().any(|a| tag.eq_ignore_ascii_case(a))
+        if (allowed.iter().any(|a| tag.eq_ignore_ascii_case(a)) || metadata)
             && !tag.to_ascii_uppercase().ends_with(".LIST")
         {
             if child.children().any(|c| c.is_element()) {
@@ -155,6 +189,14 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
     for attribute in node.attributes() {
         if !attribute.name().eq_ignore_ascii_case("NAME")
             && !attribute.name().eq_ignore_ascii_case("ACTION")
+            && !(record
+                && ["GUID", "REMOTEID", "MASTERID", "ALTERID"]
+                    .iter()
+                    .any(|a| attribute.name().eq_ignore_ascii_case(a)))
+            && !(local_name(node).eq_ignore_ascii_case("VOUCHER")
+                && ["DATE", "VCHTYPE"]
+                    .iter()
+                    .any(|a| attribute.name().eq_ignore_ascii_case(a)))
             && !(attribute.name().eq_ignore_ascii_case("TYPE")
                 && ["String", "Date", "Number", "Logical", "Amount"]
                     .iter()
@@ -175,6 +217,92 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
             issues.push(format!("{label}: only new records can be imported"));
         }
     }
+}
+fn source_metadata(node: Node<'_, '_>, label: &str, issues: &mut Vec<String>) -> SourceMetadata {
+    let value = |name: &str, issues: &mut Vec<String>| {
+        let child = direct_text(node, name).unwrap_or_default();
+        let attribute = node
+            .attributes()
+            .find(|a| a.name().eq_ignore_ascii_case(name))
+            .map(|a| a.value().trim().to_owned())
+            .unwrap_or_default();
+        if !child.is_empty() && !attribute.is_empty() && child != attribute {
+            issues.push(format!("{label}: conflicting {name} values"));
+        }
+        if child.is_empty() {
+            attribute
+        } else {
+            child
+        }
+    };
+    SourceMetadata {
+        guid: value("GUID", issues),
+        remote_id: value("REMOTEID", issues),
+        master_id: value("MASTERID", issues),
+        alteration_id: value("ALTERID", issues),
+    }
+}
+fn register_metadata(
+    kind: &str,
+    label: &str,
+    meta: &SourceMetadata,
+    seen: &mut HashSet<(String, String, String)>,
+    issues: &mut Vec<String>,
+) {
+    for (key, value) in meta.identities() {
+        if !value.is_empty() && !seen.insert((kind.to_owned(), key.to_owned(), normalized(value))) {
+            issues.push(format!("{label}: imported identifier {key} already exists"));
+        }
+    }
+}
+fn save_metadata(
+    conn: &Connection,
+    company: i64,
+    kind: &str,
+    local_id: i64,
+    meta: &SourceMetadata,
+) -> Result<()> {
+    if meta.is_empty() {
+        return Ok(());
+    }
+    let existing: Option<(String, String, String, String)> = conn.query_row("SELECT guid, remote_id, master_id, alteration_id FROM imported_record_metadata WHERE company_id = ?1 AND kind = ?2 AND local_id = ?3", params![company, kind, local_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+    if let Some((guid, remote_id, master_id, alteration_id)) = existing {
+        if *meta
+            == (SourceMetadata {
+                guid,
+                remote_id,
+                master_id,
+                alteration_id,
+            })
+        {
+            return Ok(());
+        }
+        return Err(Error::Validation(
+            "Imported identifiers changed since preview".into(),
+        ));
+    }
+    let mut stmt = conn.prepare("SELECT guid, remote_id, master_id FROM imported_record_metadata WHERE company_id = ?1 AND kind = ?2")?;
+    let rows = stmt.query_map(params![company, kind], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (guid, remote, master) = row?;
+        if (!meta.guid.is_empty() && normalized(&meta.guid) == normalized(&guid))
+            || (!meta.remote_id.is_empty() && normalized(&meta.remote_id) == normalized(&remote))
+            || (!meta.master_id.is_empty() && normalized(&meta.master_id) == normalized(&master))
+        {
+            return Err(Error::Validation(
+                "An imported identifier already exists".into(),
+            ));
+        }
+    }
+    drop(stmt);
+    conn.execute("INSERT INTO imported_record_metadata(company_id, kind, local_id, guid, remote_id, master_id, alteration_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![company, kind, local_id, meta.guid, meta.remote_id, meta.master_id, meta.alteration_id])?;
+    Ok(())
 }
 fn check_language_names(node: Node<'_, '_>, name: &str, label: &str, issues: &mut Vec<String>) {
     let lists: Vec<_> = node
@@ -397,11 +525,32 @@ impl Store {
                 .filter(|s| !s.trim().is_empty())
                 .map(xml_date)
                 .transpose()?,
+            existing_group_metadata: Vec::new(),
             groups: Vec::new(),
             accounts: Vec::new(),
             transactions: Vec::new(),
             issues: Vec::new(),
         };
+        let mut seen_metadata = HashSet::<(String, String, String)>::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT kind, guid, remote_id, master_id FROM imported_record_metadata WHERE company_id = ?1")?;
+            let rows = stmt.query_map([company_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (kind, guid, remote, master) = row?;
+                for (key, value) in [("guid", guid), ("remote", remote), ("master", master)] {
+                    if !value.is_empty() {
+                        seen_metadata.insert((kind.clone(), key.to_owned(), normalized(&value)));
+                    }
+                }
+            }
+        }
         for node in doc.descendants().filter(|n| {
             n.is_element()
                 && n.parent().is_some_and(|p| {
@@ -430,7 +579,8 @@ impl Store {
                     .push(format!("Group {} is ambiguous", group.name));
             }
         }
-        let mut pending_groups = Vec::<(String, String)>::new();
+        let mut pending_groups = Vec::<(String, String, SourceMetadata)>::new();
+        let mut seen_input_groups = HashSet::<String>::new();
         for node in doc
             .descendants()
             .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("GROUP"))
@@ -447,6 +597,18 @@ impl Store {
                 &mut plan.issues,
             );
             check_language_names(node, &name, &format!("Group {name}"), &mut plan.issues);
+            if !seen_input_groups.insert(normalized(&name)) {
+                plan.issues.push(format!("Group {name}: duplicate name"));
+                continue;
+            }
+            let metadata = source_metadata(node, &format!("Group {name}"), &mut plan.issues);
+            register_metadata(
+                "group",
+                &format!("Group {name}"),
+                &metadata,
+                &mut seen_metadata,
+                &mut plan.issues,
+            );
             let parent = direct_text(node, "PARENT").unwrap_or_default();
             if let Some(existing) = existing_groups
                 .iter()
@@ -463,6 +625,9 @@ impl Store {
                         "Group {name}: existing parent differs from the imported parent"
                     ));
                 }
+                if !metadata.is_empty() {
+                    plan.existing_group_metadata.push((existing.id, metadata));
+                }
                 continue;
             }
             if parent.is_empty() {
@@ -471,31 +636,32 @@ impl Store {
             }
             if pending_groups
                 .iter()
-                .any(|(n, _)| normalized(n) == normalized(&name))
+                .any(|(n, _, _)| normalized(n) == normalized(&name))
             {
                 plan.issues.push(format!("Group {name}: duplicate name"));
                 continue;
             }
-            pending_groups.push((name, parent));
+            pending_groups.push((name, parent, metadata));
         }
         while !pending_groups.is_empty() {
             let mut progress = false;
             let mut unresolved = Vec::new();
-            for (name, parent) in pending_groups {
+            for (name, parent, metadata) in pending_groups {
                 if let Some(&category) = known_groups.get(&normalized(&parent)) {
                     known_groups.insert(normalized(&name), category);
                     plan.groups.push(Group {
                         name,
                         parent,
                         category,
+                        metadata,
                     });
                     progress = true;
                 } else {
-                    unresolved.push((name, parent));
+                    unresolved.push((name, parent, metadata));
                 }
             }
             if !progress {
-                for (name, parent) in unresolved {
+                for (name, parent, _) in unresolved {
                     plan.issues.push(format!(
                         "Group {name}: parent {parent} is missing or cyclic"
                     ));
@@ -546,6 +712,14 @@ impl Store {
             );
             check_language_names(node, &name, &format!("Ledger {name}"), &mut plan.issues);
             let label = format!("Ledger {name}");
+            let metadata = source_metadata(node, &label, &mut plan.issues);
+            register_metadata(
+                "ledger",
+                &label,
+                &metadata,
+                &mut seen_metadata,
+                &mut plan.issues,
+            );
             let mailing = profile_list_values(
                 node,
                 "MAILINGNAME.LIST",
@@ -609,6 +783,7 @@ impl Store {
                 category,
                 profile,
                 opening,
+                metadata,
             });
         }
         let mut references: HashSet<(String, String, String)> = self
@@ -630,6 +805,14 @@ impl Store {
             let label = format!(
                 "Voucher {}",
                 direct_text(node, "VOUCHERNUMBER").unwrap_or_default()
+            );
+            let metadata = source_metadata(node, &label, &mut plan.issues);
+            register_metadata(
+                "voucher",
+                &label,
+                &metadata,
+                &mut seen_metadata,
+                &mut plan.issues,
             );
             check_fields(
                 node,
@@ -664,6 +847,15 @@ impl Store {
                     continue;
                 }
             };
+            if let Some(attr) = node
+                .attributes()
+                .find(|a| a.name().eq_ignore_ascii_case("VCHTYPE"))
+            {
+                if parse_kind(attr.value()) != Some(kind) {
+                    plan.issues
+                        .push(format!("{label}: conflicting voucher type"));
+                }
+            }
             let date = match direct_text(node, "DATE").and_then(|v| xml_date(&v).ok()) {
                 Some(v) => v,
                 None => {
@@ -672,6 +864,15 @@ impl Store {
                     continue;
                 }
             };
+            if let Some(attr) = node
+                .attributes()
+                .find(|a| a.name().eq_ignore_ascii_case("DATE"))
+            {
+                if xml_date(attr.value()).ok().as_deref() != Some(date.as_str()) {
+                    plan.issues
+                        .push(format!("{label}: conflicting voucher date"));
+                }
+            }
             let reference = direct_text(node, "VOUCHERNUMBER").unwrap_or_default();
             if reference.is_empty() {
                 plan.issues
@@ -771,6 +972,7 @@ impl Store {
                 date,
                 narration,
                 lines,
+                metadata,
             });
         }
         for node in doc.descendants().filter(|n| {
@@ -800,6 +1002,19 @@ impl Store {
             ));
         }
         let tx = self.conn.transaction()?;
+        for (id, metadata) in &plan.existing_group_metadata {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM account_groups WHERE company_id = ?1 AND id = ?2)",
+                params![plan.company_id, id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(Error::Validation(
+                    "An account group changed since preview".into(),
+                ));
+            }
+            save_metadata(&tx, plan.company_id, "group", *id, metadata)?;
+        }
         for group in &plan.groups {
             if find_group(&tx, plan.company_id, &group.name)?.is_some() {
                 return Err(Error::Validation(format!(
@@ -816,6 +1031,13 @@ impl Store {
                 )));
             }
             tx.execute("INSERT INTO account_groups(company_id, name, category, parent_id) VALUES (?1, ?2, ?3, ?4)", params![plan.company_id, group.name, group.category.as_str(), parent])?;
+            save_metadata(
+                &tx,
+                plan.company_id,
+                "group",
+                tx.last_insert_rowid(),
+                &group.metadata,
+            )?;
         }
         for account in &plan.accounts {
             if find_ledger(&tx, plan.company_id, &account.name)?.is_some() {
@@ -836,12 +1058,9 @@ impl Store {
                 "INSERT INTO ledgers(company_id, name, category, group_id) VALUES (?1, ?2, ?3, ?4)",
                 params![plan.company_id, account.name, category.as_str(), group_id],
             )?;
-            insert_new_profile(
-                &tx,
-                plan.company_id,
-                tx.last_insert_rowid(),
-                &account.profile,
-            )?;
+            let ledger_id = tx.last_insert_rowid();
+            save_metadata(&tx, plan.company_id, "ledger", ledger_id, &account.metadata)?;
+            insert_new_profile(&tx, plan.company_id, ledger_id, &account.profile)?;
             if let Some(amount) = account.opening {
                 let ledger_id =
                     find_ledger(&tx, plan.company_id, &account.name)?.ok_or_else(|| {
@@ -904,6 +1123,7 @@ impl Store {
             crate::opening::check_no_control_postings(&tx, plan.company_id, &postings)?;
             tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![plan.company_id, voucher.kind.as_str(), voucher.reference, voucher.date, voucher.narration])?;
             let id = tx.last_insert_rowid();
+            save_metadata(&tx, plan.company_id, "voucher", id, &voucher.metadata)?;
             for posting in postings {
                 tx.execute(
                     "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",

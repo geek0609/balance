@@ -231,7 +231,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 9 {
+        if version > 10 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -312,6 +312,13 @@ impl Store {
                 CREATE TABLE invoice_revision_lines(id INTEGER PRIMARY KEY, revision_id INTEGER NOT NULL REFERENCES invoice_revisions(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), quantity INTEGER NOT NULL, unit_price INTEGER NOT NULL, amount INTEGER NOT NULL);
                 CREATE INDEX invoice_revisions_invoice ON invoice_revisions(invoice_id, id);
                 PRAGMA user_version = 9;")?;
+        }
+        if version < 10 {
+            tx.execute_batch("CREATE TABLE imported_record_metadata(company_id INTEGER NOT NULL REFERENCES companies(id), kind TEXT NOT NULL, local_id INTEGER NOT NULL, guid TEXT NOT NULL, remote_id TEXT NOT NULL, master_id TEXT NOT NULL, alteration_id TEXT NOT NULL, PRIMARY KEY(company_id, kind, local_id));
+                CREATE INDEX imported_record_guid ON imported_record_metadata(company_id, kind, guid);
+                CREATE INDEX imported_record_remote_id ON imported_record_metadata(company_id, kind, remote_id);
+                CREATE INDEX imported_record_master_id ON imported_record_metadata(company_id, kind, master_id);
+                PRAGMA user_version = 10;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1118,7 +1125,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
