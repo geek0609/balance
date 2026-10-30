@@ -25,6 +25,7 @@ enum Page {
 }
 struct App {
     store: Store,
+    database_path: std::path::PathBuf,
     page: Page,
     company: Option<i64>,
     company_name: String,
@@ -60,6 +61,8 @@ struct App {
     import_path: String,
     import_opening_date: String,
     backup_path: String,
+    restore_source: String,
+    restore_destination: String,
     import_preview: Option<ImportPlan>,
     stock_name: String,
     stock_description: String,
@@ -143,9 +146,10 @@ impl VoucherLine {
     }
 }
 impl App {
-    fn new(store: Store) -> Self {
+    fn new(store: Store, database_path: std::path::PathBuf) -> Self {
         Self {
             store,
+            database_path,
             page: Page::Company,
             company: None,
             company_name: String::new(),
@@ -181,6 +185,8 @@ impl App {
             import_path: String::new(),
             import_opening_date: String::new(),
             backup_path: String::new(),
+            restore_source: String::new(),
+            restore_destination: String::new(),
             import_preview: None,
             stock_name: String::new(),
             stock_description: String::new(),
@@ -2363,7 +2369,7 @@ impl App {
     fn backup_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Back up data");
         ui.label("Create a snapshot of all companies, ledgers, vouchers, invoices, stock records and saved revisions in this database.");
-        ui.label("Choose a new file path. Existing files are not overwritten. Restoring a backup from the app is not yet available.");
+        ui.label("Choose a new file path. Existing files are not overwritten.");
         ui.horizontal(|ui| {
             ui.label("New backup file");
             ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(420.0));
@@ -2380,6 +2386,25 @@ impl App {
             }
         }
         ui.small("If backup creation fails, an incomplete file may remain at the selected path.");
+        ui.separator();
+        ui.heading("Restore to a new file");
+        ui.label("Choose an existing backup and a new destination. The current database stays open and is not replaced. The new copy is checked and upgraded before use.");
+        ui.horizontal(|ui| {
+            ui.label("Backup file");
+            ui.add(egui::TextEdit::singleline(&mut self.restore_source).desired_width(420.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("New database file");
+            ui.add(egui::TextEdit::singleline(&mut self.restore_destination).desired_width(420.0));
+        });
+        if ui.button("Restore copy").clicked() {
+            match Store::restore_backup(self.restore_source.trim(), self.restore_destination.trim())
+            {
+                Ok(()) => self.message = "Backup restored to a new database file".into(),
+                Err(e) => self.failure(e),
+            }
+        }
+        ui.small("After a successful restore, open the copy by launching Balance with --database followed by its absolute path. If restoration fails, an incomplete destination file may remain.");
     }
 }
 fn pick_location(
@@ -2475,6 +2500,7 @@ impl eframe::App for App {
                 ui.heading(RichText::new("Balance").color(Color32::from_rgb(30, 75, 115)));
                 ui.label("Early accounting prototype");
             });
+            ui.small(format!("Database: {}", self.database_path.display()));
         });
         egui::SidePanel::left("navigation").show(ctx, |ui| {
             ui.heading("Gateway");
@@ -2533,14 +2559,32 @@ impl eframe::App for App {
     }
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dirs = directories::ProjectDirs::from("org", "Balance", "Balance")
-        .ok_or("Cannot find application data directory")?;
-    std::fs::create_dir_all(dirs.data_local_dir())?;
-    let store = Store::open(dirs.data_local_dir().join("balance.db"))?;
+    let mut args = std::env::args_os().skip(1);
+    let explicit_database = args.len() != 0;
+    let database_path = if let Some(flag) = args.next() {
+        if flag != "--database" {
+            return Err("Usage: balance [--database <absolute path>]".into());
+        }
+        let path = args.next().ok_or("Missing database path")?;
+        if args.next().is_some() {
+            return Err("Usage: balance [--database <absolute path>]".into());
+        }
+        std::path::PathBuf::from(path)
+    } else {
+        let dirs = directories::ProjectDirs::from("org", "Balance", "Balance")
+            .ok_or("Cannot find application data directory")?;
+        std::fs::create_dir_all(dirs.data_local_dir())?;
+        dirs.data_local_dir().join("balance.db")
+    };
+    let store = if explicit_database {
+        Store::open_existing(&database_path)?
+    } else {
+        Store::open(&database_path)?
+    };
     eframe::run_native(
         "Balance",
         eframe::NativeOptions::default(),
-        Box::new(move |_| Ok(Box::new(App::new(store)))),
+        Box::new(move |_| Ok(Box::new(App::new(store, database_path)))),
     )?;
     Ok(())
 }

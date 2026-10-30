@@ -8,6 +8,8 @@ Balance is an open-source accounting and business-management application written
 
 On Windows, install a Rust toolchain and run `cargo run`. Balance stores a SQLite database in the user's local application-data directory. Create a company, create ledgers in account groups, and enter balanced vouchers. The application is licensed under [Apache-2.0](LICENSE).
 
+To open an existing database at a different absolute path, run `cargo run -- --database "C:\path\to\balance.db"`. The selected path is shown in the application header. The optional path must already exist; the default database is used when the option is omitted.
+
 ## Feature status at a glance
 
 | Area | Available now | Planned coverage |
@@ -18,7 +20,7 @@ On Windows, install a Rust toolchain and run `cargo run`. Balance stores a SQLit
 | Inventory | Units, groups, items, locations and quantity movements | Valuation, advanced tracking and manufacturing |
 | Tax and payroll | Manual invoice tax amount | Jurisdiction-specific tax and payroll workflows |
 | Banking | Payment and receipt vouchers | Statements, reconciliation, instruments and integrations |
-| Data exchange | Restricted XML import and database snapshots | Guided migration, reconciliation, restore and APIs |
+| Data exchange | Restricted XML import, database snapshots and restore to a new file | Guided migration, reconciliation and APIs |
 | Administration | Single-user local prototype | Permissions, security, concurrent access and recovery |
 
 ## Available in the prototype
@@ -30,14 +32,14 @@ These capabilities are implemented at a basic level; their coverage, usability a
 - **Accounting reports:** a searchable day book with date and voucher-type filters; ledger activity with opening, running and closing balances; date-filtered trial balance, profit and loss, and balance-sheet summaries.
 - **Stock:** create simple units with up to three decimal places, hierarchical stock groups, items with descriptions and locations; edit item names, groups and descriptions with previous versions retained; record quantity-only adjustments and transfers; allocate invoice items to locations; view balances and dated movement history across all locations or for one location. Item base units cannot be changed. Quantities can go negative, and adjustments and transfers do not create accounting entries.
 - **Invoices and settlement:** create basic sales and purchase invoices with items, quantities, prices, an optional due date or credit period in days, and a manually entered tax amount; create the related voucher and stock movements atomically; review invoices; edit unsettled invoices with prior versions retained; allocate partial receipts or payments to a single invoice; view outstanding invoices and ageing buckets from the invoice or due date as of a chosen date. Past reports use each invoice's current details and due date.
-- **Data and continuity:** preview and atomically import a restricted subset of XML, including supported account groups, ledgers, contact fields, opening balances, voucher lines, record identifiers, simple units, stock groups, items, unvalued opening stock quantities and narrowly supported item invoices. Detected unsupported records and fields block the import. Create a SQLite snapshot of all companies at a new file path.
+- **Data and continuity:** preview and atomically import a restricted subset of XML, including supported account groups, ledgers, contact fields, opening balances, voucher lines, record identifiers, simple units, stock groups, items, unvalued opening stock quantities and narrowly supported item invoices. Detected unsupported records and fields block the import. Create a SQLite snapshot of all companies or restore a backup to a new file, with database integrity and reference checks and schema upgrades on the restored copy.
 - **Interface:** Windows desktop interface with a navigation menu, scrollable screens and `Ctrl+Enter` for saving an ordinary voucher.
 
 ### Current limits
 
 - XML import needs verification against representative exports. Item invoices require one matching new bill reference, one trade ledger, no additional ledger entries and matching quantities and amounts. Credit periods expressed in whole days are retained; other payment-term forms, tax, batches, location allocations and other bill allocations are not supported. Imported stock quantities are assigned to the default location. Other inventory transactions, opening stock valuation, statutory tax information and many account and transaction fields are also unsupported. A clean preview does not establish that an entire business dataset has been migrated correctly.
 - Stock valuation, cost of goods, automatic tax calculations, tax filing and statutory compliance are not implemented. Invoice tax amounts are manual; invoices with payments and settlement records cannot yet be edited. Clearing an opening balance is not yet supported.
-- Backup restoration, multi-user access, permissions, comprehensive audit controls, payroll, manufacturing, banking reconciliation and most advanced reports are not implemented.
+- Backup and restore need runtime verification; a failed operation may leave an incomplete destination file. Restoring creates a separate database and does not replace the one currently in use. Multi-user access, permissions, comprehensive audit controls, payroll, manufacturing, banking reconciliation and most advanced reports are not implemented.
 - This is not a finished or verified migration tool. Keep original records and independently reconcile all data and reports before relying on any future migration.
 
 ## Planned feature coverage

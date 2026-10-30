@@ -2,7 +2,7 @@
 //! integer hundredths and parsed with decimal arithmetic, never floating point.
 
 use chrono::NaiveDate;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use std::{collections::HashMap, path::Path, str::FromStr};
 use thiserror::Error;
@@ -206,6 +206,57 @@ pub fn format_amount(value: i64) -> String {
 pub struct Store {
     conn: Connection,
 }
+fn snapshot_to(conn: &Connection, destination: &Path) -> Result<()> {
+    if !destination.is_absolute() {
+        return Err(Error::Validation(
+            "Enter an absolute destination file path".into(),
+        ));
+    }
+    let path = destination
+        .to_str()
+        .ok_or_else(|| Error::Validation("Destination path must be valid Unicode".into()))?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|e| Error::Validation(format!("Cannot create destination file: {e}")))?;
+    drop(file);
+    conn.execute("VACUUM main INTO ?1", [path])?;
+    Ok(())
+}
+fn check_database_integrity(conn: &Connection) -> Result<()> {
+    let mut check = conn.prepare("PRAGMA quick_check")?;
+    let mut ok = false;
+    for row in check.query_map([], |r| r.get::<_, String>(0))? {
+        if row? != "ok" {
+            return Err(Error::Validation("Database integrity check failed".into()));
+        }
+        ok = true;
+    }
+    if !ok {
+        return Err(Error::Validation(
+            "Database integrity check returned no result".into(),
+        ));
+    }
+    let mut foreign_keys = conn.prepare("PRAGMA foreign_key_check")?;
+    if foreign_keys.exists([])? {
+        return Err(Error::Validation("Database has broken references".into()));
+    }
+    Ok(())
+}
+fn check_database_signature(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if !(1..=15).contains(&version) {
+        return Err(Error::Validation(
+            "Database has an unsupported version".into(),
+        ));
+    }
+    conn.prepare("SELECT id, name FROM companies LIMIT 0")?;
+    conn.prepare("SELECT id, company_id, name, category FROM ledgers LIMIT 0")?;
+    conn.prepare("SELECT id, company_id, date, narration FROM vouchers LIMIT 0")?;
+    conn.prepare("SELECT voucher_id, ledger_id, amount FROM postings LIMIT 0")?;
+    Ok(())
+}
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_connection(Connection::open(path)?)
@@ -213,25 +264,90 @@ impl Store {
     pub fn memory() -> Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
     }
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.is_absolute() || !path.is_file() {
+            return Err(Error::Validation(
+                "Choose an existing absolute database path".into(),
+            ));
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
+        check_database_signature(&conn)?;
+        Self::from_connection(conn)
+    }
     /// Create a consistent snapshot at a new path. Existing files are never
     /// intentionally overwritten; on failure, an incomplete file may remain.
     pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<()> {
-        let destination = destination.as_ref();
-        if !destination.is_absolute() {
+        snapshot_to(&self.conn, destination.as_ref())
+    }
+    /// Restore into a new file; the running database and source are never replaced.
+    /// The resulting copy is checked and upgraded to the current schema.
+    pub fn restore_backup(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> Result<()> {
+        let source = source.as_ref();
+        if !source.is_absolute() || !source.is_file() {
             return Err(Error::Validation(
-                "Enter an absolute backup file path".into(),
+                "Choose an existing absolute backup path".into(),
             ));
         }
-        let path = destination
-            .to_str()
-            .ok_or_else(|| Error::Validation("Backup path must be valid Unicode".into()))?;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination)
-            .map_err(|e| Error::Validation(format!("Cannot create backup file: {e}")))?;
-        drop(file);
-        self.conn.execute("VACUUM main INTO ?1", [path])?;
+        let conn = Connection::open_with_flags(
+            source,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
+        // A version number alone does not identify this database. Check core columns
+        // before copying; later migration and consistency checks provide further validation.
+        check_database_signature(&conn)?;
+        snapshot_to(&conn, destination.as_ref())?;
+        drop(conn);
+        let restored = Connection::open_with_flags(
+            destination,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        restored.execute_batch("PRAGMA trusted_schema = OFF;")?;
+        check_database_integrity(&restored)?;
+        let store = Self::from_connection(restored)?;
+        check_database_integrity(&store.conn)?;
+        for table in [
+            "companies",
+            "ledgers",
+            "vouchers",
+            "postings",
+            "voucher_revisions",
+            "revision_postings",
+            "account_groups",
+            "stock_items",
+            "stock_adjustments",
+            "invoices",
+            "invoice_lines",
+            "invoice_settlements",
+            "ledger_profiles",
+            "ledger_profile_revisions",
+            "company_controls",
+            "opening_balances",
+            "invoice_revisions",
+            "invoice_revision_lines",
+            "imported_record_metadata",
+            "stock_units",
+            "stock_groups",
+            "stock_item_revisions",
+            "stock_locations",
+            "stock_transfers",
+        ] {
+            let exists: bool = store.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(Error::Validation(format!(
+                    "Restored database is missing {table}"
+                )));
+            }
+        }
         Ok(())
     }
     fn from_connection(mut conn: Connection) -> Result<Self> {
