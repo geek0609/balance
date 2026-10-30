@@ -2,9 +2,9 @@
 //! Unsupported or ambiguous data is reported before any database writes.
 use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
-    check_quantity_precision, create_stock_item_on_connection, insert_invoice_on_connection,
-    line_amount, main_stock_location, parse_quantity, InvoiceAdjustment, InvoiceDraft, InvoiceKind,
-    InvoiceLine,
+    check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
+    find_stock_batch, insert_invoice_on_connection, line_amount, main_stock_location,
+    parse_quantity, InvoiceAdjustment, InvoiceDraft, InvoiceKind, InvoiceLine,
 };
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
@@ -83,6 +83,8 @@ struct ImportedInvoiceLine {
     precision: u8,
     location: String,
     existing_location_id: Option<i64>,
+    batch: Option<String>,
+    existing_batch_id: Option<i64>,
     quantity: i64,
     unit_price: i64,
 }
@@ -626,6 +628,7 @@ fn parse_imported_invoice(
     ledgers: &HashMap<String, (Option<i64>, Category)>,
     items: &HashMap<String, (Option<i64>, String, u8)>,
     locations: &HashMap<String, Option<i64>>,
+    batches: &HashMap<(String, String), i64>,
     issues: &mut Vec<String>,
 ) -> Result<ImportedInvoice> {
     check_fields(
@@ -921,6 +924,7 @@ fn parse_imported_invoice(
                 "multiple location or batch allocations are not supported".into(),
             ));
         }
+        let mut batch_name = None;
         let location = if let Some(location_node) = locations_in_line.first() {
             let location_node = *location_node;
             invoice_list_fields(
@@ -935,9 +939,7 @@ fn parse_imported_invoice(
                 label,
                 issues,
             );
-            if direct_text(location_node, "BATCHNAME").is_some_and(|value| !value.is_empty()) {
-                return Err(Error::Validation("named batches are not supported".into()));
-            }
+            batch_name = direct_text(location_node, "BATCHNAME").filter(|value| !value.is_empty());
             if xml_stock_quantity(&invoice_field(location_node, "ACTUALQTY")?, unit)? != actual
                 || xml_stock_quantity(&invoice_field(location_node, "BILLEDQTY")?, unit)? != billed
                 || xml_amount(&invoice_field(location_node, "AMOUNT")?)? != expected
@@ -953,6 +955,11 @@ fn parse_imported_invoice(
         let existing_location_id = *locations.get(&normalized(&location)).ok_or_else(|| {
             Error::Validation(format!("stock location {location} is unavailable"))
         })?;
+        let existing_batch_id = batch_name.as_ref().and_then(|batch| {
+            batches
+                .get(&(normalized(&name), normalized(batch)))
+                .copied()
+        });
         invoice_side(allocation, "ISDEEMEDPOSITIVE", expected > 0)?;
         if trade
             .as_ref()
@@ -971,6 +978,8 @@ fn parse_imported_invoice(
             precision: *precision,
             location,
             existing_location_id,
+            batch: batch_name,
+            existing_batch_id,
             quantity,
             unit_price,
         });
@@ -1798,7 +1807,19 @@ impl Store {
                 .map(|a| (normalized(&a.name), (None, a.category))),
         );
         let mut invoice_items = HashMap::<String, (Option<i64>, String, u8)>::new();
+        let mut invoice_batches = HashMap::<(String, String), i64>::new();
         for item in self.stock_items(company_id)? {
+            for batch in self.stock_batches(company_id, item.id)? {
+                if invoice_batches
+                    .insert((normalized(&item.name), normalized(&batch.name)), batch.id)
+                    .is_some()
+                {
+                    plan.issues.push(format!(
+                        "Batch {} for item {} is ambiguous",
+                        batch.name, item.name
+                    ));
+                }
+            }
             if let Some(precision) = known_units.get(&normalized(&item.unit)) {
                 invoice_items.insert(
                     normalized(&item.name),
@@ -1866,6 +1887,7 @@ impl Store {
                     &invoice_ledgers,
                     &invoice_items,
                     &known_locations,
+                    &invoice_batches,
                     &mut plan.issues,
                 ) {
                     Ok(invoice) => {
@@ -2346,6 +2368,7 @@ impl Store {
                 )?;
             }
         }
+        let mut created_batches = HashMap::<(i64, String), i64>::new();
         for invoice in &plan.invoices {
             let voucher_kind = if invoice.kind == InvoiceKind::Sale {
                 VoucherKind::Sales
@@ -2407,6 +2430,44 @@ impl Store {
                         line.item
                     )));
                 }
+                let batch_id = if let Some(name) = &line.batch {
+                    let key = (item_id, normalized(name));
+                    let existing = find_stock_batch(&tx, plan.company_id, item_id, name)?;
+                    let id = if let Some(expected) = line.existing_batch_id {
+                        if existing != Some(expected) {
+                            return Err(Error::Validation(format!(
+                                "Batch {name} changed since preview"
+                            )));
+                        }
+                        expected
+                    } else if let Some(created) = created_batches.get(&key) {
+                        if existing != Some(*created) {
+                            return Err(Error::Validation(format!(
+                                "Batch {name} changed since preview"
+                            )));
+                        }
+                        *created
+                    } else {
+                        if existing.is_some() {
+                            return Err(Error::Validation(format!(
+                                "Batch {name} appeared since preview"
+                            )));
+                        }
+                        let id = create_stock_batch_on_connection(
+                            &tx,
+                            plan.company_id,
+                            item_id,
+                            name,
+                            None,
+                            None,
+                        )?;
+                        created_batches.insert(key, id);
+                        id
+                    };
+                    Some(id)
+                } else {
+                    None
+                };
                 lines.push(InvoiceLine {
                     item_id,
                     location_id: {
@@ -2428,6 +2489,7 @@ impl Store {
                         }
                         id
                     },
+                    batch_id,
                     quantity: line.quantity,
                     unit_price: line.unit_price,
                 });

@@ -46,6 +46,14 @@ pub struct StockLocation {
     pub name: String,
 }
 #[derive(Debug, Clone)]
+pub struct StockBatch {
+    pub id: i64,
+    pub item_id: i64,
+    pub name: String,
+    pub manufactured_on: Option<String>,
+    pub expires_on: Option<String>,
+}
+#[derive(Debug, Clone)]
 pub struct StockBalance {
     pub item: StockItem,
     pub quantity: i128,
@@ -55,6 +63,7 @@ pub struct StockTransfer {
     pub date: String,
     pub item: String,
     pub unit: String,
+    pub batch: Option<String>,
     pub from: String,
     pub to: String,
     pub quantity: i64,
@@ -105,6 +114,7 @@ impl InvoiceKind {
 pub struct InvoiceLine {
     pub item_id: i64,
     pub location_id: i64,
+    pub batch_id: Option<i64>,
     pub quantity: i64,
     pub unit_price: i64,
 }
@@ -204,6 +214,7 @@ pub struct InvoiceDetailLine {
     pub item: String,
     pub unit: String,
     pub location: String,
+    pub batch: Option<String>,
     pub quantity: i64,
     pub unit_price: i64,
     pub amount: i64,
@@ -364,6 +375,7 @@ fn prepare_invoice(
                 "Every stock location must belong to the selected company".into(),
             ));
         }
+        check_stock_batch(conn, company_id, line.item_id, line.batch_id)?;
         check_quantity_precision(conn, company_id, line.item_id, line.quantity)?;
         let amount = line_amount(line.quantity, line.unit_price)?;
         subtotal += i128::from(amount);
@@ -447,7 +459,7 @@ fn write_invoice_lines(
     amounts: &[i64],
 ) -> Result<()> {
     for (line, amount) in lines.iter().zip(amounts) {
-        conn.execute("INSERT INTO invoice_lines(invoice_id, item_id, quantity, unit_price, amount, location_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![invoice, line.item_id, line.quantity, line.unit_price, amount, line.location_id])?;
+        conn.execute("INSERT INTO invoice_lines(invoice_id, item_id, quantity, unit_price, amount, location_id, batch_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![invoice, line.item_id, line.quantity, line.unit_price, amount, line.location_id, line.batch_id])?;
     }
     Ok(())
 }
@@ -541,6 +553,80 @@ pub(crate) fn main_stock_location(conn: &Connection, company_id: i64) -> Result<
         other => Error::Database(other),
     })
 }
+pub(crate) fn find_stock_batch(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    name: &str,
+) -> Result<Option<i64>> {
+    let mut stmt =
+        conn.prepare("SELECT id, name FROM stock_batches WHERE company_id = ?1 AND item_id = ?2")?;
+    let mut found = None;
+    for row in stmt.query_map(params![company, item], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (id, existing) = row?;
+        if existing.trim().to_lowercase() == name.trim().to_lowercase() {
+            if found.is_some() {
+                return Err(Error::Validation("Stock batch name is ambiguous".into()));
+            }
+            found = Some(id);
+        }
+    }
+    Ok(found)
+}
+pub(crate) fn check_stock_batch(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    batch: Option<i64>,
+) -> Result<()> {
+    if let Some(batch) = batch {
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM stock_batches WHERE id = ?1 AND company_id = ?2 AND item_id = ?3)", params![batch, company, item], |r| r.get(0))?;
+        if !exists {
+            return Err(Error::Validation(
+                "Batch must belong to the selected stock item and company".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+pub(crate) fn create_stock_batch_on_connection(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    name: &str,
+    manufactured_on: Option<&str>,
+    expires_on: Option<&str>,
+) -> Result<i64> {
+    let name = required(name, "Batch name")?;
+    let item_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM stock_items WHERE id = ?1 AND company_id = ?2)",
+        params![item, company],
+        |r| r.get(0),
+    )?;
+    if !item_exists {
+        return Err(Error::Validation(
+            "Stock item not found in the selected company".into(),
+        ));
+    }
+    if find_stock_batch(conn, company, item, name)?.is_some() {
+        return Err(Error::Validation(
+            "Batch already exists for this item".into(),
+        ));
+    }
+    let manufactured = manufactured_on.map(parse_date).transpose()?;
+    let expires = expires_on.map(parse_date).transpose()?;
+    if matches!((manufactured, expires), (Some(a), Some(b)) if a > b) {
+        return Err(Error::Validation(
+            "Expiry date cannot precede manufacture date".into(),
+        ));
+    }
+    let manufactured = manufactured.map(|d| d.format("%Y-%m-%d").to_string());
+    let expires = expires.map(|d| d.format("%Y-%m-%d").to_string());
+    conn.execute("INSERT INTO stock_batches(company_id, item_id, name, manufactured_on, expires_on) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, item, name, manufactured, expires])?;
+    Ok(conn.last_insert_rowid())
+}
 pub(crate) fn check_quantity_precision(
     conn: &Connection,
     company_id: i64,
@@ -617,6 +703,87 @@ pub(crate) fn create_stock_item_on_connection(
     Ok(conn.last_insert_rowid())
 }
 impl Store {
+    pub fn stock_batches(&self, company: i64, item: i64) -> Result<Vec<StockBatch>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stock_items WHERE id = ?1 AND company_id = ?2)",
+            params![item, company],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::Validation(
+                "Stock item not found in the selected company".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare("SELECT id, item_id, name, manufactured_on, expires_on FROM stock_batches WHERE company_id = ?1 AND item_id = ?2 ORDER BY name")?;
+        let rows = stmt
+            .query_map(params![company, item], |r| {
+                Ok(StockBatch {
+                    id: r.get(0)?,
+                    item_id: r.get(1)?,
+                    name: r.get(2)?,
+                    manufactured_on: r.get(3)?,
+                    expires_on: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    pub fn create_stock_batch(
+        &self,
+        company: i64,
+        item: i64,
+        name: &str,
+        manufactured_on: Option<&str>,
+        expires_on: Option<&str>,
+    ) -> Result<i64> {
+        create_stock_batch_on_connection(
+            &self.conn,
+            company,
+            item,
+            name,
+            manufactured_on,
+            expires_on,
+        )
+    }
+    /// Quantity for one batch, optionally in one location, through an inclusive date.
+    pub fn stock_batch_quantity(
+        &self,
+        company: i64,
+        item: i64,
+        batch: i64,
+        location: Option<i64>,
+        as_of: Option<&str>,
+    ) -> Result<i128> {
+        check_stock_batch(&self.conn, company, item, Some(batch))?;
+        if let Some(location) = location {
+            if !self
+                .stock_locations(company)?
+                .iter()
+                .any(|l| l.id == location)
+            {
+                return Err(Error::Validation(
+                    "Stock location not found in the selected company".into(),
+                ));
+            }
+        }
+        let end = as_of.map(parse_date).transpose()?;
+        let sql = "SELECT date, quantity FROM stock_adjustments WHERE company_id = ?1 AND item_id = ?2 AND batch_id = ?3 AND (?4 IS NULL OR location_id = ?4)
+            UNION ALL SELECT v.date, CASE i.kind WHEN 'Purchase' THEN l.quantity ELSE -l.quantity END FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND l.batch_id = ?3 AND (?4 IS NULL OR l.location_id = ?4)
+            UNION ALL SELECT date, -quantity FROM stock_transfers WHERE company_id = ?1 AND item_id = ?2 AND batch_id = ?3 AND (?4 IS NULL OR from_location_id = ?4)
+            UNION ALL SELECT date, quantity FROM stock_transfers WHERE company_id = ?1 AND item_id = ?2 AND batch_id = ?3 AND (?4 IS NULL OR to_location_id = ?4)";
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut total = 0_i128;
+        for row in stmt.query_map(params![company, item, batch, location], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (date, quantity) = row?;
+            let date = parse_date(&date)?;
+            if end.is_none_or(|limit| date <= limit) {
+                total += i128::from(quantity);
+            }
+        }
+        Ok(total)
+    }
     pub fn stock_locations(&self, company_id: i64) -> Result<Vec<StockLocation>> {
         let mut stmt = self
             .conn
@@ -656,6 +823,19 @@ impl Store {
         quantity: i64,
         reason: &str,
     ) -> Result<i64> {
+        self.transfer_stock_batch(company_id, item_id, None, from, to, date, quantity, reason)
+    }
+    pub fn transfer_stock_batch(
+        &self,
+        company_id: i64,
+        item_id: i64,
+        batch_id: Option<i64>,
+        from: i64,
+        to: i64,
+        date: &str,
+        quantity: i64,
+        reason: &str,
+    ) -> Result<i64> {
         let date = parse_date(date)?.format("%Y-%m-%d").to_string();
         let reason = required(reason, "Reason")?;
         if quantity <= 0 || from == to {
@@ -670,17 +850,19 @@ impl Store {
             ));
         }
         check_quantity_precision(&self.conn, company_id, item_id, quantity)?;
-        self.conn.execute("INSERT INTO stock_transfers(company_id, item_id, from_location_id, to_location_id, date, quantity, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![company_id, item_id, from, to, date, quantity, reason])?;
+        check_stock_batch(&self.conn, company_id, item_id, batch_id)?;
+        self.conn.execute("INSERT INTO stock_transfers(company_id, item_id, from_location_id, to_location_id, date, quantity, reason, batch_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![company_id, item_id, from, to, date, quantity, reason, batch_id])?;
         Ok(self.conn.last_insert_rowid())
     }
     pub fn stock_transfers(&self, company_id: i64) -> Result<Vec<StockTransfer>> {
-        let mut stmt = self.conn.prepare("SELECT t.date, i.name, i.unit, f.name, d.name, t.quantity, t.reason FROM stock_transfers t JOIN stock_items i ON i.id = t.item_id AND i.company_id = t.company_id JOIN stock_locations f ON f.id = t.from_location_id AND f.company_id = t.company_id JOIN stock_locations d ON d.id = t.to_location_id AND d.company_id = t.company_id WHERE t.company_id = ?1 ORDER BY t.date DESC, t.id DESC")?;
+        let mut stmt = self.conn.prepare("SELECT t.date, i.name, i.unit, f.name, d.name, t.quantity, t.reason, b.name FROM stock_transfers t JOIN stock_items i ON i.id = t.item_id AND i.company_id = t.company_id JOIN stock_locations f ON f.id = t.from_location_id AND f.company_id = t.company_id JOIN stock_locations d ON d.id = t.to_location_id AND d.company_id = t.company_id LEFT JOIN stock_batches b ON b.id = t.batch_id WHERE t.company_id = ?1 ORDER BY t.date DESC, t.id DESC")?;
         let rows = stmt
             .query_map([company_id], |r| {
                 Ok(StockTransfer {
                     date: r.get(0)?,
                     item: r.get(1)?,
                     unit: r.get(2)?,
+                    batch: r.get(7)?,
                     from: r.get(3)?,
                     to: r.get(4)?,
                     quantity: r.get(5)?,
@@ -911,6 +1093,26 @@ impl Store {
         quantity: i64,
         reason: &str,
     ) -> Result<i64> {
+        self.adjust_stock_batch(
+            company_id,
+            item_id,
+            location_id,
+            None,
+            date,
+            quantity,
+            reason,
+        )
+    }
+    pub fn adjust_stock_batch(
+        &self,
+        company_id: i64,
+        item_id: i64,
+        location_id: i64,
+        batch_id: Option<i64>,
+        date: &str,
+        quantity: i64,
+        reason: &str,
+    ) -> Result<i64> {
         let date = parse_date(date)?.format("%Y-%m-%d").to_string();
         let reason = required(reason, "Reason")?;
         if quantity == 0 {
@@ -927,6 +1129,7 @@ impl Store {
             ));
         }
         check_quantity_precision(&self.conn, company_id, item_id, quantity)?;
+        check_stock_batch(&self.conn, company_id, item_id, batch_id)?;
         if !self
             .stock_locations(company_id)?
             .iter()
@@ -936,7 +1139,7 @@ impl Store {
                 "Stock location not found in the selected company".into(),
             ));
         }
-        self.conn.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![company_id, item_id, date, quantity, reason, location_id])?;
+        self.conn.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id, batch_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![company_id, item_id, date, quantity, reason, location_id, batch_id])?;
         Ok(self.conn.last_insert_rowid())
     }
     pub fn stock_location_balances(
@@ -1119,7 +1322,7 @@ impl Store {
                 Error::Validation("Stock item not found in the selected company".into())
             })?;
         let mut raw = Vec::<(chrono::NaiveDate, u8, i64, String, i64)>::new();
-        let mut stmt = self.conn.prepare("SELECT a.id, a.date, a.quantity, a.reason, loc.name FROM stock_adjustments a JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = a.company_id WHERE a.company_id = ?1 AND a.item_id = ?2 AND (?3 IS NULL OR a.location_id = ?3)")?;
+        let mut stmt = self.conn.prepare("SELECT a.id, a.date, a.quantity, a.reason, loc.name, b.name FROM stock_adjustments a JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = a.company_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.company_id = ?1 AND a.item_id = ?2 AND (?3 IS NULL OR a.location_id = ?3)")?;
         let rows = stmt.query_map(params![company_id, item_id, location_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -1127,19 +1330,23 @@ impl Store {
                 r.get::<_, i64>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         for row in rows {
-            let (id, date, qty, reason, location) = row?;
+            let (id, date, qty, reason, location, batch) = row?;
             raw.push((
                 parse_date(&date)?,
                 0,
                 id,
-                format!("Adjustment at {location}: {reason}"),
+                format!(
+                    "Adjustment at {location}, batch {}: {reason}",
+                    batch.as_deref().unwrap_or("unbatched")
+                ),
                 qty,
             ));
         }
-        let mut stmt = self.conn.prepare("SELECT l.id, v.date, i.kind, v.reference, l.quantity, loc.name FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id JOIN stock_locations loc ON loc.id = l.location_id AND loc.company_id = i.company_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND (?3 IS NULL OR l.location_id = ?3)")?;
+        let mut stmt = self.conn.prepare("SELECT l.id, v.date, i.kind, v.reference, l.quantity, loc.name, b.name FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id JOIN stock_locations loc ON loc.id = l.location_id AND loc.company_id = i.company_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND (?3 IS NULL OR l.location_id = ?3)")?;
         let rows = stmt.query_map(params![company_id, item_id, location_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -1148,16 +1355,23 @@ impl Store {
                 r.get::<_, String>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?;
         for row in rows {
-            let (id, date, kind, reference, qty, location) = row?;
+            let (id, date, kind, reference, qty, location, batch) = row?;
             let kind = InvoiceKind::parse(&kind)?;
             raw.push((
                 parse_date(&date)?,
                 1,
                 id,
-                format!("{}: {} at {}", kind.as_str(), reference, location),
+                format!(
+                    "{}: {} at {}, batch {}",
+                    kind.as_str(),
+                    reference,
+                    location,
+                    batch.as_deref().unwrap_or("unbatched")
+                ),
                 if kind == InvoiceKind::Purchase {
                     qty
                 } else {
@@ -1166,7 +1380,7 @@ impl Store {
             ));
         }
         if let Some(location) = location_id {
-            let mut stmt = self.conn.prepare("SELECT t.id, t.date, t.quantity, t.from_location_id, f.name, d.name, t.reason FROM stock_transfers t JOIN stock_locations f ON f.id = t.from_location_id AND f.company_id = t.company_id JOIN stock_locations d ON d.id = t.to_location_id AND d.company_id = t.company_id WHERE t.company_id = ?1 AND t.item_id = ?2 AND (t.from_location_id = ?3 OR t.to_location_id = ?3)")?;
+            let mut stmt = self.conn.prepare("SELECT t.id, t.date, t.quantity, t.from_location_id, f.name, d.name, t.reason, b.name FROM stock_transfers t JOIN stock_locations f ON f.id = t.from_location_id AND f.company_id = t.company_id JOIN stock_locations d ON d.id = t.to_location_id AND d.company_id = t.company_id LEFT JOIN stock_batches b ON b.id = t.batch_id WHERE t.company_id = ?1 AND t.item_id = ?2 AND (t.from_location_id = ?3 OR t.to_location_id = ?3)")?;
             for row in stmt.query_map(params![company_id, item_id, location], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -1176,9 +1390,10 @@ impl Store {
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
+                    r.get::<_, Option<String>>(7)?,
                 ))
             })? {
-                let (id, date, quantity, from_id, from, to, reason) = row?;
+                let (id, date, quantity, from_id, from, to, reason, batch) = row?;
                 let change = if from_id == location {
                     -quantity
                 } else {
@@ -1188,7 +1403,10 @@ impl Store {
                     parse_date(&date)?,
                     2,
                     id,
-                    format!("Transfer {from} to {to}: {reason}"),
+                    format!(
+                        "Transfer {from} to {to}, batch {}: {reason}",
+                        batch.as_deref().unwrap_or("unbatched")
+                    ),
                     change,
                 ));
             }
@@ -1230,12 +1448,13 @@ impl Store {
     /// Return a complete editable draft, scoped to the company.
     pub fn invoice_draft(&self, company_id: i64, invoice_id: i64) -> Result<InvoiceDraft> {
         let (kind, date, reference, narration, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days): (String, String, String, String, i64, i64, Option<i64>, i64, Option<String>, Option<u32>) = self.conn.query_row("SELECT i.kind, v.date, v.reference, v.narration, i.party_ledger_id, i.trade_ledger_id, i.tax_ledger_id, i.tax_amount, i.due_date, i.credit_days FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
-        let mut stmt = self.conn.prepare("SELECT item_id, quantity, unit_price, location_id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+        let mut stmt = self.conn.prepare("SELECT item_id, quantity, unit_price, location_id, batch_id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
         let lines = stmt
             .query_map([invoice_id], |r| {
                 Ok(InvoiceLine {
                     item_id: r.get(0)?,
                     location_id: r.get(3)?,
+                    batch_id: r.get(4)?,
                     quantity: r.get(1)?,
                     unit_price: r.get(2)?,
                 })
@@ -1306,7 +1525,7 @@ impl Store {
         tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![voucher_revision, voucher_id])?;
         tx.execute("INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days) SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days FROM invoices WHERE id = ?2 AND company_id = ?3", params![voucher_revision, invoice_id, company_id])?;
         let revision_id = tx.last_insert_rowid();
-        tx.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount, location_id) SELECT ?1, item_id, quantity, unit_price, amount, location_id FROM invoice_lines WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
+        tx.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount, location_id, batch_id) SELECT ?1, item_id, quantity, unit_price, amount, location_id, batch_id FROM invoice_lines WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
         tx.execute("INSERT INTO invoice_revision_adjustments(revision_id, ledger_id, amount, description) SELECT ?1, ledger_id, amount, description FROM invoice_adjustments WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
         tx.execute("UPDATE vouchers SET kind = ?1, reference = ?2, date = ?3, narration = ?4 WHERE id = ?5 AND company_id = ?6", params![draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim(), voucher_id, company_id])?;
         tx.execute("UPDATE invoices SET kind = ?1, party_ledger_id = ?2, trade_ledger_id = ?3, tax_ledger_id = ?4, tax_amount = ?5, due_date = ?6, credit_days = ?7 WHERE id = ?8 AND company_id = ?9", params![draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount, prepared.due_date, prepared.credit_days, invoice_id, company_id])?;
@@ -1372,13 +1591,14 @@ impl Store {
             credit_days,
         ) in rows
         {
-            let mut items = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name FROM invoice_revision_lines l JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id WHERE l.revision_id = ?1 ORDER BY l.id")?;
+            let mut items = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name FROM invoice_revision_lines l JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.revision_id = ?1 ORDER BY l.id")?;
             let lines = items
                 .query_map([id], |r| {
                     Ok(InvoiceDetailLine {
                         item: r.get(0)?,
                         unit: r.get(1)?,
                         location: r.get(5)?,
+                        batch: r.get(6)?,
                         quantity: r.get(2)?,
                         unit_price: r.get(3)?,
                         amount: r.get(4)?,
@@ -1421,12 +1641,13 @@ impl Store {
         let mut result = Vec::new();
         for row in rows {
             let (id, voucher_id, kind, date, reference, party, tax, due_date, credit_days) = row?;
-            let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name FROM invoice_lines l JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
+            let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name FROM invoice_lines l JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
             let line_amounts = amounts.query_map([id], |r| {
                 Ok(InvoiceDetailLine {
                     item: r.get(0)?,
                     unit: r.get(1)?,
                     location: r.get(5)?,
+                    batch: r.get(6)?,
                     quantity: r.get(2)?,
                     unit_price: r.get(3)?,
                     amount: r.get(4)?,

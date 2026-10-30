@@ -247,7 +247,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=19).contains(&version) {
+    if !(1..=20).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -344,6 +344,7 @@ impl Store {
             "bank_match_events",
             "invoice_adjustments",
             "invoice_revision_adjustments",
+            "stock_batches",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -361,7 +362,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 19 {
+        if version > 20 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -526,6 +527,15 @@ impl Store {
                 CREATE TABLE invoice_revision_adjustments(id INTEGER PRIMARY KEY, revision_id INTEGER NOT NULL REFERENCES invoice_revisions(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), amount INTEGER NOT NULL CHECK(amount != 0), description TEXT NOT NULL);
                 CREATE INDEX invoice_revision_adjustments_revision ON invoice_revision_adjustments(revision_id, id);
                 PRAGMA user_version = 19;")?;
+        }
+        if version < 20 {
+            tx.execute_batch("CREATE TABLE stock_batches(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), name TEXT NOT NULL, manufactured_on TEXT, expires_on TEXT, UNIQUE(company_id, item_id, name));
+                ALTER TABLE stock_adjustments ADD COLUMN batch_id INTEGER REFERENCES stock_batches(id);
+                ALTER TABLE invoice_lines ADD COLUMN batch_id INTEGER REFERENCES stock_batches(id);
+                ALTER TABLE invoice_revision_lines ADD COLUMN batch_id INTEGER REFERENCES stock_batches(id);
+                ALTER TABLE stock_transfers ADD COLUMN batch_id INTEGER REFERENCES stock_batches(id);
+                CREATE INDEX stock_batches_item ON stock_batches(company_id, item_id, name);
+                PRAGMA user_version = 20;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1388,7 +1398,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

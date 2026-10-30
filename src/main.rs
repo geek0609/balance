@@ -5,7 +5,7 @@ use balance::contacts::LedgerProfile;
 use balance::exchange::ImportPlan;
 use balance::inventory::{
     format_quantity, line_amount, parse_quantity, InvoiceAdjustment, InvoiceDraft, InvoiceKind,
-    InvoiceLine, SettlementAllocation, StockItem, StockLocation,
+    InvoiceLine, SettlementAllocation, StockBatch, StockItem, StockLocation,
 };
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
@@ -90,11 +90,17 @@ struct App {
     stock_group_name: String,
     stock_group_parent: Option<i64>,
     stock_location_name: String,
+    batch_item: Option<i64>,
+    batch_name: String,
+    batch_manufactured: String,
+    batch_expiry: String,
     stock_balance_location: Option<i64>,
     adjustment_location: Option<i64>,
+    adjustment_batch: Option<i64>,
     transfer_item: Option<i64>,
     transfer_from: Option<i64>,
     transfer_to: Option<i64>,
+    transfer_batch: Option<i64>,
     transfer_date: String,
     transfer_quantity: String,
     transfer_reason: String,
@@ -141,6 +147,7 @@ struct InvoiceAdjustmentForm {
 struct InvoiceLineForm {
     item: Option<i64>,
     location: Option<i64>,
+    batch: Option<i64>,
     quantity: String,
     price: String,
 }
@@ -149,6 +156,7 @@ impl InvoiceLineForm {
         Self {
             item: None,
             location: None,
+            batch: None,
             quantity: String::new(),
             price: String::new(),
         }
@@ -235,11 +243,17 @@ impl App {
             stock_group_name: String::new(),
             stock_group_parent: None,
             stock_location_name: String::new(),
+            batch_item: None,
+            batch_name: String::new(),
+            batch_manufactured: String::new(),
+            batch_expiry: String::new(),
             stock_balance_location: None,
             adjustment_location: None,
+            adjustment_batch: None,
             transfer_item: None,
             transfer_from: None,
             transfer_to: None,
+            transfer_batch: None,
             transfer_date: String::new(),
             transfer_quantity: String::new(),
             transfer_reason: String::new(),
@@ -314,10 +328,16 @@ impl App {
         self.stock_edit_description.clear();
         self.stock_group_parent = None;
         self.stock_balance_location = None;
+        self.batch_item = None;
+        self.batch_name.clear();
+        self.batch_manufactured.clear();
+        self.batch_expiry.clear();
         self.adjustment_location = None;
+        self.adjustment_batch = None;
         self.transfer_item = None;
         self.transfer_from = None;
         self.transfer_to = None;
+        self.transfer_batch = None;
         self.transfer_date.clear();
         self.transfer_quantity.clear();
         self.transfer_reason.clear();
@@ -1293,6 +1313,73 @@ impl App {
             }
         };
         ui.separator();
+        ui.heading("Stock batches");
+        pick_stock(ui, "batch-item", "Item", &items, &mut self.batch_item);
+        ui.horizontal(|ui| {
+            ui.label("Batch name");
+            ui.text_edit_singleline(&mut self.batch_name);
+            ui.label("Manufactured (optional)");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.batch_manufactured).hint_text("YYYY-MM-DD"),
+            );
+            ui.label("Expires (optional)");
+            ui.add(egui::TextEdit::singleline(&mut self.batch_expiry).hint_text("YYYY-MM-DD"));
+        });
+        if ui.button("Create batch").clicked() {
+            let result = match self.batch_item {
+                Some(item) => self.store.create_stock_batch(
+                    company,
+                    item,
+                    &self.batch_name,
+                    (!self.batch_manufactured.trim().is_empty())
+                        .then_some(self.batch_manufactured.trim()),
+                    (!self.batch_expiry.trim().is_empty()).then_some(self.batch_expiry.trim()),
+                ),
+                None => Err(balance::Error::Validation("Select an item".into())),
+            };
+            match result {
+                Ok(_) => {
+                    self.batch_name.clear();
+                    self.batch_manufactured.clear();
+                    self.batch_expiry.clear();
+                    self.message = "Stock batch created".into();
+                }
+                Err(e) => self.failure(e),
+            }
+        }
+        if let Some(item) = self.batch_item {
+            ui.small("Batch quantities use the stock location and as-of filters below. Existing unbatched quantities are not included.");
+            match self.store.stock_batches(company, item) {
+                Ok(batches) => {
+                    for batch in batches {
+                        let as_of = (!self.stock_as_of.trim().is_empty())
+                            .then_some(self.stock_as_of.trim());
+                        match self.store.stock_batch_quantity(
+                            company,
+                            item,
+                            batch.id,
+                            self.stock_balance_location,
+                            as_of,
+                        ) {
+                            Ok(qty) => {
+                                ui.label(format!(
+                                    "{} — quantity {} — manufactured {} — expires {}",
+                                    batch.name,
+                                    format_quantity(qty),
+                                    batch.manufactured_on.as_deref().unwrap_or("—"),
+                                    batch.expires_on.as_deref().unwrap_or("—")
+                                ));
+                            }
+                            Err(e) => {
+                                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(e) => self.failure(e),
+            }
+        }
+        ui.separator();
         ui.heading("Edit stock item");
         if self.stock_editing.is_none() {
             pick_stock(
@@ -1392,6 +1479,7 @@ impl App {
         ui.separator();
         ui.heading("Quantity adjustment");
         ui.label("Adjustments change quantities only; create any accounting entry separately.");
+        let previous_adjustment_item = self.adjustment_item;
         pick_stock(
             ui,
             "adjustment-item",
@@ -1399,6 +1487,17 @@ impl App {
             &items,
             &mut self.adjustment_item,
         );
+        if previous_adjustment_item != self.adjustment_item {
+            self.adjustment_batch = None;
+        }
+        if let Some(item) = self.adjustment_item {
+            match self.store.stock_batches(company, item) {
+                Ok(batches) => {
+                    pick_batch(ui, "adjustment-batch", &batches, &mut self.adjustment_batch)
+                }
+                Err(e) => self.failure(e),
+            }
+        }
         pick_location(
             ui,
             "adjustment-location",
@@ -1438,12 +1537,13 @@ impl App {
                         "Quantity must be greater than zero".into(),
                     ));
                 }
-                self.store.adjust_stock_at(
+                self.store.adjust_stock_batch(
                     company,
                     item,
                     self.adjustment_location.ok_or_else(|| {
                         balance::Error::Validation("Select a stock location".into())
                     })?,
+                    self.adjustment_batch,
                     &self.adjustment_date,
                     if self.adjustment_increase { qty } else { -qty },
                     &self.adjustment_reason,
@@ -1461,7 +1561,17 @@ impl App {
         ui.separator();
         ui.heading("Transfer stock");
         ui.label("Transfers change location quantities only and do not create accounting entries. Negative location balances are allowed.");
+        let previous_transfer_item = self.transfer_item;
         pick_stock(ui, "transfer-item", "Item", &items, &mut self.transfer_item);
+        if previous_transfer_item != self.transfer_item {
+            self.transfer_batch = None;
+        }
+        if let Some(item) = self.transfer_item {
+            match self.store.stock_batches(company, item) {
+                Ok(batches) => pick_batch(ui, "transfer-batch", &batches, &mut self.transfer_batch),
+                Err(e) => self.failure(e),
+            }
+        }
         ui.horizontal(|ui| {
             pick_location(
                 ui,
@@ -1490,10 +1600,11 @@ impl App {
         });
         if ui.button("Save transfer").clicked() {
             let result = (|| -> balance::Result<i64> {
-                self.store.transfer_stock(
+                self.store.transfer_stock_batch(
                     company,
                     self.transfer_item
                         .ok_or_else(|| balance::Error::Validation("Select a stock item".into()))?,
+                    self.transfer_batch,
                     self.transfer_from.ok_or_else(|| {
                         balance::Error::Validation("Select a source location".into())
                     })?,
@@ -1519,11 +1630,12 @@ impl App {
                 Ok(transfers) => {
                     for transfer in transfers {
                         ui.label(format!(
-                            "{}: {} {} {} from {} to {} — {}",
+                            "{}: {} {} {} batch {} from {} to {} — {}",
                             transfer.date,
                             transfer.item,
                             format_quantity(i128::from(transfer.quantity)),
                             transfer.unit,
+                            transfer.batch.as_deref().unwrap_or("unbatched"),
                             transfer.from,
                             transfer.to,
                             transfer.reason
@@ -1661,6 +1773,18 @@ impl App {
                 return;
             }
         };
+        let mut item_batches = std::collections::HashMap::new();
+        for item in &items {
+            match self.store.stock_batches(company, item.id) {
+                Ok(batches) => {
+                    item_batches.insert(item.id, batches);
+                }
+                Err(e) => {
+                    self.failure(e);
+                    return;
+                }
+            }
+        }
         let locations = match self.store.stock_locations(company) {
             Ok(v) => v,
             Err(e) => {
@@ -1735,7 +1859,14 @@ impl App {
         for (index, line) in self.invoice_lines.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("{}.", index + 1));
+                let previous_item = line.item;
                 pick_stock(ui, ("invoice-item", index), "Item", &items, &mut line.item);
+                if previous_item != line.item {
+                    line.batch = None;
+                }
+                if let Some(batches) = line.item.and_then(|item| item_batches.get(&item)) {
+                    pick_batch(ui, ("invoice-batch", index), batches, &mut line.batch);
+                }
                 pick_location(
                     ui,
                     ("invoice-location", index),
@@ -1852,6 +1983,7 @@ impl App {
                         location_id: line.location.ok_or_else(|| {
                             balance::Error::Validation("Select a location for every line".into())
                         })?,
+                        batch_id: line.batch,
                         quantity: parse_quantity(&line.quantity)?,
                         unit_price: parse_amount(&line.price)?,
                     });
@@ -2121,6 +2253,7 @@ impl App {
                                     .map(|line| InvoiceLineForm {
                                         item: Some(line.item_id),
                                         location: Some(line.location_id),
+                                        batch: line.batch_id,
                                         quantity: format_quantity(i128::from(line.quantity)),
                                         price: format_amount(line.unit_price),
                                     })
@@ -2153,9 +2286,10 @@ impl App {
                     }
                     for line in invoice.lines {
                         ui.label(format!(
-                            "  {} at {}: {} {} × {} = {}",
+                            "  {} at {}, batch {}: {} {} × {} = {}",
                             line.item,
                             line.location,
+                            line.batch.as_deref().unwrap_or("unbatched"),
                             format_quantity(i128::from(line.quantity)),
                             line.unit,
                             format_amount(line.unit_price),
@@ -2227,9 +2361,10 @@ impl App {
                                         }
                                         for line in revision.lines {
                                             ui.label(format!(
-                                                "  {} at {}: {} {} × {} = {}",
+                                                "  {} at {}, batch {}: {} {} × {} = {}",
                                                 line.item,
                                                 line.location,
+                                                line.batch.as_deref().unwrap_or("unbatched"),
                                                 format_quantity(i128::from(line.quantity)),
                                                 line.unit,
                                                 format_amount(line.unit_price),
@@ -2352,7 +2487,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, unvalued stock items and a restricted form of item invoice. Invoices require one matching new bill reference and one trade ledger; additional ledger postings become unclassified charges or deductions. Only one location allocation per item is supported. Tax details, named batches, nested locations, other bill allocations, valued opening stock and other unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, unvalued stock items and a restricted form of item invoice. Invoices require one matching new bill reference and one trade ledger; additional ledger postings become unclassified charges or deductions. One location and batch allocation per item is supported; newly imported batches have no manufacture or expiry dates. Tax details, batch dates, nested locations, other bill allocations, valued opening stock and other unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Bank clearance");
@@ -2992,6 +3127,27 @@ impl App {
         }
         ui.small("After a successful restore, open the copy by launching Balance with --database followed by its absolute path. If restoration fails, an incomplete destination file may remain.");
     }
+}
+fn pick_batch(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    batches: &[StockBatch],
+    selected: &mut Option<i64>,
+) {
+    ui.label("Batch");
+    let text = batches
+        .iter()
+        .find(|batch| Some(batch.id) == *selected)
+        .map(|batch| batch.name.as_str())
+        .unwrap_or("Unbatched");
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(selected, None, "Unbatched");
+            for batch in batches {
+                ui.selectable_value(selected, Some(batch.id), &batch.name);
+            }
+        });
 }
 fn pick_location(
     ui: &mut egui::Ui,
