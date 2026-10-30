@@ -1,6 +1,7 @@
 //! Manual clearance of cash and bank ledger postings.
-use crate::{parse_date, required, Category, Error, Result, Store};
+use crate::{parse_amount, parse_date, required, Category, Error, Result, Store};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct BankEntry {
@@ -28,6 +29,57 @@ pub struct ClearanceEvent {
     pub voucher_date: String,
     pub previous_date: Option<String>,
     pub new_date: Option<String>,
+    pub reason: String,
+}
+#[derive(Debug, Clone)]
+pub struct StatementRow {
+    pub external_id: String,
+    pub date: String,
+    pub description: String,
+    pub amount: i64,
+}
+#[derive(Debug, Clone)]
+pub struct StatementPlan {
+    company: i64,
+    ledger: i64,
+    rows: Vec<StatementRow>,
+    issues: Vec<String>,
+}
+impl StatementPlan {
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+    pub fn issues(&self) -> &[String] {
+        &self.issues
+    }
+    pub fn rows(&self) -> &[StatementRow] {
+        &self.rows
+    }
+    pub fn can_apply(&self) -> bool {
+        !self.rows.is_empty() && self.issues.is_empty()
+    }
+    pub fn company(&self) -> i64 {
+        self.company
+    }
+    pub fn ledger(&self) -> i64 {
+        self.ledger
+    }
+}
+#[derive(Debug, Clone)]
+pub struct StatementEntry {
+    pub id: i64,
+    pub external_id: String,
+    pub date: String,
+    pub description: String,
+    pub amount: i64,
+    pub matched_posting: Option<i64>,
+}
+#[derive(Debug, Clone)]
+pub struct MatchEvent {
+    pub changed_at: String,
+    pub action: String,
+    pub voucher_id: i64,
+    pub posting_id: i64,
     pub reason: String,
 }
 
@@ -59,7 +111,284 @@ fn asset_ledger(conn: &Connection, company: i64, ledger: i64) -> Result<()> {
     }
     Ok(())
 }
+fn record_clearance(
+    conn: &Connection,
+    company: i64,
+    ledger: i64,
+    posting: i64,
+    date: Option<&str>,
+    reason: &str,
+) -> Result<()> {
+    let reason = required(reason, "Reason")?;
+    let new_date = date
+        .map(parse_date)
+        .transpose()?
+        .map(|d| d.format("%Y-%m-%d").to_string());
+    asset_ledger(conn, company, ledger)?;
+    let (voucher, voucher_date, amount): (i64, String, i64) = conn.query_row("SELECT v.id, v.date, p.amount FROM postings p JOIN vouchers v ON v.id = p.voucher_id WHERE p.id = ?1 AND p.ledger_id = ?2 AND v.company_id = ?3", params![posting, ledger, company], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Posting not found in this ledger and company".into()), other => Error::Database(other) })?;
+    if let Some(new_date) = &new_date {
+        if parse_date(new_date)? < parse_date(&voucher_date)? {
+            return Err(Error::Validation(
+                "Clearance date must not precede the voucher date".into(),
+            ));
+        }
+    }
+    let existing: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT company_id, cleared_on FROM bank_clearances WHERE posting_id = ?1",
+            [posting],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if existing
+        .as_ref()
+        .is_some_and(|(owner, _)| *owner != company)
+    {
+        return Err(Error::Validation(
+            "Clearance has an inconsistent company".into(),
+        ));
+    }
+    let previous = existing.map(|(_, date)| date);
+    if previous == new_date {
+        return Err(Error::Validation("Clearance has not changed".into()));
+    }
+    conn.execute("INSERT INTO bank_clearance_events(company_id, voucher_id, posting_id, ledger_id, amount, voucher_date, previous_date, new_date, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![company, voucher, posting, ledger, amount, voucher_date, previous, new_date, reason])?;
+    if let Some(value) = new_date {
+        conn.execute("INSERT INTO bank_clearances(posting_id, company_id, cleared_on) VALUES (?1, ?2, ?3) ON CONFLICT(posting_id) DO UPDATE SET cleared_on = excluded.cleared_on", params![posting, company, value])?;
+    } else {
+        conn.execute(
+            "DELETE FROM bank_clearances WHERE posting_id = ?1 AND company_id = ?2",
+            params![posting, company],
+        )?;
+    }
+    Ok(())
+}
+
 impl Store {
+    /// Preview a strict CSV with id,date,description,amount columns.
+    pub fn preview_bank_statement(
+        &self,
+        company: i64,
+        ledger: i64,
+        bytes: &[u8],
+    ) -> Result<StatementPlan> {
+        asset_ledger(&self.conn, company, ledger)?;
+        if bytes.len() > 10 * 1024 * 1024 {
+            return Err(Error::Validation("Statement file exceeds 10 MiB".into()));
+        }
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .flexible(false)
+            .from_reader(bytes);
+        let headers = reader
+            .headers()
+            .map_err(|e| Error::Validation(format!("Cannot read statement header: {e}")))?;
+        if headers.len() != 4
+            || !headers
+                .iter()
+                .zip(["id", "date", "description", "amount"])
+                .all(|(actual, expected)| actual.trim().eq_ignore_ascii_case(expected))
+        {
+            return Err(Error::Validation(
+                "Statement columns must be id,date,description,amount in that order".into(),
+            ));
+        }
+        let mut seen = HashSet::new();
+        let mut stmt = self.conn.prepare("SELECT external_id FROM bank_statement_entries WHERE company_id = ?1 AND ledger_id = ?2")?;
+        for row in stmt.query_map(params![company, ledger], |r| r.get::<_, String>(0))? {
+            seen.insert(row?.trim().to_lowercase());
+        }
+        let mut plan = StatementPlan {
+            company,
+            ledger,
+            rows: Vec::new(),
+            issues: Vec::new(),
+        };
+        for (index, record) in reader.records().enumerate() {
+            if index >= 10_000 {
+                return Err(Error::Validation(
+                    "Statement has more than 10,000 rows".into(),
+                ));
+            }
+            let record = record.map_err(|e| {
+                Error::Validation(format!("Cannot read statement row {}: {e}", index + 2))
+            })?;
+            let id = record[0].trim().to_owned();
+            if id.is_empty() {
+                plan.issues
+                    .push(format!("Row {}: id is required", index + 2));
+                continue;
+            }
+            if !seen.insert(id.to_lowercase()) {
+                plan.issues.push(format!(
+                    "Row {}: id already exists or is repeated",
+                    index + 2
+                ));
+            }
+            let date = match parse_date(&record[1]) {
+                Ok(date) => date.format("%Y-%m-%d").to_string(),
+                Err(_) => {
+                    plan.issues.push(format!("Row {}: invalid date", index + 2));
+                    continue;
+                }
+            };
+            let value = record[3].trim();
+            let amount = if let Some(number) = value.strip_prefix('-') {
+                parse_amount(number).and_then(|v| {
+                    v.checked_neg()
+                        .ok_or_else(|| Error::Validation("Amount is too large".into()))
+                })
+            } else {
+                parse_amount(value.strip_prefix('+').unwrap_or(value))
+            };
+            let amount = match amount {
+                Ok(amount) if amount != 0 => amount,
+                _ => {
+                    plan.issues
+                        .push(format!("Row {}: invalid or zero amount", index + 2));
+                    continue;
+                }
+            };
+            plan.rows.push(StatementRow {
+                external_id: id,
+                date,
+                description: record[2].to_owned(),
+                amount,
+            });
+        }
+        if plan.rows.is_empty() && plan.issues.is_empty() {
+            plan.issues.push("No statement rows found".into());
+        }
+        Ok(plan)
+    }
+    pub fn apply_bank_statement(&mut self, plan: &StatementPlan) -> Result<usize> {
+        if !plan.can_apply() {
+            return Err(Error::Validation(
+                "Resolve statement preview issues first".into(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        asset_ledger(&tx, plan.company, plan.ledger)?;
+        let mut seen = HashSet::new();
+        let mut stmt = tx.prepare("SELECT external_id FROM bank_statement_entries WHERE company_id = ?1 AND ledger_id = ?2")?;
+        for row in stmt.query_map(params![plan.company, plan.ledger], |r| {
+            r.get::<_, String>(0)
+        })? {
+            seen.insert(row?.trim().to_lowercase());
+        }
+        drop(stmt);
+        for row in &plan.rows {
+            if !seen.insert(row.external_id.to_lowercase()) {
+                return Err(Error::Validation(
+                    "A statement id already exists; preview the file again".into(),
+                ));
+            }
+            tx.execute("INSERT INTO bank_statement_entries(company_id, ledger_id, external_id, date, description, amount) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![plan.company, plan.ledger, row.external_id, row.date, row.description, row.amount])?;
+        }
+        tx.commit()?;
+        Ok(plan.rows.len())
+    }
+    pub fn bank_statement_entries(
+        &self,
+        company: i64,
+        ledger: i64,
+        as_of: &str,
+    ) -> Result<Vec<StatementEntry>> {
+        asset_ledger(&self.conn, company, ledger)?;
+        let end = parse_date(as_of)?;
+        let mut stmt = self.conn.prepare("SELECT s.id, s.external_id, s.date, s.description, s.amount, m.posting_id FROM bank_statement_entries s LEFT JOIN bank_matches m ON m.statement_id = s.id AND m.company_id = s.company_id WHERE s.company_id = ?1 AND s.ledger_id = ?2 ORDER BY s.date, s.id")?;
+        let rows = stmt.query_map(params![company, ledger], |r| {
+            Ok(StatementEntry {
+                id: r.get(0)?,
+                external_id: r.get(1)?,
+                date: r.get(2)?,
+                description: r.get(3)?,
+                amount: r.get(4)?,
+                matched_posting: r.get(5)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let entry = row?;
+            if parse_date(&entry.date)? <= end {
+                result.push(entry);
+            }
+        }
+        Ok(result)
+    }
+    pub fn match_bank_statement(
+        &mut self,
+        company: i64,
+        ledger: i64,
+        statement: i64,
+        posting: i64,
+        reason: &str,
+    ) -> Result<()> {
+        let reason = required(reason, "Reason")?;
+        let tx = self.conn.transaction()?;
+        asset_ledger(&tx, company, ledger)?;
+        let (date, amount): (String, i64) = tx.query_row("SELECT date, amount FROM bank_statement_entries WHERE id = ?1 AND company_id = ?2 AND ledger_id = ?3", params![statement, company, ledger], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Statement entry not found in this ledger".into()), other => Error::Database(other) })?;
+        let (voucher, posting_amount): (i64, i64) = tx.query_row("SELECT v.id, p.amount FROM postings p JOIN vouchers v ON v.id = p.voucher_id WHERE p.id = ?1 AND p.ledger_id = ?2 AND v.company_id = ?3", params![posting, ledger, company], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Posting not found in this ledger".into()), other => Error::Database(other) })?;
+        if posting_amount != amount {
+            return Err(Error::Validation(
+                "Statement and posting amounts must match exactly".into(),
+            ));
+        }
+        let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bank_matches WHERE statement_id = ?1 OR posting_id = ?2 UNION ALL SELECT 1 FROM bank_clearances WHERE posting_id = ?2)", params![statement, posting], |r| r.get(0))?;
+        if occupied {
+            return Err(Error::Validation(
+                "Statement entry or posting is already matched or cleared".into(),
+            ));
+        }
+        record_clearance(&tx, company, ledger, posting, Some(&date), reason)?;
+        tx.execute(
+            "INSERT INTO bank_matches(posting_id, statement_id, company_id) VALUES (?1, ?2, ?3)",
+            params![posting, statement, company],
+        )?;
+        tx.execute("INSERT INTO bank_match_events(company_id, statement_id, voucher_id, posting_id, action, reason) VALUES (?1, ?2, ?3, ?4, 'match', ?5)", params![company, statement, voucher, posting, reason])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn unmatch_bank_statement(
+        &mut self,
+        company: i64,
+        ledger: i64,
+        statement: i64,
+        reason: &str,
+    ) -> Result<()> {
+        let reason = required(reason, "Reason")?;
+        let tx = self.conn.transaction()?;
+        asset_ledger(&tx, company, ledger)?;
+        let (posting, voucher, date, clearance): (i64, i64, String, String) = tx.query_row("SELECT m.posting_id, v.id, s.date, c.cleared_on FROM bank_matches m JOIN bank_statement_entries s ON s.id = m.statement_id AND s.company_id = m.company_id JOIN postings p ON p.id = m.posting_id AND p.ledger_id = s.ledger_id JOIN vouchers v ON v.id = p.voucher_id AND v.company_id = s.company_id JOIN bank_clearances c ON c.posting_id = p.id AND c.company_id = s.company_id WHERE m.company_id = ?1 AND s.ledger_id = ?2 AND s.id = ?3", params![company, ledger, statement], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Matching entry not found or inconsistent".into()), other => Error::Database(other) })?;
+        if date != clearance {
+            return Err(Error::Validation(
+                "Matching clearance is inconsistent".into(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM bank_matches WHERE company_id = ?1 AND statement_id = ?2",
+            params![company, statement],
+        )?;
+        record_clearance(&tx, company, ledger, posting, None, reason)?;
+        tx.execute("INSERT INTO bank_match_events(company_id, statement_id, voucher_id, posting_id, action, reason) VALUES (?1, ?2, ?3, ?4, 'unmatch', ?5)", params![company, statement, voucher, posting, reason])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn bank_match_events(&self, company: i64, statement: i64) -> Result<Vec<MatchEvent>> {
+        let mut stmt = self.conn.prepare("SELECT changed_at, action, voucher_id, posting_id, reason FROM bank_match_events WHERE company_id = ?1 AND statement_id = ?2 ORDER BY id DESC")?;
+        let rows = stmt
+            .query_map(params![company, statement], |r| {
+                Ok(MatchEvent {
+                    changed_at: r.get(0)?,
+                    action: r.get(1)?,
+                    voucher_id: r.get(2)?,
+                    posting_id: r.get(3)?,
+                    reason: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
     /// Report book postings through an inclusive date, using current clearance dates.
     pub fn bank_report(&self, company: i64, ledger: i64, as_of: &str) -> Result<BankReport> {
         asset_ledger(&self.conn, company, ledger)?;
@@ -99,7 +428,7 @@ impl Store {
             uncleared: book - cleared,
         })
     }
-    /// Set or remove a clearance; every change records the prior value and posting snapshot.
+    /// Set or remove a manual clearance, retaining a history of changes.
     pub fn set_bank_clearance(
         &mut self,
         company: i64,
@@ -108,49 +437,18 @@ impl Store {
         date: Option<&str>,
         reason: &str,
     ) -> Result<()> {
-        let reason = required(reason, "Reason")?;
-        let new_date = date
-            .map(parse_date)
-            .transpose()?
-            .map(|d| d.format("%Y-%m-%d").to_string());
         let tx = self.conn.transaction()?;
-        asset_ledger(&tx, company, ledger)?;
-        let (voucher, voucher_date, amount): (i64, String, i64) = tx.query_row("SELECT v.id, v.date, p.amount FROM postings p JOIN vouchers v ON v.id = p.voucher_id WHERE p.id = ?1 AND p.ledger_id = ?2 AND v.company_id = ?3", params![posting, ledger, company], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Posting not found in this ledger and company".into()), other => Error::Database(other) })?;
-        if let Some(new_date) = &new_date {
-            if parse_date(new_date)? < parse_date(&voucher_date)? {
-                return Err(Error::Validation(
-                    "Clearance date must not precede the voucher date".into(),
-                ));
-            }
-        }
-        let existing: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT company_id, cleared_on FROM bank_clearances WHERE posting_id = ?1",
-                [posting],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        if existing
-            .as_ref()
-            .is_some_and(|(owner, _)| *owner != company)
-        {
+        let matched: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bank_matches WHERE posting_id = ?1 AND company_id = ?2)",
+            params![posting, company],
+            |r| r.get(0),
+        )?;
+        if matched {
             return Err(Error::Validation(
-                "Clearance has an inconsistent company".into(),
+                "Unmatch the statement entry before changing its clearance".into(),
             ));
         }
-        let previous = existing.map(|(_, date)| date);
-        if previous == new_date {
-            return Err(Error::Validation("Clearance has not changed".into()));
-        }
-        tx.execute("INSERT INTO bank_clearance_events(company_id, voucher_id, posting_id, ledger_id, amount, voucher_date, previous_date, new_date, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![company, voucher, posting, ledger, amount, voucher_date, previous, new_date, reason])?;
-        if let Some(value) = new_date {
-            tx.execute("INSERT INTO bank_clearances(posting_id, company_id, cleared_on) VALUES (?1, ?2, ?3) ON CONFLICT(posting_id) DO UPDATE SET cleared_on = excluded.cleared_on", params![posting, company, value])?;
-        } else {
-            tx.execute(
-                "DELETE FROM bank_clearances WHERE posting_id = ?1 AND company_id = ?2",
-                params![posting, company],
-            )?;
-        }
+        record_clearance(&tx, company, ledger, posting, date, reason)?;
         tx.commit()?;
         Ok(())
     }

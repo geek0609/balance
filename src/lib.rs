@@ -247,7 +247,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=17).contains(&version) {
+    if !(1..=18).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -339,6 +339,9 @@ impl Store {
             "stock_transfers",
             "bank_clearances",
             "bank_clearance_events",
+            "bank_statement_entries",
+            "bank_matches",
+            "bank_match_events",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -356,7 +359,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 17 {
+        if version > 18 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -507,6 +510,13 @@ impl Store {
                 CREATE TABLE bank_clearance_events(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), voucher_id INTEGER NOT NULL REFERENCES vouchers(id), posting_id INTEGER NOT NULL, ledger_id INTEGER NOT NULL REFERENCES ledgers(id), amount INTEGER NOT NULL, voucher_date TEXT NOT NULL, previous_date TEXT, new_date TEXT, reason TEXT NOT NULL, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
                 CREATE INDEX bank_clearance_events_voucher ON bank_clearance_events(company_id, voucher_id, id);
                 PRAGMA user_version = 17;")?;
+        }
+        if version < 18 {
+            tx.execute_batch("CREATE TABLE bank_statement_entries(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), external_id TEXT NOT NULL, date TEXT NOT NULL, description TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount != 0), UNIQUE(company_id, ledger_id, external_id));
+                CREATE INDEX bank_statement_ledger ON bank_statement_entries(company_id, ledger_id, date);
+                CREATE TABLE bank_matches(posting_id INTEGER PRIMARY KEY REFERENCES postings(id), statement_id INTEGER NOT NULL UNIQUE REFERENCES bank_statement_entries(id), company_id INTEGER NOT NULL REFERENCES companies(id));
+                CREATE TABLE bank_match_events(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), statement_id INTEGER NOT NULL REFERENCES bank_statement_entries(id), voucher_id INTEGER NOT NULL REFERENCES vouchers(id), posting_id INTEGER NOT NULL, action TEXT NOT NULL CHECK(action IN ('match', 'unmatch')), reason TEXT NOT NULL, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                PRAGMA user_version = 18;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1369,7 +1379,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use balance::banking::StatementPlan;
 use balance::contacts::LedgerProfile;
 use balance::exchange::ImportPlan;
 use balance::inventory::{
@@ -64,6 +65,10 @@ struct App {
     bank_posting: Option<i64>,
     bank_clearance_date: String,
     bank_reason: String,
+    bank_csv_path: String,
+    bank_csv_preview: Option<StatementPlan>,
+    bank_statement_selection: Option<i64>,
+    bank_match_reason: String,
     import_path: String,
     import_opening_date: String,
     backup_path: String,
@@ -198,6 +203,10 @@ impl App {
             bank_posting: None,
             bank_clearance_date: String::new(),
             bank_reason: String::new(),
+            bank_csv_path: String::new(),
+            bank_csv_preview: None,
+            bank_statement_selection: None,
+            bank_match_reason: String::new(),
             import_path: String::new(),
             import_opening_date: String::new(),
             backup_path: String::new(),
@@ -281,6 +290,9 @@ impl App {
         self.bank_posting = None;
         self.bank_clearance_date.clear();
         self.bank_reason.clear();
+        self.bank_csv_preview = None;
+        self.bank_statement_selection = None;
+        self.bank_match_reason.clear();
         self.opening_date.clear();
         self.opening_amount.clear();
         self.import_preview = None;
@@ -2264,6 +2276,8 @@ impl App {
         );
         if before != self.bank_ledger {
             self.bank_posting = None;
+            self.bank_csv_preview = None;
+            self.bank_statement_selection = None;
         }
         ui.horizontal(|ui| {
             ui.label("As of");
@@ -2317,6 +2331,10 @@ impl App {
                     ui.end_row();
                 }
             });
+        let selected_posting = self
+            .bank_posting
+            .filter(|id| report.entries.iter().any(|entry| entry.posting_id == *id));
+        self.bank_statement_page(ui, company, ledger, selected_posting);
         let Some(entry) = report
             .entries
             .iter()
@@ -2394,6 +2412,218 @@ impl App {
                                 event.voucher_date,
                                 event.previous_date.as_deref().unwrap_or("not cleared"),
                                 event.new_date.as_deref().unwrap_or("not cleared"),
+                                event.reason
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                    }
+                }
+            });
+    }
+    fn bank_statement_page(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        ledger: i64,
+        posting: Option<i64>,
+    ) {
+        ui.separator();
+        ui.heading("Statement entries");
+        ui.small("CSV columns: id,date,description,amount. Dates use YYYY-MM-DD; deposits are positive and withdrawals negative. IDs must be unique for this ledger. Matching requires the exact amount and a statement date on or after the voucher date.");
+        ui.horizontal(|ui| {
+            ui.label("CSV file");
+            if ui
+                .add(egui::TextEdit::singleline(&mut self.bank_csv_path).desired_width(360.0))
+                .changed()
+            {
+                self.bank_csv_preview = None;
+            }
+        });
+        if ui.button("Preview statement").clicked() {
+            self.bank_csv_preview = None;
+            let result = (|| -> balance::Result<StatementPlan> {
+                let path = std::path::Path::new(self.bank_csv_path.trim());
+                let metadata = std::fs::metadata(path).map_err(|e| {
+                    balance::Error::Validation(format!("Cannot read statement: {e}"))
+                })?;
+                if !metadata.is_file() || metadata.len() > 10 * 1024 * 1024 {
+                    return Err(balance::Error::Validation(
+                        "Choose a file no larger than 10 MiB".into(),
+                    ));
+                }
+                use std::io::Read;
+                let file = std::fs::File::open(path).map_err(|e| {
+                    balance::Error::Validation(format!("Cannot read statement: {e}"))
+                })?;
+                let mut bytes = Vec::new();
+                file.take(10 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| {
+                        balance::Error::Validation(format!("Cannot read statement: {e}"))
+                    })?;
+                self.store.preview_bank_statement(company, ledger, &bytes)
+            })();
+            match result {
+                Ok(plan) => {
+                    self.bank_csv_preview = Some(plan);
+                    self.message.clear();
+                }
+                Err(e) => self.failure(e),
+            }
+        }
+        if let Some(plan) = &self.bank_csv_preview {
+            ui.label(format!("Preview: {} entries", plan.row_count()));
+            for issue in plan.issues().iter().take(100) {
+                ui.colored_label(Color32::from_rgb(155, 55, 35), issue);
+            }
+            if plan.issues().len() > 100 {
+                ui.label("Additional issues are not shown.");
+            }
+            egui::CollapsingHeader::new("Review preview rows").show(ui, |ui| {
+                for row in plan.rows().iter().take(100) {
+                    ui.label(format!(
+                        "{} | {} | {} | {}",
+                        row.external_id,
+                        row.date,
+                        row.description,
+                        format_amount(row.amount)
+                    ));
+                }
+                if plan.row_count() > 100 {
+                    ui.label("Only the first 100 rows are shown.");
+                }
+            });
+            if ui
+                .add_enabled(
+                    plan.can_apply() && plan.company() == company && plan.ledger() == ledger,
+                    egui::Button::new("Import statement preview"),
+                )
+                .clicked()
+            {
+                match self.store.apply_bank_statement(plan) {
+                    Ok(count) => {
+                        self.message = format!("Imported {count} statement entries");
+                        self.bank_csv_preview = None;
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        }
+        let entries = match self
+            .store
+            .bank_statement_entries(company, ledger, &self.bank_as_of)
+        {
+            Ok(entries) => entries,
+            Err(e) => {
+                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                return;
+            }
+        };
+        egui::Grid::new("bank-statement")
+            .striped(true)
+            .show(ui, |ui| {
+                for title in [
+                    "Select",
+                    "ID",
+                    "Date",
+                    "Description",
+                    "Amount",
+                    "Matched posting",
+                ] {
+                    ui.strong(title);
+                }
+                ui.end_row();
+                for entry in &entries {
+                    ui.selectable_value(
+                        &mut self.bank_statement_selection,
+                        Some(entry.id),
+                        "Select",
+                    );
+                    ui.label(&entry.external_id);
+                    ui.label(&entry.date);
+                    ui.label(&entry.description);
+                    ui.label(format_amount(entry.amount));
+                    ui.label(
+                        entry
+                            .matched_posting
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "—".into()),
+                    );
+                    ui.end_row();
+                }
+            });
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| Some(entry.id) == self.bank_statement_selection)
+        else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label("Match reason");
+            ui.text_edit_singleline(&mut self.bank_match_reason);
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    entry.matched_posting.is_none() && posting.is_some(),
+                    egui::Button::new("Match selected posting"),
+                )
+                .clicked()
+            {
+                if let Some(posting) = posting {
+                    match self.store.match_bank_statement(
+                        company,
+                        ledger,
+                        entry.id,
+                        posting,
+                        &self.bank_match_reason,
+                    ) {
+                        Ok(()) => {
+                            self.bank_match_reason.clear();
+                            self.message = "Statement entry matched".into();
+                        }
+                        Err(e) => self.failure(e),
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    entry.matched_posting.is_some(),
+                    egui::Button::new("Remove statement match"),
+                )
+                .clicked()
+            {
+                match self.store.unmatch_bank_statement(
+                    company,
+                    ledger,
+                    entry.id,
+                    &self.bank_match_reason,
+                ) {
+                    Ok(()) => {
+                        self.bank_match_reason.clear();
+                        self.message = "Statement match removed".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        });
+        egui::CollapsingHeader::new("Statement match history")
+            .id_salt(("statement-match-history", entry.id))
+            .show(ui, |ui| {
+                match self.store.bank_match_events(company, entry.id) {
+                    Ok(events) if events.is_empty() => {
+                        ui.label("No matching changes.");
+                    }
+                    Ok(events) => {
+                        for event in events {
+                            ui.label(format!(
+                                "{} UTC — {} voucher {} posting {} — {}",
+                                event.changed_at,
+                                event.action,
+                                event.voucher_id,
+                                event.posting_id,
                                 event.reason
                             ));
                         }
