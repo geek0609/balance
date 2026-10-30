@@ -21,6 +21,7 @@ enum Page {
     Backup,
     DayBook,
     Outstanding,
+    Bank,
     Reports,
 }
 struct App {
@@ -58,6 +59,11 @@ struct App {
     day_kind: Option<VoucherKind>,
     day_search: String,
     outstanding_date: String,
+    bank_ledger: Option<i64>,
+    bank_as_of: String,
+    bank_posting: Option<i64>,
+    bank_clearance_date: String,
+    bank_reason: String,
     import_path: String,
     import_opening_date: String,
     backup_path: String,
@@ -187,6 +193,11 @@ impl App {
             day_kind: None,
             day_search: String::new(),
             outstanding_date: String::new(),
+            bank_ledger: None,
+            bank_as_of: String::new(),
+            bank_posting: None,
+            bank_clearance_date: String::new(),
+            bank_reason: String::new(),
             import_path: String::new(),
             import_opening_date: String::new(),
             backup_path: String::new(),
@@ -266,6 +277,10 @@ impl App {
         self.ledger_profile = LedgerProfile::default();
         self.profile_original = LedgerProfile::default();
         self.opening_ledger = None;
+        self.bank_ledger = None;
+        self.bank_posting = None;
+        self.bank_clearance_date.clear();
+        self.bank_reason.clear();
         self.opening_date.clear();
         self.opening_amount.clear();
         self.import_preview = None;
@@ -2225,6 +2240,170 @@ impl App {
         }
         ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, unvalued stock items and a restricted form of item invoice. Invoice import requires one matching new bill reference, one trade ledger and no additional ledger entries; tax, batches, locations, other bill allocations, valued opening stock, statutory tax information and other unsupported fields block import. Import has not been verified against representative exports.");
     }
+    fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.heading("Bank clearance");
+        ui.label("Manually record clearance dates for postings in a cash or bank asset ledger. Compare these with your bank statement; a cleared balance is calculated from marked book entries, not imported from the bank.");
+        let ledgers = match self.store.ledgers(company) {
+            Ok(values) => values
+                .into_iter()
+                .filter(|ledger| ledger.category == Category::Asset)
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        let before = self.bank_ledger;
+        pick_account(
+            ui,
+            "bank-ledger",
+            "Asset ledger",
+            &ledgers,
+            &mut self.bank_ledger,
+            false,
+        );
+        if before != self.bank_ledger {
+            self.bank_posting = None;
+        }
+        ui.horizontal(|ui| {
+            ui.label("As of");
+            ui.add(egui::TextEdit::singleline(&mut self.bank_as_of).hint_text("YYYY-MM-DD"));
+        });
+        let Some(ledger) = self.bank_ledger else {
+            ui.label("Select an asset ledger.");
+            return;
+        };
+        if self.bank_as_of.trim().is_empty() {
+            ui.label("Enter an as-of date.");
+            return;
+        }
+        let report = match self.store.bank_report(company, ledger, &self.bank_as_of) {
+            Ok(report) => report,
+            Err(e) => {
+                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                return;
+            }
+        };
+        ui.label(format!(
+            "Book balance: {}    Cleared postings: {}    Uncleared difference: {}",
+            money(report.book_balance),
+            money(report.cleared_balance),
+            money(report.uncleared)
+        ));
+        ui.small("Balances are debit minus credit. Past reports use the current clearance dates; revisions do not reconstruct past states.");
+        egui::Grid::new("bank-postings")
+            .striped(true)
+            .show(ui, |ui| {
+                for title in [
+                    "Select",
+                    "Date",
+                    "Voucher",
+                    "Reference",
+                    "Narration",
+                    "Amount",
+                    "Cleared on",
+                ] {
+                    ui.strong(title);
+                }
+                ui.end_row();
+                for entry in &report.entries {
+                    ui.selectable_value(&mut self.bank_posting, Some(entry.posting_id), "Select");
+                    ui.label(&entry.date);
+                    ui.label(entry.voucher_id.to_string());
+                    ui.label(&entry.reference);
+                    ui.label(&entry.narration);
+                    ui.label(format_amount(entry.amount));
+                    ui.label(entry.cleared_on.as_deref().unwrap_or("—"));
+                    ui.end_row();
+                }
+            });
+        let Some(entry) = report
+            .entries
+            .iter()
+            .find(|entry| Some(entry.posting_id) == self.bank_posting)
+        else {
+            return;
+        };
+        ui.separator();
+        ui.label(format!(
+            "Selected posting {} in voucher {}",
+            entry.posting_id, entry.voucher_id
+        ));
+        ui.horizontal(|ui| {
+            ui.label("Clearance date");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.bank_clearance_date).hint_text("YYYY-MM-DD"),
+            );
+            ui.label("Reason");
+            ui.text_edit_singleline(&mut self.bank_reason);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Set clearance date").clicked() {
+                match self.store.set_bank_clearance(
+                    company,
+                    ledger,
+                    entry.posting_id,
+                    Some(self.bank_clearance_date.trim()),
+                    &self.bank_reason,
+                ) {
+                    Ok(()) => {
+                        self.bank_reason.clear();
+                        self.message = "Clearance saved".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+            if ui
+                .add_enabled(
+                    entry.cleared_on.is_some(),
+                    egui::Button::new("Remove clearance"),
+                )
+                .clicked()
+            {
+                match self.store.set_bank_clearance(
+                    company,
+                    ledger,
+                    entry.posting_id,
+                    None,
+                    &self.bank_reason,
+                ) {
+                    Ok(()) => {
+                        self.bank_reason.clear();
+                        self.message = "Clearance removed".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        });
+        ui.small("Remove a clearance before editing its voucher. The clearance history remains attached to the voucher.");
+        egui::CollapsingHeader::new("Voucher clearance history")
+            .id_salt(("bank-history", entry.voucher_id))
+            .show(ui, |ui| {
+                match self.store.clearance_events(company, entry.voucher_id) {
+                    Ok(events) if events.is_empty() => {
+                        ui.label("No clearance changes.");
+                    }
+                    Ok(events) => {
+                        for event in events {
+                            ui.label(format!(
+                                "{} UTC — posting {} / {} / {} / voucher date {}: {} → {} — {}",
+                                event.changed_at,
+                                event.posting_id,
+                                event.ledger,
+                                format_amount(event.amount),
+                                event.voucher_date,
+                                event.previous_date.as_deref().unwrap_or("not cleared"),
+                                event.new_date.as_deref().unwrap_or("not cleared"),
+                                event.reason
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                    }
+                }
+            });
+    }
     fn outstanding_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Outstanding invoices");
         ui.label("Age is measured from the invoice date; overdue days are measured from the optional due date. Credit notes and unallocated payments are not included. Past reports use the invoice's current details and due date.");
@@ -2586,6 +2765,7 @@ impl eframe::App for App {
                 ("Ledger activity", Page::Register),
                 ("Day book", Page::DayBook),
                 ("Outstanding", Page::Outstanding),
+                ("Bank clearance", Page::Bank),
                 ("Stock", Page::Stock),
                 ("Invoices", Page::Invoice),
                 ("Import XML", Page::Import),
@@ -2623,6 +2803,7 @@ impl eframe::App for App {
                     Page::Register => self.register_page(ui, company),
                     Page::DayBook => self.day_book_page(ui, company),
                     Page::Outstanding => self.outstanding_page(ui, company),
+                    Page::Bank => self.bank_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),
                     Page::Invoice => self.invoice_page(ui, company),
                     Page::Import => self.import_page(ui, company),

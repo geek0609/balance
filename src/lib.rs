@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use std::{collections::HashMap, path::Path, str::FromStr};
 use thiserror::Error;
+pub mod banking;
 pub mod contacts;
 pub mod exchange;
 pub mod inventory;
@@ -246,7 +247,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=16).contains(&version) {
+    if !(1..=17).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -336,6 +337,8 @@ impl Store {
             "stock_item_revisions",
             "stock_locations",
             "stock_transfers",
+            "bank_clearances",
+            "bank_clearance_events",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -353,7 +356,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 16 {
+        if version > 17 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -498,6 +501,12 @@ impl Store {
                 ALTER TABLE invoice_settlements_new RENAME TO invoice_settlements;
                 CREATE INDEX settlements_invoice ON invoice_settlements(invoice_id, id);
                 PRAGMA user_version = 16;")?;
+        }
+        if version < 17 {
+            tx.execute_batch("CREATE TABLE bank_clearances(posting_id INTEGER PRIMARY KEY REFERENCES postings(id), company_id INTEGER NOT NULL REFERENCES companies(id), cleared_on TEXT NOT NULL);
+                CREATE TABLE bank_clearance_events(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), voucher_id INTEGER NOT NULL REFERENCES vouchers(id), posting_id INTEGER NOT NULL, ledger_id INTEGER NOT NULL REFERENCES ledgers(id), amount INTEGER NOT NULL, voucher_date TEXT NOT NULL, previous_date TEXT, new_date TEXT, reason TEXT NOT NULL, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE INDEX bank_clearance_events_voucher ON bank_clearance_events(company_id, voucher_id, id);
+                PRAGMA user_version = 17;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -755,6 +764,7 @@ impl Store {
                 "Linked postings cannot be edited from the voucher screen".into(),
             ));
         }
+        banking::ensure_no_bank_clearance(&tx, company_id, voucher_id)?;
         let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
         if saved != 1 {
             return Err(Error::Validation(
@@ -1359,7 +1369,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

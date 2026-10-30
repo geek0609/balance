@@ -102,6 +102,7 @@ pub(crate) fn save_opening_in_transaction(
         )
         .optional()?;
     let voucher_id = if let Some(id) = existing {
+        crate::banking::ensure_no_bank_clearance(conn, company, id)?;
         conn.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![id, company])?;
         let revision = conn.last_insert_rowid();
         conn.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![revision, id])?;

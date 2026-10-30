@@ -1217,6 +1217,7 @@ impl Store {
                 "An invoice with receipts or payments cannot yet be edited".into(),
             ));
         }
+        crate::banking::ensure_no_bank_clearance(&tx, company_id, voucher_id)?;
         let prepared = prepare_invoice(&tx, company_id, draft, Some(invoice_id))?;
         let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
         if saved != 1 {
