@@ -350,6 +350,21 @@ fn write_invoice_lines(
     }
     Ok(())
 }
+/// Insert an invoice using the caller's transaction, including its stock lines and voucher.
+pub(crate) fn insert_invoice_on_connection(
+    conn: &Connection,
+    company_id: i64,
+    draft: &InvoiceDraft,
+) -> Result<(i64, i64)> {
+    let prepared = prepare_invoice(conn, company_id, draft, None)?;
+    conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim()])?;
+    let voucher_id = conn.last_insert_rowid();
+    write_postings(conn, voucher_id, &prepared.postings)?;
+    conn.execute("INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![company_id, voucher_id, draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount])?;
+    let invoice_id = conn.last_insert_rowid();
+    write_invoice_lines(conn, invoice_id, &draft.lines, &prepared.amounts)?;
+    Ok((invoice_id, voucher_id))
+}
 fn ledger_category(conn: &Connection, company_id: i64, ledger_id: i64) -> Result<Category> {
     let value: String = conn
         .query_row(
@@ -828,13 +843,7 @@ impl Store {
     /// Atomically creates the invoice, stock movements and balanced voucher.
     pub fn create_invoice(&mut self, company_id: i64, draft: &InvoiceDraft) -> Result<i64> {
         let tx = self.conn.transaction()?;
-        let prepared = prepare_invoice(&tx, company_id, draft, None)?;
-        tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim()])?;
-        let voucher_id = tx.last_insert_rowid();
-        write_postings(&tx, voucher_id, &prepared.postings)?;
-        tx.execute("INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![company_id, voucher_id, draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount])?;
-        let invoice_id = tx.last_insert_rowid();
-        write_invoice_lines(&tx, invoice_id, &draft.lines, &prepared.amounts)?;
+        let (invoice_id, _) = insert_invoice_on_connection(&tx, company_id, draft)?;
         tx.commit()?;
         Ok(invoice_id)
     }

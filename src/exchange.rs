@@ -1,7 +1,10 @@
 //! Import of a limited accounting XML interchange format.
 //! Unsupported or ambiguous data is reported before any database writes.
 use crate::contacts::{insert_new_profile, LedgerProfile};
-use crate::inventory::{check_quantity_precision, create_stock_item_on_connection, parse_quantity};
+use crate::inventory::{
+    check_quantity_precision, create_stock_item_on_connection, insert_invoice_on_connection,
+    line_amount, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine,
+};
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
     Store, VoucherKind,
@@ -66,6 +69,28 @@ struct Transaction {
     lines: Vec<Line>,
     metadata: SourceMetadata,
 }
+#[derive(Debug, Clone)]
+struct ImportedInvoiceLine {
+    item: String,
+    existing_item_id: Option<i64>,
+    unit: String,
+    precision: u8,
+    quantity: i64,
+    unit_price: i64,
+}
+#[derive(Debug, Clone)]
+struct ImportedInvoice {
+    kind: InvoiceKind,
+    date: String,
+    reference: String,
+    narration: String,
+    party: String,
+    existing_party_id: Option<i64>,
+    trade: String,
+    existing_trade_id: Option<i64>,
+    lines: Vec<ImportedInvoiceLine>,
+    metadata: SourceMetadata,
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SourceMetadata {
     guid: String,
@@ -103,6 +128,7 @@ pub struct ImportPlan {
     stock_groups: Vec<StockGroupImport>,
     items: Vec<Item>,
     transactions: Vec<Transaction>,
+    invoices: Vec<ImportedInvoice>,
     issues: Vec<String>,
 }
 impl ImportPlan {
@@ -114,6 +140,9 @@ impl ImportPlan {
     }
     pub fn voucher_count(&self) -> usize {
         self.transactions.len()
+    }
+    pub fn invoice_count(&self) -> usize {
+        self.invoices.len()
     }
     pub fn opening_count(&self) -> usize {
         self.accounts.iter().filter(|a| a.opening.is_some()).count()
@@ -146,7 +175,8 @@ impl ImportPlan {
                 || !self.stock_groups.is_empty()
                 || !self.items.is_empty()
                 || !self.accounts.is_empty()
-                || !self.transactions.is_empty())
+                || !self.transactions.is_empty()
+                || !self.invoices.is_empty())
     }
 }
 #[derive(Debug, Clone, Copy)]
@@ -154,6 +184,7 @@ pub struct ImportCounts {
     pub groups: usize,
     pub ledgers: usize,
     pub vouchers: usize,
+    pub invoices: usize,
     pub units: usize,
     pub stock_groups: usize,
     pub items: usize,
@@ -532,6 +563,334 @@ fn xml_stock_quantity(value: &str, unit: &str) -> Result<i64> {
         parse_quantity(number)
     }
 }
+fn invoice_field(node: Node<'_, '_>, field: &str) -> Result<String> {
+    direct_text(node, field)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::Validation(format!("missing {field}")))
+}
+fn invoice_side(node: Node<'_, '_>, field: &str, debit: bool) -> Result<()> {
+    if let Some(value) = direct_text(node, field).filter(|v| !v.is_empty()) {
+        if !value.eq_ignore_ascii_case(if debit { "yes" } else { "no" }) {
+            return Err(Error::Validation(format!(
+                "{field} conflicts with the amount"
+            )));
+        }
+    }
+    Ok(())
+}
+fn invoice_list_fields(
+    node: Node<'_, '_>,
+    allowed: &[&str],
+    label: &str,
+    issues: &mut Vec<String>,
+) {
+    check_fields(node, allowed, label, issues);
+    if node.attributes().any(|a| !a.value().trim().is_empty()) {
+        issues.push(format!(
+            "{label}: attributes on {} are not supported",
+            local_name(node)
+        ));
+    }
+}
+/// Parse only invoices whose party, item accounting, amounts and bill reference
+/// can all be represented without dropping information.
+fn parse_imported_invoice(
+    node: Node<'_, '_>,
+    label: &str,
+    metadata: SourceMetadata,
+    ledgers: &HashMap<String, (Option<i64>, Category)>,
+    items: &HashMap<String, (Option<i64>, String, u8)>,
+    issues: &mut Vec<String>,
+) -> Result<ImportedInvoice> {
+    check_fields(
+        node,
+        &[
+            "DATE",
+            "VOUCHERTYPENAME",
+            "VOUCHERNUMBER",
+            "NARRATION",
+            "PERSISTEDVIEW",
+            "OBJVIEW",
+            "ISINVOICE",
+            "LEDGERENTRIES.LIST",
+            "ALLLEDGERENTRIES.LIST",
+            "ALLINVENTORYENTRIES.LIST",
+        ],
+        label,
+        issues,
+    );
+    if node
+        .attributes()
+        .any(|a| a.name().eq_ignore_ascii_case("NAME") && !a.value().trim().is_empty())
+    {
+        issues.push(format!("{label}: voucher name attribute is not supported"));
+    }
+    for field in ["PERSISTEDVIEW", "OBJVIEW"] {
+        if direct_text(node, field)
+            .is_some_and(|v| !v.is_empty() && !v.eq_ignore_ascii_case("Invoice Voucher View"))
+        {
+            return Err(Error::Validation(format!("unsupported {field}")));
+        }
+    }
+    let voucher_kind = parse_kind(&invoice_field(node, "VOUCHERTYPENAME")?)
+        .ok_or_else(|| Error::Validation("unsupported invoice type".into()))?;
+    let kind = match voucher_kind {
+        VoucherKind::Sales => InvoiceKind::Sale,
+        VoucherKind::Purchase => InvoiceKind::Purchase,
+        _ => {
+            return Err(Error::Validation(
+                "only sales and purchase item invoices are supported".into(),
+            ))
+        }
+    };
+    let date = xml_date(&invoice_field(node, "DATE")?)?;
+    if let Some(attr) = node
+        .attributes()
+        .find(|a| a.name().eq_ignore_ascii_case("DATE"))
+    {
+        if xml_date(attr.value())? != date {
+            return Err(Error::Validation("conflicting dates".into()));
+        }
+    }
+    if let Some(attr) = node
+        .attributes()
+        .find(|a| a.name().eq_ignore_ascii_case("VCHTYPE"))
+    {
+        if parse_kind(attr.value()) != Some(voucher_kind) {
+            return Err(Error::Validation("conflicting invoice types".into()));
+        }
+    }
+    let reference = invoice_field(node, "VOUCHERNUMBER")?;
+    let entries: Vec<_> = node
+        .children()
+        .filter(|n| {
+            n.is_element()
+                && ["LEDGERENTRIES.LIST", "ALLLEDGERENTRIES.LIST"]
+                    .iter()
+                    .any(|tag| local_name(*n).eq_ignore_ascii_case(tag))
+        })
+        .collect();
+    if entries
+        .iter()
+        .any(|n| local_name(*n).eq_ignore_ascii_case("LEDGERENTRIES.LIST"))
+        && entries
+            .iter()
+            .any(|n| local_name(*n).eq_ignore_ascii_case("ALLLEDGERENTRIES.LIST"))
+    {
+        return Err(Error::Validation(
+            "multiple ledger entry representations".into(),
+        ));
+    }
+    let mut party: Option<(String, i64)> = None;
+    let party_debit = kind == InvoiceKind::Sale;
+    for entry in entries {
+        invoice_list_fields(
+            entry,
+            &[
+                "LEDGERNAME",
+                "AMOUNT",
+                "ISDEEMEDPOSITIVE",
+                "ISLASTDEEMEDPOSITIVE",
+                "ISPARTYLEDGER",
+                "BILLALLOCATIONS.LIST",
+            ],
+            label,
+            issues,
+        );
+        let ledger = invoice_field(entry, "LEDGERNAME")?;
+        let (_, category) = ledgers
+            .get(&normalized(&ledger))
+            .ok_or_else(|| Error::Validation(format!("ledger {ledger} is unavailable")))?;
+        let amount = xml_amount(&invoice_field(entry, "AMOUNT")?)?;
+        if amount == 0 {
+            return Err(Error::Validation("zero ledger amount".into()));
+        }
+        invoice_side(entry, "ISDEEMEDPOSITIVE", amount > 0)?;
+        invoice_side(entry, "ISLASTDEEMEDPOSITIVE", amount > 0)?;
+        let is_party = match direct_text(entry, "ISPARTYLEDGER").as_deref() {
+            Some(v) if v.eq_ignore_ascii_case("yes") => true,
+            Some(v) if v.eq_ignore_ascii_case("no") || v.is_empty() => false,
+            None => false,
+            _ => return Err(Error::Validation("invalid party flag".into())),
+        };
+        if !matches!(category, Category::Asset | Category::Liability) {
+            return Err(Error::Validation(
+                "party ledger must be an asset or liability".into(),
+            ));
+        }
+        let bills: Vec<_> = entry
+            .children()
+            .filter(|n| {
+                n.is_element() && local_name(*n).eq_ignore_ascii_case("BILLALLOCATIONS.LIST")
+            })
+            .collect();
+        if is_party {
+            if party.is_some() || (amount > 0) != party_debit || bills.len() != 1 {
+                return Err(Error::Validation(
+                    "invoice needs one party and one new bill reference with the correct direction"
+                        .into(),
+                ));
+            }
+            let bill = bills[0];
+            invoice_list_fields(bill, &["NAME", "BILLTYPE", "AMOUNT"], label, issues);
+            if invoice_field(bill, "NAME")? != reference
+                || !invoice_field(bill, "BILLTYPE")?.eq_ignore_ascii_case("New Ref")
+                || xml_amount(&invoice_field(bill, "AMOUNT")?)? != amount
+            {
+                return Err(Error::Validation(
+                    "bill reference does not match the invoice".into(),
+                ));
+            }
+            party = Some((ledger, amount));
+        } else {
+            return Err(Error::Validation(
+                "additional invoice ledger entries are not yet supported".into(),
+            ));
+        }
+    }
+    let (party_name, party_amount) =
+        party.ok_or_else(|| Error::Validation("party ledger is missing".into()))?;
+    let mut lines = Vec::new();
+    let mut trade: Option<String> = None;
+    let mut subtotal = 0_i128;
+    for item_node in node.children().filter(|n| {
+        n.is_element() && local_name(*n).eq_ignore_ascii_case("ALLINVENTORYENTRIES.LIST")
+    }) {
+        invoice_list_fields(
+            item_node,
+            &[
+                "STOCKITEMNAME",
+                "ISDEEMEDPOSITIVE",
+                "RATE",
+                "AMOUNT",
+                "ACTUALQTY",
+                "BILLEDQTY",
+                "ACCOUNTINGALLOCATIONS.LIST",
+            ],
+            label,
+            issues,
+        );
+        let name = invoice_field(item_node, "STOCKITEMNAME")?;
+        let (existing_item_id, unit, precision) = items
+            .get(&normalized(&name))
+            .ok_or_else(|| Error::Validation(format!("stock item {name} is unavailable")))?;
+        let actual = xml_stock_quantity(&invoice_field(item_node, "ACTUALQTY")?, unit)?;
+        let billed = xml_stock_quantity(&invoice_field(item_node, "BILLEDQTY")?, unit)?;
+        if actual != billed || actual == 0 || (actual < 0 && kind == InvoiceKind::Purchase) {
+            return Err(Error::Validation(
+                "actual and billed quantities must match the supported stock direction".into(),
+            ));
+        }
+        let quantity = actual
+            .checked_abs()
+            .ok_or_else(|| Error::Validation("quantity is too large".into()))?;
+        if quantity % 10_i64.pow(u32::from(3 - *precision)) != 0 {
+            return Err(Error::Validation("quantity exceeds unit precision".into()));
+        }
+        let rate = invoice_field(item_node, "RATE")?;
+        let (price, rate_unit) = rate
+            .split_once('/')
+            .ok_or_else(|| Error::Validation("rate must specify the base unit".into()))?;
+        if normalized(rate_unit) != normalized(unit) {
+            return Err(Error::Validation("rate uses another unit".into()));
+        }
+        let unit_price = parse_amount(price)?;
+        let amount = line_amount(quantity, unit_price)?;
+        if amount == 0 {
+            return Err(Error::Validation(
+                "zero-value item lines are not supported".into(),
+            ));
+        }
+        let source_amount = xml_amount(&invoice_field(item_node, "AMOUNT")?)?;
+        let expected = if party_debit { -amount } else { amount };
+        if source_amount != expected {
+            return Err(Error::Validation(
+                "item amount differs from quantity and rate".into(),
+            ));
+        }
+        invoice_side(item_node, "ISDEEMEDPOSITIVE", expected > 0)?;
+        let allocations: Vec<_> = item_node
+            .children()
+            .filter(|n| {
+                n.is_element() && local_name(*n).eq_ignore_ascii_case("ACCOUNTINGALLOCATIONS.LIST")
+            })
+            .collect();
+        if allocations.len() != 1 {
+            return Err(Error::Validation(
+                "each item needs exactly one accounting allocation".into(),
+            ));
+        }
+        let allocation = allocations[0];
+        invoice_list_fields(
+            allocation,
+            &["LEDGERNAME", "AMOUNT", "ISDEEMEDPOSITIVE"],
+            label,
+            issues,
+        );
+        let ledger = invoice_field(allocation, "LEDGERNAME")?;
+        let (_, category) = ledgers
+            .get(&normalized(&ledger))
+            .ok_or_else(|| Error::Validation(format!("ledger {ledger} is unavailable")))?;
+        if (kind == InvoiceKind::Sale && *category != Category::Income)
+            || (kind == InvoiceKind::Purchase
+                && !matches!(category, Category::Expense | Category::Asset))
+        {
+            return Err(Error::Validation(
+                "item accounting ledger has an incompatible category".into(),
+            ));
+        }
+        if xml_amount(&invoice_field(allocation, "AMOUNT")?)? != expected {
+            return Err(Error::Validation(
+                "item accounting allocation differs from the item amount".into(),
+            ));
+        }
+        invoice_side(allocation, "ISDEEMEDPOSITIVE", expected > 0)?;
+        if trade
+            .as_ref()
+            .is_some_and(|existing| normalized(existing) != normalized(&ledger))
+        {
+            return Err(Error::Validation(
+                "multiple trade ledgers are not supported".into(),
+            ));
+        }
+        trade = Some(ledger);
+        subtotal += i128::from(amount);
+        lines.push(ImportedInvoiceLine {
+            item: name,
+            existing_item_id: *existing_item_id,
+            unit: unit.clone(),
+            precision: *precision,
+            quantity,
+            unit_price,
+        });
+    }
+    let trade = trade.ok_or_else(|| Error::Validation("at least one item is required".into()))?;
+    i64::try_from(subtotal).map_err(|_| Error::Validation("invoice amount is too large".into()))?;
+    if i128::from(party_amount).abs() != subtotal {
+        return Err(Error::Validation(
+            "party amount does not equal the item subtotal".into(),
+        ));
+    }
+    if normalized(&party_name) == normalized(&trade) {
+        return Err(Error::Validation(
+            "party and trade ledgers must be different".into(),
+        ));
+    }
+    let existing_party_id = ledgers[&normalized(&party_name)].0;
+    let existing_trade_id = ledgers[&normalized(&trade)].0;
+    Ok(ImportedInvoice {
+        kind,
+        date,
+        reference,
+        narration: direct_text(node, "NARRATION").unwrap_or_default(),
+        party: party_name,
+        existing_party_id,
+        trade,
+        existing_trade_id,
+        lines,
+        metadata,
+    })
+}
 fn find_group(conn: &Connection, company: i64, name: &str) -> Result<Option<(i64, Category)>> {
     let mut stmt =
         conn.prepare("SELECT id, name, category FROM account_groups WHERE company_id = ?1")?;
@@ -565,6 +924,22 @@ fn find_ledger(conn: &Connection, company: i64, name: &str) -> Result<Option<i64
         if normalized(&candidate) == normalized(name) {
             if found.is_some() {
                 return Err(Error::Validation(format!("Ledger {name} is ambiguous")));
+            }
+            found = Some(id);
+        }
+    }
+    Ok(found)
+}
+fn find_stock_item(conn: &Connection, company: i64, name: &str) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare("SELECT id, name FROM stock_items WHERE company_id = ?1")?;
+    let mut found = None;
+    for row in stmt.query_map([company], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (id, candidate) = row?;
+        if normalized(&candidate) == normalized(name) {
+            if found.is_some() {
+                return Err(Error::Validation(format!("Stock item {name} is ambiguous")));
             }
             found = Some(id);
         }
@@ -648,6 +1023,7 @@ impl Store {
             stock_groups: Vec::new(),
             items: Vec::new(),
             transactions: Vec::new(),
+            invoices: Vec::new(),
             issues: Vec::new(),
         };
         let mut seen_metadata = HashSet::<(String, String, String)>::new();
@@ -1203,6 +1579,49 @@ impl Store {
                 metadata,
             });
         }
+        let mut invoice_ledgers: HashMap<String, (Option<i64>, Category)> = self
+            .ledgers(company_id)?
+            .into_iter()
+            .map(|l| (normalized(&l.name), (Some(l.id), l.category)))
+            .collect();
+        invoice_ledgers.extend(
+            plan.accounts
+                .iter()
+                .map(|a| (normalized(&a.name), (None, a.category))),
+        );
+        let mut invoice_items = HashMap::<String, (Option<i64>, String, u8)>::new();
+        for item in self.stock_items(company_id)? {
+            if let Some(precision) = known_units.get(&normalized(&item.unit)) {
+                invoice_items.insert(
+                    normalized(&item.name),
+                    (Some(item.id), item.unit, *precision),
+                );
+            }
+        }
+        invoice_items.extend(plan.items.iter().map(|i| {
+            (
+                normalized(&i.name),
+                (None, i.unit.clone(), i.unit_precision),
+            )
+        }));
+        let mut invoice_references = HashSet::<(String, String, String)>::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT i.kind, l.name, v.reference FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1")?;
+            for row in stmt.query_map([company_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })? {
+                let (kind, party, reference) = row?;
+                invoice_references.insert((
+                    normalized(&kind),
+                    normalized(&party),
+                    normalized(&reference),
+                ));
+            }
+        }
         let mut references: HashSet<(String, String, String)> = self
             .vouchers(company_id)?
             .iter()
@@ -1231,6 +1650,41 @@ impl Store {
                 &mut seen_metadata,
                 &mut plan.issues,
             );
+            if direct_text(node, "ISINVOICE").is_some_and(|v| v.eq_ignore_ascii_case("yes")) {
+                match parse_imported_invoice(
+                    node,
+                    &label,
+                    metadata,
+                    &invoice_ledgers,
+                    &invoice_items,
+                    &mut plan.issues,
+                ) {
+                    Ok(invoice) => {
+                        let voucher_kind = if invoice.kind == InvoiceKind::Sale {
+                            VoucherKind::Sales
+                        } else {
+                            VoucherKind::Purchase
+                        };
+                        if !references.insert((
+                            normalized(voucher_kind.as_str()),
+                            invoice.date.clone(),
+                            normalized(&invoice.reference),
+                        )) {
+                            plan.issues.push(format!("{label}: a voucher with the same type, date and number already exists"));
+                        }
+                        if !invoice_references.insert((
+                            normalized(invoice.kind.as_str()),
+                            normalized(&invoice.party),
+                            normalized(&invoice.reference),
+                        )) {
+                            plan.issues.push(format!("{label}: an invoice with the same type, party and reference already exists"));
+                        }
+                        plan.invoices.push(invoice);
+                    }
+                    Err(e) => plan.issues.push(format!("{label}: {e}")),
+                }
+                continue;
+            }
             check_fields(
                 node,
                 &[
@@ -1404,6 +1858,7 @@ impl Store {
         if plan.groups.is_empty()
             && plan.accounts.is_empty()
             && plan.transactions.is_empty()
+            && plan.invoices.is_empty()
             && plan.units.is_empty()
             && plan.stock_groups.is_empty()
             && plan.items.is_empty()
@@ -1647,11 +2102,99 @@ impl Store {
                 )?;
             }
         }
+        for invoice in &plan.invoices {
+            let voucher_kind = if invoice.kind == InvoiceKind::Sale {
+                VoucherKind::Sales
+            } else {
+                VoucherKind::Purchase
+            };
+            let mut stmt =
+                tx.prepare("SELECT kind, date, reference FROM vouchers WHERE company_id = ?1")?;
+            for row in stmt.query_map([plan.company_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })? {
+                let (kind, date, reference) = row?;
+                if normalized(&kind) == normalized(voucher_kind.as_str())
+                    && xml_date(&date)? == invoice.date
+                    && normalized(&reference) == normalized(&invoice.reference)
+                {
+                    return Err(Error::Validation(format!(
+                        "Voucher {} already exists",
+                        invoice.reference
+                    )));
+                }
+            }
+            drop(stmt);
+            let resolve_ledger = |name: &str, expected: Option<i64>| -> Result<i64> {
+                let id = find_ledger(&tx, plan.company_id, name)?
+                    .ok_or_else(|| Error::Validation(format!("Ledger {name} is missing")))?;
+                if expected.is_some_and(|previous| previous != id) {
+                    return Err(Error::Validation(format!(
+                        "Ledger {name} changed since preview"
+                    )));
+                }
+                Ok(id)
+            };
+            let party_id = resolve_ledger(&invoice.party, invoice.existing_party_id)?;
+            let trade_id = resolve_ledger(&invoice.trade, invoice.existing_trade_id)?;
+            let mut lines = Vec::with_capacity(invoice.lines.len());
+            for line in &invoice.lines {
+                let item_id =
+                    find_stock_item(&tx, plan.company_id, &line.item)?.ok_or_else(|| {
+                        Error::Validation(format!("Stock item {} is missing", line.item))
+                    })?;
+                if line
+                    .existing_item_id
+                    .is_some_and(|previous| previous != item_id)
+                {
+                    return Err(Error::Validation(format!(
+                        "Stock item {} changed since preview",
+                        line.item
+                    )));
+                }
+                let (unit, precision): (String, u8) = tx.query_row("SELECT u.symbol, u.decimal_places FROM stock_items i JOIN stock_units u ON u.id = i.unit_id AND u.company_id = i.company_id WHERE i.id = ?1 AND i.company_id = ?2", params![item_id, plan.company_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                if normalized(&unit) != normalized(&line.unit) || precision != line.precision {
+                    return Err(Error::Validation(format!(
+                        "Unit for {} changed since preview",
+                        line.item
+                    )));
+                }
+                lines.push(InvoiceLine {
+                    item_id,
+                    quantity: line.quantity,
+                    unit_price: line.unit_price,
+                });
+            }
+            let draft = InvoiceDraft {
+                kind: invoice.kind,
+                date: invoice.date.clone(),
+                reference: invoice.reference.clone(),
+                narration: invoice.narration.clone(),
+                party_ledger_id: party_id,
+                trade_ledger_id: trade_id,
+                tax_ledger_id: None,
+                tax_amount: 0,
+                lines,
+            };
+            let (_, voucher_id) = insert_invoice_on_connection(&tx, plan.company_id, &draft)?;
+            save_metadata(
+                &tx,
+                plan.company_id,
+                "voucher",
+                voucher_id,
+                &invoice.metadata,
+            )?;
+        }
         tx.commit()?;
         Ok(ImportCounts {
             groups: plan.groups.len(),
             ledgers: plan.accounts.len(),
             vouchers: plan.transactions.len(),
+            invoices: plan.invoices.len(),
             units: plan.units.len(),
             stock_groups: plan.stock_groups.len(),
             items: plan.items.len(),
