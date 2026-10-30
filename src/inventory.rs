@@ -73,6 +73,16 @@ pub struct InvoiceSummary {
     pub reference: String,
     pub party: String,
     pub total: i128,
+    pub tax_amount: i64,
+    pub lines: Vec<InvoiceDetailLine>,
+}
+#[derive(Debug, Clone)]
+pub struct InvoiceDetailLine {
+    pub item: String,
+    pub unit: String,
+    pub quantity: i64,
+    pub unit_price: i64,
+    pub amount: i64,
 }
 
 pub fn parse_quantity(input: &str) -> Result<i64> {
@@ -386,13 +396,22 @@ impl Store {
         let mut result = Vec::new();
         for row in rows {
             let (id, voucher_id, kind, date, reference, party, tax) = row?;
-            let mut amounts = self
-                .conn
-                .prepare("SELECT amount FROM invoice_lines WHERE invoice_id = ?1")?;
-            let line_amounts = amounts.query_map([id], |r| r.get::<_, i64>(0))?;
+            let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount FROM invoice_lines l JOIN stock_items s ON s.id = l.item_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
+            let line_amounts = amounts.query_map([id], |r| {
+                Ok(InvoiceDetailLine {
+                    item: r.get(0)?,
+                    unit: r.get(1)?,
+                    quantity: r.get(2)?,
+                    unit_price: r.get(3)?,
+                    amount: r.get(4)?,
+                })
+            })?;
             let mut total = i128::from(tax);
-            for amount in line_amounts {
-                total += i128::from(amount?);
+            let mut lines = Vec::new();
+            for line in line_amounts {
+                let line = line?;
+                total += i128::from(line.amount);
+                lines.push(line);
             }
             result.push(InvoiceSummary {
                 id,
@@ -402,6 +421,8 @@ impl Store {
                 reference,
                 party,
                 total,
+                tax_amount: tax,
+                lines,
             });
         }
         Ok(result)

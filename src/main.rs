@@ -2,7 +2,10 @@
 
 use eframe::egui::{self, Color32, RichText};
 use optimus_prime::exchange::ImportPlan;
-use optimus_prime::{format_amount, parse_amount, Category, Posting, Store, VoucherKind};
+use optimus_prime::inventory::{
+    format_quantity, line_amount, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine, StockItem,
+};
+use optimus_prime::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 
 #[derive(PartialEq)]
 enum Page {
@@ -11,6 +14,8 @@ enum Page {
     Voucher,
     Register,
     Import,
+    Stock,
+    Invoice,
     Reports,
 }
 struct App {
@@ -36,7 +41,38 @@ struct App {
     register_to: String,
     import_path: String,
     import_preview: Option<ImportPlan>,
+    stock_name: String,
+    stock_unit: String,
+    stock_as_of: String,
+    adjustment_item: Option<i64>,
+    adjustment_date: String,
+    adjustment_quantity: String,
+    adjustment_increase: bool,
+    adjustment_reason: String,
+    invoice_kind: InvoiceKind,
+    invoice_date: String,
+    invoice_reference: String,
+    invoice_narration: String,
+    invoice_party: Option<i64>,
+    invoice_trade: Option<i64>,
+    invoice_tax_ledger: Option<i64>,
+    invoice_tax_amount: String,
+    invoice_lines: Vec<InvoiceLineForm>,
     message: String,
+}
+struct InvoiceLineForm {
+    item: Option<i64>,
+    quantity: String,
+    price: String,
+}
+impl InvoiceLineForm {
+    fn new() -> Self {
+        Self {
+            item: None,
+            quantity: String::new(),
+            price: String::new(),
+        }
+    }
 }
 struct VoucherLine {
     ledger: Option<i64>,
@@ -77,6 +113,23 @@ impl App {
             register_to: String::new(),
             import_path: String::new(),
             import_preview: None,
+            stock_name: String::new(),
+            stock_unit: String::new(),
+            stock_as_of: String::new(),
+            adjustment_item: None,
+            adjustment_date: String::new(),
+            adjustment_quantity: String::new(),
+            adjustment_increase: true,
+            adjustment_reason: String::new(),
+            invoice_kind: InvoiceKind::Sale,
+            invoice_date: String::new(),
+            invoice_reference: String::new(),
+            invoice_narration: String::new(),
+            invoice_party: None,
+            invoice_trade: None,
+            invoice_tax_ledger: None,
+            invoice_tax_amount: String::new(),
+            invoice_lines: vec![InvoiceLineForm::new()],
             message: String::new(),
         }
     }
@@ -96,6 +149,14 @@ impl App {
         self.ledger_group = None;
         self.group_parent = None;
         self.import_preview = None;
+        self.adjustment_item = None;
+        self.invoice_party = None;
+        self.invoice_trade = None;
+        self.invoice_tax_ledger = None;
+        self.invoice_lines = vec![InvoiceLineForm::new()];
+        self.invoice_reference.clear();
+        self.invoice_narration.clear();
+        self.invoice_tax_amount.clear();
     }
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
@@ -384,6 +445,10 @@ impl App {
         match self.store.vouchers(company) {
             Ok(vouchers) => {
                 for voucher in vouchers {
+                    let invoice_backed = self
+                        .store
+                        .is_invoice_voucher(company, voucher.id)
+                        .unwrap_or(true);
                     ui.horizontal(|ui| {
                         ui.label(format!(
                             "{}  #{}  {}",
@@ -393,7 +458,10 @@ impl App {
                         if !voucher.reference.is_empty() {
                             ui.label(format!("Ref: {}", voucher.reference));
                         }
-                        if ui.button("Edit").clicked() {
+                        if ui
+                            .add_enabled(!invoice_backed, egui::Button::new("Edit"))
+                            .clicked()
+                        {
                             self.editing_voucher = Some(voucher.id);
                             self.voucher_kind = voucher.kind;
                             self.voucher_reference = voucher.reference.clone();
@@ -411,6 +479,9 @@ impl App {
                                 })
                                 .collect();
                             self.message.clear();
+                        }
+                        if invoice_backed {
+                            ui.small("Invoice postings cannot yet be edited");
                         }
                     });
                     for p in &voucher.postings {
@@ -630,6 +701,304 @@ impl App {
             "Debit balances are positive; credit balances are negative. Boundaries are inclusive.",
         );
     }
+    fn stock_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.heading("Stock items");
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            ui.text_edit_singleline(&mut self.stock_name);
+            ui.label("Unit");
+            ui.text_edit_singleline(&mut self.stock_unit);
+            if ui.button("Create item").clicked() {
+                match self
+                    .store
+                    .create_stock_item(company, &self.stock_name, &self.stock_unit)
+                {
+                    Ok(_) => {
+                        self.stock_name.clear();
+                        self.stock_unit.clear();
+                        self.message = "Stock item created".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        });
+        let items = match self.store.stock_items(company) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        ui.separator();
+        ui.heading("Quantity adjustment");
+        ui.label("Adjustments change quantities only; create any accounting entry separately.");
+        pick_stock(
+            ui,
+            "adjustment-item",
+            "Item",
+            &items,
+            &mut self.adjustment_item,
+        );
+        ui.horizontal(|ui| {
+            ui.label("Date");
+            ui.add(egui::TextEdit::singleline(&mut self.adjustment_date).hint_text("YYYY-MM-DD"));
+            ui.label("Quantity");
+            ui.text_edit_singleline(&mut self.adjustment_quantity);
+            egui::ComboBox::from_id_salt("adjustment-direction")
+                .selected_text(if self.adjustment_increase {
+                    "Increase"
+                } else {
+                    "Decrease"
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.adjustment_increase, true, "Increase");
+                    ui.selectable_value(&mut self.adjustment_increase, false, "Decrease");
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Reason");
+            ui.text_edit_singleline(&mut self.adjustment_reason);
+        });
+        if ui.button("Save adjustment").clicked() {
+            let result = (|| -> optimus_prime::Result<i64> {
+                let item = self.adjustment_item.ok_or_else(|| {
+                    optimus_prime::Error::Validation("Select a stock item".into())
+                })?;
+                let qty = parse_quantity(&self.adjustment_quantity)?;
+                if qty == 0 {
+                    return Err(optimus_prime::Error::Validation(
+                        "Quantity must be greater than zero".into(),
+                    ));
+                }
+                self.store.adjust_stock(
+                    company,
+                    item,
+                    &self.adjustment_date,
+                    if self.adjustment_increase { qty } else { -qty },
+                    &self.adjustment_reason,
+                )
+            })();
+            match result {
+                Ok(_) => {
+                    self.adjustment_quantity.clear();
+                    self.adjustment_reason.clear();
+                    self.message = "Stock adjustment saved".into();
+                }
+                Err(e) => self.failure(e),
+            }
+        }
+        ui.separator();
+        ui.heading("Stock quantities");
+        ui.horizontal(|ui| {
+            ui.label("As of (optional)");
+            ui.add(egui::TextEdit::singleline(&mut self.stock_as_of).hint_text("YYYY-MM-DD"));
+        });
+        let end = if self.stock_as_of.trim().is_empty() {
+            None
+        } else {
+            Some(self.stock_as_of.trim())
+        };
+        match self.store.stock_balances(company, end) {
+            Ok(balances) => {
+                for balance in balances {
+                    ui.label(format!(
+                        "{}: {} {}",
+                        balance.item.name,
+                        format_quantity(balance.quantity),
+                        balance.item.unit
+                    ));
+                }
+            }
+            Err(e) => {
+                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+            }
+        }
+        ui.small(
+            "Quantities may be negative. Stock valuation and cost of goods are not calculated.",
+        );
+    }
+    fn invoice_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.heading("Sales and purchase invoices");
+        ui.label("Save an invoice to create its accounting voucher and stock movements together. Prices are per unit; each line rounds to two decimal places.");
+        let items = match self.store.stock_items(company) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        let ledgers = match self.store.ledgers(company) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("Type")
+                .selected_text(self.invoice_kind.as_str())
+                .show_ui(ui, |ui| {
+                    for kind in InvoiceKind::ALL {
+                        ui.selectable_value(&mut self.invoice_kind, kind, kind.as_str());
+                    }
+                });
+            ui.label("Date");
+            ui.add(egui::TextEdit::singleline(&mut self.invoice_date).hint_text("YYYY-MM-DD"));
+            ui.label("Reference");
+            ui.text_edit_singleline(&mut self.invoice_reference);
+        });
+        pick_account(
+            ui,
+            "invoice-party",
+            "Party",
+            &ledgers,
+            &mut self.invoice_party,
+            false,
+        );
+        pick_account(
+            ui,
+            "invoice-trade",
+            "Sales / purchase ledger",
+            &ledgers,
+            &mut self.invoice_trade,
+            false,
+        );
+        pick_account(
+            ui,
+            "invoice-tax",
+            "Tax ledger (optional)",
+            &ledgers,
+            &mut self.invoice_tax_ledger,
+            true,
+        );
+        ui.horizontal(|ui| {
+            ui.label("Tax amount");
+            ui.add(egui::TextEdit::singleline(&mut self.invoice_tax_amount).hint_text("0.00"));
+        });
+        ui.small("Tax is entered manually; statutory rules and filing are not implemented.");
+        let mut remove = None;
+        for (index, line) in self.invoice_lines.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{}.", index + 1));
+                pick_stock(ui, ("invoice-item", index), "Item", &items, &mut line.item);
+                ui.add(
+                    egui::TextEdit::singleline(&mut line.quantity)
+                        .hint_text("Quantity")
+                        .desired_width(90.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut line.price)
+                        .hint_text("Unit price")
+                        .desired_width(90.0),
+                );
+                if let (Ok(qty), Ok(price)) =
+                    (parse_quantity(&line.quantity), parse_amount(&line.price))
+                {
+                    if let Ok(amount) = line_amount(qty, price) {
+                        ui.label(format!("Amount {}", format_amount(amount)));
+                    }
+                }
+                if ui.button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            if self.invoice_lines.len() > 1 {
+                self.invoice_lines.remove(index);
+            } else {
+                self.message = "An invoice needs at least one line".into();
+            }
+        }
+        if ui.button("Add item line").clicked() {
+            self.invoice_lines.push(InvoiceLineForm::new());
+        }
+        ui.horizontal(|ui| {
+            ui.label("Narration");
+            ui.text_edit_singleline(&mut self.invoice_narration);
+        });
+        if ui.button("Save invoice").clicked() {
+            let result = (|| -> optimus_prime::Result<i64> {
+                let mut lines = Vec::new();
+                for line in &self.invoice_lines {
+                    let item_id = line.item.ok_or_else(|| {
+                        optimus_prime::Error::Validation("Select an item for every line".into())
+                    })?;
+                    lines.push(InvoiceLine {
+                        item_id,
+                        quantity: parse_quantity(&line.quantity)?,
+                        unit_price: parse_amount(&line.price)?,
+                    });
+                }
+                let tax_amount = if self.invoice_tax_amount.trim().is_empty() {
+                    0
+                } else {
+                    parse_amount(&self.invoice_tax_amount)?
+                };
+                let draft = InvoiceDraft {
+                    kind: self.invoice_kind,
+                    date: self.invoice_date.clone(),
+                    reference: self.invoice_reference.clone(),
+                    narration: self.invoice_narration.clone(),
+                    party_ledger_id: self.invoice_party.ok_or_else(|| {
+                        optimus_prime::Error::Validation("Select a party ledger".into())
+                    })?,
+                    trade_ledger_id: self.invoice_trade.ok_or_else(|| {
+                        optimus_prime::Error::Validation("Select a sales or purchase ledger".into())
+                    })?,
+                    tax_ledger_id: self.invoice_tax_ledger,
+                    tax_amount,
+                    lines,
+                };
+                self.store.create_invoice(company, &draft)
+            })();
+            match result {
+                Ok(id) => {
+                    self.message = format!("Invoice {id} saved");
+                    self.invoice_reference.clear();
+                    self.invoice_narration.clear();
+                    self.invoice_lines = vec![InvoiceLineForm::new()];
+                    self.invoice_tax_amount.clear();
+                    self.invoice_tax_ledger = None;
+                }
+                Err(e) => self.failure(e),
+            }
+        }
+        ui.separator();
+        ui.heading("Invoices");
+        match self.store.invoices(company) {
+            Ok(invoices) => {
+                for invoice in invoices {
+                    ui.strong(format!(
+                        "{}  {}  {}  {}  Total {}",
+                        invoice.date,
+                        invoice.kind.as_str(),
+                        invoice.reference,
+                        invoice.party,
+                        money(invoice.total)
+                    ));
+                    for line in invoice.lines {
+                        ui.label(format!(
+                            "  {}: {} {} × {} = {}",
+                            line.item,
+                            format_quantity(i128::from(line.quantity)),
+                            line.unit,
+                            format_amount(line.unit_price),
+                            format_amount(line.amount)
+                        ));
+                    }
+                    if invoice.tax_amount > 0 {
+                        ui.label(format!("  Tax: {}", format_amount(invoice.tax_amount)));
+                    }
+                    ui.small(format!(
+                        "Accounting voucher #{}; editing is not yet available",
+                        invoice.voucher_id
+                    ));
+                }
+            }
+            Err(e) => self.failure(e),
+        }
+    }
     fn import_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Import accounting XML");
         ui.label("Preview a file before importing. Only supported, complete records can be imported; no changes are made if any issue is found.");
@@ -715,6 +1084,54 @@ impl App {
         ui.small("This initial importer handles simple groups, ledgers and accounting vouchers. It does not import inventory, invoices, party details, opening balances, tax details or other unsupported fields.");
     }
 }
+fn pick_stock(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    label: &str,
+    items: &[StockItem],
+    selected: &mut Option<i64>,
+) {
+    ui.label(label);
+    let text = items
+        .iter()
+        .find(|item| Some(item.id) == *selected)
+        .map(|item| item.name.as_str())
+        .unwrap_or("Select item");
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            for item in items {
+                ui.selectable_value(selected, Some(item.id), &item.name);
+            }
+        });
+}
+fn pick_account(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    label: &str,
+    ledgers: &[Ledger],
+    selected: &mut Option<i64>,
+    optional: bool,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let text = ledgers
+            .iter()
+            .find(|ledger| Some(ledger.id) == *selected)
+            .map(|ledger| ledger.name.as_str())
+            .unwrap_or("Select ledger");
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(text)
+            .show_ui(ui, |ui| {
+                if optional {
+                    ui.selectable_value(selected, None, "None");
+                }
+                for ledger in ledgers {
+                    ui.selectable_value(selected, Some(ledger.id), &ledger.name);
+                }
+            });
+    });
+}
 fn money(value: i128) -> String {
     let n = value.unsigned_abs();
     format!(
@@ -739,6 +1156,8 @@ impl eframe::App for App {
                 ("Ledgers", Page::Ledger),
                 ("Voucher", Page::Voucher),
                 ("Ledger activity", Page::Register),
+                ("Stock", Page::Stock),
+                ("Invoices", Page::Invoice),
                 ("Import XML", Page::Import),
                 ("Reports", Page::Reports),
             ] {
@@ -767,6 +1186,8 @@ impl eframe::App for App {
                     Page::Ledger => self.ledger_page(ui, company),
                     Page::Voucher => self.voucher_page(ui, company),
                     Page::Register => self.register_page(ui, company),
+                    Page::Stock => self.stock_page(ui, company),
+                    Page::Invoice => self.invoice_page(ui, company),
                     Page::Import => self.import_page(ui, company),
                     Page::Reports => self.reports_page(ui, company),
                 }
