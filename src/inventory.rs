@@ -93,6 +93,7 @@ pub struct InvoiceLine {
 pub struct InvoiceDraft {
     pub kind: InvoiceKind,
     pub date: String,
+    pub due_date: Option<String>,
     pub reference: String,
     pub narration: String,
     pub party_ledger_id: i64,
@@ -107,6 +108,7 @@ pub struct InvoiceSummary {
     pub voucher_id: i64,
     pub kind: InvoiceKind,
     pub date: String,
+    pub due_date: Option<String>,
     pub reference: String,
     pub party: String,
     pub total: i128,
@@ -128,6 +130,7 @@ pub struct Settlement {
 pub struct InvoiceRevision {
     pub changed_at: String,
     pub date: String,
+    pub due_date: Option<String>,
     pub kind: InvoiceKind,
     pub reference: String,
     pub narration: String,
@@ -142,6 +145,7 @@ pub struct OutstandingInvoice {
     pub invoice_id: i64,
     pub kind: InvoiceKind,
     pub date: String,
+    pub due_date: Option<String>,
     pub reference: String,
     pub party: String,
     pub total: i128,
@@ -149,6 +153,8 @@ pub struct OutstandingInvoice {
     pub outstanding: i128,
     /// Days since the invoice date, not days past a payment due date.
     pub age_days: i64,
+    /// Days after the due date, if one is set. Zero means not overdue yet.
+    pub overdue_days: Option<i64>,
 }
 #[derive(Debug, Clone)]
 pub struct InvoiceDetailLine {
@@ -196,6 +202,7 @@ pub fn line_amount(quantity: i64, unit_price: i64) -> Result<i64> {
 }
 struct PreparedInvoice {
     date: String,
+    due_date: Option<String>,
     reference: String,
     postings: Vec<Posting>,
     amounts: Vec<i64>,
@@ -207,6 +214,12 @@ fn prepare_invoice(
     excluding: Option<i64>,
 ) -> Result<PreparedInvoice> {
     let date = parse_date(&draft.date)?.format("%Y-%m-%d").to_string();
+    let due_date = draft
+        .due_date
+        .as_deref()
+        .map(parse_date)
+        .transpose()?
+        .map(|date| date.format("%Y-%m-%d").to_string());
     let reference = required(&draft.reference, "Invoice reference")?.to_owned();
     if draft.lines.is_empty() {
         return Err(Error::Validation(
@@ -325,6 +338,7 @@ fn prepare_invoice(
     crate::opening::check_no_control_postings(conn, company_id, &postings)?;
     Ok(PreparedInvoice {
         date,
+        due_date,
         reference,
         postings,
         amounts,
@@ -360,7 +374,7 @@ pub(crate) fn insert_invoice_on_connection(
     conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim()])?;
     let voucher_id = conn.last_insert_rowid();
     write_postings(conn, voucher_id, &prepared.postings)?;
-    conn.execute("INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![company_id, voucher_id, draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount])?;
+    conn.execute("INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![company_id, voucher_id, draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount, prepared.due_date])?;
     let invoice_id = conn.last_insert_rowid();
     write_invoice_lines(conn, invoice_id, &draft.lines, &prepared.amounts)?;
     Ok((invoice_id, voucher_id))
@@ -849,7 +863,7 @@ impl Store {
     }
     /// Return a complete editable draft, scoped to the company.
     pub fn invoice_draft(&self, company_id: i64, invoice_id: i64) -> Result<InvoiceDraft> {
-        let (kind, date, reference, narration, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount): (String, String, String, String, i64, i64, Option<i64>, i64) = self.conn.query_row("SELECT i.kind, v.date, v.reference, v.narration, i.party_ledger_id, i.trade_ledger_id, i.tax_ledger_id, i.tax_amount FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
+        let (kind, date, reference, narration, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date): (String, String, String, String, i64, i64, Option<i64>, i64, Option<String>) = self.conn.query_row("SELECT i.kind, v.date, v.reference, v.narration, i.party_ledger_id, i.trade_ledger_id, i.tax_ledger_id, i.tax_amount, i.due_date FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
         let mut stmt = self.conn.prepare("SELECT item_id, quantity, unit_price FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
         let lines = stmt
             .query_map([invoice_id], |r| {
@@ -863,6 +877,7 @@ impl Store {
         Ok(InvoiceDraft {
             kind: InvoiceKind::parse(&kind)?,
             date,
+            due_date,
             reference,
             narration,
             party_ledger_id,
@@ -905,11 +920,11 @@ impl Store {
         }
         let voucher_revision = tx.last_insert_rowid();
         tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![voucher_revision, voucher_id])?;
-        tx.execute("INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount) SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount FROM invoices WHERE id = ?2 AND company_id = ?3", params![voucher_revision, invoice_id, company_id])?;
+        tx.execute("INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date) SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date FROM invoices WHERE id = ?2 AND company_id = ?3", params![voucher_revision, invoice_id, company_id])?;
         let revision_id = tx.last_insert_rowid();
         tx.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount) SELECT ?1, item_id, quantity, unit_price, amount FROM invoice_lines WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
         tx.execute("UPDATE vouchers SET kind = ?1, reference = ?2, date = ?3, narration = ?4 WHERE id = ?5 AND company_id = ?6", params![draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim(), voucher_id, company_id])?;
-        tx.execute("UPDATE invoices SET kind = ?1, party_ledger_id = ?2, trade_ledger_id = ?3, tax_ledger_id = ?4, tax_amount = ?5 WHERE id = ?6 AND company_id = ?7", params![draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount, invoice_id, company_id])?;
+        tx.execute("UPDATE invoices SET kind = ?1, party_ledger_id = ?2, trade_ledger_id = ?3, tax_ledger_id = ?4, tax_amount = ?5, due_date = ?6 WHERE id = ?7 AND company_id = ?8", params![draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount, prepared.due_date, invoice_id, company_id])?;
         tx.execute("DELETE FROM postings WHERE voucher_id = ?1", [voucher_id])?;
         tx.execute(
             "DELETE FROM invoice_lines WHERE invoice_id = ?1",
@@ -932,7 +947,7 @@ impl Store {
         company_id: i64,
         invoice_id: i64,
     ) -> Result<Vec<InvoiceRevision>> {
-        let mut stmt = self.conn.prepare("SELECT r.id, r.changed_at, r.kind, v.date, v.reference, v.narration, p.name, t.name, x.name, r.tax_amount FROM invoice_revisions r JOIN voucher_revisions v ON v.id = r.voucher_revision_id JOIN ledgers p ON p.id = r.party_ledger_id JOIN ledgers t ON t.id = r.trade_ledger_id LEFT JOIN ledgers x ON x.id = r.tax_ledger_id WHERE r.company_id = ?1 AND r.invoice_id = ?2 ORDER BY r.id DESC")?;
+        let mut stmt = self.conn.prepare("SELECT r.id, r.changed_at, r.kind, v.date, v.reference, v.narration, p.name, t.name, x.name, r.tax_amount, r.due_date FROM invoice_revisions r JOIN voucher_revisions v ON v.id = r.voucher_revision_id JOIN ledgers p ON p.id = r.party_ledger_id JOIN ledgers t ON t.id = r.trade_ledger_id LEFT JOIN ledgers x ON x.id = r.tax_ledger_id WHERE r.company_id = ?1 AND r.invoice_id = ?2 ORDER BY r.id DESC")?;
         let rows = stmt
             .query_map(params![company_id, invoice_id], |r| {
                 Ok((
@@ -946,6 +961,7 @@ impl Store {
                     r.get::<_, String>(7)?,
                     r.get::<_, Option<String>>(8)?,
                     r.get::<_, i64>(9)?,
+                    r.get::<_, Option<String>>(10)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -961,6 +977,7 @@ impl Store {
             trade,
             tax_ledger,
             tax_amount,
+            due_date,
         ) in rows
         {
             let mut items = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount FROM invoice_revision_lines l JOIN stock_items s ON s.id = l.item_id WHERE l.revision_id = ?1 ORDER BY l.id")?;
@@ -978,6 +995,7 @@ impl Store {
             result.push(InvoiceRevision {
                 changed_at,
                 date,
+                due_date,
                 kind: InvoiceKind::parse(&kind)?,
                 reference,
                 narration,
@@ -991,7 +1009,7 @@ impl Store {
         Ok(result)
     }
     pub fn invoices(&self, company_id: i64) -> Result<Vec<InvoiceSummary>> {
-        let mut stmt = self.conn.prepare("SELECT i.id, i.voucher_id, i.kind, v.date, v.reference, l.name, i.tax_amount FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1 ORDER BY v.date DESC, i.id DESC")?;
+        let mut stmt = self.conn.prepare("SELECT i.id, i.voucher_id, i.kind, v.date, v.reference, l.name, i.tax_amount, i.due_date FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1 ORDER BY v.date DESC, i.id DESC")?;
         let rows = stmt.query_map([company_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -1001,11 +1019,12 @@ impl Store {
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, i64>(6)?,
+                r.get::<_, Option<String>>(7)?,
             ))
         })?;
         let mut result = Vec::new();
         for row in rows {
-            let (id, voucher_id, kind, date, reference, party, tax) = row?;
+            let (id, voucher_id, kind, date, reference, party, tax, due_date) = row?;
             let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount FROM invoice_lines l JOIN stock_items s ON s.id = l.item_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
             let line_amounts = amounts.query_map([id], |r| {
                 Ok(InvoiceDetailLine {
@@ -1037,6 +1056,7 @@ impl Store {
                 voucher_id,
                 kind: InvoiceKind::parse(&kind)?,
                 date,
+                due_date,
                 reference,
                 party,
                 total,
@@ -1181,16 +1201,24 @@ impl Store {
             if outstanding == 0 {
                 continue;
             }
+            let overdue_days = invoice
+                .due_date
+                .as_deref()
+                .map(parse_date)
+                .transpose()?
+                .map(|due| (end - due).num_days().max(0));
             result.push(OutstandingInvoice {
                 invoice_id: invoice.id,
                 kind: invoice.kind,
                 date: invoice.date,
+                due_date: invoice.due_date,
                 reference: invoice.reference,
                 party: invoice.party,
                 total: invoice.total,
                 settled,
                 outstanding,
                 age_days: (end - date).num_days(),
+                overdue_days,
             });
         }
         result.sort_by(|a, b| {

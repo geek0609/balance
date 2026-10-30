@@ -2172,6 +2172,7 @@ impl Store {
             let draft = InvoiceDraft {
                 kind: invoice.kind,
                 date: invoice.date.clone(),
+                due_date: None,
                 reference: invoice.reference.clone(),
                 narration: invoice.narration.clone(),
                 party_ledger_id: party_id,

@@ -85,6 +85,7 @@ struct App {
     adjustment_reason: String,
     invoice_kind: InvoiceKind,
     invoice_date: String,
+    invoice_due_date: String,
     invoice_reference: String,
     invoice_narration: String,
     invoice_party: Option<i64>,
@@ -193,6 +194,7 @@ impl App {
             adjustment_reason: String::new(),
             invoice_kind: InvoiceKind::Sale,
             invoice_date: String::new(),
+            invoice_due_date: String::new(),
             invoice_reference: String::new(),
             invoice_narration: String::new(),
             invoice_party: None,
@@ -249,6 +251,7 @@ impl App {
         self.editing_invoice = None;
         self.invoice_reference.clear();
         self.invoice_narration.clear();
+        self.invoice_due_date.clear();
         self.invoice_tax_amount.clear();
         self.settlement_invoice = None;
         self.settlement_bank = None;
@@ -1457,6 +1460,8 @@ impl App {
                 });
             ui.label("Date");
             ui.add(egui::TextEdit::singleline(&mut self.invoice_date).hint_text("YYYY-MM-DD"));
+            ui.label("Due date (optional)");
+            ui.add(egui::TextEdit::singleline(&mut self.invoice_due_date).hint_text("YYYY-MM-DD"));
             ui.label("Reference");
             ui.text_edit_singleline(&mut self.invoice_reference);
         });
@@ -1534,6 +1539,7 @@ impl App {
             self.editing_invoice = None;
             self.invoice_reference.clear();
             self.invoice_narration.clear();
+            self.invoice_due_date.clear();
             self.invoice_lines = vec![InvoiceLineForm::new()];
             self.invoice_tax_amount.clear();
             self.invoice_tax_ledger = None;
@@ -1559,6 +1565,8 @@ impl App {
                 let draft = InvoiceDraft {
                     kind: self.invoice_kind,
                     date: self.invoice_date.clone(),
+                    due_date: (!self.invoice_due_date.trim().is_empty())
+                        .then(|| self.invoice_due_date.trim().to_owned()),
                     reference: self.invoice_reference.clone(),
                     narration: self.invoice_narration.clone(),
                     party_ledger_id: self.invoice_party.ok_or_else(|| {
@@ -1583,6 +1591,7 @@ impl App {
                     self.message = format!("Invoice {id} saved");
                     self.invoice_reference.clear();
                     self.invoice_narration.clear();
+                    self.invoice_due_date.clear();
                     self.invoice_lines = vec![InvoiceLineForm::new()];
                     self.invoice_tax_amount.clear();
                     self.invoice_tax_ledger = None;
@@ -1694,6 +1703,7 @@ impl App {
                                 self.editing_invoice = Some(invoice.id);
                                 self.invoice_kind = draft.kind;
                                 self.invoice_date = draft.date;
+                                self.invoice_due_date = draft.due_date.unwrap_or_default();
                                 self.invoice_reference = draft.reference;
                                 self.invoice_narration = draft.narration;
                                 self.invoice_party = Some(draft.party_ledger_id);
@@ -1720,6 +1730,9 @@ impl App {
                     }
                     if invoice.settled != 0 {
                         ui.small("Invoices with receipts or payments cannot yet be edited.");
+                    }
+                    if let Some(due_date) = &invoice.due_date {
+                        ui.small(format!("Due: {due_date}"));
                     }
                     for line in invoice.lines {
                         ui.label(format!(
@@ -1775,6 +1788,9 @@ impl App {
                                             revision.tax_ledger.unwrap_or_default(),
                                             format_amount(revision.tax_amount)
                                         ));
+                                        if let Some(due_date) = &revision.due_date {
+                                            ui.label(format!("Due: {due_date}"));
+                                        }
                                         if !revision.narration.is_empty() {
                                             ui.label(revision.narration);
                                         }
@@ -1900,7 +1916,7 @@ impl App {
     }
     fn outstanding_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Outstanding invoices");
-        ui.label("Age is measured from the invoice date. Due dates, credit notes and unallocated payments are not included.");
+        ui.label("Age is measured from the invoice date; overdue days are measured from the optional due date. Credit notes and unallocated payments are not included. Past reports use the invoice's current details and due date.");
         ui.horizontal(|ui| {
             ui.label("As of");
             ui.add(
@@ -1922,16 +1938,20 @@ impl App {
                 let mut payable = 0_i128;
                 let mut receivable_age = [0_i128; 4];
                 let mut payable_age = [0_i128; 4];
+                let mut receivable_due = [0_i128; 6];
+                let mut payable_due = [0_i128; 6];
                 egui::Grid::new("outstanding").striped(true).show(ui, |ui| {
                     for title in [
                         "Type",
                         "Party",
                         "Date",
+                        "Due date",
                         "Reference",
                         "Total",
                         "Settled",
                         "Outstanding",
                         "Age (days)",
+                        "Overdue (days)",
                     ] {
                         ui.strong(title);
                     }
@@ -1943,21 +1963,37 @@ impl App {
                             61..=90 => 2,
                             _ => 3,
                         };
+                        let due_bucket = match row.overdue_days {
+                            None => 0,
+                            Some(0) => 1,
+                            Some(1..=30) => 2,
+                            Some(31..=60) => 3,
+                            Some(61..=90) => 4,
+                            Some(_) => 5,
+                        };
                         if row.kind == InvoiceKind::Sale {
                             receivable += row.outstanding;
                             receivable_age[bucket] += row.outstanding;
+                            receivable_due[due_bucket] += row.outstanding;
                         } else {
                             payable += row.outstanding;
                             payable_age[bucket] += row.outstanding;
+                            payable_due[due_bucket] += row.outstanding;
                         }
                         ui.label(row.kind.as_str());
                         ui.label(row.party);
                         ui.label(row.date);
+                        ui.label(row.due_date.as_deref().unwrap_or("—"));
                         ui.label(row.reference);
                         ui.label(money(row.total));
                         ui.label(money(row.settled));
                         ui.label(money(row.outstanding));
                         ui.label(row.age_days.to_string());
+                        ui.label(
+                            row.overdue_days
+                                .map(|days| days.to_string())
+                                .unwrap_or_else(|| "—".into()),
+                        );
                         ui.end_row();
                     }
                 });
@@ -1982,6 +2018,34 @@ impl App {
                         ui.end_row();
                         ui.label("Payable");
                         for amount in payable_age {
+                            ui.label(money(amount));
+                        }
+                        ui.end_row();
+                    });
+                ui.heading("Age from due date");
+                ui.small("Current includes invoices due today or later; invoices without a due date are shown separately.");
+                egui::Grid::new("outstanding-due-age")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for title in [
+                            "",
+                            "No due date",
+                            "Current",
+                            "1–30 days",
+                            "31–60 days",
+                            "61–90 days",
+                            "Over 90 days",
+                        ] {
+                            ui.strong(title);
+                        }
+                        ui.end_row();
+                        ui.label("Receivable");
+                        for amount in receivable_due {
+                            ui.label(money(amount));
+                        }
+                        ui.end_row();
+                        ui.label("Payable");
+                        for amount in payable_due {
                             ui.label(money(amount));
                         }
                         ui.end_row();

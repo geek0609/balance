@@ -237,7 +237,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 12 {
+        if version > 13 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -341,6 +341,13 @@ impl Store {
             tx.execute_batch("CREATE TABLE stock_item_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, name TEXT NOT NULL, group_id INTEGER NOT NULL REFERENCES stock_groups(id), description TEXT NOT NULL);
                 CREATE INDEX stock_item_revisions_item ON stock_item_revisions(item_id, id);
                 PRAGMA user_version = 12;")?;
+        }
+        if version < 13 {
+            tx.execute_batch(
+                "ALTER TABLE invoices ADD COLUMN due_date TEXT;
+                ALTER TABLE invoice_revisions ADD COLUMN due_date TEXT;
+                PRAGMA user_version = 13;",
+            )?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1201,7 +1208,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
