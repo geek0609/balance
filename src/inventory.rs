@@ -109,6 +109,19 @@ pub struct InvoiceLine {
     pub unit_price: i64,
 }
 #[derive(Debug, Clone)]
+pub struct InvoiceAdjustment {
+    pub ledger_id: i64,
+    /// Positive increases the invoice total; negative decreases it.
+    pub amount: i64,
+    pub description: String,
+}
+#[derive(Debug, Clone)]
+pub struct InvoiceAdjustmentDetail {
+    pub ledger: String,
+    pub amount: i64,
+    pub description: String,
+}
+#[derive(Debug, Clone)]
 pub struct InvoiceDraft {
     pub kind: InvoiceKind,
     pub date: String,
@@ -121,6 +134,7 @@ pub struct InvoiceDraft {
     pub tax_ledger_id: Option<i64>,
     pub tax_amount: i64,
     pub lines: Vec<InvoiceLine>,
+    pub adjustments: Vec<InvoiceAdjustment>,
 }
 #[derive(Debug, Clone)]
 pub struct InvoiceSummary {
@@ -137,6 +151,7 @@ pub struct InvoiceSummary {
     pub settled: i128,
     pub outstanding: i128,
     pub lines: Vec<InvoiceDetailLine>,
+    pub adjustments: Vec<InvoiceAdjustmentDetail>,
 }
 #[derive(Debug, Clone)]
 pub struct Settlement {
@@ -166,6 +181,7 @@ pub struct InvoiceRevision {
     pub tax_ledger: Option<String>,
     pub tax_amount: i64,
     pub lines: Vec<InvoiceDetailLine>,
+    pub adjustments: Vec<InvoiceAdjustmentDetail>,
 }
 #[derive(Debug, Clone)]
 pub struct OutstandingInvoice {
@@ -355,14 +371,27 @@ fn prepare_invoice(
     }
     let subtotal = i64::try_from(subtotal)
         .map_err(|_| Error::Validation("Invoice amount is too large".into()))?;
-    let total = subtotal
-        .checked_add(draft.tax_amount)
-        .ok_or_else(|| Error::Validation("Invoice amount is too large".into()))?;
-    if total == 0 {
+    let mut total = i128::from(subtotal) + i128::from(draft.tax_amount);
+    for adjustment in &draft.adjustments {
+        if adjustment.amount == 0
+            || adjustment.amount == i64::MIN
+            || adjustment.ledger_id == draft.party_ledger_id
+        {
+            return Err(Error::Validation(
+                "Each adjustment needs a non-zero amount and a ledger different from the party"
+                    .into(),
+            ));
+        }
+        ledger_category(conn, company_id, adjustment.ledger_id)?;
+        total += i128::from(adjustment.amount);
+    }
+    if total <= 0 {
         return Err(Error::Validation(
             "Invoice amount must be greater than zero".into(),
         ));
     }
+    let total = i64::try_from(total)
+        .map_err(|_| Error::Validation("Invoice amount is too large".into()))?;
     let direction = if draft.kind == InvoiceKind::Sale {
         1
     } else {
@@ -382,6 +411,12 @@ fn prepare_invoice(
         postings.push(Posting {
             ledger_id: tax_id,
             amount: -direction * draft.tax_amount,
+        });
+    }
+    for adjustment in &draft.adjustments {
+        postings.push(Posting {
+            ledger_id: adjustment.ledger_id,
+            amount: -direction * adjustment.amount,
         });
     }
     validate_voucher(&date, &postings)?;
@@ -416,6 +451,38 @@ fn write_invoice_lines(
     }
     Ok(())
 }
+fn write_invoice_adjustments(
+    conn: &Connection,
+    invoice: i64,
+    adjustments: &[InvoiceAdjustment],
+) -> Result<()> {
+    for adjustment in adjustments {
+        conn.execute("INSERT INTO invoice_adjustments(invoice_id, ledger_id, amount, description) VALUES (?1, ?2, ?3, ?4)", params![invoice, adjustment.ledger_id, adjustment.amount, adjustment.description.trim()])?;
+    }
+    Ok(())
+}
+fn read_invoice_adjustments(
+    conn: &Connection,
+    id: i64,
+    revision: bool,
+) -> Result<Vec<InvoiceAdjustmentDetail>> {
+    let sql = if revision {
+        "SELECT l.name, a.amount, a.description FROM invoice_revision_adjustments a JOIN ledgers l ON l.id = a.ledger_id WHERE a.revision_id = ?1 ORDER BY a.id"
+    } else {
+        "SELECT l.name, a.amount, a.description FROM invoice_adjustments a JOIN ledgers l ON l.id = a.ledger_id WHERE a.invoice_id = ?1 ORDER BY a.id"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map([id], |r| {
+            Ok(InvoiceAdjustmentDetail {
+                ledger: r.get(0)?,
+                amount: r.get(1)?,
+                description: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
 /// Insert an invoice using the caller's transaction, including its stock lines and voucher.
 pub(crate) fn insert_invoice_on_connection(
     conn: &Connection,
@@ -429,6 +496,7 @@ pub(crate) fn insert_invoice_on_connection(
     conn.execute("INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![company_id, voucher_id, draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount, prepared.due_date, prepared.credit_days])?;
     let invoice_id = conn.last_insert_rowid();
     write_invoice_lines(conn, invoice_id, &draft.lines, &prepared.amounts)?;
+    write_invoice_adjustments(conn, invoice_id, &draft.adjustments)?;
     Ok((invoice_id, voucher_id))
 }
 fn ledger_category(conn: &Connection, company_id: i64, ledger_id: i64) -> Result<Category> {
@@ -1173,6 +1241,16 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt = self.conn.prepare("SELECT ledger_id, amount, description FROM invoice_adjustments WHERE invoice_id = ?1 ORDER BY id")?;
+        let adjustments = stmt
+            .query_map([invoice_id], |r| {
+                Ok(InvoiceAdjustment {
+                    ledger_id: r.get(0)?,
+                    amount: r.get(1)?,
+                    description: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(InvoiceDraft {
             kind: InvoiceKind::parse(&kind)?,
             date,
@@ -1189,6 +1267,7 @@ impl Store {
             tax_ledger_id,
             tax_amount,
             lines,
+            adjustments,
         })
     }
     /// Atomically replace an unsettled invoice, preserving both prior versions.
@@ -1228,6 +1307,7 @@ impl Store {
         tx.execute("INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days) SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days FROM invoices WHERE id = ?2 AND company_id = ?3", params![voucher_revision, invoice_id, company_id])?;
         let revision_id = tx.last_insert_rowid();
         tx.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount, location_id) SELECT ?1, item_id, quantity, unit_price, amount, location_id FROM invoice_lines WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
+        tx.execute("INSERT INTO invoice_revision_adjustments(revision_id, ledger_id, amount, description) SELECT ?1, ledger_id, amount, description FROM invoice_adjustments WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
         tx.execute("UPDATE vouchers SET kind = ?1, reference = ?2, date = ?3, narration = ?4 WHERE id = ?5 AND company_id = ?6", params![draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim(), voucher_id, company_id])?;
         tx.execute("UPDATE invoices SET kind = ?1, party_ledger_id = ?2, trade_ledger_id = ?3, tax_ledger_id = ?4, tax_amount = ?5, due_date = ?6, credit_days = ?7 WHERE id = ?8 AND company_id = ?9", params![draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount, prepared.due_date, prepared.credit_days, invoice_id, company_id])?;
         tx.execute("DELETE FROM postings WHERE voucher_id = ?1", [voucher_id])?;
@@ -1235,8 +1315,13 @@ impl Store {
             "DELETE FROM invoice_lines WHERE invoice_id = ?1",
             [invoice_id],
         )?;
+        tx.execute(
+            "DELETE FROM invoice_adjustments WHERE invoice_id = ?1",
+            [invoice_id],
+        )?;
         write_postings(&tx, voucher_id, &prepared.postings)?;
         write_invoice_lines(&tx, invoice_id, &draft.lines, &prepared.amounts)?;
+        write_invoice_adjustments(&tx, invoice_id, &draft.adjustments)?;
         tx.commit()?;
         Ok(())
     }
@@ -1313,6 +1398,7 @@ impl Store {
                 tax_ledger,
                 tax_amount,
                 lines,
+                adjustments: read_invoice_adjustments(&self.conn, id, true)?,
             });
         }
         Ok(result)
@@ -1353,6 +1439,10 @@ impl Store {
                 total += i128::from(line.amount);
                 lines.push(line);
             }
+            let adjustments = read_invoice_adjustments(&self.conn, id, false)?;
+            for adjustment in &adjustments {
+                total += i128::from(adjustment.amount);
+            }
             let mut settlement_stmt = self.conn.prepare(
                 "SELECT amount FROM invoice_settlements WHERE invoice_id = ?1 AND company_id = ?2",
             )?;
@@ -1376,6 +1466,7 @@ impl Store {
                 settled,
                 outstanding: total - settled,
                 lines,
+                adjustments,
             });
         }
         Ok(result)
@@ -1457,6 +1548,12 @@ impl Store {
                 invoice_total += i128::from(value?);
             }
             drop(amounts);
+            let mut adjustments =
+                tx.prepare("SELECT amount FROM invoice_adjustments WHERE invoice_id = ?1")?;
+            for value in adjustments.query_map([allocation.invoice_id], |r| r.get::<_, i64>(0))? {
+                invoice_total += i128::from(value?);
+            }
+            drop(adjustments);
             let mut paid = 0_i128;
             let mut previous = tx.prepare("SELECT s.amount, v.reference FROM invoice_settlements s JOIN vouchers v ON v.id = s.voucher_id WHERE s.invoice_id = ?1 AND s.company_id = ?2")?;
             for row in previous.query_map(params![allocation.invoice_id, company_id], |r| {

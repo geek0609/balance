@@ -3,7 +3,8 @@
 use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_item_on_connection, insert_invoice_on_connection,
-    line_amount, main_stock_location, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine,
+    line_amount, main_stock_location, parse_quantity, InvoiceAdjustment, InvoiceDraft, InvoiceKind,
+    InvoiceLine,
 };
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
@@ -79,6 +80,12 @@ struct ImportedInvoiceLine {
     unit_price: i64,
 }
 #[derive(Debug, Clone)]
+struct ImportedInvoiceAdjustment {
+    ledger: String,
+    existing_ledger_id: Option<i64>,
+    amount: i64,
+}
+#[derive(Debug, Clone)]
 struct ImportedInvoice {
     kind: InvoiceKind,
     date: String,
@@ -90,6 +97,7 @@ struct ImportedInvoice {
     trade: String,
     existing_trade_id: Option<i64>,
     lines: Vec<ImportedInvoiceLine>,
+    adjustments: Vec<ImportedInvoiceAdjustment>,
     metadata: SourceMetadata,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -684,6 +692,7 @@ fn parse_imported_invoice(
     }
     let mut party: Option<(String, i64)> = None;
     let mut credit_days = None;
+    let mut adjustments = Vec::new();
     let party_debit = kind == InvoiceKind::Sale;
     for entry in entries {
         invoice_list_fields(
@@ -700,7 +709,7 @@ fn parse_imported_invoice(
             issues,
         );
         let ledger = invoice_field(entry, "LEDGERNAME")?;
-        let (_, category) = ledgers
+        let (existing_ledger_id, category) = ledgers
             .get(&normalized(&ledger))
             .ok_or_else(|| Error::Validation(format!("ledger {ledger} is unavailable")))?;
         let amount = xml_amount(&invoice_field(entry, "AMOUNT")?)?;
@@ -715,18 +724,20 @@ fn parse_imported_invoice(
             None => false,
             _ => return Err(Error::Validation("invalid party flag".into())),
         };
-        if !matches!(category, Category::Asset | Category::Liability) {
-            return Err(Error::Validation(
-                "party ledger must be an asset or liability".into(),
-            ));
-        }
         let bills: Vec<_> = entry
             .children()
             .filter(|n| {
-                n.is_element() && local_name(*n).eq_ignore_ascii_case("BILLALLOCATIONS.LIST")
+                n.is_element()
+                    && local_name(*n).eq_ignore_ascii_case("BILLALLOCATIONS.LIST")
+                    && meaningful(*n)
             })
             .collect();
         if is_party {
+            if !matches!(category, Category::Asset | Category::Liability) {
+                return Err(Error::Validation(
+                    "party ledger must be an asset or liability".into(),
+                ));
+            }
             if party.is_some() || (amount > 0) != party_debit || bills.len() != 1 {
                 return Err(Error::Validation(
                     "invoice needs one party and one new bill reference with the correct direction"
@@ -771,9 +782,16 @@ fn parse_imported_invoice(
             }
             party = Some((ledger, amount));
         } else {
-            return Err(Error::Validation(
-                "additional invoice ledger entries are not yet supported".into(),
-            ));
+            if !bills.is_empty() {
+                return Err(Error::Validation(
+                    "additional ledger bill allocations are not supported".into(),
+                ));
+            }
+            adjustments.push(ImportedInvoiceAdjustment {
+                ledger,
+                existing_ledger_id: *existing_ledger_id,
+                amount: if party_debit { -amount } else { amount },
+            });
         }
     }
     let (party_name, party_amount) =
@@ -894,14 +912,27 @@ fn parse_imported_invoice(
     }
     let trade = trade.ok_or_else(|| Error::Validation("at least one item is required".into()))?;
     i64::try_from(subtotal).map_err(|_| Error::Validation("invoice amount is too large".into()))?;
-    if i128::from(party_amount).abs() != subtotal {
+    let total = subtotal
+        + adjustments
+            .iter()
+            .map(|adjustment| i128::from(adjustment.amount))
+            .sum::<i128>();
+    if total <= 0 || i128::from(party_amount).abs() != total {
         return Err(Error::Validation(
-            "party amount does not equal the item subtotal".into(),
+            "party amount does not equal items plus ledger adjustments".into(),
         ));
     }
     if normalized(&party_name) == normalized(&trade) {
         return Err(Error::Validation(
             "party and trade ledgers must be different".into(),
+        ));
+    }
+    if adjustments
+        .iter()
+        .any(|adjustment| normalized(&adjustment.ledger) == normalized(&party_name))
+    {
+        return Err(Error::Validation(
+            "adjustment ledger must differ from the party".into(),
         ));
     }
     let existing_party_id = ledgers[&normalized(&party_name)].0;
@@ -917,6 +948,7 @@ fn parse_imported_invoice(
         trade,
         existing_trade_id,
         lines,
+        adjustments,
         metadata,
     })
 }
@@ -2212,6 +2244,20 @@ impl Store {
                 tax_ledger_id: None,
                 tax_amount: 0,
                 lines,
+                adjustments: invoice
+                    .adjustments
+                    .iter()
+                    .map(|adjustment| {
+                        Ok(InvoiceAdjustment {
+                            ledger_id: resolve_ledger(
+                                &adjustment.ledger,
+                                adjustment.existing_ledger_id,
+                            )?,
+                            amount: adjustment.amount,
+                            description: String::new(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
             };
             let (_, voucher_id) = insert_invoice_on_connection(&tx, plan.company_id, &draft)?;
             save_metadata(

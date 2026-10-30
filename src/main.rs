@@ -4,8 +4,8 @@ use balance::banking::StatementPlan;
 use balance::contacts::LedgerProfile;
 use balance::exchange::ImportPlan;
 use balance::inventory::{
-    format_quantity, line_amount, parse_quantity, InvoiceDraft, InvoiceKind, InvoiceLine,
-    SettlementAllocation, StockItem, StockLocation,
+    format_quantity, line_amount, parse_quantity, InvoiceAdjustment, InvoiceDraft, InvoiceKind,
+    InvoiceLine, SettlementAllocation, StockItem, StockLocation,
 };
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
@@ -118,6 +118,7 @@ struct App {
     invoice_tax_ledger: Option<i64>,
     invoice_tax_amount: String,
     invoice_lines: Vec<InvoiceLineForm>,
+    invoice_adjustments: Vec<InvoiceAdjustmentForm>,
     editing_invoice: Option<i64>,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -130,6 +131,12 @@ struct App {
 struct SettlementLineForm {
     invoice: Option<i64>,
     amount: String,
+}
+struct InvoiceAdjustmentForm {
+    ledger: Option<i64>,
+    amount: String,
+    increase: bool,
+    description: String,
 }
 struct InvoiceLineForm {
     item: Option<i64>,
@@ -256,6 +263,7 @@ impl App {
             invoice_tax_ledger: None,
             invoice_tax_amount: String::new(),
             invoice_lines: vec![InvoiceLineForm::new()],
+            invoice_adjustments: Vec::new(),
             editing_invoice: None,
             settlement_invoice: None,
             settlement_bank: None,
@@ -318,6 +326,7 @@ impl App {
         self.invoice_trade = None;
         self.invoice_tax_ledger = None;
         self.invoice_lines = vec![InvoiceLineForm::new()];
+        self.invoice_adjustments.clear();
         self.editing_invoice = None;
         self.invoice_reference.clear();
         self.invoice_narration.clear();
@@ -1767,6 +1776,55 @@ impl App {
         if ui.button("Add item line").clicked() {
             self.invoice_lines.push(InvoiceLineForm::new());
         }
+        ui.heading("Additional charges and deductions");
+        ui.small("Enter each amount manually. These ledger adjustments do not calculate or classify tax.");
+        let mut remove_adjustment = None;
+        for (index, adjustment) in self.invoice_adjustments.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                pick_account(
+                    ui,
+                    ("invoice-adjustment", index),
+                    "Ledger",
+                    &ledgers,
+                    &mut adjustment.ledger,
+                    false,
+                );
+                egui::ComboBox::from_id_salt(("adjustment-direction", index))
+                    .selected_text(if adjustment.increase {
+                        "Increase total"
+                    } else {
+                        "Decrease total"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut adjustment.increase, true, "Increase total");
+                        ui.selectable_value(&mut adjustment.increase, false, "Decrease total");
+                    });
+                ui.add(
+                    egui::TextEdit::singleline(&mut adjustment.amount)
+                        .hint_text("Amount")
+                        .desired_width(90.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut adjustment.description)
+                        .hint_text("Description")
+                        .desired_width(130.0),
+                );
+                if ui.button("Remove").clicked() {
+                    remove_adjustment = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove_adjustment {
+            self.invoice_adjustments.remove(index);
+        }
+        if ui.button("Add charge or deduction").clicked() {
+            self.invoice_adjustments.push(InvoiceAdjustmentForm {
+                ledger: None,
+                amount: String::new(),
+                increase: true,
+                description: String::new(),
+            });
+        }
         ui.horizontal(|ui| {
             ui.label("Narration");
             ui.text_edit_singleline(&mut self.invoice_narration);
@@ -1778,6 +1836,7 @@ impl App {
             self.invoice_due_date.clear();
             self.invoice_credit_days.clear();
             self.invoice_lines = vec![InvoiceLineForm::new()];
+            self.invoice_adjustments.clear();
             self.invoice_tax_amount.clear();
             self.invoice_tax_ledger = None;
         }
@@ -1802,6 +1861,19 @@ impl App {
                 } else {
                     parse_amount(&self.invoice_tax_amount)?
                 };
+                let mut adjustments = Vec::new();
+                for line in &self.invoice_adjustments {
+                    let amount = parse_amount(&line.amount)?;
+                    adjustments.push(InvoiceAdjustment {
+                        ledger_id: line.ledger.ok_or_else(|| {
+                            balance::Error::Validation(
+                                "Select a ledger for every adjustment".into(),
+                            )
+                        })?,
+                        amount: if line.increase { amount } else { -amount },
+                        description: line.description.clone(),
+                    });
+                }
                 let draft = InvoiceDraft {
                     kind: self.invoice_kind,
                     date: self.invoice_date.clone(),
@@ -1832,6 +1904,7 @@ impl App {
                     tax_ledger_id: self.invoice_tax_ledger,
                     tax_amount,
                     lines,
+                    adjustments,
                 };
                 if let Some(id) = self.editing_invoice {
                     self.store.update_invoice(company, id, &draft)?;
@@ -1848,6 +1921,7 @@ impl App {
                     self.invoice_due_date.clear();
                     self.invoice_credit_days.clear();
                     self.invoice_lines = vec![InvoiceLineForm::new()];
+                    self.invoice_adjustments.clear();
                     self.invoice_tax_amount.clear();
                     self.invoice_tax_ledger = None;
                     self.editing_invoice = None;
@@ -2051,6 +2125,18 @@ impl App {
                                         price: format_amount(line.unit_price),
                                     })
                                     .collect();
+                                self.invoice_adjustments = draft
+                                    .adjustments
+                                    .into_iter()
+                                    .map(|adjustment| InvoiceAdjustmentForm {
+                                        ledger: Some(adjustment.ledger_id),
+                                        amount: format_amount(adjustment.amount)
+                                            .trim_start_matches('-')
+                                            .to_owned(),
+                                        increase: adjustment.amount > 0,
+                                        description: adjustment.description,
+                                    })
+                                    .collect();
                                 self.message = "Invoice loaded for editing".into();
                             }
                             Err(e) => self.failure(e),
@@ -2078,6 +2164,14 @@ impl App {
                     }
                     if invoice.tax_amount > 0 {
                         ui.label(format!("  Tax: {}", format_amount(invoice.tax_amount)));
+                    }
+                    for adjustment in invoice.adjustments {
+                        ui.label(format!(
+                            "  {}: {} ({})",
+                            adjustment.ledger,
+                            format_amount(adjustment.amount),
+                            adjustment.description
+                        ));
                     }
                     match self.store.invoice_settlements(company, invoice.id) {
                         Ok(rows) => {
@@ -2140,6 +2234,14 @@ impl App {
                                                 line.unit,
                                                 format_amount(line.unit_price),
                                                 format_amount(line.amount)
+                                            ));
+                                        }
+                                        for adjustment in revision.adjustments {
+                                            ui.label(format!(
+                                                "  {}: {} ({})",
+                                                adjustment.ledger,
+                                                format_amount(adjustment.amount),
+                                                adjustment.description
                                             ));
                                         }
                                     }
@@ -2250,7 +2352,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, unvalued stock items and a restricted form of item invoice. Invoice import requires one matching new bill reference, one trade ledger and no additional ledger entries; tax, batches, locations, other bill allocations, valued opening stock, statutory tax information and other unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, unvalued stock items and a restricted form of item invoice. Invoices require one matching new bill reference and one trade ledger; additional ledger postings become unclassified charges or deductions. Tax details, batches, locations, other bill allocations, valued opening stock and other unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Bank clearance");

@@ -247,7 +247,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=18).contains(&version) {
+    if !(1..=19).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -342,6 +342,8 @@ impl Store {
             "bank_statement_entries",
             "bank_matches",
             "bank_match_events",
+            "invoice_adjustments",
+            "invoice_revision_adjustments",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -359,7 +361,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 18 {
+        if version > 19 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -517,6 +519,13 @@ impl Store {
                 CREATE TABLE bank_matches(posting_id INTEGER PRIMARY KEY REFERENCES postings(id), statement_id INTEGER NOT NULL UNIQUE REFERENCES bank_statement_entries(id), company_id INTEGER NOT NULL REFERENCES companies(id));
                 CREATE TABLE bank_match_events(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), statement_id INTEGER NOT NULL REFERENCES bank_statement_entries(id), voucher_id INTEGER NOT NULL REFERENCES vouchers(id), posting_id INTEGER NOT NULL, action TEXT NOT NULL CHECK(action IN ('match', 'unmatch')), reason TEXT NOT NULL, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
                 PRAGMA user_version = 18;")?;
+        }
+        if version < 19 {
+            tx.execute_batch("CREATE TABLE invoice_adjustments(id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES invoices(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), amount INTEGER NOT NULL CHECK(amount != 0), description TEXT NOT NULL);
+                CREATE INDEX invoice_adjustments_invoice ON invoice_adjustments(invoice_id, id);
+                CREATE TABLE invoice_revision_adjustments(id INTEGER PRIMARY KEY, revision_id INTEGER NOT NULL REFERENCES invoice_revisions(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), amount INTEGER NOT NULL CHECK(amount != 0), description TEXT NOT NULL);
+                CREATE INDEX invoice_revision_adjustments_revision ON invoice_revision_adjustments(revision_id, id);
+                PRAGMA user_version = 19;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1379,7 +1388,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
