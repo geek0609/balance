@@ -12,4 +12,6 @@ The prototype supports company creation, hierarchical account groups and ledgers
 
 The initial XML importer supports a limited set of simple accounting records and selected ledger contact fields, and blocks imports containing detected unsupported data. It must be verified with representative exports before using it to migrate business records. It currently requires supported records to include their account groups, unambiguous ledger names, and voucher numbers; it does not accept files containing unsupported records or fields. Preview shows issues before any data is written, and applying a preview writes the entire set in one database transaction.
 
+The Back up screen can create a SQLite snapshot of all companies at a new, absolute file path. Restore from within the application is not implemented, and the backup workflow has not yet been verified.
+
 Licensed under Apache-2.0; see [LICENSE](LICENSE).

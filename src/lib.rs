@@ -207,6 +207,27 @@ impl Store {
     pub fn memory() -> Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
     }
+    /// Create a consistent snapshot at a new path. Existing files are never
+    /// intentionally overwritten; on failure, an incomplete file may remain.
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<()> {
+        let destination = destination.as_ref();
+        if !destination.is_absolute() {
+            return Err(Error::Validation(
+                "Enter an absolute backup file path".into(),
+            ));
+        }
+        let path = destination
+            .to_str()
+            .ok_or_else(|| Error::Validation("Backup path must be valid Unicode".into()))?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|e| Error::Validation(format!("Cannot create backup file: {e}")))?;
+        drop(file);
+        self.conn.execute("VACUUM main INTO ?1", [path])?;
+        Ok(())
+    }
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;

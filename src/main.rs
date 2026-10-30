@@ -17,6 +17,7 @@ enum Page {
     Import,
     Stock,
     Invoice,
+    Backup,
     Reports,
 }
 struct App {
@@ -50,6 +51,7 @@ struct App {
     register_to: String,
     import_path: String,
     import_opening_date: String,
+    backup_path: String,
     import_preview: Option<ImportPlan>,
     stock_name: String,
     stock_unit: String,
@@ -139,6 +141,7 @@ impl App {
             register_to: String::new(),
             import_path: String::new(),
             import_opening_date: String::new(),
+            backup_path: String::new(),
             import_preview: None,
             stock_name: String::new(),
             stock_unit: String::new(),
@@ -1525,6 +1528,27 @@ impl App {
         }
         ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and accounting vouchers. It does not import inventory, invoices, party allocations, statutory tax information or other unsupported fields.");
     }
+    fn backup_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Back up data");
+        ui.label("Create a snapshot of all companies, ledgers, vouchers, invoices, stock records and saved revisions in this database.");
+        ui.label("Choose a new file path. Existing files are not overwritten. Restoring a backup from the app is not yet available.");
+        ui.horizontal(|ui| {
+            ui.label("New backup file");
+            ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(420.0));
+        });
+        if ui.button("Create backup").clicked() {
+            let path = self.backup_path.trim();
+            if path.is_empty() {
+                self.message = "Enter a backup file path".into();
+            } else {
+                match self.store.backup_to(path) {
+                    Ok(()) => self.message = "Backup created".into(),
+                    Err(e) => self.failure(e),
+                }
+            }
+        }
+        ui.small("If backup creation fails, an incomplete file may remain at the selected path.");
+    }
 }
 fn pick_stock(
     ui: &mut egui::Ui,
@@ -1601,6 +1625,7 @@ impl eframe::App for App {
                 ("Stock", Page::Stock),
                 ("Invoices", Page::Invoice),
                 ("Import XML", Page::Import),
+                ("Back up", Page::Backup),
                 ("Reports", Page::Reports),
             ] {
                 if ui.selectable_label(self.page == page, label).clicked() {
@@ -1619,6 +1644,10 @@ impl eframe::App for App {
                     self.company_page(ui);
                     return;
                 }
+                if self.page == Page::Backup {
+                    self.backup_page(ui);
+                    return;
+                }
                 let Some(company) = self.company else {
                     ui.label("Select a company first.");
                     return;
@@ -1631,6 +1660,7 @@ impl eframe::App for App {
                     Page::Stock => self.stock_page(ui, company),
                     Page::Invoice => self.invoice_page(ui, company),
                     Page::Import => self.import_page(ui, company),
+                    Page::Backup => {}
                     Page::Reports => self.reports_page(ui, company),
                 }
             });
