@@ -74,6 +74,12 @@ pub struct Voucher {
     pub postings: Vec<Posting>,
 }
 #[derive(Debug, Clone)]
+pub struct VoucherRevision {
+    /// UTC timestamp at which this historical version was replaced.
+    pub changed_at: String,
+    pub voucher: Voucher,
+}
+#[derive(Debug, Clone)]
 pub struct Balance {
     pub ledger: Ledger,
     /// Debit minus credit, in hundredths.
@@ -128,12 +134,29 @@ impl Store {
     pub fn memory() -> Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
     }
-    fn from_connection(conn: Connection) -> Result<Self> {
-        conn.execute_batch("PRAGMA foreign_keys = ON;
+    fn from_connection(mut conn: Connection) -> Result<Self> {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version > 1 {
+            return Err(Error::Validation(
+                "This database was created by a newer version of the application".into(),
+            ));
+        }
+        let tx = conn.transaction()?;
+        if version == 0 {
+            tx.execute_batch("
             CREATE TABLE IF NOT EXISTS companies(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
             CREATE TABLE IF NOT EXISTS ledgers(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), name TEXT NOT NULL, category TEXT NOT NULL, UNIQUE(company_id, name));
             CREATE TABLE IF NOT EXISTS vouchers(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), date TEXT NOT NULL, narration TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS postings(id INTEGER PRIMARY KEY, voucher_id INTEGER NOT NULL REFERENCES vouchers(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), amount INTEGER NOT NULL CHECK(amount != 0));")?;
+            CREATE TABLE IF NOT EXISTS postings(id INTEGER PRIMARY KEY, voucher_id INTEGER NOT NULL REFERENCES vouchers(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), amount INTEGER NOT NULL CHECK(amount != 0));
+            CREATE TABLE voucher_revisions(id INTEGER PRIMARY KEY, voucher_id INTEGER NOT NULL REFERENCES vouchers(id), company_id INTEGER NOT NULL REFERENCES companies(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, date TEXT NOT NULL, narration TEXT NOT NULL);
+            CREATE TABLE revision_postings(id INTEGER PRIMARY KEY, revision_id INTEGER NOT NULL REFERENCES voucher_revisions(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), amount INTEGER NOT NULL CHECK(amount != 0));
+            CREATE INDEX vouchers_company_date ON vouchers(company_id, date);
+            CREATE INDEX postings_voucher ON postings(voucher_id);
+            CREATE INDEX revisions_voucher ON voucher_revisions(voucher_id, id);
+            PRAGMA user_version = 1;")?;
+        }
+        tx.commit()?;
         Ok(Self { conn })
     }
     pub fn create_company(&self, name: &str) -> Result<i64> {
@@ -223,6 +246,14 @@ impl Store {
         let date = validate_voucher(date, postings)?;
         let tx = self.conn.transaction()?;
         check_ledgers(&tx, company_id, postings)?;
+        let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration) SELECT id, company_id, date, narration FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
+        if saved != 1 {
+            return Err(Error::Validation(
+                "Voucher not found in the selected company".into(),
+            ));
+        }
+        let revision_id = tx.last_insert_rowid();
+        tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![revision_id, voucher_id])?;
         let changed = tx.execute(
             "UPDATE vouchers SET date = ?1, narration = ?2 WHERE id = ?3 AND company_id = ?4",
             params![
@@ -279,6 +310,42 @@ impl Store {
         }
         vouchers.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.id.cmp(&a.id)));
         Ok(vouchers)
+    }
+    pub fn voucher_revisions(
+        &self,
+        company_id: i64,
+        voucher_id: i64,
+    ) -> Result<Vec<VoucherRevision>> {
+        let mut stmt = self.conn.prepare("SELECT id, changed_at, date, narration FROM voucher_revisions WHERE company_id = ?1 AND voucher_id = ?2 ORDER BY id DESC")?;
+        let rows = stmt
+            .query_map(params![company_id, voucher_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<(i64, String, String, String)>>>()?;
+        let mut posting_stmt = self.conn.prepare(
+            "SELECT ledger_id, amount FROM revision_postings WHERE revision_id = ?1 ORDER BY id",
+        )?;
+        let mut revisions = Vec::with_capacity(rows.len());
+        for (revision_id, changed_at, date, narration) in rows {
+            let postings = posting_stmt
+                .query_map([revision_id], |r| {
+                    Ok(Posting {
+                        ledger_id: r.get(0)?,
+                        amount: r.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            revisions.push(VoucherRevision {
+                changed_at,
+                voucher: Voucher {
+                    id: voucher_id,
+                    date,
+                    narration,
+                    postings,
+                },
+            });
+        }
+        Ok(revisions)
     }
     pub fn balances(&self, company_id: i64) -> Result<Vec<Balance>> {
         self.balances_in_period(company_id, None, None)
@@ -407,6 +474,76 @@ fn required<'a>(value: &'a str, label: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upgrades_existing_database_and_retains_prior_voucher_versions() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE companies(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+            CREATE TABLE ledgers(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), name TEXT NOT NULL, category TEXT NOT NULL, UNIQUE(company_id, name));
+            CREATE TABLE vouchers(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), date TEXT NOT NULL, narration TEXT NOT NULL);
+            CREATE TABLE postings(id INTEGER PRIMARY KEY, voucher_id INTEGER NOT NULL REFERENCES vouchers(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), amount INTEGER NOT NULL CHECK(amount != 0));
+            INSERT INTO companies VALUES (1, 'Example');
+            INSERT INTO ledgers VALUES (1, 1, 'Cash', 'Asset'), (2, 1, 'Capital', 'Equity');
+            INSERT INTO vouchers VALUES (1, 1, '2026-01-01', 'Original');
+            INSERT INTO postings VALUES (1, 1, 1, 100), (2, 1, 2, -100);").unwrap();
+        let mut db = Store::from_connection(conn).unwrap();
+        assert_eq!(db.vouchers(1).unwrap()[0].narration, "Original");
+        db.update_voucher(
+            1,
+            1,
+            "2026-01-02",
+            "Corrected",
+            &[
+                Posting {
+                    ledger_id: 1,
+                    amount: 200,
+                },
+                Posting {
+                    ledger_id: 2,
+                    amount: -200,
+                },
+            ],
+        )
+        .unwrap();
+        let revisions = db.voucher_revisions(1, 1).unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].voucher.narration, "Original");
+        assert_eq!(revisions[0].voucher.postings[0].amount, 100);
+        assert!(db.voucher_revisions(2, 1).unwrap().is_empty());
+        assert!(db
+            .update_voucher(
+                1,
+                1,
+                "2026-01-03",
+                "invalid",
+                &[
+                    Posting {
+                        ledger_id: 1,
+                        amount: 2
+                    },
+                    Posting {
+                        ledger_id: 2,
+                        amount: -1
+                    }
+                ]
+            )
+            .is_err());
+        assert_eq!(db.voucher_revisions(1, 1).unwrap().len(), 1);
+        assert_eq!(db.vouchers(1).unwrap()[0].narration, "Corrected");
+        let version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+    }
+    #[test]
+    fn rejects_newer_database_versions_without_modifying_them() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA user_version = 99").unwrap();
+        assert!(matches!(
+            Store::from_connection(conn),
+            Err(Error::Validation(_))
+        ));
+    }
     #[test]
     fn reports_apply_period_to_profit_and_end_date_to_balance_sheet() {
         let mut db = Store::memory().unwrap();

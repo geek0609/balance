@@ -293,6 +293,41 @@ impl App {
                             format_amount(p.amount).trim_start_matches('-')
                         ));
                     }
+                    egui::CollapsingHeader::new("Previous versions")
+                        .id_salt(("voucher-revisions", voucher.id))
+                        .show(ui, |ui| {
+                            match self.store.voucher_revisions(company, voucher.id) {
+                                Ok(revisions) if revisions.is_empty() => {
+                                    ui.label("No previous versions.");
+                                }
+                                Ok(revisions) => {
+                                    for revision in revisions {
+                                        ui.label(format!(
+                                            "Replaced at {} UTC • {} • {}",
+                                            revision.changed_at,
+                                            revision.voucher.date,
+                                            revision.voucher.narration
+                                        ));
+                                        for p in revision.voucher.postings {
+                                            let name = ledgers
+                                                .iter()
+                                                .find(|l| l.id == p.ledger_id)
+                                                .map(|l| l.name.as_str())
+                                                .unwrap_or("Unknown ledger");
+                                            ui.label(format!(
+                                                "  {}  {}  {}",
+                                                name,
+                                                if p.amount > 0 { "Dr" } else { "Cr" },
+                                                format_amount(p.amount).trim_start_matches('-')
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                                }
+                            }
+                        });
                 }
             }
             Err(e) => self.failure(e),
