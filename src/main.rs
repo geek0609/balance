@@ -18,6 +18,7 @@ enum Page {
     Stock,
     Invoice,
     Backup,
+    DayBook,
     Reports,
 }
 struct App {
@@ -49,6 +50,10 @@ struct App {
     register_ledger: Option<i64>,
     register_from: String,
     register_to: String,
+    day_from: String,
+    day_to: String,
+    day_kind: Option<VoucherKind>,
+    day_search: String,
     import_path: String,
     import_opening_date: String,
     backup_path: String,
@@ -140,6 +145,10 @@ impl App {
             register_ledger: None,
             register_from: String::new(),
             register_to: String::new(),
+            day_from: String::new(),
+            day_to: String::new(),
+            day_kind: None,
+            day_search: String::new(),
             import_path: String::new(),
             import_opening_date: String::new(),
             backup_path: String::new(),
@@ -1620,6 +1629,80 @@ impl App {
         }
         ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and accounting vouchers. It does not import inventory, invoices, party allocations, statutory tax information or other unsupported fields.");
     }
+    fn day_book_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.heading("Day book");
+        ui.horizontal(|ui| {
+            ui.label("From");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.day_from)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+            ui.label("To");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.day_to)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+            egui::ComboBox::from_label("Type")
+                .selected_text(self.day_kind.map(|k| k.as_str()).unwrap_or("All"))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.day_kind, None, "All");
+                    for kind in VoucherKind::ALL {
+                        ui.selectable_value(&mut self.day_kind, Some(kind), kind.as_str());
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Search reference, narration or ID");
+            ui.text_edit_singleline(&mut self.day_search);
+        });
+        let from = if self.day_from.trim().is_empty() {
+            None
+        } else {
+            Some(self.day_from.trim())
+        };
+        let to = if self.day_to.trim().is_empty() {
+            None
+        } else {
+            Some(self.day_to.trim())
+        };
+        match self
+            .store
+            .day_book(company, from, to, self.day_kind, &self.day_search)
+        {
+            Ok(entries) => {
+                ui.label(format!("{} voucher(s)", entries.len()));
+                egui::Grid::new("day-book").striped(true).show(ui, |ui| {
+                    for name in [
+                        "Date",
+                        "ID",
+                        "Type",
+                        "Reference",
+                        "Narration",
+                        "Debit",
+                        "Credit",
+                    ] {
+                        ui.strong(name);
+                    }
+                    ui.end_row();
+                    for entry in entries {
+                        ui.label(entry.voucher.date);
+                        ui.label(entry.voucher.id.to_string());
+                        ui.label(entry.voucher.kind.as_str());
+                        ui.label(entry.voucher.reference);
+                        ui.label(entry.voucher.narration);
+                        ui.label(money(entry.debit_total));
+                        ui.label(money(entry.credit_total));
+                        ui.end_row();
+                    }
+                });
+            }
+            Err(e) => {
+                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+            }
+        }
+    }
     fn backup_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Back up data");
         ui.label("Create a snapshot of all companies, ledgers, vouchers, invoices, stock records and saved revisions in this database.");
@@ -1714,6 +1797,7 @@ impl eframe::App for App {
                 ("Ledgers", Page::Ledger),
                 ("Voucher", Page::Voucher),
                 ("Ledger activity", Page::Register),
+                ("Day book", Page::DayBook),
                 ("Stock", Page::Stock),
                 ("Invoices", Page::Invoice),
                 ("Import XML", Page::Import),
@@ -1749,6 +1833,7 @@ impl eframe::App for App {
                     Page::Ledger => self.ledger_page(ui, company),
                     Page::Voucher => self.voucher_page(ui, company),
                     Page::Register => self.register_page(ui, company),
+                    Page::DayBook => self.day_book_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),
                     Page::Invoice => self.invoice_page(ui, company),
                     Page::Import => self.import_page(ui, company),

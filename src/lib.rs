@@ -137,6 +137,12 @@ pub struct VoucherRevision {
     pub voucher: Voucher,
 }
 #[derive(Debug, Clone)]
+pub struct DayBookEntry {
+    pub voucher: Voucher,
+    pub debit_total: i128,
+    pub credit_total: i128,
+}
+#[derive(Debug, Clone)]
 pub struct LedgerEntry {
     pub voucher_id: i64,
     pub date: String,
@@ -644,6 +650,59 @@ impl Store {
         }
         vouchers.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.id.cmp(&a.id)));
         Ok(vouchers)
+    }
+    /// Search voucher history in an inclusive date range.
+    pub fn day_book(
+        &self,
+        company_id: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        kind: Option<VoucherKind>,
+        search: &str,
+    ) -> Result<Vec<DayBookEntry>> {
+        let start = start.map(parse_date).transpose()?;
+        let end = end.map(parse_date).transpose()?;
+        if matches!((start, end), (Some(a), Some(b)) if a > b) {
+            return Err(Error::Validation(
+                "The start date must not be after the end date".into(),
+            ));
+        }
+        let search = search.trim().to_lowercase();
+        let mut entries = Vec::new();
+        for voucher in self.vouchers(company_id)? {
+            let date = parse_date(&voucher.date)?;
+            if start.is_some_and(|v| date < v)
+                || end.is_some_and(|v| date > v)
+                || kind.is_some_and(|v| v != voucher.kind)
+            {
+                continue;
+            }
+            if !search.is_empty()
+                && !voucher.reference.to_lowercase().contains(&search)
+                && !voucher.narration.to_lowercase().contains(&search)
+                && !voucher.id.to_string().contains(&search)
+            {
+                continue;
+            }
+            let debit_total = voucher
+                .postings
+                .iter()
+                .filter(|p| p.amount > 0)
+                .map(|p| i128::from(p.amount))
+                .sum();
+            let credit_total = voucher
+                .postings
+                .iter()
+                .filter(|p| p.amount < 0)
+                .map(|p| -i128::from(p.amount))
+                .sum();
+            entries.push(DayBookEntry {
+                voucher,
+                debit_total,
+                credit_total,
+            });
+        }
+        Ok(entries)
     }
     pub fn voucher_revisions(
         &self,

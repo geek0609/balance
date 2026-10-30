@@ -618,8 +618,14 @@ impl Store {
                     .parent_id
                     .and_then(|id| existing_groups.iter().find(|g| g.id == id))
                     .map(|g| normalized(&g.name));
+                let primary_root = parent.eq_ignore_ascii_case("Primary")
+                    && existing
+                        .parent_id
+                        .and_then(|id| existing_groups.iter().find(|g| g.id == id))
+                        .is_some_and(|g| g.parent_id.is_none() && g.name == g.category.as_str());
                 if !parent.is_empty()
                     && expected_parent.as_deref() != Some(normalized(&parent).as_str())
+                    && !primary_root
                 {
                     plan.issues.push(format!(
                         "Group {name}: existing parent differs from the imported parent"
