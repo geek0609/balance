@@ -13,6 +13,22 @@ pub struct StockItem {
     pub id: i64,
     pub name: String,
     pub unit: String,
+    pub unit_id: i64,
+    pub group_id: i64,
+    pub description: String,
+}
+#[derive(Debug, Clone)]
+pub struct StockUnit {
+    pub id: i64,
+    pub symbol: String,
+    pub formal_name: String,
+    pub decimal_places: u8,
+}
+#[derive(Debug, Clone)]
+pub struct StockGroup {
+    pub id: i64,
+    pub name: String,
+    pub parent_id: Option<i64>,
 }
 #[derive(Debug, Clone)]
 pub struct StockBalance {
@@ -261,6 +277,7 @@ fn prepare_invoice(
                 "Every item must belong to the selected company".into(),
             ));
         }
+        check_quantity_precision(conn, company_id, line.item_id, line.quantity)?;
         let amount = line_amount(line.quantity, line.unit_price)?;
         subtotal += i128::from(amount);
         amounts.push(amount);
@@ -341,19 +358,201 @@ fn ledger_category(conn: &Connection, company_id: i64, ledger_id: i64) -> Result
         })?;
     Category::parse(&value)
 }
+pub(crate) fn seed_stock_groups(conn: &Connection, company_id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO stock_groups(company_id, name, parent_id) VALUES (?1, 'Primary', NULL)",
+        [company_id],
+    )?;
+    Ok(())
+}
+pub(crate) fn check_quantity_precision(
+    conn: &Connection,
+    company_id: i64,
+    item_id: i64,
+    quantity: i64,
+) -> Result<()> {
+    let places: i64 = conn.query_row("SELECT u.decimal_places FROM stock_items i JOIN stock_units u ON u.id = i.unit_id AND u.company_id = i.company_id WHERE i.id = ?1 AND i.company_id = ?2", params![item_id, company_id], |r| r.get(0)).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Stock item or its unit was not found in the selected company".into()), other => Error::Database(other) })?;
+    if !(0..=3).contains(&places) {
+        return Err(Error::Validation("Unsupported unit precision".into()));
+    }
+    let step = 10_i64.pow((3 - places) as u32);
+    if quantity % step != 0 {
+        return Err(Error::Validation(format!(
+            "Quantity must have at most {places} decimal places for this unit"
+        )));
+    }
+    Ok(())
+}
+fn find_unit(conn: &Connection, company_id: i64, symbol: &str) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare("SELECT id, symbol FROM stock_units WHERE company_id = ?1")?;
+    let mut found = None;
+    for row in stmt.query_map([company_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (id, name) = row?;
+        if name.trim().to_lowercase() == symbol.trim().to_lowercase() {
+            if found.is_some() {
+                return Err(Error::Validation("Unit name is ambiguous".into()));
+            }
+            found = Some(id);
+        }
+    }
+    Ok(found)
+}
+pub(crate) fn create_stock_item_on_connection(
+    conn: &Connection,
+    company_id: i64,
+    name: &str,
+    unit_id: i64,
+    group_id: i64,
+    description: &str,
+) -> Result<i64> {
+    let name = required(name, "Stock item name")?;
+    let unit: String = conn
+        .query_row(
+            "SELECT symbol FROM stock_units WHERE id = ?1 AND company_id = ?2",
+            params![unit_id, company_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                Error::Validation("Unit not found in the selected company".into())
+            }
+            other => Error::Database(other),
+        })?;
+    let group_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM stock_groups WHERE id = ?1 AND company_id = ?2)",
+        params![group_id, company_id],
+        |r| r.get(0),
+    )?;
+    if !group_exists {
+        return Err(Error::Validation(
+            "Stock group not found in the selected company".into(),
+        ));
+    }
+    let mut stmt = conn.prepare("SELECT name FROM stock_items WHERE company_id = ?1")?;
+    for existing in stmt.query_map([company_id], |r| r.get::<_, String>(0))? {
+        if existing?.trim().to_lowercase() == name.to_lowercase() {
+            return Err(Error::Validation("Stock item already exists".into()));
+        }
+    }
+    drop(stmt);
+    conn.execute("INSERT INTO stock_items(company_id, name, unit, unit_id, group_id, description) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![company_id, name, unit, unit_id, group_id, description.trim()])?;
+    Ok(conn.last_insert_rowid())
+}
 impl Store {
-    pub fn create_stock_item(&self, company_id: i64, name: &str, unit: &str) -> Result<i64> {
-        let name = required(name, "Stock item name")?;
-        let unit = required(unit, "Unit")?;
+    pub fn stock_units(&self, company_id: i64) -> Result<Vec<StockUnit>> {
+        let mut stmt = self.conn.prepare("SELECT id, symbol, formal_name, decimal_places FROM stock_units WHERE company_id = ?1 ORDER BY symbol")?;
+        let rows = stmt
+            .query_map([company_id], |r| {
+                Ok(StockUnit {
+                    id: r.get(0)?,
+                    symbol: r.get(1)?,
+                    formal_name: r.get(2)?,
+                    decimal_places: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    pub fn create_stock_unit(
+        &self,
+        company_id: i64,
+        symbol: &str,
+        formal_name: &str,
+        decimal_places: u8,
+    ) -> Result<i64> {
+        let symbol = required(symbol, "Unit symbol")?;
+        if decimal_places > 3 {
+            return Err(Error::Validation(
+                "Units currently support at most three decimal places".into(),
+            ));
+        }
+        if find_unit(&self.conn, company_id, symbol)?.is_some() {
+            return Err(Error::Validation("Unit already exists".into()));
+        }
+        self.conn.execute("INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) VALUES (?1, ?2, ?3, ?4)", params![company_id, symbol, formal_name.trim(), decimal_places])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+    pub fn stock_groups(&self, company_id: i64) -> Result<Vec<StockGroup>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, parent_id FROM stock_groups WHERE company_id = ?1 ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([company_id], |r| {
+                Ok(StockGroup {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    parent_id: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    pub fn create_stock_group(&self, company_id: i64, name: &str, parent_id: i64) -> Result<i64> {
+        let name = required(name, "Stock group name")?;
+        let groups = self.stock_groups(company_id)?;
+        if !groups.iter().any(|g| g.id == parent_id) {
+            return Err(Error::Validation(
+                "Parent stock group not found in the selected company".into(),
+            ));
+        }
+        if groups
+            .iter()
+            .any(|g| g.name.trim().to_lowercase() == name.to_lowercase())
+        {
+            return Err(Error::Validation("Stock group already exists".into()));
+        }
         self.conn.execute(
-            "INSERT INTO stock_items(company_id, name, unit) VALUES (?1, ?2, ?3)",
-            params![company_id, name, unit],
+            "INSERT INTO stock_groups(company_id, name, parent_id) VALUES (?1, ?2, ?3)",
+            params![company_id, name, parent_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
+    pub fn create_stock_item_in_group(
+        &self,
+        company_id: i64,
+        name: &str,
+        unit_id: i64,
+        group_id: i64,
+    ) -> Result<i64> {
+        create_stock_item_on_connection(&self.conn, company_id, name, unit_id, group_id, "")
+    }
+    pub fn create_stock_item_with_description(
+        &self,
+        company_id: i64,
+        name: &str,
+        unit_id: i64,
+        group_id: i64,
+        description: &str,
+    ) -> Result<i64> {
+        create_stock_item_on_connection(
+            &self.conn,
+            company_id,
+            name,
+            unit_id,
+            group_id,
+            description,
+        )
+    }
+    pub fn create_stock_item(&self, company_id: i64, name: &str, unit: &str) -> Result<i64> {
+        let name = required(name, "Stock item name")?;
+        let unit = required(unit, "Unit")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let unit_id = if let Some(id) = find_unit(&tx, company_id, unit)? {
+            id
+        } else {
+            tx.execute("INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) VALUES (?1, ?2, ?2, 3)", params![company_id, unit])?;
+            tx.last_insert_rowid()
+        };
+        let group_id: i64 = tx.query_row("SELECT id FROM stock_groups WHERE company_id = ?1 AND name = 'Primary' AND parent_id IS NULL", [company_id], |r| r.get(0))?;
+        let id = create_stock_item_on_connection(&tx, company_id, name, unit_id, group_id, "")?;
+        tx.commit()?;
+        Ok(id)
+    }
     pub fn stock_items(&self, company_id: i64) -> Result<Vec<StockItem>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, unit FROM stock_items WHERE company_id = ?1 ORDER BY name",
+            "SELECT id, name, unit, unit_id, group_id, description FROM stock_items WHERE company_id = ?1 ORDER BY name",
         )?;
         let rows = stmt
             .query_map([company_id], |r| {
@@ -361,6 +560,9 @@ impl Store {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     unit: r.get(2)?,
+                    unit_id: r.get(3)?,
+                    group_id: r.get(4)?,
+                    description: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -390,6 +592,7 @@ impl Store {
                 "Stock item not found in the selected company".into(),
             ));
         }
+        check_quantity_precision(&self.conn, company_id, item_id, quantity)?;
         self.conn.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, item_id, date, quantity, reason])?;
         Ok(self.conn.last_insert_rowid())
     }

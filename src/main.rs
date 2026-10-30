@@ -61,7 +61,14 @@ struct App {
     backup_path: String,
     import_preview: Option<ImportPlan>,
     stock_name: String,
-    stock_unit: String,
+    stock_description: String,
+    stock_creation_unit: Option<i64>,
+    stock_creation_group: Option<i64>,
+    unit_symbol: String,
+    unit_formal_name: String,
+    unit_decimals: u8,
+    stock_group_name: String,
+    stock_group_parent: Option<i64>,
     stock_as_of: String,
     stock_register_item: Option<i64>,
     stock_register_from: String,
@@ -157,7 +164,14 @@ impl App {
             backup_path: String::new(),
             import_preview: None,
             stock_name: String::new(),
-            stock_unit: String::new(),
+            stock_description: String::new(),
+            stock_creation_unit: None,
+            stock_creation_group: None,
+            unit_symbol: String::new(),
+            unit_formal_name: String::new(),
+            unit_decimals: 0,
+            stock_group_name: String::new(),
+            stock_group_parent: None,
             stock_as_of: String::new(),
             stock_register_item: None,
             stock_register_from: String::new(),
@@ -209,6 +223,9 @@ impl App {
         self.opening_amount.clear();
         self.import_preview = None;
         self.adjustment_item = None;
+        self.stock_creation_unit = None;
+        self.stock_creation_group = None;
+        self.stock_group_parent = None;
         self.stock_register_item = None;
         self.invoice_party = None;
         self.invoice_trade = None;
@@ -980,25 +997,160 @@ impl App {
         );
     }
     fn stock_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        let units = match self.store.stock_units(company) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        let groups = match self.store.stock_groups(company) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        if self.stock_creation_group.is_none() {
+            self.stock_creation_group = groups
+                .iter()
+                .find(|g| g.parent_id.is_none() && g.name == "Primary")
+                .map(|g| g.id);
+        }
+        if self.stock_group_parent.is_none() {
+            self.stock_group_parent = groups
+                .iter()
+                .find(|g| g.parent_id.is_none() && g.name == "Primary")
+                .map(|g| g.id);
+        }
+        ui.heading("Units and stock groups");
+        ui.horizontal(|ui| {
+            ui.label("Unit symbol");
+            ui.text_edit_singleline(&mut self.unit_symbol);
+            ui.label("Formal name");
+            ui.text_edit_singleline(&mut self.unit_formal_name);
+            ui.label("Decimal places");
+            ui.add(egui::DragValue::new(&mut self.unit_decimals).range(0..=3));
+            if ui.button("Create unit").clicked() {
+                match self.store.create_stock_unit(
+                    company,
+                    &self.unit_symbol,
+                    &self.unit_formal_name,
+                    self.unit_decimals,
+                ) {
+                    Ok(id) => {
+                        self.stock_creation_unit = Some(id);
+                        self.unit_symbol.clear();
+                        self.unit_formal_name.clear();
+                        self.message = "Unit created".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Stock group");
+            ui.text_edit_singleline(&mut self.stock_group_name);
+            let parent = groups
+                .iter()
+                .find(|g| Some(g.id) == self.stock_group_parent)
+                .map(|g| g.name.as_str())
+                .unwrap_or("Select parent");
+            egui::ComboBox::from_id_salt("stock-group-parent")
+                .selected_text(parent)
+                .show_ui(ui, |ui| {
+                    for group in &groups {
+                        ui.selectable_value(
+                            &mut self.stock_group_parent,
+                            Some(group.id),
+                            &group.name,
+                        );
+                    }
+                });
+            if ui.button("Create stock group").clicked() {
+                let result = match self.stock_group_parent {
+                    Some(id) => self
+                        .store
+                        .create_stock_group(company, &self.stock_group_name, id),
+                    None => Err(balance::Error::Validation(
+                        "Select a parent stock group".into(),
+                    )),
+                };
+                match result {
+                    Ok(id) => {
+                        self.stock_creation_group = Some(id);
+                        self.stock_group_name.clear();
+                        self.message = "Stock group created".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        });
+        ui.separator();
         ui.heading("Stock items");
         ui.horizontal(|ui| {
             ui.label("Name");
             ui.text_edit_singleline(&mut self.stock_name);
             ui.label("Unit");
-            ui.text_edit_singleline(&mut self.stock_unit);
+            let unit = units
+                .iter()
+                .find(|u| Some(u.id) == self.stock_creation_unit)
+                .map(|u| u.symbol.as_str())
+                .unwrap_or("Select unit");
+            egui::ComboBox::from_id_salt("stock-create-unit")
+                .selected_text(unit)
+                .show_ui(ui, |ui| {
+                    for value in &units {
+                        ui.selectable_value(
+                            &mut self.stock_creation_unit,
+                            Some(value.id),
+                            &value.symbol,
+                        );
+                    }
+                });
+            ui.label("Group");
+            let group = groups
+                .iter()
+                .find(|g| Some(g.id) == self.stock_creation_group)
+                .map(|g| g.name.as_str())
+                .unwrap_or("Select group");
+            egui::ComboBox::from_id_salt("stock-create-group")
+                .selected_text(group)
+                .show_ui(ui, |ui| {
+                    for value in &groups {
+                        ui.selectable_value(
+                            &mut self.stock_creation_group,
+                            Some(value.id),
+                            &value.name,
+                        );
+                    }
+                });
             if ui.button("Create item").clicked() {
-                match self
-                    .store
-                    .create_stock_item(company, &self.stock_name, &self.stock_unit)
-                {
+                let result = match (self.stock_creation_unit, self.stock_creation_group) {
+                    (Some(unit), Some(group)) => self.store.create_stock_item_with_description(
+                        company,
+                        &self.stock_name,
+                        unit,
+                        group,
+                        &self.stock_description,
+                    ),
+                    _ => Err(balance::Error::Validation(
+                        "Select a unit and stock group".into(),
+                    )),
+                };
+                match result {
                     Ok(_) => {
                         self.stock_name.clear();
-                        self.stock_unit.clear();
+                        self.stock_description.clear();
                         self.message = "Stock item created".into();
                     }
                     Err(e) => self.failure(e),
                 }
             }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Item description");
+            ui.text_edit_singleline(&mut self.stock_description);
         });
         let items = match self.store.stock_items(company) {
             Ok(v) => v,
@@ -1593,11 +1745,12 @@ impl App {
         }
         if let Some(plan) = &self.import_preview {
             ui.label(format!(
-                "Preview: {} new groups, {} new ledgers, {} opening balances, {} vouchers",
+                "Preview: {} account groups, {} ledgers, {} opening balances, {} vouchers; {} units, {} stock groups, {} items, {} opening quantities",
                 plan.group_count(),
                 plan.ledger_count(),
                 plan.opening_count(),
                 plan.voucher_count()
+                , plan.unit_count(), plan.stock_group_count(), plan.item_count(), plan.stock_opening_count()
             ));
             if plan.issues().is_empty() {
                 ui.label("Preview found no issues. Review the limitations below before importing.");
@@ -1621,8 +1774,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} groups, {} ledgers and {} vouchers",
-                            counts.groups, counts.ledgers, counts.vouchers
+                            "Imported {} account groups, {} ledgers, {} vouchers, {} units, {} stock groups and {} items",
+                            counts.groups, counts.ledgers, counts.vouchers, counts.units, counts.stock_groups, counts.items
                         );
                         self.import_preview = None;
                     }
@@ -1630,7 +1783,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and accounting vouchers. It does not import inventory, invoices, party allocations, statutory tax information or other unsupported fields.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups and unvalued stock items. It does not import valued opening stock, invoices, party allocations, statutory tax information or other unsupported fields.");
     }
     fn outstanding_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Outstanding invoices");

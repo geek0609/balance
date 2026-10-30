@@ -237,7 +237,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 10 {
+        if version > 11 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -326,6 +326,17 @@ impl Store {
                 CREATE INDEX imported_record_master_id ON imported_record_metadata(company_id, kind, master_id);
                 PRAGMA user_version = 10;")?;
         }
+        if version < 11 {
+            tx.execute_batch("CREATE TABLE stock_units(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), symbol TEXT NOT NULL, formal_name TEXT NOT NULL, decimal_places INTEGER NOT NULL CHECK(decimal_places BETWEEN 0 AND 3), UNIQUE(company_id, symbol));
+                CREATE TABLE stock_groups(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), name TEXT NOT NULL, parent_id INTEGER REFERENCES stock_groups(id), UNIQUE(company_id, name));
+                ALTER TABLE stock_items ADD COLUMN unit_id INTEGER REFERENCES stock_units(id);
+                ALTER TABLE stock_items ADD COLUMN group_id INTEGER REFERENCES stock_groups(id);
+                ALTER TABLE stock_items ADD COLUMN description TEXT NOT NULL DEFAULT '';
+                INSERT INTO stock_groups(company_id, name) SELECT id, 'Primary' FROM companies;
+                INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) SELECT DISTINCT company_id, unit, unit, 3 FROM stock_items;
+                UPDATE stock_items SET unit_id = (SELECT id FROM stock_units WHERE company_id = stock_items.company_id AND symbol = stock_items.unit), group_id = (SELECT id FROM stock_groups WHERE company_id = stock_items.company_id AND name = 'Primary');
+                PRAGMA user_version = 11;")?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
@@ -335,6 +346,7 @@ impl Store {
         tx.execute("INSERT INTO companies(name) VALUES (?1)", [name])?;
         let id = tx.last_insert_rowid();
         seed_groups(&tx, id)?;
+        inventory::seed_stock_groups(&tx, id)?;
         tx.commit()?;
         Ok(id)
     }
@@ -1184,7 +1196,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

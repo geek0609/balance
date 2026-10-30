@@ -1,6 +1,7 @@
 //! Import of a limited accounting XML interchange format.
 //! Unsupported or ambiguous data is reported before any database writes.
 use crate::contacts::{insert_new_profile, LedgerProfile};
+use crate::inventory::{check_quantity_precision, create_stock_item_on_connection, parse_quantity};
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
     Store, VoucherKind,
@@ -25,6 +26,29 @@ struct Account {
     group: String,
     category: Category,
     profile: LedgerProfile,
+    opening: Option<i64>,
+    metadata: SourceMetadata,
+}
+#[derive(Debug, Clone)]
+struct Unit {
+    symbol: String,
+    formal_name: String,
+    decimal_places: u8,
+    metadata: SourceMetadata,
+}
+#[derive(Debug, Clone)]
+struct StockGroupImport {
+    name: String,
+    parent: String,
+    metadata: SourceMetadata,
+}
+#[derive(Debug, Clone)]
+struct Item {
+    name: String,
+    unit: String,
+    unit_precision: u8,
+    group: String,
+    description: String,
     opening: Option<i64>,
     metadata: SourceMetadata,
 }
@@ -71,8 +95,13 @@ pub struct ImportPlan {
     company_id: i64,
     opening_date: Option<String>,
     existing_group_metadata: Vec<(i64, SourceMetadata)>,
+    existing_unit_metadata: Vec<(i64, SourceMetadata)>,
+    existing_stock_group_metadata: Vec<(i64, SourceMetadata)>,
     groups: Vec<Group>,
     accounts: Vec<Account>,
+    units: Vec<Unit>,
+    stock_groups: Vec<StockGroupImport>,
+    items: Vec<Item>,
     transactions: Vec<Transaction>,
     issues: Vec<String>,
 }
@@ -89,6 +118,18 @@ impl ImportPlan {
     pub fn opening_count(&self) -> usize {
         self.accounts.iter().filter(|a| a.opening.is_some()).count()
     }
+    pub fn unit_count(&self) -> usize {
+        self.units.len()
+    }
+    pub fn stock_group_count(&self) -> usize {
+        self.stock_groups.len()
+    }
+    pub fn item_count(&self) -> usize {
+        self.items.len()
+    }
+    pub fn stock_opening_count(&self) -> usize {
+        self.items.iter().filter(|i| i.opening.is_some()).count()
+    }
     pub fn company_id(&self) -> i64 {
         self.company_id
     }
@@ -99,6 +140,11 @@ impl ImportPlan {
         self.issues.is_empty()
             && (!self.groups.is_empty()
                 || !self.existing_group_metadata.is_empty()
+                || !self.existing_unit_metadata.is_empty()
+                || !self.existing_stock_group_metadata.is_empty()
+                || !self.units.is_empty()
+                || !self.stock_groups.is_empty()
+                || !self.items.is_empty()
                 || !self.accounts.is_empty()
                 || !self.transactions.is_empty())
     }
@@ -108,6 +154,9 @@ pub struct ImportCounts {
     pub groups: usize,
     pub ledgers: usize,
     pub vouchers: usize,
+    pub units: usize,
+    pub stock_groups: usize,
+    pub items: usize,
 }
 
 fn normalized(value: &str) -> String {
@@ -149,9 +198,16 @@ fn meaningful(node: Node<'_, '_>) -> bool {
 }
 fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut Vec<String>) {
     let mut singletons = HashSet::new();
-    let record = ["GROUP", "LEDGER", "VOUCHER"]
-        .iter()
-        .any(|tag| local_name(node).eq_ignore_ascii_case(tag));
+    let record = [
+        "GROUP",
+        "LEDGER",
+        "VOUCHER",
+        "UNIT",
+        "STOCKGROUP",
+        "STOCKITEM",
+    ]
+    .iter()
+    .any(|tag| local_name(node).eq_ignore_ascii_case(tag));
     for child in node.children().filter(|n| n.is_element()) {
         let tag = local_name(child);
         let metadata = record
@@ -457,6 +513,25 @@ fn xml_amount(value: &str) -> Result<i64> {
             .ok_or_else(|| Error::Validation("Amount is too large".into()))
     }
 }
+fn xml_stock_quantity(value: &str, unit: &str) -> Result<i64> {
+    let mut parts = value.split_whitespace();
+    let number = parts
+        .next()
+        .ok_or_else(|| Error::Validation("Missing stock quantity".into()))?;
+    let suffix = parts.collect::<Vec<_>>().join(" ");
+    if !suffix.is_empty() && normalized(&suffix) != normalized(unit) {
+        return Err(Error::Validation(
+            "Stock quantity uses a different unit".into(),
+        ));
+    }
+    if let Some(rest) = number.strip_prefix('-') {
+        parse_quantity(rest)?
+            .checked_neg()
+            .ok_or_else(|| Error::Validation("Quantity is too large".into()))
+    } else {
+        parse_quantity(number)
+    }
+}
 fn find_group(conn: &Connection, company: i64, name: &str) -> Result<Option<(i64, Category)>> {
     let mut stmt =
         conn.prepare("SELECT id, name, category FROM account_groups WHERE company_id = ?1")?;
@@ -496,6 +571,45 @@ fn find_ledger(conn: &Connection, company: i64, name: &str) -> Result<Option<i64
     }
     Ok(found)
 }
+fn find_stock_unit(conn: &Connection, company: i64, symbol: &str) -> Result<Option<(i64, u8)>> {
+    let mut stmt =
+        conn.prepare("SELECT id, symbol, decimal_places FROM stock_units WHERE company_id = ?1")?;
+    let mut found = None;
+    for row in stmt.query_map([company], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, u8>(2)?,
+        ))
+    })? {
+        let (id, name, places) = row?;
+        if normalized(&name) == normalized(symbol) {
+            if found.is_some() {
+                return Err(Error::Validation(format!("Unit {symbol} is ambiguous")));
+            }
+            found = Some((id, places));
+        }
+    }
+    Ok(found)
+}
+fn find_stock_group(conn: &Connection, company: i64, name: &str) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare("SELECT id, name FROM stock_groups WHERE company_id = ?1")?;
+    let mut found = None;
+    for row in stmt.query_map([company], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (id, candidate) = row?;
+        if normalized(&candidate) == normalized(name) {
+            if found.is_some() {
+                return Err(Error::Validation(format!(
+                    "Stock group {name} is ambiguous"
+                )));
+            }
+            found = Some(id);
+        }
+    }
+    Ok(found)
+}
 
 impl Store {
     pub fn preview_xml_import(&self, company_id: i64, bytes: &[u8]) -> Result<ImportPlan> {
@@ -526,8 +640,13 @@ impl Store {
                 .map(xml_date)
                 .transpose()?,
             existing_group_metadata: Vec::new(),
+            existing_unit_metadata: Vec::new(),
+            existing_stock_group_metadata: Vec::new(),
             groups: Vec::new(),
             accounts: Vec::new(),
+            units: Vec::new(),
+            stock_groups: Vec::new(),
+            items: Vec::new(),
             transactions: Vec::new(),
             issues: Vec::new(),
         };
@@ -559,9 +678,16 @@ impl Store {
                             || local_name(p).eq_ignore_ascii_case("COLLECTION"))
                 })
         }) {
-            if !["GROUP", "LEDGER", "VOUCHER"]
-                .iter()
-                .any(|name| local_name(node).eq_ignore_ascii_case(name))
+            if ![
+                "GROUP",
+                "LEDGER",
+                "VOUCHER",
+                "UNIT",
+                "STOCKGROUP",
+                "STOCKITEM",
+            ]
+            .iter()
+            .any(|name| local_name(node).eq_ignore_ascii_case(name))
                 && meaningful(node)
             {
                 plan.issues
@@ -792,6 +918,291 @@ impl Store {
                 metadata,
             });
         }
+        let existing_units = self.stock_units(company_id)?;
+        let mut known_units = HashMap::<String, u8>::new();
+        for unit in &existing_units {
+            if known_units
+                .insert(normalized(&unit.symbol), unit.decimal_places)
+                .is_some()
+            {
+                plan.issues
+                    .push(format!("Unit {} is ambiguous", unit.symbol));
+            }
+        }
+        let mut seen_units = HashSet::new();
+        for node in doc
+            .descendants()
+            .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("UNIT"))
+        {
+            let Some(symbol) = object_name(node) else {
+                plan.issues.push("A unit has no unambiguous symbol".into());
+                continue;
+            };
+            let label = format!("Unit {symbol}");
+            check_fields(
+                node,
+                &[
+                    "NAME",
+                    "ORIGINALNAME",
+                    "ISSIMPLEUNIT",
+                    "DECIMALPLACES",
+                    "LANGUAGENAME.LIST",
+                ],
+                &label,
+                &mut plan.issues,
+            );
+            check_language_names(node, &symbol, &label, &mut plan.issues);
+            if !seen_units.insert(normalized(&symbol)) {
+                plan.issues.push(format!("{label}: duplicate symbol"));
+                continue;
+            }
+            let metadata = source_metadata(node, &label, &mut plan.issues);
+            register_metadata(
+                "stockunit",
+                &label,
+                &metadata,
+                &mut seen_metadata,
+                &mut plan.issues,
+            );
+            if !direct_text(node, "ISSIMPLEUNIT").is_some_and(|s| s.eq_ignore_ascii_case("yes")) {
+                plan.issues.push(format!(
+                    "{label}: compound or unspecified units are not supported"
+                ));
+            }
+            let places = match direct_text(node, "DECIMALPLACES")
+                .and_then(|s| s.parse::<u8>().ok())
+                .filter(|n| *n <= 3)
+            {
+                Some(v) => v,
+                None => {
+                    plan.issues
+                        .push(format!("{label}: decimal places must be between 0 and 3"));
+                    continue;
+                }
+            };
+            let formal_name = direct_text(node, "ORIGINALNAME").unwrap_or_default();
+            if let Some(existing) = existing_units
+                .iter()
+                .find(|u| normalized(&u.symbol) == normalized(&symbol))
+            {
+                if existing.decimal_places != places
+                    || (!formal_name.is_empty() && existing.formal_name != formal_name)
+                {
+                    plan.issues
+                        .push(format!("{label}: existing unit has different details"));
+                }
+                if !metadata.is_empty() {
+                    plan.existing_unit_metadata.push((existing.id, metadata));
+                }
+            } else {
+                known_units.insert(normalized(&symbol), places);
+                plan.units.push(Unit {
+                    symbol,
+                    formal_name,
+                    decimal_places: places,
+                    metadata,
+                });
+            }
+        }
+        let existing_stock_groups = self.stock_groups(company_id)?;
+        let mut known_stock_groups = HashSet::<String>::new();
+        for group in &existing_stock_groups {
+            if !known_stock_groups.insert(normalized(&group.name)) {
+                plan.issues
+                    .push(format!("Stock group {} is ambiguous", group.name));
+            }
+        }
+        let mut input_stock_groups = HashSet::new();
+        let mut pending_stock_groups = Vec::<(String, String, SourceMetadata)>::new();
+        for node in doc
+            .descendants()
+            .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("STOCKGROUP"))
+        {
+            let Some(name) = object_name(node) else {
+                plan.issues
+                    .push("A stock group has no unambiguous name".into());
+                continue;
+            };
+            let label = format!("Stock group {name}");
+            check_fields(
+                node,
+                &["NAME", "PARENT", "LANGUAGENAME.LIST"],
+                &label,
+                &mut plan.issues,
+            );
+            check_language_names(node, &name, &label, &mut plan.issues);
+            if !input_stock_groups.insert(normalized(&name)) {
+                plan.issues.push(format!("{label}: duplicate name"));
+                continue;
+            }
+            let metadata = source_metadata(node, &label, &mut plan.issues);
+            register_metadata(
+                "stockgroup",
+                &label,
+                &metadata,
+                &mut seen_metadata,
+                &mut plan.issues,
+            );
+            let parent = direct_text(node, "PARENT")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Primary".into());
+            if let Some(existing) = existing_stock_groups
+                .iter()
+                .find(|g| normalized(&g.name) == normalized(&name))
+            {
+                let actual = existing
+                    .parent_id
+                    .and_then(|id| existing_stock_groups.iter().find(|g| g.id == id))
+                    .map(|g| normalized(&g.name));
+                if actual.as_deref() != Some(normalized(&parent).as_str())
+                    && !(actual.is_none()
+                        && normalized(&name) == "primary"
+                        && normalized(&parent) == "primary")
+                {
+                    plan.issues
+                        .push(format!("{label}: existing parent differs"));
+                }
+                if !metadata.is_empty() {
+                    plan.existing_stock_group_metadata
+                        .push((existing.id, metadata));
+                }
+            } else {
+                pending_stock_groups.push((name, parent, metadata));
+            }
+        }
+        while !pending_stock_groups.is_empty() {
+            let mut progress = false;
+            let mut unresolved = Vec::new();
+            for (name, parent, metadata) in pending_stock_groups {
+                if known_stock_groups.contains(&normalized(&parent)) {
+                    known_stock_groups.insert(normalized(&name));
+                    plan.stock_groups.push(StockGroupImport {
+                        name,
+                        parent,
+                        metadata,
+                    });
+                    progress = true;
+                } else {
+                    unresolved.push((name, parent, metadata));
+                }
+            }
+            if !progress {
+                for (name, parent, _) in unresolved {
+                    plan.issues.push(format!(
+                        "Stock group {name}: parent {parent} is missing or cyclic"
+                    ));
+                }
+                break;
+            }
+            pending_stock_groups = unresolved;
+        }
+        let mut known_items = HashSet::<String>::new();
+        for item in self.stock_items(company_id)? {
+            if !known_items.insert(normalized(&item.name)) {
+                plan.issues
+                    .push(format!("Stock item {} is ambiguous", item.name));
+            }
+        }
+        for node in doc
+            .descendants()
+            .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("STOCKITEM"))
+        {
+            let Some(name) = object_name(node) else {
+                plan.issues
+                    .push("A stock item has no unambiguous name".into());
+                continue;
+            };
+            let label = format!("Stock item {name}");
+            check_fields(
+                node,
+                &[
+                    "NAME",
+                    "NAME.LIST",
+                    "LANGUAGENAME.LIST",
+                    "PARENT",
+                    "BASEUNITS",
+                    "DESCRIPTION",
+                    "OPENINGBALANCE",
+                    "OPENINGRATE",
+                    "OPENINGVALUE",
+                ],
+                &label,
+                &mut plan.issues,
+            );
+            check_language_names(node, &name, &label, &mut plan.issues);
+            let names = profile_list_values(node, "NAME.LIST", "NAME", &label, &mut plan.issues);
+            if !names.is_empty() && (names.len() != 1 || names[0] != name) {
+                plan.issues
+                    .push(format!("{label}: aliases are not supported"));
+            }
+            let metadata = source_metadata(node, &label, &mut plan.issues);
+            register_metadata(
+                "stockitem",
+                &label,
+                &metadata,
+                &mut seen_metadata,
+                &mut plan.issues,
+            );
+            let unit = direct_text(node, "BASEUNITS").unwrap_or_default();
+            let precision = match known_units.get(&normalized(&unit)) {
+                Some(v) => *v,
+                None => {
+                    plan.issues
+                        .push(format!("{label}: unit {unit} is not available"));
+                    continue;
+                }
+            };
+            let group = direct_text(node, "PARENT")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Primary".into());
+            if !known_stock_groups.contains(&normalized(&group)) {
+                plan.issues
+                    .push(format!("{label}: stock group {group} is not available"));
+            }
+            if !known_items.insert(normalized(&name)) {
+                plan.issues.push(format!("{label}: duplicate name"));
+            }
+            for field in ["OPENINGRATE", "OPENINGVALUE"] {
+                if let Some(value) = direct_text(node, field) {
+                    if !value.is_empty() && !matches!(xml_amount(&value), Ok(0)) {
+                        plan.issues
+                            .push(format!("{label}: opening valuation is not supported"));
+                    }
+                }
+            }
+            let opening = match direct_text(node, "OPENINGBALANCE").filter(|v| !v.is_empty()) {
+                Some(value) => match xml_stock_quantity(&value, &unit) {
+                    Ok(0) => None,
+                    Ok(qty) => {
+                        if qty % 10_i64.pow(u32::from(3 - precision)) != 0 {
+                            plan.issues
+                                .push(format!("{label}: opening quantity exceeds unit precision"));
+                        }
+                        if plan.opening_date.is_none() {
+                            plan.issues
+                                .push(format!("{label}: provide an opening date"));
+                        }
+                        Some(qty)
+                    }
+                    Err(_) => {
+                        plan.issues.push(format!(
+                            "{label}: opening quantity is invalid or uses another unit"
+                        ));
+                        None
+                    }
+                },
+                None => None,
+            };
+            plan.items.push(Item {
+                name,
+                unit,
+                unit_precision: precision,
+                group,
+                description: direct_text(node, "DESCRIPTION").unwrap_or_default(),
+                opening,
+                metadata,
+            });
+        }
         let mut references: HashSet<(String, String, String)> = self
             .vouchers(company_id)?
             .iter()
@@ -983,7 +1394,7 @@ impl Store {
         }
         for node in doc.descendants().filter(|n| {
             n.is_element()
-                && ["STOCKITEM", "STOCKGROUP", "UNIT", "GODOWN", "VOUCHERTYPE"]
+                && ["GODOWN", "VOUCHERTYPE", "STOCKCATEGORY"]
                     .iter()
                     .any(|tag| local_name(*n).eq_ignore_ascii_case(tag))
         }) {
@@ -993,10 +1404,15 @@ impl Store {
         if plan.groups.is_empty()
             && plan.accounts.is_empty()
             && plan.transactions.is_empty()
+            && plan.units.is_empty()
+            && plan.stock_groups.is_empty()
+            && plan.items.is_empty()
+            && plan.existing_group_metadata.is_empty()
+            && plan.existing_unit_metadata.is_empty()
+            && plan.existing_stock_group_metadata.is_empty()
             && plan.issues.is_empty()
         {
-            plan.issues
-                .push("No supported accounting records were found".into());
+            plan.issues.push("No supported records were found".into());
         }
         Ok(plan)
     }
@@ -1008,6 +1424,69 @@ impl Store {
             ));
         }
         let tx = self.conn.transaction()?;
+        for (id, metadata) in &plan.existing_unit_metadata {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stock_units WHERE company_id = ?1 AND id = ?2)",
+                params![plan.company_id, id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(Error::Validation("A unit changed since preview".into()));
+            }
+            save_metadata(&tx, plan.company_id, "stockunit", *id, metadata)?;
+        }
+        for (id, metadata) in &plan.existing_stock_group_metadata {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stock_groups WHERE company_id = ?1 AND id = ?2)",
+                params![plan.company_id, id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(Error::Validation(
+                    "A stock group changed since preview".into(),
+                ));
+            }
+            save_metadata(&tx, plan.company_id, "stockgroup", *id, metadata)?;
+        }
+        for unit in &plan.units {
+            if find_stock_unit(&tx, plan.company_id, &unit.symbol)?.is_some() {
+                return Err(Error::Validation(format!(
+                    "Unit {} already exists",
+                    unit.symbol
+                )));
+            }
+            tx.execute("INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) VALUES (?1, ?2, ?3, ?4)", params![plan.company_id, unit.symbol, unit.formal_name, unit.decimal_places])?;
+            save_metadata(
+                &tx,
+                plan.company_id,
+                "stockunit",
+                tx.last_insert_rowid(),
+                &unit.metadata,
+            )?;
+        }
+        for group in &plan.stock_groups {
+            if find_stock_group(&tx, plan.company_id, &group.name)?.is_some() {
+                return Err(Error::Validation(format!(
+                    "Stock group {} already exists",
+                    group.name
+                )));
+            }
+            let parent =
+                find_stock_group(&tx, plan.company_id, &group.parent)?.ok_or_else(|| {
+                    Error::Validation(format!("Stock group {} is missing", group.parent))
+                })?;
+            tx.execute(
+                "INSERT INTO stock_groups(company_id, name, parent_id) VALUES (?1, ?2, ?3)",
+                params![plan.company_id, group.name, parent],
+            )?;
+            save_metadata(
+                &tx,
+                plan.company_id,
+                "stockgroup",
+                tx.last_insert_rowid(),
+                &group.metadata,
+            )?;
+        }
         for (id, metadata) in &plan.existing_group_metadata {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM account_groups WHERE company_id = ?1 AND id = ?2)",
@@ -1085,6 +1564,37 @@ impl Store {
                 )?;
             }
         }
+        for item in &plan.items {
+            let (unit_id, precision) = find_stock_unit(&tx, plan.company_id, &item.unit)?
+                .ok_or_else(|| Error::Validation(format!("Unit {} is missing", item.unit)))?;
+            if precision != item.unit_precision {
+                return Err(Error::Validation(format!(
+                    "Unit {} changed since preview",
+                    item.unit
+                )));
+            }
+            let group_id =
+                find_stock_group(&tx, plan.company_id, &item.group)?.ok_or_else(|| {
+                    Error::Validation(format!("Stock group {} is missing", item.group))
+                })?;
+            let item_id = create_stock_item_on_connection(
+                &tx,
+                plan.company_id,
+                &item.name,
+                unit_id,
+                group_id,
+                &item.description,
+            )?;
+            save_metadata(&tx, plan.company_id, "stockitem", item_id, &item.metadata)?;
+            if let Some(quantity) = item.opening {
+                check_quantity_precision(&tx, plan.company_id, item_id, quantity)?;
+                let date = plan
+                    .opening_date
+                    .as_deref()
+                    .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
+                tx.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason) VALUES (?1, ?2, ?3, ?4, 'Imported opening quantity')", params![plan.company_id, item_id, date, quantity])?;
+            }
+        }
         for voucher in &plan.transactions {
             let mut stmt =
                 tx.prepare("SELECT kind, date, reference FROM vouchers WHERE company_id = ?1")?;
@@ -1142,6 +1652,9 @@ impl Store {
             groups: plan.groups.len(),
             ledgers: plan.accounts.len(),
             vouchers: plan.transactions.len(),
+            units: plan.units.len(),
+            stock_groups: plan.stock_groups.len(),
+            items: plan.items.len(),
         })
     }
 }
