@@ -64,6 +64,11 @@ struct App {
     stock_description: String,
     stock_creation_unit: Option<i64>,
     stock_creation_group: Option<i64>,
+    stock_edit_selection: Option<i64>,
+    stock_editing: Option<i64>,
+    stock_edit_name: String,
+    stock_edit_group: Option<i64>,
+    stock_edit_description: String,
     unit_symbol: String,
     unit_formal_name: String,
     unit_decimals: u8,
@@ -167,6 +172,11 @@ impl App {
             stock_description: String::new(),
             stock_creation_unit: None,
             stock_creation_group: None,
+            stock_edit_selection: None,
+            stock_editing: None,
+            stock_edit_name: String::new(),
+            stock_edit_group: None,
+            stock_edit_description: String::new(),
             unit_symbol: String::new(),
             unit_formal_name: String::new(),
             unit_decimals: 0,
@@ -225,6 +235,11 @@ impl App {
         self.adjustment_item = None;
         self.stock_creation_unit = None;
         self.stock_creation_group = None;
+        self.stock_edit_selection = None;
+        self.stock_editing = None;
+        self.stock_edit_name.clear();
+        self.stock_edit_group = None;
+        self.stock_edit_description.clear();
         self.stock_group_parent = None;
         self.stock_register_item = None;
         self.invoice_party = None;
@@ -245,7 +260,8 @@ impl App {
         ui.label("Create or select a company to work with.");
         let profile_dirty = (self.profile_ledger.is_some()
             && self.ledger_profile != self.profile_original)
-            || self.editing_invoice.is_some();
+            || self.editing_invoice.is_some()
+            || self.stock_editing.is_some();
         if profile_dirty {
             ui.label("Save or discard the current edits before changing company.");
         }
@@ -1159,6 +1175,103 @@ impl App {
                 return;
             }
         };
+        ui.separator();
+        ui.heading("Edit stock item");
+        if self.stock_editing.is_none() {
+            pick_stock(
+                ui,
+                "edit-stock-item",
+                "Item",
+                &items,
+                &mut self.stock_edit_selection,
+            );
+            if ui.button("Edit selected item").clicked() {
+                if let Some(item) = items
+                    .iter()
+                    .find(|item| Some(item.id) == self.stock_edit_selection)
+                {
+                    self.stock_editing = Some(item.id);
+                    self.stock_edit_name = item.name.clone();
+                    self.stock_edit_group = Some(item.group_id);
+                    self.stock_edit_description = item.description.clone();
+                } else {
+                    self.message = "Select a stock item".into();
+                }
+            }
+        }
+        if let Some(item_id) = self.stock_editing {
+            if let Some(item) = items.iter().find(|item| item.id == item_id) {
+                ui.label(format!("Base unit: {} (cannot be changed)", item.unit));
+            }
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut self.stock_edit_name);
+                ui.label("Group");
+                let group = groups
+                    .iter()
+                    .find(|g| Some(g.id) == self.stock_edit_group)
+                    .map(|g| g.name.as_str())
+                    .unwrap_or("Select group");
+                egui::ComboBox::from_id_salt("stock-edit-group")
+                    .selected_text(group)
+                    .show_ui(ui, |ui| {
+                        for value in &groups {
+                            ui.selectable_value(
+                                &mut self.stock_edit_group,
+                                Some(value.id),
+                                &value.name,
+                            );
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Description");
+                ui.text_edit_singleline(&mut self.stock_edit_description);
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Save item").clicked() {
+                    let result = match self.stock_edit_group {
+                        Some(group) => self.store.update_stock_item(
+                            company,
+                            item_id,
+                            &self.stock_edit_name,
+                            group,
+                            &self.stock_edit_description,
+                        ),
+                        None => Err(balance::Error::Validation("Select a stock group".into())),
+                    };
+                    match result {
+                        Ok(()) => {
+                            self.stock_editing = None;
+                            self.message = "Stock item saved".into();
+                        }
+                        Err(e) => self.failure(e),
+                    }
+                }
+                if ui.button("Discard item edits").clicked() {
+                    self.stock_editing = None;
+                }
+            });
+            match self.store.stock_item_revisions(company, item_id) {
+                Ok(revisions) => {
+                    egui::CollapsingHeader::new("Prior item versions").show(ui, |ui| {
+                        if revisions.is_empty() {
+                            ui.label("No prior versions.");
+                        }
+                        for revision in revisions {
+                            ui.label(format!(
+                                "{} — {} / {} / {}",
+                                revision.changed_at,
+                                revision.name,
+                                revision.group,
+                                revision.description
+                            ));
+                        }
+                    });
+                }
+                Err(e) => self.failure(e),
+            }
+        }
         ui.separator();
         ui.heading("Quantity adjustment");
         ui.label("Adjustments change quantities only; create any accounting entry separately.");

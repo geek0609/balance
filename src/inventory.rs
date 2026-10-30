@@ -18,6 +18,13 @@ pub struct StockItem {
     pub description: String,
 }
 #[derive(Debug, Clone)]
+pub struct StockItemRevision {
+    pub changed_at: String,
+    pub name: String,
+    pub group: String,
+    pub description: String,
+}
+#[derive(Debug, Clone)]
 pub struct StockUnit {
     pub id: i64,
     pub symbol: String,
@@ -563,6 +570,79 @@ impl Store {
                     unit_id: r.get(3)?,
                     group_id: r.get(4)?,
                     description: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    /// Retain the previous name, group and description with each change.
+    /// The base unit is deliberately immutable because existing quantities use it.
+    pub fn update_stock_item(
+        &mut self,
+        company_id: i64,
+        item_id: i64,
+        name: &str,
+        group_id: i64,
+        description: &str,
+    ) -> Result<()> {
+        let name = required(name, "Stock item name")?;
+        let tx = self.conn.transaction()?;
+        let current: (String, i64, String) = tx.query_row(
+            "SELECT name, group_id, description FROM stock_items WHERE id = ?1 AND company_id = ?2",
+            params![item_id, company_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Error::Validation("Stock item not found in the selected company".into()),
+            other => Error::Database(other),
+        })?;
+        let group_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stock_groups WHERE id = ?1 AND company_id = ?2)",
+            params![group_id, company_id],
+            |r| r.get(0),
+        )?;
+        if !group_exists {
+            return Err(Error::Validation(
+                "Stock group not found in the selected company".into(),
+            ));
+        }
+        let mut stmt =
+            tx.prepare("SELECT name FROM stock_items WHERE company_id = ?1 AND id != ?2")?;
+        for existing in stmt.query_map(params![company_id, item_id], |r| r.get::<_, String>(0))? {
+            if existing?.trim().to_lowercase() == name.to_lowercase() {
+                return Err(Error::Validation("Stock item already exists".into()));
+            }
+        }
+        drop(stmt);
+        if current.0 != name || current.1 != group_id || current.2 != description.trim() {
+            tx.execute("INSERT INTO stock_item_revisions(company_id, item_id, name, group_id, description) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, item_id, current.0, current.1, current.2])?;
+            tx.execute("UPDATE stock_items SET name = ?1, group_id = ?2, description = ?3 WHERE id = ?4 AND company_id = ?5", params![name, group_id, description.trim(), item_id, company_id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn stock_item_revisions(
+        &self,
+        company_id: i64,
+        item_id: i64,
+    ) -> Result<Vec<StockItemRevision>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stock_items WHERE id = ?1 AND company_id = ?2)",
+            params![item_id, company_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::Validation(
+                "Stock item not found in the selected company".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare("SELECT r.changed_at, r.name, g.name, r.description FROM stock_item_revisions r JOIN stock_groups g ON g.id = r.group_id AND g.company_id = r.company_id WHERE r.company_id = ?1 AND r.item_id = ?2 ORDER BY r.id DESC")?;
+        let rows = stmt
+            .query_map(params![company_id, item_id], |r| {
+                Ok(StockItemRevision {
+                    changed_at: r.get(0)?,
+                    name: r.get(1)?,
+                    group: r.get(2)?,
+                    description: r.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

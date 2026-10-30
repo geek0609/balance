@@ -237,7 +237,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 11 {
+        if version > 12 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -336,6 +336,11 @@ impl Store {
                 INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) SELECT DISTINCT company_id, unit, unit, 3 FROM stock_items;
                 UPDATE stock_items SET unit_id = (SELECT id FROM stock_units WHERE company_id = stock_items.company_id AND symbol = stock_items.unit), group_id = (SELECT id FROM stock_groups WHERE company_id = stock_items.company_id AND name = 'Primary');
                 PRAGMA user_version = 11;")?;
+        }
+        if version < 12 {
+            tx.execute_batch("CREATE TABLE stock_item_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, name TEXT NOT NULL, group_id INTEGER NOT NULL REFERENCES stock_groups(id), description TEXT NOT NULL);
+                CREATE INDEX stock_item_revisions_item ON stock_item_revisions(item_id, id);
+                PRAGMA user_version = 12;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1196,7 +1201,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
