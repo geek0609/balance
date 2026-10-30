@@ -82,6 +82,7 @@ struct ImportedInvoiceLine {
 struct ImportedInvoice {
     kind: InvoiceKind,
     date: String,
+    credit_days: Option<u32>,
     reference: String,
     narration: String,
     party: String,
@@ -682,6 +683,7 @@ fn parse_imported_invoice(
         ));
     }
     let mut party: Option<(String, i64)> = None;
+    let mut credit_days = None;
     let party_debit = kind == InvoiceKind::Sale;
     for entry in entries {
         invoice_list_fields(
@@ -732,7 +734,12 @@ fn parse_imported_invoice(
                 ));
             }
             let bill = bills[0];
-            invoice_list_fields(bill, &["NAME", "BILLTYPE", "AMOUNT"], label, issues);
+            invoice_list_fields(
+                bill,
+                &["NAME", "BILLTYPE", "AMOUNT", "BILLCREDITPERIOD"],
+                label,
+                issues,
+            );
             if invoice_field(bill, "NAME")? != reference
                 || !invoice_field(bill, "BILLTYPE")?.eq_ignore_ascii_case("New Ref")
                 || xml_amount(&invoice_field(bill, "AMOUNT")?)? != amount
@@ -740,6 +747,27 @@ fn parse_imported_invoice(
                 return Err(Error::Validation(
                     "bill reference does not match the invoice".into(),
                 ));
+            }
+            if let Some(term) = direct_text(bill, "BILLCREDITPERIOD").filter(|v| !v.is_empty()) {
+                let parts: Vec<_> = term.split_whitespace().collect();
+                if parts.len() != 2
+                    || !parts[0].bytes().all(|b| b.is_ascii_digit())
+                    || !(parts[1].eq_ignore_ascii_case("day")
+                        || parts[1].eq_ignore_ascii_case("days"))
+                {
+                    return Err(Error::Validation(
+                        "credit period must be a whole number of days".into(),
+                    ));
+                }
+                let days = parts[0]
+                    .parse::<u32>()
+                    .map_err(|_| Error::Validation("credit period is too large".into()))?;
+                parse_date(&date)?
+                    .checked_add_days(chrono::Days::new(u64::from(days)))
+                    .ok_or_else(|| {
+                        Error::Validation("credit period produces an invalid due date".into())
+                    })?;
+                credit_days = Some(days);
             }
             party = Some((ledger, amount));
         } else {
@@ -881,6 +909,7 @@ fn parse_imported_invoice(
     Ok(ImportedInvoice {
         kind,
         date,
+        credit_days,
         reference,
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
         party: party_name,
@@ -2173,6 +2202,7 @@ impl Store {
                 kind: invoice.kind,
                 date: invoice.date.clone(),
                 due_date: None,
+                credit_days: invoice.credit_days,
                 reference: invoice.reference.clone(),
                 narration: invoice.narration.clone(),
                 party_ledger_id: party_id,

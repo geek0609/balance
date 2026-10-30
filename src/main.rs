@@ -86,6 +86,7 @@ struct App {
     invoice_kind: InvoiceKind,
     invoice_date: String,
     invoice_due_date: String,
+    invoice_credit_days: String,
     invoice_reference: String,
     invoice_narration: String,
     invoice_party: Option<i64>,
@@ -195,6 +196,7 @@ impl App {
             invoice_kind: InvoiceKind::Sale,
             invoice_date: String::new(),
             invoice_due_date: String::new(),
+            invoice_credit_days: String::new(),
             invoice_reference: String::new(),
             invoice_narration: String::new(),
             invoice_party: None,
@@ -252,6 +254,7 @@ impl App {
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
+        self.invoice_credit_days.clear();
         self.invoice_tax_amount.clear();
         self.settlement_invoice = None;
         self.settlement_bank = None;
@@ -1462,6 +1465,12 @@ impl App {
             ui.add(egui::TextEdit::singleline(&mut self.invoice_date).hint_text("YYYY-MM-DD"));
             ui.label("Due date (optional)");
             ui.add(egui::TextEdit::singleline(&mut self.invoice_due_date).hint_text("YYYY-MM-DD"));
+            ui.label("or credit days");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.invoice_credit_days)
+                    .hint_text("Days")
+                    .desired_width(60.0),
+            );
             ui.label("Reference");
             ui.text_edit_singleline(&mut self.invoice_reference);
         });
@@ -1540,6 +1549,7 @@ impl App {
             self.invoice_reference.clear();
             self.invoice_narration.clear();
             self.invoice_due_date.clear();
+            self.invoice_credit_days.clear();
             self.invoice_lines = vec![InvoiceLineForm::new()];
             self.invoice_tax_amount.clear();
             self.invoice_tax_ledger = None;
@@ -1567,6 +1577,20 @@ impl App {
                     date: self.invoice_date.clone(),
                     due_date: (!self.invoice_due_date.trim().is_empty())
                         .then(|| self.invoice_due_date.trim().to_owned()),
+                    credit_days: if self.invoice_credit_days.trim().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            self.invoice_credit_days
+                                .trim()
+                                .parse::<u32>()
+                                .map_err(|_| {
+                                    balance::Error::Validation(
+                                        "Credit days must be a non-negative whole number".into(),
+                                    )
+                                })?,
+                        )
+                    },
                     reference: self.invoice_reference.clone(),
                     narration: self.invoice_narration.clone(),
                     party_ledger_id: self.invoice_party.ok_or_else(|| {
@@ -1592,6 +1616,7 @@ impl App {
                     self.invoice_reference.clear();
                     self.invoice_narration.clear();
                     self.invoice_due_date.clear();
+                    self.invoice_credit_days.clear();
                     self.invoice_lines = vec![InvoiceLineForm::new()];
                     self.invoice_tax_amount.clear();
                     self.invoice_tax_ledger = None;
@@ -1704,6 +1729,10 @@ impl App {
                                 self.invoice_kind = draft.kind;
                                 self.invoice_date = draft.date;
                                 self.invoice_due_date = draft.due_date.unwrap_or_default();
+                                self.invoice_credit_days = draft
+                                    .credit_days
+                                    .map(|days| days.to_string())
+                                    .unwrap_or_default();
                                 self.invoice_reference = draft.reference;
                                 self.invoice_narration = draft.narration;
                                 self.invoice_party = Some(draft.party_ledger_id);
@@ -1733,6 +1762,9 @@ impl App {
                     }
                     if let Some(due_date) = &invoice.due_date {
                         ui.small(format!("Due: {due_date}"));
+                    }
+                    if let Some(days) = invoice.credit_days {
+                        ui.small(format!("Credit period: {days} days from invoice date"));
                     }
                     for line in invoice.lines {
                         ui.label(format!(
@@ -1790,6 +1822,11 @@ impl App {
                                         ));
                                         if let Some(due_date) = &revision.due_date {
                                             ui.label(format!("Due: {due_date}"));
+                                        }
+                                        if let Some(days) = revision.credit_days {
+                                            ui.label(format!(
+                                                "Credit period: {days} days from invoice date"
+                                            ));
                                         }
                                         if !revision.narration.is_empty() {
                                             ui.label(revision.narration);
