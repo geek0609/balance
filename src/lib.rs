@@ -102,6 +102,14 @@ pub struct Ledger {
     pub id: i64,
     pub name: String,
     pub category: Category,
+    pub group_id: Option<i64>,
+}
+#[derive(Debug, Clone)]
+pub struct AccountGroup {
+    pub id: i64,
+    pub name: String,
+    pub category: Category,
+    pub parent_id: Option<i64>,
 }
 #[derive(Debug, Clone)]
 pub struct Posting {
@@ -197,7 +205,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 2 {
+        if version > 3 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -223,14 +231,33 @@ impl Store {
                 PRAGMA user_version = 2;",
             )?;
         }
+        if version < 3 {
+            tx.execute_batch("CREATE TABLE account_groups(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), name TEXT NOT NULL, category TEXT NOT NULL, parent_id INTEGER REFERENCES account_groups(id), UNIQUE(company_id, name));
+                ALTER TABLE ledgers ADD COLUMN group_id INTEGER REFERENCES account_groups(id);")?;
+            let companies = {
+                let mut stmt = tx.prepare("SELECT id FROM companies")?;
+                let values = stmt
+                    .query_map([], |r| r.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                values
+            };
+            for company in companies {
+                seed_groups(&tx, company)?;
+                tx.execute("UPDATE ledgers SET group_id = (SELECT id FROM account_groups WHERE company_id = ?1 AND name = ledgers.category) WHERE company_id = ?1", [company])?;
+            }
+            tx.execute_batch("PRAGMA user_version = 3;")?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
     pub fn create_company(&self, name: &str) -> Result<i64> {
         let name = required(name, "Company name")?;
-        self.conn
-            .execute("INSERT INTO companies(name) VALUES (?1)", [name])?;
-        Ok(self.conn.last_insert_rowid())
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("INSERT INTO companies(name) VALUES (?1)", [name])?;
+        let id = tx.last_insert_rowid();
+        seed_groups(&tx, id)?;
+        tx.commit()?;
+        Ok(id)
     }
     pub fn companies(&self) -> Result<Vec<Company>> {
         let mut s = self
@@ -247,31 +274,99 @@ impl Store {
         Ok(rows)
     }
     pub fn create_ledger(&self, company_id: i64, name: &str, category: Category) -> Result<i64> {
+        let group_id: i64 = self.conn.query_row("SELECT id FROM account_groups WHERE company_id = ?1 AND name = ?2 AND parent_id IS NULL", params![company_id, category.as_str()], |r| r.get(0))?;
+        self.create_ledger_in_group(company_id, name, group_id)
+    }
+    pub fn create_ledger_in_group(
+        &self,
+        company_id: i64,
+        name: &str,
+        group_id: i64,
+    ) -> Result<i64> {
         let name = required(name, "Ledger name")?;
+        let category: String = self
+            .conn
+            .query_row(
+                "SELECT category FROM account_groups WHERE id = ?1 AND company_id = ?2",
+                params![group_id, company_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::Validation("Group not found in the selected company".into())
+                }
+                other => Error::Database(other),
+            })?;
         self.conn.execute(
-            "INSERT INTO ledgers(company_id, name, category) VALUES (?1, ?2, ?3)",
-            params![company_id, name, category.as_str()],
+            "INSERT INTO ledgers(company_id, name, category, group_id) VALUES (?1, ?2, ?3, ?4)",
+            params![company_id, name, category, group_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
     pub fn ledgers(&self, company_id: i64) -> Result<Vec<Ledger>> {
         let mut s = self.conn.prepare(
-            "SELECT id, name, category FROM ledgers WHERE company_id = ?1 ORDER BY name",
+            "SELECT id, name, category, group_id FROM ledgers WHERE company_id = ?1 ORDER BY name",
         )?;
         let rows = s
             .query_map([company_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?, r.get(3)?))
             })?
-            .collect::<rusqlite::Result<Vec<(i64, String, String)>>>()?;
+            .collect::<rusqlite::Result<Vec<(i64, String, String, Option<i64>)>>>()?;
         rows.into_iter()
-            .map(|(id, name, category)| {
+            .map(|(id, name, category, group_id)| {
                 Ok(Ledger {
                     id,
                     name,
                     category: Category::parse(&category)?,
+                    group_id,
                 })
             })
             .collect()
+    }
+    pub fn account_groups(&self, company_id: i64) -> Result<Vec<AccountGroup>> {
+        let mut stmt = self.conn.prepare("SELECT id, name, category, parent_id FROM account_groups WHERE company_id = ?1 ORDER BY name")?;
+        let rows = stmt
+            .query_map([company_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<(i64, String, String, Option<i64>)>>>()?;
+        rows.into_iter()
+            .map(|(id, name, category, parent_id)| {
+                Ok(AccountGroup {
+                    id,
+                    name,
+                    parent_id,
+                    category: Category::parse(&category)?,
+                })
+            })
+            .collect()
+    }
+    pub fn create_group(
+        &self,
+        company_id: i64,
+        name: &str,
+        parent_id: Option<i64>,
+        root_category: Category,
+    ) -> Result<i64> {
+        let name = required(name, "Group name")?;
+        let category = if let Some(parent) = parent_id {
+            self.conn
+                .query_row(
+                    "SELECT category FROM account_groups WHERE id = ?1 AND company_id = ?2",
+                    params![parent, company_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => {
+                        Error::Validation("Parent group not found in the selected company".into())
+                    }
+                    other => Error::Database(other),
+                })?
+        } else {
+            root_category.as_str().to_owned()
+        };
+        self.conn.execute("INSERT INTO account_groups(company_id, name, category, parent_id) VALUES (?1, ?2, ?3, ?4)", params![company_id, name, category, parent_id])?;
+        Ok(self.conn.last_insert_rowid())
     }
     pub fn post_voucher(
         &mut self,
@@ -587,6 +682,74 @@ impl Store {
         })
     }
 }
+fn seed_groups(conn: &Connection, company_id: i64) -> Result<()> {
+    let groups = [
+        ("Asset", Category::Asset, None),
+        ("Liability", Category::Liability, None),
+        ("Equity", Category::Equity, None),
+        ("Income", Category::Income, None),
+        ("Expense", Category::Expense, None),
+        ("Current Assets", Category::Asset, Some("Asset")),
+        ("Fixed Assets", Category::Asset, Some("Asset")),
+        ("Investments", Category::Asset, Some("Asset")),
+        ("Bank Accounts", Category::Asset, Some("Current Assets")),
+        ("Cash-in-Hand", Category::Asset, Some("Current Assets")),
+        ("Sundry Debtors", Category::Asset, Some("Current Assets")),
+        ("Stock-in-Hand", Category::Asset, Some("Current Assets")),
+        ("Deposits (Asset)", Category::Asset, Some("Current Assets")),
+        (
+            "Loans & Advances (Asset)",
+            Category::Asset,
+            Some("Current Assets"),
+        ),
+        (
+            "Current Liabilities",
+            Category::Liability,
+            Some("Liability"),
+        ),
+        (
+            "Sundry Creditors",
+            Category::Liability,
+            Some("Current Liabilities"),
+        ),
+        (
+            "Duties & Taxes",
+            Category::Liability,
+            Some("Current Liabilities"),
+        ),
+        (
+            "Provisions",
+            Category::Liability,
+            Some("Current Liabilities"),
+        ),
+        ("Loans (Liability)", Category::Liability, Some("Liability")),
+        (
+            "Secured Loans",
+            Category::Liability,
+            Some("Loans (Liability)"),
+        ),
+        (
+            "Unsecured Loans",
+            Category::Liability,
+            Some("Loans (Liability)"),
+        ),
+        ("Capital Account", Category::Equity, Some("Equity")),
+        ("Reserves & Surplus", Category::Equity, Some("Equity")),
+        ("Sales Accounts", Category::Income, Some("Income")),
+        ("Direct Incomes", Category::Income, Some("Income")),
+        ("Indirect Incomes", Category::Income, Some("Income")),
+        ("Purchase Accounts", Category::Expense, Some("Expense")),
+        ("Direct Expenses", Category::Expense, Some("Expense")),
+        ("Indirect Expenses", Category::Expense, Some("Expense")),
+    ];
+    let mut ids = HashMap::new();
+    for (name, category, parent) in groups {
+        let parent_id = parent.map(|p| ids[p]);
+        conn.execute("INSERT INTO account_groups(company_id, name, category, parent_id) VALUES (?1, ?2, ?3, ?4)", params![company_id, name, category.as_str(), parent_id])?;
+        ids.insert(name, conn.last_insert_rowid());
+    }
+    Ok(())
+}
 fn parse_date(date: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d")
         .map_err(|_| Error::Validation("Date must be a valid YYYY-MM-DD date".into()))
@@ -638,6 +801,35 @@ fn required<'a>(value: &'a str, label: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn account_groups_inherit_categories_and_are_company_scoped() {
+        let db = Store::memory().unwrap();
+        let a = db.create_company("A").unwrap();
+        let b = db.create_company("B").unwrap();
+        let groups = db.account_groups(a).unwrap();
+        let receivables = groups.iter().find(|g| g.name == "Sundry Debtors").unwrap();
+        let regional = db
+            .create_group(
+                a,
+                "Regional accounts",
+                Some(receivables.id),
+                Category::Expense,
+            )
+            .unwrap();
+        let ledger_id = db.create_ledger_in_group(a, "Customer", regional).unwrap();
+        let customer = db
+            .ledgers(a)
+            .unwrap()
+            .into_iter()
+            .find(|l| l.id == ledger_id)
+            .unwrap();
+        assert_eq!(customer.category, Category::Asset);
+        assert_eq!(customer.group_id, Some(regional));
+        assert!(db
+            .create_group(b, "Wrong", Some(receivables.id), Category::Asset)
+            .is_err());
+        assert!(db.create_ledger_in_group(b, "Wrong", regional).is_err());
+    }
     #[test]
     fn voucher_kind_survives_edits_and_is_recorded_in_revisions() {
         let mut db = Store::memory().unwrap();
@@ -799,7 +991,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

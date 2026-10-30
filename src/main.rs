@@ -18,6 +18,9 @@ struct App {
     company_name: String,
     ledger_name: String,
     category: Category,
+    ledger_group: Option<i64>,
+    group_name: String,
+    group_parent: Option<i64>,
     lines: Vec<VoucherLine>,
     editing_voucher: Option<i64>,
     voucher_kind: VoucherKind,
@@ -53,6 +56,9 @@ impl App {
             company_name: String::new(),
             ledger_name: String::new(),
             category: Category::Asset,
+            ledger_group: None,
+            group_name: String::new(),
+            group_parent: None,
             lines: vec![VoucherLine::new(true), VoucherLine::new(false)],
             editing_voucher: None,
             voucher_kind: VoucherKind::Journal,
@@ -78,6 +84,8 @@ impl App {
     fn reset_company_forms(&mut self) {
         self.clear_voucher();
         self.register_ledger = None;
+        self.ledger_group = None;
+        self.group_parent = None;
     }
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
@@ -115,22 +123,39 @@ impl App {
     }
     fn ledger_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Ledgers");
+        let groups = match self.store.account_groups(company) {
+            Ok(v) => v,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
         ui.horizontal(|ui| {
             ui.label("Name");
             ui.text_edit_singleline(&mut self.ledger_name);
-            egui::ComboBox::from_label("Category")
-                .selected_text(self.category.as_str())
+            let group_name = groups
+                .iter()
+                .find(|g| Some(g.id) == self.ledger_group)
+                .map(|g| g.name.as_str())
+                .unwrap_or("Select group");
+            egui::ComboBox::from_label("Group")
+                .selected_text(group_name)
                 .show_ui(ui, |ui| {
-                    for c in Category::ALL {
-                        ui.selectable_value(&mut self.category, c, c.as_str());
+                    for group in &groups {
+                        ui.selectable_value(&mut self.ledger_group, Some(group.id), &group.name);
                     }
                 });
         });
         if ui.button("Create ledger").clicked() {
-            match self
-                .store
-                .create_ledger(company, &self.ledger_name, self.category)
-            {
+            let result = match self.ledger_group {
+                Some(group) => self
+                    .store
+                    .create_ledger_in_group(company, &self.ledger_name, group),
+                None => Err(optimus_prime::Error::Validation(
+                    "Select an account group".into(),
+                )),
+            };
+            match result {
                 Ok(_) => {
                     self.ledger_name.clear();
                     self.message = "Ledger created".into();
@@ -142,10 +167,70 @@ impl App {
         match self.store.ledgers(company) {
             Ok(ledgers) => {
                 for ledger in ledgers {
-                    ui.label(format!("{}  —  {}", ledger.name, ledger.category.as_str()));
+                    let group = groups
+                        .iter()
+                        .find(|g| Some(g.id) == ledger.group_id)
+                        .map(|g| g.name.as_str())
+                        .unwrap_or(ledger.category.as_str());
+                    ui.label(format!("{}  —  {}", ledger.name, group));
                 }
             }
             Err(e) => self.failure(e),
+        }
+        ui.separator();
+        ui.heading("Account groups");
+        ui.horizontal(|ui| {
+            ui.label("New group");
+            ui.text_edit_singleline(&mut self.group_name);
+            let parent_name = groups
+                .iter()
+                .find(|g| Some(g.id) == self.group_parent)
+                .map(|g| g.name.as_str())
+                .unwrap_or("No parent");
+            egui::ComboBox::from_label("Parent")
+                .selected_text(parent_name)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.group_parent, None, "No parent");
+                    for group in &groups {
+                        ui.selectable_value(&mut self.group_parent, Some(group.id), &group.name);
+                    }
+                });
+            if self.group_parent.is_none() {
+                egui::ComboBox::from_label("Category")
+                    .selected_text(self.category.as_str())
+                    .show_ui(ui, |ui| {
+                        for c in Category::ALL {
+                            ui.selectable_value(&mut self.category, c, c.as_str());
+                        }
+                    });
+            }
+        });
+        if ui.button("Create group").clicked() {
+            match self.store.create_group(
+                company,
+                &self.group_name,
+                self.group_parent,
+                self.category,
+            ) {
+                Ok(_) => {
+                    self.group_name.clear();
+                    self.message = "Account group created".into();
+                }
+                Err(e) => self.failure(e),
+            }
+        }
+        for group in &groups {
+            let parent = group
+                .parent_id
+                .and_then(|id| groups.iter().find(|g| g.id == id))
+                .map(|g| g.name.as_str())
+                .unwrap_or("Root");
+            ui.label(format!(
+                "{}  —  {}  ({})",
+                group.name,
+                parent,
+                group.category.as_str()
+            ));
         }
     }
     fn voucher_page(&mut self, ui: &mut egui::Ui, company: i64) {

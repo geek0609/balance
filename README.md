@@ -8,6 +8,6 @@ Install a Rust toolchain and run `cargo run` on Windows. The application stores 
 
 ## Status
 
-The prototype supports company and ledger creation, categorized multi-line vouchers, voucher history and editing, date-filtered ledger activity, trial balance, profit and loss, and balance sheet summaries. Voucher categories are labels and do not automatically calculate tax or stock movements. Each edit retains the previous voucher and its postings; edits made before this feature do not have a recorded history. Imports, opening balances, tax, and statutory reports are not implemented. See the [roadmap](docs/roadmap.md) for planned work.
+The prototype supports company creation, hierarchical account groups and ledgers, categorized multi-line vouchers, voucher history and editing, date-filtered ledger activity, trial balance, profit and loss, and balance sheet summaries. Voucher categories are labels and do not automatically calculate tax or stock movements. Each edit retains the previous voucher and its postings; edits made before this feature do not have a recorded history. Imports, opening balances, tax, and statutory reports are not implemented. See the [roadmap](docs/roadmap.md) for planned work.
 
 Licensed under Apache-2.0; see [LICENSE](LICENSE).
