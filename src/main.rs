@@ -21,6 +21,8 @@ struct App {
     editing_voucher: Option<i64>,
     date: String,
     narration: String,
+    report_from: String,
+    report_to: String,
     message: String,
 }
 struct VoucherLine {
@@ -50,6 +52,8 @@ impl App {
             editing_voucher: None,
             date: String::new(),
             narration: String::new(),
+            report_from: String::new(),
+            report_to: String::new(),
             message: String::new(),
         }
     }
@@ -295,16 +299,41 @@ impl App {
         }
     }
     fn reports_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Trial balance");
-        ui.label("All posted vouchers; debit balances are positive, credits negative.");
-        let balances = match self.store.balances(company) {
+        ui.heading("Financial reports");
+        ui.label("Dates are inclusive. Leave a field blank for an open boundary.");
+        ui.horizontal(|ui| {
+            ui.label("Profit and loss from");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.report_from)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+            ui.label("To / as of");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.report_to)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+        });
+        let from = if self.report_from.trim().is_empty() {
+            None
+        } else {
+            Some(self.report_from.trim())
+        };
+        let to = if self.report_to.trim().is_empty() {
+            None
+        } else {
+            Some(self.report_to.trim())
+        };
+        let report = match self.store.financial_report(company, from, to) {
             Ok(v) => v,
             Err(e) => {
-                self.failure(e);
+                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
                 return;
             }
         };
-        let mut totals = [0_i128; 5];
+        ui.heading("Trial balance");
+        ui.label("As of the end date; debit balances are positive, credits negative.");
         egui::Grid::new("trial_balance")
             .striped(true)
             .show(ui, |ui| {
@@ -312,37 +341,29 @@ impl App {
                 ui.strong("Category");
                 ui.strong("Balance");
                 ui.end_row();
-                for b in &balances {
+                for b in &report.trial_balance {
                     ui.label(&b.ledger.name);
                     ui.label(b.ledger.category.as_str());
                     ui.label(format_amount(b.amount));
                     ui.end_row();
-                    let index = Category::ALL
-                        .iter()
-                        .position(|c| *c == b.ledger.category)
-                        .unwrap();
-                    totals[index] += i128::from(b.amount);
                 }
             });
         ui.separator();
-        let income = -totals[3];
-        let expense = totals[4];
-        let profit = income - expense;
         ui.heading("Profit and loss");
         ui.label(format!(
             "Income: {}    Expenses: {}    Net profit: {}",
-            money(income),
-            money(expense),
-            money(profit)
+            money(report.income),
+            money(report.expenses),
+            money(report.profit)
         ));
         ui.heading("Balance sheet");
         ui.label(format!(
             "Assets: {}    Liabilities: {}    Equity including profit: {}",
-            money(totals[0]),
-            money(-totals[1]),
-            money(-totals[2] + profit)
+            money(report.assets),
+            money(report.liabilities),
+            money(report.equity)
         ));
-        ui.small("Reports cover all dates; opening balances, tax, and statutory adjustments are not implemented.");
+        ui.small("The balance sheet includes cumulative profit through the end date. Opening balances, tax, and statutory adjustments are not implemented.");
     }
 }
 fn money(value: i128) -> String {

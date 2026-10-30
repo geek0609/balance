@@ -79,6 +79,18 @@ pub struct Balance {
     /// Debit minus credit, in hundredths.
     pub amount: i64,
 }
+/// Financial totals in hundredths. Profit is income less expenses.
+#[derive(Debug, Clone)]
+pub struct FinancialReport {
+    pub trial_balance: Vec<Balance>,
+    pub income: i128,
+    pub expenses: i128,
+    pub profit: i128,
+    pub assets: i128,
+    pub liabilities: i128,
+    /// Includes cumulative net income through the report end date.
+    pub equity: i128,
+}
 
 /// Parse a non-negative amount to hundredths, rejecting fractions of a hundredth.
 pub fn parse_amount(input: &str) -> Result<i64> {
@@ -261,34 +273,95 @@ impl Store {
                 postings,
             });
         }
+        // Older databases may contain valid dates without zero-padding.
+        for voucher in &mut vouchers {
+            voucher.date = parse_date(&voucher.date)?.format("%Y-%m-%d").to_string();
+        }
+        vouchers.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.id.cmp(&a.id)));
         Ok(vouchers)
     }
     pub fn balances(&self, company_id: i64) -> Result<Vec<Balance>> {
+        self.balances_in_period(company_id, None, None)
+    }
+    /// Return debit-minus-credit balances for an inclusive date range.
+    pub fn balances_in_period(
+        &self,
+        company_id: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Vec<Balance>> {
+        let start = start.map(parse_date).transpose()?;
+        let end = end.map(parse_date).transpose()?;
+        if matches!((start, end), (Some(a), Some(b)) if a > b) {
+            return Err(Error::Validation(
+                "The start date must not be after the end date".into(),
+            ));
+        }
         let ledgers = self.ledgers(company_id)?;
-        let mut sums = HashMap::<i64, i64>::new();
-        let mut s = self.conn.prepare("SELECT p.ledger_id, p.amount FROM postings p JOIN vouchers v ON p.voucher_id = v.id WHERE v.company_id = ?1")?;
+        let mut sums = HashMap::<i64, i128>::new();
+        let mut s = self.conn.prepare("SELECT p.ledger_id, p.amount, v.date FROM postings p JOIN vouchers v ON p.voucher_id = v.id WHERE v.company_id = ?1")?;
         let rows = s.query_map([company_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         for row in rows {
-            let (id, amount) = row?;
-            let sum = sums.entry(id).or_default();
-            *sum = sum
-                .checked_add(amount)
-                .ok_or_else(|| Error::Validation("Balance exceeds supported range".into()))?;
+            let (id, amount, date) = row?;
+            let date = parse_date(&date)?;
+            if start.is_some_and(|v| date < v) || end.is_some_and(|v| date > v) {
+                continue;
+            }
+            *sums.entry(id).or_default() += i128::from(amount);
         }
-        Ok(ledgers
+        ledgers
             .into_iter()
-            .map(|ledger| Balance {
-                amount: *sums.get(&ledger.id).unwrap_or(&0),
-                ledger,
+            .map(|ledger| {
+                let amount = i64::try_from(*sums.get(&ledger.id).unwrap_or(&0))
+                    .map_err(|_| Error::Validation("Balance exceeds supported range".into()))?;
+                Ok(Balance { amount, ledger })
             })
-            .collect())
+            .collect()
+    }
+    /// Trial balance and balance sheet are as of `end`; profit and loss is
+    /// inclusive from `start` through `end`. None denotes an open boundary.
+    pub fn financial_report(
+        &self,
+        company_id: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<FinancialReport> {
+        let period = self.balances_in_period(company_id, start, end)?;
+        let trial_balance = self.balances_in_period(company_id, None, end)?;
+        let category_total = |balances: &[Balance], category: Category| -> i128 {
+            balances
+                .iter()
+                .filter(|b| b.ledger.category == category)
+                .map(|b| i128::from(b.amount))
+                .sum()
+        };
+        let income = -category_total(&period, Category::Income);
+        let expenses = category_total(&period, Category::Expense);
+        let cumulative_profit = -category_total(&trial_balance, Category::Income)
+            - category_total(&trial_balance, Category::Expense);
+        Ok(FinancialReport {
+            assets: category_total(&trial_balance, Category::Asset),
+            liabilities: -category_total(&trial_balance, Category::Liability),
+            equity: -category_total(&trial_balance, Category::Equity) + cumulative_profit,
+            profit: income - expenses,
+            income,
+            expenses,
+            trial_balance,
+        })
     }
 }
+fn parse_date(date: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d")
+        .map_err(|_| Error::Validation("Date must be a valid YYYY-MM-DD date".into()))
+}
 fn validate_voucher(date: &str, postings: &[Posting]) -> Result<NaiveDate> {
-    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map_err(|_| Error::Validation("Date must be a valid YYYY-MM-DD date".into()))?;
+    let date = parse_date(date)?;
     if postings.len() < 2 || postings.iter().any(|p| p.amount == 0) {
         return Err(Error::Validation(
             "A voucher requires at least two non-zero postings".into(),
@@ -334,6 +407,75 @@ fn required<'a>(value: &'a str, label: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reports_apply_period_to_profit_and_end_date_to_balance_sheet() {
+        let mut db = Store::memory().unwrap();
+        let company = db.create_company("Example").unwrap();
+        let cash = db.create_ledger(company, "Cash", Category::Asset).unwrap();
+        let capital = db
+            .create_ledger(company, "Capital", Category::Equity)
+            .unwrap();
+        let income = db
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        let expenses = db
+            .create_ledger(company, "Rent", Category::Expense)
+            .unwrap();
+        let post = |db: &mut Store, date: &str, debit: i64, credit: i64, amount: i64| {
+            db.post_voucher(
+                company,
+                date,
+                "",
+                &[
+                    Posting {
+                        ledger_id: debit,
+                        amount,
+                    },
+                    Posting {
+                        ledger_id: credit,
+                        amount: -amount,
+                    },
+                ],
+            )
+            .unwrap();
+        };
+        post(&mut db, "2025-01-01", cash, capital, 10_000);
+        post(&mut db, "2025-06-01", cash, income, 2_000);
+        post(&mut db, "2026-01-01", expenses, cash, 500);
+        post(&mut db, "2027-01-01", cash, income, 4_000);
+        let report = db
+            .financial_report(company, Some("2026-01-01"), Some("2026-12-31"))
+            .unwrap();
+        assert_eq!(
+            (report.income, report.expenses, report.profit),
+            (0, 500, -500)
+        );
+        assert_eq!(
+            (report.assets, report.liabilities, report.equity),
+            (11_500, 0, 11_500)
+        );
+        assert_eq!(
+            report
+                .trial_balance
+                .iter()
+                .map(|b| i128::from(b.amount))
+                .sum::<i128>(),
+            0
+        );
+        let early = db
+            .financial_report(company, None, Some("2025-12-31"))
+            .unwrap();
+        assert_eq!(
+            (early.income, early.profit, early.assets, early.equity),
+            (2_000, 2_000, 12_000, 12_000)
+        );
+        assert!(db
+            .financial_report(company, Some("2027-01-01"), Some("2026-12-31"))
+            .is_err());
+        assert!(db
+            .financial_report(company, Some("2026-02-30"), None)
+            .is_err());
+    }
     #[test]
     fn voucher_history_and_edits_are_scoped_and_atomic() {
         let mut db = Store::memory().unwrap();
