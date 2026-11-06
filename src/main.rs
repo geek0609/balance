@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use balance::banking::{parse_signed_amount, BankEntry, StatementPlan};
+use balance::company::CompanyProfile;
 use balance::contacts::LedgerProfile;
 use balance::exchange::ImportPlan;
 use balance::inventory::{
@@ -32,6 +33,9 @@ struct App {
     page: Page,
     company: Option<i64>,
     company_name: String,
+    company_profile_selection: Option<i64>,
+    company_profile: CompanyProfile,
+    company_profile_original: CompanyProfile,
     ledger_name: String,
     category: Category,
     ledger_group: Option<i64>,
@@ -222,6 +226,9 @@ impl App {
             page: Page::Company,
             company: None,
             company_name: String::new(),
+            company_profile_selection: None,
+            company_profile: CompanyProfile::default(),
+            company_profile_original: CompanyProfile::default(),
             ledger_name: String::new(),
             category: Category::Asset,
             ledger_group: None,
@@ -346,6 +353,9 @@ impl App {
         self.narration.clear();
     }
     fn reset_company_forms(&mut self) {
+        self.company_profile_selection = None;
+        self.company_profile = CompanyProfile::default();
+        self.company_profile_original = CompanyProfile::default();
         self.clear_voucher();
         self.register_ledger = None;
         self.ledger_group = None;
@@ -416,8 +426,24 @@ impl App {
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
         ui.label("Create or select a company to work with.");
+        if self.company != self.company_profile_selection {
+            if let Some(company) = self.company {
+                match self.store.company_profile(company) {
+                    Ok(profile) => {
+                        self.company_profile = profile.clone();
+                        self.company_profile_original = profile;
+                        self.company_profile_selection = Some(company);
+                    }
+                    Err(e) => {
+                        self.failure(e);
+                        return;
+                    }
+                }
+            }
+        }
         let profile_dirty = (self.profile_ledger.is_some()
             && self.ledger_profile != self.profile_original)
+            || self.company_profile != self.company_profile_original
             || self.editing_invoice.is_some()
             || self.stock_editing.is_some();
         if profile_dirty {
@@ -461,6 +487,70 @@ impl App {
                 }
             }
             Err(e) => self.failure(e),
+        }
+        if let Some(company) = self.company {
+            ui.separator();
+            ui.heading("Company details");
+            ui.small(
+                "Accounting dates are informational and do not restrict entries or close periods.",
+            );
+            egui::Grid::new("company-profile")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    for (label, value) in [
+                        ("Address", &mut self.company_profile.address),
+                        ("Region", &mut self.company_profile.region),
+                        ("Postal code", &mut self.company_profile.postal_code),
+                        ("Country", &mut self.company_profile.country),
+                        ("Email", &mut self.company_profile.email),
+                        ("Phone", &mut self.company_profile.phone),
+                        ("Tax ID", &mut self.company_profile.tax_id),
+                        (
+                            "Registration type",
+                            &mut self.company_profile.registration_type,
+                        ),
+                        (
+                            "Financial year start (YYYY-MM-DD)",
+                            &mut self.company_profile.financial_year_start,
+                        ),
+                        (
+                            "Books start (YYYY-MM-DD)",
+                            &mut self.company_profile.books_start,
+                        ),
+                    ] {
+                        ui.label(label);
+                        ui.text_edit_singleline(value);
+                        ui.end_row();
+                    }
+                });
+            ui.horizontal(|ui| {
+                if ui.button("Save company details").clicked() {
+                    match self
+                        .store
+                        .save_company_profile(company, &self.company_profile)
+                        .and_then(|()| self.store.company_profile(company))
+                    {
+                        Ok(profile) => {
+                            self.company_profile = profile.clone();
+                            self.company_profile_original = profile;
+                            self.message = "Company details saved".into();
+                        }
+                        Err(e) => self.failure(e),
+                    }
+                }
+                if ui.button("Discard company detail edits").clicked() {
+                    self.company_profile = self.company_profile_original.clone();
+                }
+            });
+            egui::CollapsingHeader::new("Company detail history").show(ui, |ui| {
+                match self.store.company_profile_revisions(company) {
+                    Ok(rows) if rows.is_empty() => { ui.label("No earlier saved versions."); }
+                    Ok(rows) => for row in rows {
+                        ui.label(format!("{} UTC — {}, {}, {}, {} | {} | {} | Tax ID: {} | Registration: {} | Financial year: {} | Books: {}", row.changed_at, row.profile.address, row.profile.region, row.profile.postal_code, row.profile.country, row.profile.email, row.profile.phone, row.profile.tax_id, row.profile.registration_type, row.profile.financial_year_start, row.profile.books_start));
+                    },
+                    Err(e) => { ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string()); }
+                }
+            });
         }
     }
     fn ledger_page(&mut self, ui: &mut egui::Ui, company: i64) {
@@ -2452,7 +2542,7 @@ impl App {
                             .desired_width(350.0),
                     );
                 });
-                ui.small("Export a saved invoice for review or printing in a browser. Existing files are not overwritten; party details are current. This basic layout is not a statutory tax document.");
+                ui.small("Export a saved invoice for review or printing in a browser. Existing files are not overwritten; company and party details are current. This basic layout is not a statutory tax document.");
                 for invoice in invoices {
                     ui.strong(format!(
                         "{}  {}  {}  {}  Total {}  Paid {}  Outstanding {}",

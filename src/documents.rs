@@ -62,11 +62,32 @@ impl Store {
             .ok_or_else(|| Error::Validation("Invoice not found in the selected company".into()))?;
         let draft = self.invoice_draft(company_id, invoice_id)?;
         let profile = self.ledger_profile(company_id, draft.party_ledger_id)?;
+        let business = self.company_profile(company_id)?;
         let mut html = String::from("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>Invoice record</title><style>body{font:14px system-ui,sans-serif;color:#182431;max-width:900px;margin:2rem auto;padding:0 1rem}h1{margin-bottom:.2rem}p{white-space:pre-line}table{border-collapse:collapse;width:100%;margin:1.5rem 0}th,td{text-align:left;border-bottom:1px solid #ccd3db;padding:.55rem;vertical-align:top}.num{text-align:right;white-space:nowrap}.totals{margin-left:auto;width:min(100%,360px)}.totals td{border:0}.total{font-weight:bold;border-top:2px solid #182431}.note{color:#4c5b68;font-size:12px}@media print{body{margin:0;max-width:none}}</style></head><body>");
+        let _ = write!(html, "<h1>{}</h1><p>", escape(&company.name));
+        for value in [
+            &business.address,
+            &business.region,
+            &business.postal_code,
+            &business.country,
+        ] {
+            if !value.trim().is_empty() {
+                let _ = write!(html, "{}<br>", escape(value));
+            }
+        }
+        for (label, value) in [
+            ("Email", &business.email),
+            ("Phone", &business.phone),
+            ("Tax ID", &business.tax_id),
+            ("Registration type", &business.registration_type),
+        ] {
+            if !value.trim().is_empty() {
+                let _ = write!(html, "{}: {}<br>", label, escape(value));
+            }
+        }
         let _ = write!(
             html,
-            "<h1>{}</h1><p><strong>{} invoice record</strong><br>Reference: {}<br>Date: {}",
-            escape(&company.name),
+            "</p><p><strong>{} invoice record</strong><br>Reference: {}<br>Date: {}",
             invoice.kind.as_str(),
             escape(&invoice.reference),
             escape(&invoice.date)
@@ -143,7 +164,7 @@ impl Store {
                 escape(&draft.narration)
             );
         }
-        html.push_str("<p class=\"note\">Basic invoice record. Party details reflect the current ledger profile. Review before use; this layout does not establish tax or statutory compliance.</p></body></html>");
+        html.push_str("<p class=\"note\">Basic invoice record. Company and party details reflect their current profiles. Review before use; this layout does not establish tax or statutory compliance.</p></body></html>");
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

@@ -7,6 +7,7 @@ use rust_decimal::{prelude::ToPrimitive, Decimal};
 use std::{collections::HashMap, path::Path, str::FromStr};
 use thiserror::Error;
 pub mod banking;
+pub mod company;
 pub mod contacts;
 pub mod documents;
 pub mod exchange;
@@ -249,7 +250,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=25).contains(&version) {
+    if !(1..=26).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -352,6 +353,8 @@ impl Store {
             "settlement_reversals",
             "invoice_line_allocations",
             "invoice_revision_line_allocations",
+            "company_profiles",
+            "company_profile_revisions",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -369,7 +372,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 25 {
+        if version > 26 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -576,6 +579,12 @@ impl Store {
                 ALTER TABLE invoice_revision_lines ADD COLUMN discount_value TEXT NOT NULL DEFAULT '';
                 ALTER TABLE invoice_revision_lines ADD COLUMN discount_amount INTEGER NOT NULL DEFAULT 0 CHECK(discount_amount >= 0);
                 PRAGMA user_version = 25;")?;
+        }
+        if version < 26 {
+            tx.execute_batch("CREATE TABLE company_profiles(company_id INTEGER PRIMARY KEY REFERENCES companies(id), address TEXT NOT NULL, region TEXT NOT NULL, postal_code TEXT NOT NULL, country TEXT NOT NULL, email TEXT NOT NULL, phone TEXT NOT NULL, tax_id TEXT NOT NULL, registration_type TEXT NOT NULL, financial_year_start TEXT NOT NULL, books_start TEXT NOT NULL);
+                CREATE TABLE company_profile_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, address TEXT NOT NULL, region TEXT NOT NULL, postal_code TEXT NOT NULL, country TEXT NOT NULL, email TEXT NOT NULL, phone TEXT NOT NULL, tax_id TEXT NOT NULL, registration_type TEXT NOT NULL, financial_year_start TEXT NOT NULL, books_start TEXT NOT NULL);
+                CREATE INDEX company_profile_revisions_company ON company_profile_revisions(company_id, id);
+                PRAGMA user_version = 26;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1438,7 +1447,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
