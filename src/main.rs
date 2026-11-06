@@ -135,6 +135,10 @@ struct App {
     settlement_reference: String,
     settlement_amount: String,
     settlement_extra: Vec<SettlementLineForm>,
+    reversal_target: Option<i64>,
+    reversal_date: String,
+    reversal_reference: String,
+    reversal_reason: String,
     message: String,
 }
 struct SettlementLineForm {
@@ -291,6 +295,10 @@ impl App {
             settlement_reference: String::new(),
             settlement_amount: String::new(),
             settlement_extra: Vec::new(),
+            reversal_target: None,
+            reversal_date: String::new(),
+            reversal_reference: String::new(),
+            reversal_reason: String::new(),
             message: String::new(),
         }
     }
@@ -367,6 +375,10 @@ impl App {
         self.settlement_reference.clear();
         self.settlement_amount.clear();
         self.settlement_extra.clear();
+        self.reversal_target = None;
+        self.reversal_date.clear();
+        self.reversal_reference.clear();
+        self.reversal_reason.clear();
     }
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
@@ -2088,6 +2100,42 @@ impl App {
         }
         ui.separator();
         ui.heading("Invoices");
+        ui.small("Invoice totals include all recorded settlements and reversals, including future-dated entries. Use Outstanding for a specific as-of date.");
+        if let Some(voucher) = self.reversal_target {
+            ui.heading(format!("Reverse settlement voucher {voucher}"));
+            ui.label("This reverses the entire receipt or payment, including all invoices allocated to it.");
+            ui.horizontal(|ui| {
+                ui.label("Date");
+                ui.add(egui::TextEdit::singleline(&mut self.reversal_date).hint_text("YYYY-MM-DD"));
+                ui.label("Reference");
+                ui.text_edit_singleline(&mut self.reversal_reference);
+                ui.label("Reason");
+                ui.text_edit_singleline(&mut self.reversal_reason);
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Save reversal").clicked() {
+                    match self.store.reverse_settlement(
+                        company,
+                        voucher,
+                        &self.reversal_date,
+                        &self.reversal_reference,
+                        &self.reversal_reason,
+                    ) {
+                        Ok(id) => {
+                            self.reversal_target = None;
+                            self.reversal_date.clear();
+                            self.reversal_reference.clear();
+                            self.reversal_reason.clear();
+                            self.message = format!("Reversal voucher {id} saved");
+                        }
+                        Err(e) => self.failure(e),
+                    }
+                }
+                if ui.button("Cancel reversal").clicked() {
+                    self.reversal_target = None;
+                }
+            });
+        }
         match self.store.invoices(company) {
             Ok(invoices) => {
                 ui.heading("Record a receipt or payment");
@@ -2247,7 +2295,7 @@ impl App {
                     ));
                     if ui
                         .add_enabled(
-                            invoice.settled == 0 && self.editing_invoice.is_none(),
+                            !invoice.has_settlement_history && self.editing_invoice.is_none(),
                             egui::Button::new("Edit invoice"),
                         )
                         .clicked()
@@ -2300,8 +2348,8 @@ impl App {
                             Err(e) => self.failure(e),
                         }
                     }
-                    if invoice.settled != 0 {
-                        ui.small("Invoices with receipts or payments cannot yet be edited.");
+                    if invoice.has_settlement_history {
+                        ui.small("Invoices with settlement history cannot yet be edited, even after a reversal.");
                     }
                     if let Some(due_date) = &invoice.due_date {
                         ui.small(format!("Due: {due_date}"));
@@ -2335,14 +2383,33 @@ impl App {
                     match self.store.invoice_settlements(company, invoice.id) {
                         Ok(rows) => {
                             for payment in rows {
-                                ui.label(format!(
-                                    "  {} — {} — {} — {} (voucher #{})",
-                                    payment.date,
-                                    payment.reference,
-                                    payment.bank_ledger,
-                                    format_amount(payment.amount),
-                                    payment.voucher_id
-                                ));
+                                ui.horizontal(|ui| {
+                                    ui.label(format!(
+                                        "  {} — {} — {} — {} (voucher #{})",
+                                        payment.date,
+                                        payment.reference,
+                                        payment.bank_ledger,
+                                        format_amount(payment.amount),
+                                        payment.voucher_id
+                                    ));
+                                    if let (Some(id), Some(date)) = (
+                                        payment.reversal_voucher_id,
+                                        payment.reversal_date.as_deref(),
+                                    ) {
+                                        ui.label(format!(
+                                            "Reversed on {date} by voucher #{id}: {}",
+                                            payment.reversal_reason.as_deref().unwrap_or("")
+                                        ));
+                                    } else if ui
+                                        .add_enabled(
+                                            self.reversal_target.is_none(),
+                                            egui::Button::new("Reverse whole payment"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.reversal_target = Some(payment.voucher_id);
+                                    }
+                                });
                             }
                         }
                         Err(e) => {

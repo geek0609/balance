@@ -247,7 +247,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=21).contains(&version) {
+    if !(1..=22).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -347,6 +347,7 @@ impl Store {
             "stock_batches",
             "bank_statement_openings",
             "bank_statement_opening_events",
+            "settlement_reversals",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -364,7 +365,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 21 {
+        if version > 22 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -544,6 +545,10 @@ impl Store {
                 CREATE TABLE bank_statement_opening_events(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), previous_date TEXT, previous_amount INTEGER, new_date TEXT, new_amount INTEGER, reason TEXT NOT NULL, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
                 CREATE INDEX bank_statement_opening_events_ledger ON bank_statement_opening_events(company_id, ledger_id, id);
                 PRAGMA user_version = 21;")?;
+        }
+        if version < 22 {
+            tx.execute_batch("CREATE TABLE settlement_reversals(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), settlement_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), reversal_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                PRAGMA user_version = 22;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -792,7 +797,7 @@ impl Store {
         check_ledgers(&tx, company_id, postings)?;
         opening::check_no_control_postings(&tx, company_id, postings)?;
         let invoice_backed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2)",
             params![voucher_id, company_id],
             |r| r.get(0),
         )?;
@@ -1406,7 +1411,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
