@@ -618,6 +618,60 @@ impl Store {
         )?;
         save(csv, destination)
     }
+
+    pub fn export_party_outstanding_csv(
+        &self,
+        company: i64,
+        as_of: &str,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let date = parse_date(as_of)?.format("%Y-%m-%d").to_string();
+        let rows = self.party_outstanding(company, &date)?;
+        let context = vec![self.report_company_name(company)?, date];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "as_of"]),
+            &strings(&[
+                "row_type",
+                "party_id",
+                "party",
+                "open_invoices",
+                "receivable",
+                "payable",
+                "overdue_receivable",
+                "overdue_payable",
+                "current_informational_credit_limit",
+            ]),
+        )?;
+        contextual_row(
+            &mut csv,
+            &context,
+            &strings(&["context", "", "", "", "", "", "", "", ""]),
+        )?;
+        for entry in rows {
+            let terms = self.ledger_terms(company, entry.party_ledger_id)?;
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "party".into(),
+                    entry.party_ledger_id.to_string(),
+                    text_cell(&entry.party),
+                    entry.invoices.to_string(),
+                    money(entry.receivable),
+                    money(entry.payable),
+                    money(entry.overdue_receivable),
+                    money(entry.overdue_payable),
+                    terms
+                        .credit_limit
+                        .map(|value| money(i128::from(value)))
+                        .unwrap_or_default(),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
 }
 
 fn strings(values: &[&str]) -> Vec<String> {

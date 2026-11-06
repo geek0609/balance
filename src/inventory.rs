@@ -229,6 +229,7 @@ pub struct OutstandingInvoice {
     pub due_date: Option<String>,
     pub reference: String,
     pub party: String,
+    pub party_ledger_id: i64,
     pub total: i128,
     pub settled: i128,
     pub outstanding: i128,
@@ -236,6 +237,16 @@ pub struct OutstandingInvoice {
     pub age_days: i64,
     /// Days after the due date, if one is set. Zero means not overdue yet.
     pub overdue_days: Option<i64>,
+}
+#[derive(Debug, Clone)]
+pub struct PartyOutstanding {
+    pub party_ledger_id: i64,
+    pub party: String,
+    pub receivable: i128,
+    pub payable: i128,
+    pub overdue_receivable: i128,
+    pub overdue_payable: i128,
+    pub invoices: usize,
 }
 #[derive(Debug, Clone)]
 pub struct InvoiceDetailLine {
@@ -2475,6 +2486,7 @@ impl Store {
                 due_date: invoice.due_date,
                 reference: invoice.reference,
                 party: invoice.party,
+                party_ledger_id: invoice.party_ledger_id,
                 total: invoice.total,
                 settled,
                 outstanding,
@@ -2488,6 +2500,49 @@ impl Store {
                 .cmp(&b.party.to_lowercase())
                 .then_with(|| a.date.cmp(&b.date))
                 .then_with(|| a.invoice_id.cmp(&b.invoice_id))
+        });
+        Ok(result)
+    }
+
+    /// Group as-of open invoices by party without netting receivables and payables.
+    pub fn party_outstanding(&self, company: i64, as_of: &str) -> Result<Vec<PartyOutstanding>> {
+        let mut parties = BTreeMap::<i64, PartyOutstanding>::new();
+        for invoice in self.outstanding_invoices(company, as_of)? {
+            let entry =
+                parties
+                    .entry(invoice.party_ledger_id)
+                    .or_insert_with(|| PartyOutstanding {
+                        party_ledger_id: invoice.party_ledger_id,
+                        party: invoice.party.clone(),
+                        receivable: 0,
+                        payable: 0,
+                        overdue_receivable: 0,
+                        overdue_payable: 0,
+                        invoices: 0,
+                    });
+            entry.invoices += 1;
+            let overdue = invoice.overdue_days.is_some_and(|days| days > 0);
+            match invoice.kind {
+                InvoiceKind::Sale => {
+                    entry.receivable += invoice.outstanding;
+                    if overdue {
+                        entry.overdue_receivable += invoice.outstanding;
+                    }
+                }
+                InvoiceKind::Purchase => {
+                    entry.payable += invoice.outstanding;
+                    if overdue {
+                        entry.overdue_payable += invoice.outstanding;
+                    }
+                }
+            }
+        }
+        let mut result: Vec<_> = parties.into_values().collect();
+        result.sort_by(|a, b| {
+            a.party
+                .to_lowercase()
+                .cmp(&b.party.to_lowercase())
+                .then_with(|| a.party_ledger_id.cmp(&b.party_ledger_id))
         });
         Ok(result)
     }

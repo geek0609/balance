@@ -4545,6 +4545,64 @@ impl App {
                     money(receivable),
                     money(payable)
                 ));
+                ui.heading("Outstanding by party");
+                ui.small("Receivables and payables are not netted. Overdue totals exclude invoices with no due date. Credit limits are current and informational.");
+                if ui.button("Export party outstanding as CSV").clicked() {
+                    match self.store.export_party_outstanding_csv(
+                        company,
+                        self.outstanding_date.trim(),
+                        self.report_export_path.trim(),
+                    ) {
+                        Ok(()) => self.message = "Party outstanding report exported".into(),
+                        Err(e) => self.failure(e),
+                    }
+                }
+                match self
+                    .store
+                    .party_outstanding(company, self.outstanding_date.trim())
+                {
+                    Ok(parties) => {
+                        egui::Grid::new("outstanding-parties")
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for label in [
+                                    "Party",
+                                    "Invoices",
+                                    "Receivable",
+                                    "Payable",
+                                    "Overdue receivable",
+                                    "Overdue payable",
+                                    "Credit limit",
+                                ] {
+                                    ui.strong(label);
+                                }
+                                ui.end_row();
+                                for party in parties {
+                                    let limit = self
+                                        .store
+                                        .ledger_terms(company, party.party_ledger_id)
+                                        .map(|terms| {
+                                            terms
+                                                .credit_limit
+                                                .map(format_amount)
+                                                .unwrap_or_else(|| "—".into())
+                                        })
+                                        .unwrap_or_else(|_| "Unavailable".into());
+                                    ui.label(party.party);
+                                    ui.label(party.invoices.to_string());
+                                    ui.label(money(party.receivable));
+                                    ui.label(money(party.payable));
+                                    ui.label(money(party.overdue_receivable));
+                                    ui.label(money(party.overdue_payable));
+                                    ui.label(limit);
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    Err(e) => {
+                        ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                    }
+                };
                 ui.heading("Age from invoice date");
                 egui::Grid::new("outstanding-age")
                     .striped(true)
