@@ -1,5 +1,8 @@
 //! Narrow CSV exports of the reports shown in the application.
-use crate::{inventory::InvoiceKind, parse_date, Error, Result, Store, VoucherKind};
+use crate::{
+    inventory::{format_quantity, InvoiceKind},
+    parse_date, Error, Result, Store, VoucherKind,
+};
 use std::{io::Write, path::Path};
 
 fn money(value: i128) -> String {
@@ -376,6 +379,79 @@ impl Store {
                     money(invoice.total),
                     money(invoice.settled),
                     money(invoice.outstanding),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
+    /// Export company-wide quantities and current reorder settings.
+    pub fn export_stock_csv(
+        &self,
+        company: i64,
+        as_of: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let balances = self.stock_balances(company, as_of)?;
+        let context = vec![self.report_company_name(company)?, optional_date(as_of)?];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "as_of"]),
+            &strings(&[
+                "row_type",
+                "item_id",
+                "item",
+                "unit",
+                "on_hand",
+                "reorder_enabled",
+                "reorder_level",
+                "suggested_quantity",
+                "low_stock",
+            ]),
+        )?;
+        contextual_row(
+            &mut csv,
+            &context,
+            &strings(&["context", "", "", "", "", "", "", "", ""]),
+        )?;
+        for balance in balances {
+            let rule = self.reorder_rule(company, balance.item.id)?;
+            let enabled = rule
+                .as_ref()
+                .map(|r| if r.enabled { "yes" } else { "no" })
+                .unwrap_or("");
+            let level = rule
+                .as_ref()
+                .map(|r| format_quantity(i128::from(r.level)))
+                .unwrap_or_default();
+            let quantity = rule
+                .as_ref()
+                .map(|r| format_quantity(i128::from(r.quantity)))
+                .unwrap_or_default();
+            let low = rule
+                .as_ref()
+                .map(|r| {
+                    if r.enabled && balance.quantity <= i128::from(r.level) {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                })
+                .unwrap_or("");
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "item".into(),
+                    balance.item.id.to_string(),
+                    text_cell(&balance.item.name),
+                    text_cell(&balance.item.unit),
+                    format_quantity(balance.quantity),
+                    enabled.into(),
+                    level,
+                    quantity,
+                    low.into(),
                 ],
             )?;
         }

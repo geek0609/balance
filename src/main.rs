@@ -2500,6 +2500,7 @@ impl App {
         });
         ui.separator();
         ui.heading("Stock quantities");
+        self.report_export_path_field(ui);
         ui.horizontal(|ui| {
             ui.label("As of (optional)");
             ui.add(egui::TextEdit::singleline(&mut self.stock_as_of).hint_text("YYYY-MM-DD"));
@@ -2517,6 +2518,16 @@ impl App {
         } else {
             Some(self.stock_as_of.trim())
         };
+        if ui.button("Export company-wide stock as CSV").clicked() {
+            match self
+                .store
+                .export_stock_csv(company, end, self.report_export_path.trim())
+            {
+                Ok(()) => self.message = "Stock report exported".into(),
+                Err(e) => self.message = e.to_string(),
+            }
+        }
+        ui.small("The CSV includes all locations and the current reorder settings, regardless of the selected location.");
         let balances = match self.stock_balance_location {
             Some(location) => self.store.stock_location_balances(company, location, end),
             None => self.store.stock_balances(company, end),
@@ -4643,7 +4654,7 @@ impl App {
                     .desired_width(350.0),
             );
         });
-        ui.small("Exports include the current report filters and never overwrite existing files. Day-book, invoice-register and outstanding files include a context row; ledger files include opening and closing rows. Potential spreadsheet formulas in text are prefixed with an apostrophe.");
+        ui.small("Exports include the current report filters and never overwrite existing files. Day-book, invoice-register, outstanding and stock files include a context row; ledger files include opening and closing rows. Potential spreadsheet formulas in text are prefixed with an apostrophe.");
     }
     fn backup_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Back up data");
