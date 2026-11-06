@@ -12,6 +12,7 @@ pub mod documents;
 pub mod exchange;
 pub mod inventory;
 pub mod opening;
+pub mod report_export;
 
 #[derive(Debug, Error)]
 pub enum Error {

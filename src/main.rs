@@ -60,6 +60,7 @@ struct App {
     day_to: String,
     day_kind: Option<VoucherKind>,
     day_search: String,
+    report_export_path: String,
     outstanding_date: String,
     bank_ledger: Option<i64>,
     bank_as_of: String,
@@ -249,6 +250,7 @@ impl App {
             day_to: String::new(),
             day_kind: None,
             day_search: String::new(),
+            report_export_path: String::new(),
             outstanding_date: String::new(),
             bank_ledger: None,
             bank_as_of: String::new(),
@@ -1071,10 +1073,11 @@ impl App {
             money(report.liabilities),
             money(report.equity)
         ));
-        ui.small("The balance sheet includes cumulative profit through the end date. Opening balances, tax, and statutory adjustments are not implemented.");
+        ui.small("The balance sheet includes cumulative profit through the end date and recorded opening balances. Automatic tax and statutory adjustments are not implemented.");
     }
     fn register_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Ledger activity");
+        self.report_export_path_field(ui);
         let ledgers = match self.store.ledgers(company) {
             Ok(v) => v,
             Err(e) => {
@@ -1129,6 +1132,18 @@ impl App {
                 return;
             }
         };
+        if ui.button("Export ledger activity as CSV").clicked() {
+            match self.store.export_ledger_register_csv(
+                company,
+                ledger,
+                from,
+                to,
+                self.report_export_path.trim(),
+            ) {
+                Ok(()) => self.message = "Ledger report exported".into(),
+                Err(e) => self.failure(e),
+            }
+        }
         ui.label(format!(
             "Opening balance: {}",
             money(register.opening_balance)
@@ -3337,6 +3352,7 @@ impl App {
     }
     fn outstanding_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Outstanding invoices");
+        self.report_export_path_field(ui);
         ui.label("Age is measured from the invoice date; overdue days are measured from the optional due date. Credit notes and unallocated payments are not included. Past reports use the invoice's current details and due date.");
         ui.horizontal(|ui| {
             ui.label("As of");
@@ -3355,6 +3371,16 @@ impl App {
             .outstanding_invoices(company, &self.outstanding_date)
         {
             Ok(rows) => {
+                if ui.button("Export outstanding invoices as CSV").clicked() {
+                    match self.store.export_outstanding_csv(
+                        company,
+                        self.outstanding_date.trim(),
+                        self.report_export_path.trim(),
+                    ) {
+                        Ok(()) => self.message = "Outstanding invoices exported".into(),
+                        Err(e) => self.failure(e),
+                    }
+                }
                 let mut receivable = 0_i128;
                 let mut payable = 0_i128;
                 let mut receivable_age = [0_i128; 4];
@@ -3479,6 +3505,7 @@ impl App {
     }
     fn day_book_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Day book");
+        self.report_export_path_field(ui);
         ui.horizontal(|ui| {
             ui.label("From");
             ui.add(
@@ -3520,6 +3547,19 @@ impl App {
             .day_book(company, from, to, self.day_kind, &self.day_search)
         {
             Ok(entries) => {
+                if ui.button("Export day book as CSV").clicked() {
+                    match self.store.export_day_book_csv(
+                        company,
+                        from,
+                        to,
+                        self.day_kind,
+                        &self.day_search,
+                        self.report_export_path.trim(),
+                    ) {
+                        Ok(()) => self.message = "Day book exported".into(),
+                        Err(e) => self.failure(e),
+                    }
+                }
                 ui.label(format!("{} voucher(s)", entries.len()));
                 egui::Grid::new("day-book").striped(true).show(ui, |ui| {
                     for name in [
@@ -3550,6 +3590,17 @@ impl App {
                 ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
             }
         }
+    }
+    fn report_export_path_field(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("New report CSV file");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.report_export_path)
+                    .hint_text("Absolute path ending in .csv")
+                    .desired_width(350.0),
+            );
+        });
+        ui.small("Exports include the current report filters and never overwrite existing files. Day-book and outstanding files include a context row; ledger files include opening and closing rows. Potential spreadsheet formulas in text are prefixed with an apostrophe.");
     }
     fn backup_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Back up data");
