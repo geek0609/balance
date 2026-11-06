@@ -124,6 +124,7 @@ struct ImportedBillAllocation {
     amount: i64,
     existing_invoice_id: Option<i64>,
     expected_outstanding: i128,
+    credit_days: Option<u32>,
 }
 #[derive(Debug, Clone)]
 struct ImportedSettlement {
@@ -654,6 +655,20 @@ fn invoice_field(node: Node<'_, '_>, field: &str) -> Result<String> {
         .filter(|v| !v.is_empty())
         .ok_or_else(|| Error::Validation(format!("missing {field}")))
 }
+fn xml_credit_days(term: &str) -> Result<u32> {
+    let parts: Vec<_> = term.split_whitespace().collect();
+    if parts.len() != 2
+        || !parts[0].bytes().all(|b| b.is_ascii_digit())
+        || !(parts[1].eq_ignore_ascii_case("day") || parts[1].eq_ignore_ascii_case("days"))
+    {
+        return Err(Error::Validation(
+            "credit period must be a whole number of days".into(),
+        ));
+    }
+    parts[0]
+        .parse::<u32>()
+        .map_err(|_| Error::Validation("credit period is too large".into()))
+}
 fn invoice_side(node: Node<'_, '_>, field: &str, debit: bool) -> Result<()> {
     if let Some(value) = direct_text(node, field).filter(|v| !v.is_empty()) {
         if !value.eq_ignore_ascii_case(if debit { "yes" } else { "no" }) {
@@ -828,7 +843,12 @@ fn parse_imported_settlement(
             let mut allocations = Vec::new();
             let mut seen = HashSet::new();
             for bill in bills {
-                invoice_list_fields(bill, &["NAME", "BILLTYPE", "AMOUNT"], label, issues);
+                invoice_list_fields(
+                    bill,
+                    &["NAME", "BILLTYPE", "AMOUNT", "BILLCREDITPERIOD"],
+                    label,
+                    issues,
+                );
                 let bill_reference = invoice_field(bill, "NAME")?;
                 if !seen.insert(normalized(&bill_reference)) {
                     return Err(Error::Validation(
@@ -853,6 +873,10 @@ fn parse_imported_settlement(
                         .ok_or_else(|| Error::Validation("bill amount is too large".into()))?,
                     existing_invoice_id: None,
                     expected_outstanding: 0,
+                    credit_days: direct_text(bill, "BILLCREDITPERIOD")
+                        .filter(|v| !v.is_empty())
+                        .map(|v| xml_credit_days(&v))
+                        .transpose()?,
                 });
             }
             let sum: i128 = allocations.iter().map(|v| i128::from(v.amount)).sum();
@@ -1056,19 +1080,7 @@ fn parse_imported_invoice(
                 ));
             }
             if let Some(term) = direct_text(bill, "BILLCREDITPERIOD").filter(|v| !v.is_empty()) {
-                let parts: Vec<_> = term.split_whitespace().collect();
-                if parts.len() != 2
-                    || !parts[0].bytes().all(|b| b.is_ascii_digit())
-                    || !(parts[1].eq_ignore_ascii_case("day")
-                        || parts[1].eq_ignore_ascii_case("days"))
-                {
-                    return Err(Error::Validation(
-                        "credit period must be a whole number of days".into(),
-                    ));
-                }
-                let days = parts[0]
-                    .parse::<u32>()
-                    .map_err(|_| Error::Validation("credit period is too large".into()))?;
+                let days = xml_credit_days(&term)?;
                 parse_date(&date)?
                     .checked_add_days(chrono::Days::new(u64::from(days)))
                     .ok_or_else(|| {
@@ -2522,6 +2534,7 @@ impl Store {
                     String,
                     i128,
                     Option<NaiveDate>,
+                    Option<u32>,
                     HashSet<String>,
                 ),
             >::new();
@@ -2550,6 +2563,7 @@ impl Store {
                             invoice.reference,
                             invoice.outstanding,
                             latest_reversal,
+                            invoice.credit_days,
                             settlement_references,
                         ),
                     )
@@ -2581,6 +2595,7 @@ impl Store {
                             invoice.reference.clone(),
                             total,
                             None,
+                            invoice.credit_days,
                             HashSet::new(),
                         ),
                     )
@@ -2625,9 +2640,17 @@ impl Store {
                                 reference,
                                 outstanding,
                                 reversal,
+                                invoice_credit_days,
                                 settlement_references,
                             )) = invoice_balances.get_mut(&key)
                             {
+                                if allocation.credit_days.is_some()
+                                    && allocation.credit_days != *invoice_credit_days
+                                {
+                                    plan.issues.push(format!(
+                                        "{label}: bill credit period differs from the invoice"
+                                    ));
+                                }
                                 if !settlement_references.insert(normalized(&settlement.reference))
                                 {
                                     plan.issues.push(format!(
@@ -3202,8 +3225,8 @@ impl Store {
                 })?;
             let mut allocations = Vec::new();
             for allocation in &settlement.allocations {
-                let mut stmt = tx.prepare("SELECT i.id, v.reference, i.tax_amount FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3")?;
-                let mut found: Option<(i64, i64)> = None;
+                let mut stmt = tx.prepare("SELECT i.id, v.reference, i.tax_amount, i.credit_days FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3")?;
+                let mut found: Option<(i64, i64, Option<u32>)> = None;
                 for row in stmt.query_map(
                     params![plan.company_id, settlement.kind.as_str(), party_id],
                     |r| {
@@ -3211,10 +3234,11 @@ impl Store {
                             r.get::<_, i64>(0)?,
                             r.get::<_, String>(1)?,
                             r.get::<_, i64>(2)?,
+                            r.get::<_, Option<u32>>(3)?,
                         ))
                     },
                 )? {
-                    let (id, reference, tax) = row?;
+                    let (id, reference, tax, credit_days) = row?;
                     if normalized(&reference) == normalized(&allocation.reference) {
                         if found.is_some() || reference != allocation.reference {
                             return Err(Error::Validation(
@@ -3222,13 +3246,19 @@ impl Store {
                                     .into(),
                             ));
                         }
-                        found = Some((id, tax));
+                        found = Some((id, tax, credit_days));
                     }
                 }
                 drop(stmt);
-                let (id, tax) = found.ok_or_else(|| {
+                let (id, tax, credit_days) = found.ok_or_else(|| {
                     Error::Validation(format!("Invoice {} is missing", allocation.reference))
                 })?;
+                if allocation.credit_days.is_some() && allocation.credit_days != credit_days {
+                    return Err(Error::Validation(format!(
+                        "Invoice {} credit period changed since preview",
+                        allocation.reference
+                    )));
+                }
                 if allocation
                     .existing_invoice_id
                     .is_some_and(|expected| expected != id)
