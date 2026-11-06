@@ -2541,11 +2541,11 @@ impl App {
         }
         if let Some(plan) = &self.import_preview {
             ui.label(format!(
-                "Preview: {} account groups, {} ledgers, {} opening balances, {} vouchers, {} invoices; {} units, {} stock groups, {} locations, {} items, {} opening quantities",
+                "Preview: {} account groups, {} ledgers, {} opening balances, {} vouchers, {} invoices, {} settlements; {} units, {} stock groups, {} locations, {} items, {} opening quantities",
                 plan.group_count(),
                 plan.ledger_count(),
                 plan.opening_count(),
-                plan.voucher_count(), plan.invoice_count()
+                plan.voucher_count(), plan.invoice_count(), plan.settlement_count()
                 , plan.unit_count(), plan.stock_group_count(), plan.location_count(), plan.item_count(), plan.stock_opening_count()
             ));
             if plan.issues().is_empty() {
@@ -2570,8 +2570,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} account groups, {} ledgers, {} vouchers, {} invoices, {} units, {} stock groups, {} locations and {} items",
-                            counts.groups, counts.ledgers, counts.vouchers, counts.invoices, counts.units, counts.stock_groups, counts.locations, counts.items
+                            "Imported {} account groups, {} ledgers, {} vouchers, {} invoices, {} settlements, {} units, {} stock groups, {} locations and {} items",
+                            counts.groups, counts.ledgers, counts.vouchers, counts.invoices, counts.settlements, counts.units, counts.stock_groups, counts.locations, counts.items
                         );
                         self.import_preview = None;
                     }
@@ -2579,7 +2579,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, unvalued stock items and a restricted form of item invoice. Unvalued opening quantities can be allocated by location and batch, including manufacture dates. Invoices require one matching new bill reference and one trade ledger; additional ledger postings become unclassified charges or deductions. Only one location and batch allocation per invoice item is supported. Tax details, expiry dates, invoice batch dates, nested locations, other bill allocations, valued opening stock and other unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, unvalued stock items, restricted item invoices and simple receipts or payments against invoices. Unvalued opening quantities can be allocated by location and batch, including manufacture dates. Invoices require one matching new bill reference and one trade ledger; additional ledger postings become unclassified charges or deductions. Settlements require one party, one asset ledger and references to available invoices. Only one location and batch allocation per invoice item is supported. Tax details, expiry dates, invoice batch dates, nested locations, advances, other bill allocations, valued opening stock and other unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Bank clearance");

@@ -3,8 +3,9 @@
 use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
-    find_stock_batch, insert_invoice_on_connection, line_amount, parse_quantity, InvoiceAdjustment,
-    InvoiceDraft, InvoiceKind, InvoiceLine,
+    find_stock_batch, insert_invoice_on_connection, insert_settlement_on_connection, line_amount,
+    parse_quantity, InvoiceAdjustment, InvoiceDraft, InvoiceKind, InvoiceLine,
+    SettlementAllocation,
 };
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
@@ -117,6 +118,25 @@ struct ImportedInvoice {
     adjustments: Vec<ImportedInvoiceAdjustment>,
     metadata: SourceMetadata,
 }
+#[derive(Debug, Clone)]
+struct ImportedBillAllocation {
+    reference: String,
+    amount: i64,
+    existing_invoice_id: Option<i64>,
+    expected_outstanding: i128,
+}
+#[derive(Debug, Clone)]
+struct ImportedSettlement {
+    kind: InvoiceKind,
+    date: String,
+    reference: String,
+    narration: String,
+    party: String,
+    bank: String,
+    existing_bank_id: Option<i64>,
+    allocations: Vec<ImportedBillAllocation>,
+    metadata: SourceMetadata,
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SourceMetadata {
     guid: String,
@@ -157,6 +177,7 @@ pub struct ImportPlan {
     items: Vec<Item>,
     transactions: Vec<Transaction>,
     invoices: Vec<ImportedInvoice>,
+    settlements: Vec<ImportedSettlement>,
     issues: Vec<String>,
 }
 impl ImportPlan {
@@ -171,6 +192,9 @@ impl ImportPlan {
     }
     pub fn invoice_count(&self) -> usize {
         self.invoices.len()
+    }
+    pub fn settlement_count(&self) -> usize {
+        self.settlements.len()
     }
     pub fn opening_count(&self) -> usize {
         self.accounts.iter().filter(|a| a.opening.is_some()).count()
@@ -213,7 +237,8 @@ impl ImportPlan {
                 || !self.items.is_empty()
                 || !self.accounts.is_empty()
                 || !self.transactions.is_empty()
-                || !self.invoices.is_empty())
+                || !self.invoices.is_empty()
+                || !self.settlements.is_empty())
     }
 }
 #[derive(Debug, Clone, Copy)]
@@ -222,6 +247,7 @@ pub struct ImportCounts {
     pub ledgers: usize,
     pub vouchers: usize,
     pub invoices: usize,
+    pub settlements: usize,
     pub units: usize,
     pub stock_groups: usize,
     pub locations: usize,
@@ -651,6 +677,223 @@ fn invoice_list_fields(
             local_name(node)
         ));
     }
+}
+fn parse_imported_settlement(
+    node: Node<'_, '_>,
+    label: &str,
+    metadata: SourceMetadata,
+    ledgers: &HashMap<String, (Option<i64>, Category)>,
+    issues: &mut Vec<String>,
+) -> Result<ImportedSettlement> {
+    check_fields(
+        node,
+        &[
+            "DATE",
+            "VOUCHERTYPENAME",
+            "VOUCHERNUMBER",
+            "NARRATION",
+            "PARTYLEDGERNAME",
+            "PERSISTEDVIEW",
+            "ISINVOICE",
+            "LEDGERENTRIES.LIST",
+            "ALLLEDGERENTRIES.LIST",
+        ],
+        label,
+        issues,
+    );
+    if node
+        .attributes()
+        .any(|a| a.name().eq_ignore_ascii_case("NAME") && !a.value().trim().is_empty())
+    {
+        issues.push(format!("{label}: voucher name attribute is not supported"));
+    }
+    if direct_text(node, "PERSISTEDVIEW")
+        .is_some_and(|v| !v.is_empty() && !v.eq_ignore_ascii_case("Accounting Voucher View"))
+    {
+        return Err(Error::Validation("unsupported settlement view".into()));
+    }
+    if direct_text(node, "ISINVOICE")
+        .is_some_and(|v| !v.is_empty() && !v.eq_ignore_ascii_case("no"))
+    {
+        return Err(Error::Validation(
+            "settlement must be an accounting voucher".into(),
+        ));
+    }
+    let voucher_kind = parse_kind(&invoice_field(node, "VOUCHERTYPENAME")?)
+        .ok_or_else(|| Error::Validation("unsupported settlement type".into()))?;
+    let kind = match voucher_kind {
+        VoucherKind::Receipt => InvoiceKind::Sale,
+        VoucherKind::Payment => InvoiceKind::Purchase,
+        _ => {
+            return Err(Error::Validation(
+                "bill allocations require a receipt or payment".into(),
+            ))
+        }
+    };
+    if let Some(attr) = node
+        .attributes()
+        .find(|a| a.name().eq_ignore_ascii_case("VCHTYPE"))
+    {
+        if parse_kind(attr.value()) != Some(voucher_kind) {
+            return Err(Error::Validation("conflicting settlement type".into()));
+        }
+    }
+    let date = xml_date(&invoice_field(node, "DATE")?)?;
+    if let Some(attr) = node
+        .attributes()
+        .find(|a| a.name().eq_ignore_ascii_case("DATE"))
+    {
+        if xml_date(attr.value())? != date {
+            return Err(Error::Validation("conflicting settlement date".into()));
+        }
+    }
+    let reference = invoice_field(node, "VOUCHERNUMBER")?;
+    let entries: Vec<_> = node
+        .children()
+        .filter(|n| {
+            n.is_element()
+                && ["LEDGERENTRIES.LIST", "ALLLEDGERENTRIES.LIST"]
+                    .iter()
+                    .any(|tag| local_name(*n).eq_ignore_ascii_case(tag))
+        })
+        .collect();
+    if entries
+        .iter()
+        .any(|n| local_name(*n).eq_ignore_ascii_case("LEDGERENTRIES.LIST"))
+        && entries
+            .iter()
+            .any(|n| local_name(*n).eq_ignore_ascii_case("ALLLEDGERENTRIES.LIST"))
+    {
+        return Err(Error::Validation(
+            "multiple ledger entry representations".into(),
+        ));
+    }
+    if entries.len() != 2 {
+        return Err(Error::Validation(
+            "settlement requires exactly two ledger entries".into(),
+        ));
+    }
+    let mut party: Option<(String, i64, Vec<ImportedBillAllocation>)> = None;
+    let mut bank: Option<(String, Option<i64>, i64)> = None;
+    for entry in entries {
+        invoice_list_fields(
+            entry,
+            &[
+                "LEDGERNAME",
+                "AMOUNT",
+                "ISDEEMEDPOSITIVE",
+                "ISLASTDEEMEDPOSITIVE",
+                "ISPARTYLEDGER",
+                "BILLALLOCATIONS.LIST",
+            ],
+            label,
+            issues,
+        );
+        let ledger = invoice_field(entry, "LEDGERNAME")?;
+        let (existing_id, category) = ledgers
+            .get(&normalized(&ledger))
+            .ok_or_else(|| Error::Validation(format!("ledger {ledger} is unavailable")))?;
+        let amount = xml_amount(&invoice_field(entry, "AMOUNT")?)?;
+        if amount == 0 {
+            return Err(Error::Validation("zero ledger amount".into()));
+        }
+        invoice_side(entry, "ISDEEMEDPOSITIVE", amount > 0)?;
+        invoice_side(entry, "ISLASTDEEMEDPOSITIVE", amount > 0)?;
+        if direct_text(entry, "ISPARTYLEDGER").is_some_and(|v| {
+            !v.is_empty() && !v.eq_ignore_ascii_case("yes") && !v.eq_ignore_ascii_case("no")
+        }) {
+            return Err(Error::Validation("invalid party flag".into()));
+        }
+        let bills: Vec<_> = entry
+            .children()
+            .filter(|n| {
+                n.is_element()
+                    && local_name(*n).eq_ignore_ascii_case("BILLALLOCATIONS.LIST")
+                    && meaningful(*n)
+            })
+            .collect();
+        if bills.is_empty() {
+            if bank.is_some() || *category != Category::Asset {
+                return Err(Error::Validation(
+                    "settlement needs one cash or bank asset ledger".into(),
+                ));
+            }
+            bank = Some((ledger, *existing_id, amount));
+        } else {
+            if party.is_some() || !matches!(category, Category::Asset | Category::Liability) {
+                return Err(Error::Validation(
+                    "settlement needs one party ledger".into(),
+                ));
+            }
+            let mut allocations = Vec::new();
+            let mut seen = HashSet::new();
+            for bill in bills {
+                invoice_list_fields(bill, &["NAME", "BILLTYPE", "AMOUNT"], label, issues);
+                let bill_reference = invoice_field(bill, "NAME")?;
+                if !seen.insert(normalized(&bill_reference)) {
+                    return Err(Error::Validation(
+                        "bill reference occurs more than once".into(),
+                    ));
+                }
+                if !invoice_field(bill, "BILLTYPE")?.eq_ignore_ascii_case("Agst Ref") {
+                    return Err(Error::Validation(
+                        "only allocations against existing invoices are supported".into(),
+                    ));
+                }
+                let bill_amount = xml_amount(&invoice_field(bill, "AMOUNT")?)?;
+                if bill_amount == 0 || (bill_amount > 0) != (amount > 0) {
+                    return Err(Error::Validation(
+                        "bill allocation direction is inconsistent".into(),
+                    ));
+                }
+                allocations.push(ImportedBillAllocation {
+                    reference: bill_reference,
+                    amount: bill_amount
+                        .checked_abs()
+                        .ok_or_else(|| Error::Validation("bill amount is too large".into()))?,
+                    existing_invoice_id: None,
+                    expected_outstanding: 0,
+                });
+            }
+            let sum: i128 = allocations.iter().map(|v| i128::from(v.amount)).sum();
+            if sum != i128::from(amount).abs() {
+                return Err(Error::Validation(
+                    "bill allocations do not equal the party amount".into(),
+                ));
+            }
+            party = Some((ledger, amount, allocations));
+        }
+    }
+    let (party, party_amount, allocations) =
+        party.ok_or_else(|| Error::Validation("bill allocations are missing".into()))?;
+    let (bank, existing_bank_id, bank_amount) =
+        bank.ok_or_else(|| Error::Validation("cash or bank ledger is missing".into()))?;
+    if normalized(&party) == normalized(&bank)
+        || i128::from(party_amount) + i128::from(bank_amount) != 0
+        || (bank_amount > 0) != (kind == InvoiceKind::Sale)
+    {
+        return Err(Error::Validation(
+            "party and bank amounts or directions are inconsistent".into(),
+        ));
+    }
+    if direct_text(node, "PARTYLEDGERNAME")
+        .is_some_and(|name| !name.is_empty() && normalized(&name) != normalized(&party))
+    {
+        return Err(Error::Validation(
+            "party ledger differs from the allocated ledger".into(),
+        ));
+    }
+    Ok(ImportedSettlement {
+        kind,
+        date,
+        reference,
+        narration: direct_text(node, "NARRATION").unwrap_or_default(),
+        party,
+        bank,
+        existing_bank_id,
+        allocations,
+        metadata,
+    })
 }
 /// Parse only invoices whose party, item accounting, amounts and bill reference
 /// can all be represented without dropping information.
@@ -1212,6 +1455,7 @@ impl Store {
             items: Vec::new(),
             transactions: Vec::new(),
             invoices: Vec::new(),
+            settlements: Vec::new(),
             issues: Vec::new(),
         };
         let mut seen_metadata = HashSet::<(String, String, String)>::new();
@@ -2023,6 +2267,7 @@ impl Store {
                 ));
             }
         }
+        let mut pending_settlements = Vec::new();
         let mut references: HashSet<(String, String, String)> = self
             .vouchers(company_id)?
             .iter()
@@ -2086,6 +2331,25 @@ impl Store {
                     }
                     Err(e) => plan.issues.push(format!("{label}: {e}")),
                 }
+                continue;
+            }
+            if node
+                .children()
+                .filter(|n| {
+                    n.is_element()
+                        && ["LEDGERENTRIES.LIST", "ALLLEDGERENTRIES.LIST"]
+                            .iter()
+                            .any(|tag| local_name(*n).eq_ignore_ascii_case(tag))
+                })
+                .any(|entry| {
+                    entry.children().any(|bill| {
+                        bill.is_element()
+                            && local_name(bill).eq_ignore_ascii_case("BILLALLOCATIONS.LIST")
+                            && meaningful(bill)
+                    })
+                })
+            {
+                pending_settlements.push((node, label, metadata));
                 continue;
             }
             check_fields(
@@ -2249,6 +2513,161 @@ impl Store {
                 metadata,
             });
         }
+        if !pending_settlements.is_empty() {
+            let mut invoice_balances = HashMap::<
+                (String, String, String),
+                (
+                    Option<i64>,
+                    String,
+                    String,
+                    i128,
+                    Option<NaiveDate>,
+                    HashSet<String>,
+                ),
+            >::new();
+            for invoice in self.invoices(company_id)? {
+                let mut latest_reversal = None;
+                let mut settlement_references = HashSet::new();
+                for settlement in self.invoice_settlements(company_id, invoice.id)? {
+                    settlement_references.insert(normalized(&settlement.reference));
+                    if let Some(date) = settlement.reversal_date {
+                        let date = parse_date(&date)?;
+                        latest_reversal =
+                            Some(latest_reversal.map_or(date, |old: NaiveDate| old.max(date)));
+                    }
+                }
+                let key = (
+                    normalized(invoice.kind.as_str()),
+                    normalized(&invoice.party),
+                    normalized(&invoice.reference),
+                );
+                if invoice_balances
+                    .insert(
+                        key,
+                        (
+                            Some(invoice.id),
+                            invoice.date,
+                            invoice.reference,
+                            invoice.outstanding,
+                            latest_reversal,
+                            settlement_references,
+                        ),
+                    )
+                    .is_some()
+                {
+                    plan.issues
+                        .push("Existing invoice references are ambiguous".into());
+                }
+            }
+            for invoice in &plan.invoices {
+                let key = (
+                    normalized(invoice.kind.as_str()),
+                    normalized(&invoice.party),
+                    normalized(&invoice.reference),
+                );
+                let mut total = 0_i128;
+                for line in &invoice.lines {
+                    total += i128::from(line_amount(line.quantity, line.unit_price)?);
+                }
+                for adjustment in &invoice.adjustments {
+                    total += i128::from(adjustment.amount);
+                }
+                if invoice_balances
+                    .insert(
+                        key,
+                        (
+                            None,
+                            invoice.date.clone(),
+                            invoice.reference.clone(),
+                            total,
+                            None,
+                            HashSet::new(),
+                        ),
+                    )
+                    .is_some()
+                {
+                    plan.issues
+                        .push("Imported invoice references are ambiguous".into());
+                }
+            }
+            for (node, label, metadata) in pending_settlements {
+                match parse_imported_settlement(
+                    node,
+                    &label,
+                    metadata,
+                    &invoice_ledgers,
+                    &mut plan.issues,
+                ) {
+                    Ok(mut settlement) => {
+                        let voucher_kind = if settlement.kind == InvoiceKind::Sale {
+                            VoucherKind::Receipt
+                        } else {
+                            VoucherKind::Payment
+                        };
+                        if !references.insert((
+                            normalized(voucher_kind.as_str()),
+                            settlement.date.clone(),
+                            normalized(&settlement.reference),
+                        )) {
+                            plan.issues.push(format!(
+                            "{label}: a voucher with the same type, date and number already exists"
+                        ));
+                        }
+                        for allocation in &mut settlement.allocations {
+                            let key = (
+                                normalized(settlement.kind.as_str()),
+                                normalized(&settlement.party),
+                                normalized(&allocation.reference),
+                            );
+                            if let Some((
+                                id,
+                                invoice_date,
+                                reference,
+                                outstanding,
+                                reversal,
+                                settlement_references,
+                            )) = invoice_balances.get_mut(&key)
+                            {
+                                if !settlement_references.insert(normalized(&settlement.reference))
+                                {
+                                    plan.issues.push(format!(
+                                    "{label}: settlement reference already exists for the invoice"
+                                ));
+                                }
+                                if *reference != allocation.reference {
+                                    plan.issues.push(format!(
+                                        "{label}: bill reference spelling differs from the invoice"
+                                    ));
+                                }
+                                let date = parse_date(&settlement.date)?;
+                                if date < parse_date(invoice_date)?
+                                    || reversal.is_some_and(|value| date < value)
+                                {
+                                    plan.issues.push(format!(
+                                        "{label}: settlement precedes the invoice or a reversal"
+                                    ));
+                                }
+                                if i128::from(allocation.amount) > *outstanding {
+                                    plan.issues.push(format!(
+                                    "{label}: allocation exceeds the invoice outstanding amount"
+                                ));
+                                }
+                                allocation.existing_invoice_id = *id;
+                                allocation.expected_outstanding = *outstanding;
+                                *outstanding -= i128::from(allocation.amount);
+                            } else {
+                                plan.issues.push(format!(
+                                    "{label}: referenced invoice {} is unavailable",
+                                    allocation.reference
+                                ));
+                            }
+                        }
+                        plan.settlements.push(settlement);
+                    }
+                    Err(e) => plan.issues.push(format!("{label}: {e}")),
+                }
+            }
+        }
         for node in doc.descendants().filter(|n| {
             n.is_element()
                 && ["VOUCHERTYPE", "STOCKCATEGORY"]
@@ -2262,6 +2681,7 @@ impl Store {
             && plan.accounts.is_empty()
             && plan.transactions.is_empty()
             && plan.invoices.is_empty()
+            && plan.settlements.is_empty()
             && plan.units.is_empty()
             && plan.stock_groups.is_empty()
             && plan.locations.is_empty()
@@ -2736,12 +3156,136 @@ impl Store {
                 &invoice.metadata,
             )?;
         }
+        for settlement in &plan.settlements {
+            let kind = if settlement.kind == InvoiceKind::Sale {
+                VoucherKind::Receipt
+            } else {
+                VoucherKind::Payment
+            };
+            let mut existing_vouchers =
+                tx.prepare("SELECT kind, date, reference FROM vouchers WHERE company_id = ?1")?;
+            for row in existing_vouchers.query_map([plan.company_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })? {
+                let (existing_kind, date, reference) = row?;
+                if normalized(&existing_kind) == normalized(kind.as_str())
+                    && xml_date(&date)? == settlement.date
+                    && normalized(&reference) == normalized(&settlement.reference)
+                {
+                    return Err(Error::Validation(format!(
+                        "Voucher {} already exists",
+                        settlement.reference
+                    )));
+                }
+            }
+            drop(existing_vouchers);
+            let bank_id =
+                find_ledger(&tx, plan.company_id, &settlement.bank)?.ok_or_else(|| {
+                    Error::Validation(format!("Ledger {} is missing", settlement.bank))
+                })?;
+            if settlement
+                .existing_bank_id
+                .is_some_and(|expected| expected != bank_id)
+            {
+                return Err(Error::Validation(format!(
+                    "Ledger {} changed since preview",
+                    settlement.bank
+                )));
+            }
+            let party_id =
+                find_ledger(&tx, plan.company_id, &settlement.party)?.ok_or_else(|| {
+                    Error::Validation(format!("Ledger {} is missing", settlement.party))
+                })?;
+            let mut allocations = Vec::new();
+            for allocation in &settlement.allocations {
+                let mut stmt = tx.prepare("SELECT i.id, v.reference, i.tax_amount FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3")?;
+                let mut found: Option<(i64, i64)> = None;
+                for row in stmt.query_map(
+                    params![plan.company_id, settlement.kind.as_str(), party_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    },
+                )? {
+                    let (id, reference, tax) = row?;
+                    if normalized(&reference) == normalized(&allocation.reference) {
+                        if found.is_some() || reference != allocation.reference {
+                            return Err(Error::Validation(
+                                "Invoice reference changed or became ambiguous since preview"
+                                    .into(),
+                            ));
+                        }
+                        found = Some((id, tax));
+                    }
+                }
+                drop(stmt);
+                let (id, tax) = found.ok_or_else(|| {
+                    Error::Validation(format!("Invoice {} is missing", allocation.reference))
+                })?;
+                if allocation
+                    .existing_invoice_id
+                    .is_some_and(|expected| expected != id)
+                {
+                    return Err(Error::Validation(format!(
+                        "Invoice {} changed since preview",
+                        allocation.reference
+                    )));
+                }
+                let mut outstanding = i128::from(tax);
+                let mut amounts = tx.prepare("SELECT amount FROM invoice_lines WHERE invoice_id = ?1 UNION ALL SELECT amount FROM invoice_adjustments WHERE invoice_id = ?1")?;
+                for amount in amounts.query_map([id], |r| r.get::<_, i64>(0))? {
+                    outstanding += i128::from(amount?);
+                }
+                drop(amounts);
+                let mut paid = tx.prepare("SELECT s.amount FROM invoice_settlements s WHERE s.company_id = ?1 AND s.invoice_id = ?2 AND NOT EXISTS(SELECT 1 FROM settlement_reversals r WHERE r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id)")?;
+                for amount in
+                    paid.query_map(params![plan.company_id, id], |r| r.get::<_, i64>(0))?
+                {
+                    outstanding -= i128::from(amount?);
+                }
+                drop(paid);
+                if outstanding != allocation.expected_outstanding {
+                    return Err(Error::Validation(format!(
+                        "Invoice {} changed since preview",
+                        allocation.reference
+                    )));
+                }
+                allocations.push(SettlementAllocation {
+                    invoice_id: id,
+                    amount: allocation.amount,
+                });
+            }
+            let (voucher_id, _) = insert_settlement_on_connection(
+                &tx,
+                plan.company_id,
+                bank_id,
+                &settlement.date,
+                &settlement.reference,
+                &allocations,
+                &settlement.narration,
+            )?;
+            save_metadata(
+                &tx,
+                plan.company_id,
+                "voucher",
+                voucher_id,
+                &settlement.metadata,
+            )?;
+        }
         tx.commit()?;
         Ok(ImportCounts {
             groups: plan.groups.len(),
             ledgers: plan.accounts.len(),
             vouchers: plan.transactions.len(),
             invoices: plan.invoices.len(),
+            settlements: plan.settlements.len(),
             units: plan.units.len(),
             stock_groups: plan.stock_groups.len(),
             locations: plan.locations.len(),
