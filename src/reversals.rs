@@ -48,7 +48,7 @@ impl Store {
                 "Reversal date must not precede the original voucher".into(),
             ));
         }
-        let linked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?1 AND (original_voucher_id = ?2 OR reversal_voucher_id = ?2))", params![company, original], |r| r.get(0))?;
+        let linked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?1 AND (original_voucher_id = ?2 OR reversal_voucher_id = ?2) UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?1 AND (original_voucher_id = ?2 OR clearing_voucher_id = ?2))", params![company, original], |r| r.get(0))?;
         if linked {
             return Err(Error::Validation(
                 "Linked or already reversed vouchers cannot be reversed here".into(),

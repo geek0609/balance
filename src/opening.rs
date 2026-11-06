@@ -1,7 +1,8 @@
 //! Opening balances are represented by balanced vouchers against a visible
 //! opening-difference ledger. Changes retain the earlier voucher revision.
 use crate::{
-    check_ledgers, parse_date, validate_voucher, Error, Posting, Result, Store, VoucherKind,
+    check_ledgers, parse_date, required, validate_voucher, Error, Posting, Result, Store,
+    VoucherKind,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -11,6 +12,13 @@ pub struct OpeningBalance {
     pub date: String,
     pub amount: i64,
     pub voucher_id: i64,
+}
+#[derive(Debug, Clone)]
+pub struct OpeningClear {
+    pub original_voucher_id: i64,
+    pub clearing_voucher_id: i64,
+    pub date: String,
+    pub reason: String,
 }
 
 fn control_id(conn: &Connection, company: i64) -> Result<Option<i64>> {
@@ -61,6 +69,15 @@ pub(crate) fn save_opening_in_transaction(
     amount: i64,
 ) -> Result<i64> {
     let date = parse_date(date)?.format("%Y-%m-%d").to_string();
+    let last_clear: Option<String> = conn.query_row("SELECT MAX(v.date) FROM opening_balance_clears c JOIN vouchers v ON v.id = c.clearing_voucher_id AND v.company_id = c.company_id WHERE c.company_id = ?1 AND c.ledger_id = ?2", params![company, ledger], |r| r.get(0))?;
+    if last_clear
+        .as_deref()
+        .is_some_and(|cleared| date.as_str() < cleared)
+    {
+        return Err(Error::Validation(
+            "Opening date must not precede the last clearing entry".into(),
+        ));
+    }
     if amount == 0 || amount == i64::MIN {
         return Err(Error::Validation(
             "Opening balance must be a non-zero supported amount".into(),
@@ -128,6 +145,117 @@ pub(crate) fn save_opening_in_transaction(
     Ok(voucher_id)
 }
 impl Store {
+    /// Post a counter-entry and retain both vouchers and their link as history.
+    pub fn clear_opening_balance(
+        &mut self,
+        company: i64,
+        ledger: i64,
+        date: &str,
+        reference: &str,
+        reason: &str,
+    ) -> Result<i64> {
+        let date = parse_date(date)?;
+        let reference = required(reference, "Clearing reference")?;
+        let reason = required(reason, "Clearing reason")?;
+        let tx = self.conn.transaction()?;
+        let (original, original_date, amount): (i64, String, i64) = tx.query_row("SELECT voucher_id, date, amount FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2", params![company, ledger], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Error::Validation("No opening balance exists for this ledger".into()),
+            other => Error::Database(other),
+        })?;
+        if date < parse_date(&original_date)? {
+            return Err(Error::Validation(
+                "Clearing date must not precede the opening balance".into(),
+            ));
+        }
+        let control = control_id(&tx, company)?
+            .ok_or_else(|| Error::Validation("Opening difference ledger is missing".into()))?;
+        let inverse = amount
+            .checked_neg()
+            .ok_or_else(|| Error::Validation("Opening amount cannot be cleared".into()))?;
+        let mut stmt =
+            tx.prepare("SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
+        let postings = stmt
+            .query_map([original], |r| {
+                Ok(Posting {
+                    ledger_id: r.get(0)?,
+                    amount: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let voucher_date: String = tx.query_row(
+            "SELECT date FROM vouchers WHERE id = ?1 AND company_id = ?2",
+            params![original, company],
+            |r| r.get(0),
+        )?;
+        if parse_date(&voucher_date)? != parse_date(&original_date)?
+            || postings.len() != 2
+            || !postings
+                .iter()
+                .any(|p| p.ledger_id == ledger && p.amount == amount)
+            || !postings
+                .iter()
+                .any(|p| p.ledger_id == control && p.amount == inverse)
+        {
+            return Err(Error::Validation(
+                "Opening balance postings are inconsistent".into(),
+            ));
+        }
+        let reversed = [
+            Posting {
+                ledger_id: ledger,
+                amount: inverse,
+            },
+            Posting {
+                ledger_id: control,
+                amount,
+            },
+        ];
+        let date = date.format("%Y-%m-%d").to_string();
+        validate_voucher(&date, &reversed)?;
+        check_ledgers(&tx, company, &reversed)?;
+        tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, VoucherKind::Journal.as_str(), reference, date, format!("Clearing of opening balance voucher {original}: {reason}")])?;
+        let clearing = tx.last_insert_rowid();
+        for posting in reversed {
+            tx.execute(
+                "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
+                params![clearing, posting.ledger_id, posting.amount],
+            )?;
+        }
+        tx.execute("INSERT INTO opening_balance_clears(company_id, ledger_id, original_voucher_id, clearing_voucher_id, reason) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, ledger, original, clearing, reason])?;
+        tx.execute(
+            "DELETE FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2",
+            params![company, ledger],
+        )?;
+        tx.commit()?;
+        Ok(clearing)
+    }
+
+    pub fn opening_clear_history(&self, company: i64, ledger: i64) -> Result<Vec<OpeningClear>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ledgers WHERE company_id = ?1 AND id = ?2)",
+            params![company, ledger],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::Validation(
+                "Ledger not found in the selected company".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare("SELECT c.original_voucher_id, c.clearing_voucher_id, v.date, c.reason FROM opening_balance_clears c JOIN vouchers v ON v.id = c.clearing_voucher_id AND v.company_id = c.company_id WHERE c.company_id = ?1 AND c.ledger_id = ?2 ORDER BY c.id DESC")?;
+        let rows = stmt
+            .query_map(params![company, ledger], |r| {
+                Ok(OpeningClear {
+                    original_voucher_id: r.get(0)?,
+                    clearing_voucher_id: r.get(1)?,
+                    date: r.get(2)?,
+                    reason: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn opening_balance(&self, company: i64, ledger: i64) -> Result<Option<OpeningBalance>> {
         let exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM ledgers WHERE id = ?1 AND company_id = ?2)",

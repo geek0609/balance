@@ -52,6 +52,9 @@ struct App {
     opening_date: String,
     opening_amount: String,
     opening_debit: bool,
+    opening_clear_date: String,
+    opening_clear_reference: String,
+    opening_clear_reason: String,
     lines: Vec<VoucherLine>,
     editing_voucher: Option<i64>,
     voucher_reversal_target: Option<i64>,
@@ -252,6 +255,9 @@ impl App {
             opening_date: String::new(),
             opening_amount: String::new(),
             opening_debit: true,
+            opening_clear_date: String::new(),
+            opening_clear_reference: String::new(),
+            opening_clear_reason: String::new(),
             lines: vec![VoucherLine::new(true), VoucherLine::new(false)],
             editing_voucher: None,
             voucher_reversal_target: None,
@@ -398,6 +404,9 @@ impl App {
         self.bank_opening_reason.clear();
         self.opening_date.clear();
         self.opening_amount.clear();
+        self.opening_clear_date.clear();
+        self.opening_clear_reference.clear();
+        self.opening_clear_reason.clear();
         self.import_preview = None;
         self.adjustment_item = None;
         self.stock_creation_unit = None;
@@ -731,6 +740,9 @@ impl App {
         if previous_opening_ledger != self.opening_ledger {
             self.opening_date.clear();
             self.opening_amount.clear();
+            self.opening_clear_date.clear();
+            self.opening_clear_reference.clear();
+            self.opening_clear_reason.clear();
         }
         if ui.button("Load existing opening balance").clicked() {
             if let Some(id) = self.opening_ledger {
@@ -786,7 +798,62 @@ impl App {
                 Err(e) => self.failure(e),
             }
         }
-        ui.small("Opening balances must be non-zero. Clearing one is not yet supported.");
+        ui.small("Opening balances must be non-zero. Clear an existing balance with a separate dated counter-entry; later openings cannot predate the last clearing.");
+        if let Some(ledger) = self.opening_ledger {
+            egui::CollapsingHeader::new("Clear opening balance")
+                .id_salt(("clear-opening", ledger))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Clearing date");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.opening_clear_date)
+                                .hint_text("YYYY-MM-DD"),
+                        );
+                        ui.label("Reference");
+                        ui.text_edit_singleline(&mut self.opening_clear_reference);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Reason");
+                        ui.text_edit_singleline(&mut self.opening_clear_reason);
+                        if ui.button("Post opening balance clearing").clicked() {
+                            match self.store.clear_opening_balance(
+                                company,
+                                ledger,
+                                &self.opening_clear_date,
+                                &self.opening_clear_reference,
+                                &self.opening_clear_reason,
+                            ) {
+                                Ok(voucher) => {
+                                    self.opening_date.clear();
+                                    self.opening_amount.clear();
+                                    self.opening_clear_date.clear();
+                                    self.opening_clear_reference.clear();
+                                    self.opening_clear_reason.clear();
+                                    self.message =
+                                        format!("Opening balance cleared with voucher {voucher}");
+                                }
+                                Err(e) => self.failure(e),
+                            }
+                        }
+                    });
+                    match self.store.opening_clear_history(company, ledger) {
+                        Ok(rows) => {
+                            for entry in rows {
+                                ui.label(format!(
+                                    "{} — original voucher #{} · clearing #{} · {}",
+                                    entry.date,
+                                    entry.original_voucher_id,
+                                    entry.clearing_voucher_id,
+                                    entry.reason
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                        }
+                    }
+                });
+        }
         ui.separator();
         ui.heading("Ledger details");
         let dirty = self.profile_ledger.is_some() && self.ledger_profile != self.profile_original;

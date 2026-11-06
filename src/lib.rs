@@ -252,7 +252,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=28).contains(&version) {
+    if !(1..=29).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -359,6 +359,7 @@ impl Store {
             "company_profile_revisions",
             "voucher_reversals",
             "ledger_revisions",
+            "opening_balance_clears",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -376,7 +377,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 28 {
+        if version > 29 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -598,6 +599,11 @@ impl Store {
             tx.execute_batch("CREATE TABLE ledger_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), name TEXT NOT NULL, group_id INTEGER REFERENCES account_groups(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
                 CREATE INDEX ledger_revisions_ledger ON ledger_revisions(company_id, ledger_id, id);
                 PRAGMA user_version = 28;")?;
+        }
+        if version < 29 {
+            tx.execute_batch("CREATE TABLE opening_balance_clears(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), original_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), clearing_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK(original_voucher_id != clearing_voucher_id));
+                CREATE INDEX opening_balance_clears_ledger ON opening_balance_clears(company_id, ledger_id, id);
+                PRAGMA user_version = 29;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -846,7 +852,7 @@ impl Store {
         check_ledgers(&tx, company_id, postings)?;
         opening::check_no_control_postings(&tx, company_id, postings)?;
         let invoice_backed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?2 AND (original_voucher_id = ?1 OR reversal_voucher_id = ?1))",
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?2 AND (original_voucher_id = ?1 OR reversal_voucher_id = ?1) UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?2 AND (original_voucher_id = ?1 OR clearing_voucher_id = ?1))",
             params![voucher_id, company_id],
             |r| r.get(0),
         )?;
@@ -1460,7 +1466,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 29);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
