@@ -298,7 +298,8 @@ pub fn discounted_line_amount(
         InvoiceDiscount::Fixed(value) => *value,
         InvoiceDiscount::Percent(value) => {
             let rate = Decimal::from_str(value.trim())
-                .map_err(|_| Error::Validation("Enter a valid discount percentage".into()))?;
+                .map_err(|_| Error::Validation("Enter a valid discount percentage".into()))?
+                .normalize();
             if rate < Decimal::ZERO || rate > Decimal::from(100) || rate.scale() > 4 {
                 return Err(Error::Validation("Discount percentage must be between 0 and 100 with at most four decimal places".into()));
             }

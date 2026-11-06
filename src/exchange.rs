@@ -3,9 +3,9 @@
 use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
-    find_stock_batch, insert_invoice_on_connection, insert_settlement_on_connection, line_amount,
-    parse_quantity, InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft,
-    InvoiceKind, InvoiceLine, SettlementAllocation,
+    discounted_line_amount, find_stock_batch, insert_invoice_on_connection,
+    insert_settlement_on_connection, parse_quantity, InvoiceAdjustment, InvoiceAllocation,
+    InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine, SettlementAllocation,
 };
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
@@ -95,6 +95,7 @@ struct ImportedInvoiceLine {
     existing_trade_ledger_id: Option<i64>,
     quantity: i64,
     unit_price: i64,
+    discount: InvoiceDiscount,
 }
 #[derive(Debug, Clone)]
 struct ImportedStockAllocation {
@@ -1123,6 +1124,8 @@ fn parse_imported_invoice(
                 "STOCKITEMNAME",
                 "ISDEEMEDPOSITIVE",
                 "RATE",
+                "DISCOUNT",
+                "DISCOUNTAMOUNT",
                 "AMOUNT",
                 "ACTUALQTY",
                 "BILLEDQTY",
@@ -1157,20 +1160,50 @@ fn parse_imported_invoice(
             return Err(Error::Validation("rate uses another unit".into()));
         }
         let unit_price = parse_amount(price)?;
-        let amount = line_amount(quantity, unit_price)?;
-        if amount == 0 {
+        let source_amount = xml_amount(&invoice_field(item_node, "AMOUNT")?)?;
+        if source_amount != 0 && (source_amount > 0) == party_debit {
             return Err(Error::Validation(
-                "zero-value item lines are not supported".into(),
+                "item amount direction is inconsistent".into(),
             ));
         }
-        let source_amount = xml_amount(&invoice_field(item_node, "AMOUNT")?)?;
+        let percentage = direct_text(item_node, "DISCOUNT").filter(|v| !v.is_empty());
+        let fixed = direct_text(item_node, "DISCOUNTAMOUNT")
+            .filter(|v| !v.is_empty())
+            .map(|v| parse_amount(&v))
+            .transpose()?;
+        let percentage_is_nonzero = if let Some(value) = &percentage {
+            let rate = value
+                .parse::<rust_decimal::Decimal>()
+                .map_err(|_| Error::Validation("invalid item discount percentage".into()))?;
+            discounted_line_amount(
+                quantity,
+                unit_price,
+                &InvoiceDiscount::Percent(value.clone()),
+            )?;
+            !rate.is_zero()
+        } else {
+            false
+        };
+        if percentage_is_nonzero && fixed.is_some_and(|value| value != 0) {
+            return Err(Error::Validation(
+                "combined item discount fields are not supported".into(),
+            ));
+        }
+        let discount = if percentage_is_nonzero {
+            InvoiceDiscount::Percent(percentage.unwrap_or_default())
+        } else if let Some(amount) = fixed.filter(|value| *value != 0) {
+            InvoiceDiscount::Fixed(amount)
+        } else {
+            InvoiceDiscount::None
+        };
+        let (amount, _) = discounted_line_amount(quantity, unit_price, &discount)?;
         let expected = if party_debit { -amount } else { amount };
         if source_amount != expected {
             return Err(Error::Validation(
                 "item amount differs from quantity and rate".into(),
             ));
         }
-        invoice_side(item_node, "ISDEEMEDPOSITIVE", expected > 0)?;
+        invoice_side(item_node, "ISDEEMEDPOSITIVE", !party_debit)?;
         let allocations: Vec<_> = item_node
             .children()
             .filter(|n| {
@@ -1228,6 +1261,11 @@ fn parse_imported_invoice(
                 quantity,
             });
         } else {
+            if locations_in_line.len() > 1 && matches!(discount, InvoiceDiscount::Fixed(_)) {
+                return Err(Error::Validation(
+                    "fixed discounts across multiple stock allocations are not supported".into(),
+                ));
+            }
             let mut total_quantity = 0_i128;
             let mut total_amount = 0_i128;
             for location_node in locations_in_line {
@@ -1263,7 +1301,8 @@ fn parse_imported_invoice(
                         "allocation exceeds unit precision".into(),
                     ));
                 }
-                let allocated_amount = line_amount(allocated_quantity, unit_price)?;
+                let (allocated_amount, _) =
+                    discounted_line_amount(allocated_quantity, unit_price, &discount)?;
                 let expected_amount = if party_debit {
                     -allocated_amount
                 } else {
@@ -1302,7 +1341,7 @@ fn parse_imported_invoice(
                 ));
             }
         }
-        invoice_side(allocation, "ISDEEMEDPOSITIVE", expected > 0)?;
+        invoice_side(allocation, "ISDEEMEDPOSITIVE", !party_debit)?;
         if trade.is_none() {
             trade = Some(ledger.clone());
         }
@@ -1317,6 +1356,7 @@ fn parse_imported_invoice(
             trade_ledger: ledger,
             quantity,
             unit_price,
+            discount,
         });
     }
     let trade = trade.ok_or_else(|| Error::Validation("at least one item is required".into()))?;
@@ -2636,7 +2676,9 @@ impl Store {
                 );
                 let mut total = 0_i128;
                 for line in &invoice.lines {
-                    total += i128::from(line_amount(line.quantity, line.unit_price)?);
+                    total += i128::from(
+                        discounted_line_amount(line.quantity, line.unit_price, &line.discount)?.0,
+                    );
                 }
                 for adjustment in &invoice.adjustments {
                     total += i128::from(adjustment.amount);
@@ -3210,7 +3252,7 @@ impl Store {
                     location_id: primary.location_id,
                     batch_id: primary.batch_id,
                     extra_allocations: allocations.collect(),
-                    discount: InvoiceDiscount::None,
+                    discount: line.discount.clone(),
                     quantity: line.quantity,
                     unit_price: line.unit_price,
                 });
