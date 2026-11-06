@@ -13,6 +13,7 @@ pub mod documents;
 pub mod exchange;
 pub mod grouped_reports;
 pub mod inventory;
+pub mod invoice_register;
 pub mod ledgers;
 pub mod opening;
 pub mod pricing;

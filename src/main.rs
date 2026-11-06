@@ -23,6 +23,7 @@ enum Page {
     Import,
     Stock,
     Invoice,
+    InvoiceRegister,
     Backup,
     DayBook,
     Outstanding,
@@ -84,6 +85,11 @@ struct App {
     day_search: String,
     report_export_path: String,
     outstanding_date: String,
+    invoice_register_from: String,
+    invoice_register_to: String,
+    invoice_register_kind: Option<InvoiceKind>,
+    invoice_register_party: Option<i64>,
+    invoice_register_search: String,
     bank_ledger: Option<i64>,
     bank_as_of: String,
     bank_posting: Option<i64>,
@@ -299,6 +305,11 @@ impl App {
             day_search: String::new(),
             report_export_path: String::new(),
             outstanding_date: String::new(),
+            invoice_register_from: String::new(),
+            invoice_register_to: String::new(),
+            invoice_register_kind: None,
+            invoice_register_party: None,
+            invoice_register_search: String::new(),
             bank_ledger: None,
             bank_as_of: String::new(),
             bank_posting: None,
@@ -424,6 +435,7 @@ impl App {
         self.terms_original_days.clear();
         self.terms_original_limit.clear();
         self.opening_ledger = None;
+        self.invoice_register_party = None;
         self.bank_ledger = None;
         self.bank_posting = None;
         self.bank_clearance_date.clear();
@@ -4073,6 +4085,138 @@ impl App {
                 }
             });
     }
+    fn invoice_register_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.heading("Sales and purchase register");
+        self.report_export_path_field(ui);
+        ui.small("Invoice dates are inclusive. Settled and outstanding amounts include all saved settlements and reversals, including future-dated entries; use Outstanding for an as-of view.");
+        let ledgers = match self.store.ledgers(company) {
+            Ok(value) => value,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        let parties: Vec<_> = ledgers
+            .into_iter()
+            .filter(|ledger| matches!(ledger.category, Category::Asset | Category::Liability))
+            .collect();
+        ui.horizontal(|ui| {
+            ui.label("From");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.invoice_register_from)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+            ui.label("To");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.invoice_register_to)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+            egui::ComboBox::from_label("Type")
+                .selected_text(
+                    self.invoice_register_kind
+                        .map(|k| k.as_str())
+                        .unwrap_or("All"),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.invoice_register_kind, None, "All");
+                    for kind in InvoiceKind::ALL {
+                        ui.selectable_value(
+                            &mut self.invoice_register_kind,
+                            Some(kind),
+                            kind.as_str(),
+                        );
+                    }
+                });
+        });
+        pick_account(
+            ui,
+            "invoice-register-party",
+            "Party (optional)",
+            &parties,
+            &mut self.invoice_register_party,
+            true,
+        );
+        ui.horizontal(|ui| {
+            ui.label("Search party, reference or invoice ID");
+            ui.text_edit_singleline(&mut self.invoice_register_search);
+        });
+        let from = (!self.invoice_register_from.trim().is_empty())
+            .then_some(self.invoice_register_from.trim());
+        let to = (!self.invoice_register_to.trim().is_empty())
+            .then_some(self.invoice_register_to.trim());
+        match self.store.invoice_register(
+            company,
+            from,
+            to,
+            self.invoice_register_kind,
+            self.invoice_register_party,
+            &self.invoice_register_search,
+        ) {
+            Ok(rows) => {
+                if ui.button("Export invoice register as CSV").clicked() {
+                    match self.store.export_invoice_register_csv(
+                        company,
+                        from,
+                        to,
+                        self.invoice_register_kind,
+                        self.invoice_register_party,
+                        &self.invoice_register_search,
+                        self.report_export_path.trim(),
+                    ) {
+                        Ok(()) => self.message = "Invoice register exported".into(),
+                        Err(e) => self.failure(e),
+                    }
+                }
+                let mut sales = 0_i128;
+                let mut purchases = 0_i128;
+                egui::Grid::new("invoice-register")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for label in [
+                            "Date",
+                            "Type",
+                            "Invoice",
+                            "Party",
+                            "Reference",
+                            "Due",
+                            "Total",
+                            "Settled",
+                            "Outstanding",
+                        ] {
+                            ui.strong(label);
+                        }
+                        ui.end_row();
+                        for invoice in &rows {
+                            match invoice.kind {
+                                InvoiceKind::Sale => sales += invoice.total,
+                                InvoiceKind::Purchase => purchases += invoice.total,
+                            }
+                            ui.label(&invoice.date);
+                            ui.label(invoice.kind.as_str());
+                            ui.label(invoice.id.to_string());
+                            ui.label(&invoice.party);
+                            ui.label(&invoice.reference);
+                            ui.label(invoice.due_date.as_deref().unwrap_or("—"));
+                            ui.label(money(invoice.total));
+                            ui.label(money(invoice.settled));
+                            ui.label(money(invoice.outstanding));
+                            ui.end_row();
+                        }
+                    });
+                ui.label(format!(
+                    "{} invoices · Sales {} · Purchases {}",
+                    rows.len(),
+                    money(sales),
+                    money(purchases)
+                ));
+            }
+            Err(e) => {
+                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+            }
+        }
+    }
     fn outstanding_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Outstanding invoices");
         self.report_export_path_field(ui);
@@ -4323,7 +4467,7 @@ impl App {
                     .desired_width(350.0),
             );
         });
-        ui.small("Exports include the current report filters and never overwrite existing files. Day-book and outstanding files include a context row; ledger files include opening and closing rows. Potential spreadsheet formulas in text are prefixed with an apostrophe.");
+        ui.small("Exports include the current report filters and never overwrite existing files. Day-book, invoice-register and outstanding files include a context row; ledger files include opening and closing rows. Potential spreadsheet formulas in text are prefixed with an apostrophe.");
     }
     fn backup_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Back up data");
@@ -4518,6 +4662,7 @@ impl eframe::App for App {
                 ("Ledger activity", Page::Register),
                 ("Day book", Page::DayBook),
                 ("Outstanding", Page::Outstanding),
+                ("Invoice register", Page::InvoiceRegister),
                 ("Bank clearance", Page::Bank),
                 ("Stock", Page::Stock),
                 ("Invoices", Page::Invoice),
@@ -4556,6 +4701,7 @@ impl eframe::App for App {
                     Page::Register => self.register_page(ui, company),
                     Page::DayBook => self.day_book_page(ui, company),
                     Page::Outstanding => self.outstanding_page(ui, company),
+                    Page::InvoiceRegister => self.invoice_register_page(ui, company),
                     Page::Bank => self.bank_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),
                     Page::Invoice => self.invoice_page(ui, company),

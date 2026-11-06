@@ -179,6 +179,7 @@ pub struct InvoiceSummary {
     pub credit_days: Option<u32>,
     pub reference: String,
     pub party: String,
+    pub party_ledger_id: i64,
     pub total: i128,
     pub tax_amount: i64,
     pub settled: i128,
@@ -2145,7 +2146,7 @@ impl Store {
         Ok(result)
     }
     pub fn invoices(&self, company_id: i64) -> Result<Vec<InvoiceSummary>> {
-        let mut stmt = self.conn.prepare("SELECT i.id, i.voucher_id, i.kind, v.date, v.reference, l.name, i.tax_amount, i.due_date, i.credit_days FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1 ORDER BY v.date DESC, i.id DESC")?;
+        let mut stmt = self.conn.prepare("SELECT i.id, i.voucher_id, i.kind, v.date, v.reference, l.name, i.tax_amount, i.due_date, i.credit_days, i.party_ledger_id FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1 ORDER BY v.date DESC, i.id DESC")?;
         let rows = stmt.query_map([company_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -2157,11 +2158,23 @@ impl Store {
                 r.get::<_, i64>(6)?,
                 r.get::<_, Option<String>>(7)?,
                 r.get::<_, Option<u32>>(8)?,
+                r.get::<_, i64>(9)?,
             ))
         })?;
         let mut result = Vec::new();
         for row in rows {
-            let (id, voucher_id, kind, date, reference, party, tax, due_date, credit_days) = row?;
+            let (
+                id,
+                voucher_id,
+                kind,
+                date,
+                reference,
+                party,
+                tax,
+                due_date,
+                credit_days,
+                party_ledger_id,
+            ) = row?;
             let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name, l.id FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, i.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
             let line_amounts = amounts.query_map([id], |r| {
                 Ok((
@@ -2212,6 +2225,7 @@ impl Store {
                 credit_days,
                 reference,
                 party,
+                party_ledger_id,
                 total,
                 tax_amount: tax,
                 settled,

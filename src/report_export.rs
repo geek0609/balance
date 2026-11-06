@@ -1,5 +1,5 @@
 //! Narrow CSV exports of the reports shown in the application.
-use crate::{parse_date, Error, Result, Store, VoucherKind};
+use crate::{inventory::InvoiceKind, parse_date, Error, Result, Store, VoucherKind};
 use std::{io::Write, path::Path};
 
 fn money(value: i128) -> String {
@@ -285,6 +285,97 @@ impl Store {
                         .overdue_days
                         .map(|d| d.to_string())
                         .unwrap_or_default(),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
+    pub fn export_invoice_register_csv(
+        &self,
+        company: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        kind: Option<InvoiceKind>,
+        party: Option<i64>,
+        search: &str,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let invoices = self.invoice_register(company, start, end, kind, party, search)?;
+        let context = vec![
+            self.report_company_name(company)?,
+            optional_date(start)?,
+            optional_date(end)?,
+            kind.map(|value| value.as_str()).unwrap_or("All").into(),
+            party.map(|value| value.to_string()).unwrap_or_default(),
+            text_cell(search.trim()),
+        ];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&[
+                "company",
+                "period_start",
+                "period_end",
+                "type_filter",
+                "party_filter_id",
+                "search",
+            ]),
+            &strings(&[
+                "row_type",
+                "invoice_id",
+                "voucher_id",
+                "date",
+                "type",
+                "party_id",
+                "party",
+                "reference",
+                "due_date",
+                "stock_net",
+                "manual_tax",
+                "service_and_adjustments",
+                "total",
+                "settled_all_dates",
+                "outstanding_all_dates",
+            ]),
+        )?;
+        contextual_row(
+            &mut csv,
+            &context,
+            &strings(&[
+                "context", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            ]),
+        )?;
+        for invoice in invoices {
+            let stock: i128 = invoice
+                .lines
+                .iter()
+                .map(|line| i128::from(line.amount))
+                .sum();
+            let adjustments: i128 = invoice
+                .adjustments
+                .iter()
+                .map(|line| i128::from(line.amount))
+                .sum();
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "invoice".into(),
+                    invoice.id.to_string(),
+                    invoice.voucher_id.to_string(),
+                    invoice.date,
+                    invoice.kind.as_str().into(),
+                    invoice.party_ledger_id.to_string(),
+                    text_cell(&invoice.party),
+                    text_cell(&invoice.reference),
+                    invoice.due_date.unwrap_or_default(),
+                    money(stock),
+                    money(i128::from(invoice.tax_amount)),
+                    money(adjustments),
+                    money(invoice.total),
+                    money(invoice.settled),
+                    money(invoice.outstanding),
                 ],
             )?;
         }
