@@ -12,6 +12,7 @@ pub mod contacts;
 pub mod documents;
 pub mod exchange;
 pub mod inventory;
+pub mod ledgers;
 pub mod opening;
 pub mod report_export;
 pub mod reversals;
@@ -251,7 +252,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=27).contains(&version) {
+    if !(1..=28).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -357,6 +358,7 @@ impl Store {
             "company_profiles",
             "company_profile_revisions",
             "voucher_reversals",
+            "ledger_revisions",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -374,7 +376,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 27 {
+        if version > 28 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -591,6 +593,11 @@ impl Store {
         if version < 27 {
             tx.execute_batch("CREATE TABLE voucher_reversals(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), original_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), reversal_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK(original_voucher_id != reversal_voucher_id));
                 PRAGMA user_version = 27;")?;
+        }
+        if version < 28 {
+            tx.execute_batch("CREATE TABLE ledger_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), name TEXT NOT NULL, group_id INTEGER REFERENCES account_groups(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE INDEX ledger_revisions_ledger ON ledger_revisions(company_id, ledger_id, id);
+                PRAGMA user_version = 28;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1453,7 +1460,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 27);
+        assert_eq!(version, 28);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

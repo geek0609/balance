@@ -39,6 +39,9 @@ struct App {
     ledger_name: String,
     category: Category,
     ledger_group: Option<i64>,
+    editing_ledger: Option<i64>,
+    ledger_edit_name: String,
+    ledger_edit_group: Option<i64>,
     group_name: String,
     group_parent: Option<i64>,
     profile_ledger: Option<i64>,
@@ -236,6 +239,9 @@ impl App {
             ledger_name: String::new(),
             category: Category::Asset,
             ledger_group: None,
+            editing_ledger: None,
+            ledger_edit_name: String::new(),
+            ledger_edit_group: None,
             group_name: String::new(),
             group_parent: None,
             profile_ledger: None,
@@ -371,6 +377,9 @@ impl App {
         self.voucher_reversal_reason.clear();
         self.register_ledger = None;
         self.ledger_group = None;
+        self.editing_ledger = None;
+        self.ledger_edit_name.clear();
+        self.ledger_edit_group = None;
         self.group_parent = None;
         self.profile_ledger = None;
         self.profile_selection = None;
@@ -456,6 +465,7 @@ impl App {
         let profile_dirty = (self.profile_ledger.is_some()
             && self.ledger_profile != self.profile_original)
             || self.company_profile != self.company_profile_original
+            || self.editing_ledger.is_some()
             || self.editing_invoice.is_some()
             || self.stock_editing.is_some();
         if profile_dirty {
@@ -620,7 +630,90 @@ impl App {
                     .find(|g| Some(g.id) == ledger.group_id)
                     .map(|g| g.name.as_str())
                     .unwrap_or(ledger.category.as_str());
-                ui.label(format!("{}  —  {}", ledger.name, group));
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}  —  {}", ledger.name, group));
+                    if ui
+                        .add_enabled(
+                            self.editing_ledger.is_none(),
+                            egui::Button::new("Edit ledger"),
+                        )
+                        .clicked()
+                    {
+                        self.editing_ledger = Some(ledger.id);
+                        self.ledger_edit_name = ledger.name.clone();
+                        self.ledger_edit_group = ledger.group_id;
+                    }
+                });
+                egui::CollapsingHeader::new("Previous ledger names and groups")
+                    .id_salt(("ledger-revisions", ledger.id))
+                    .show(ui, |ui| {
+                        match self.store.ledger_revisions(company, ledger.id) {
+                            Ok(rows) if rows.is_empty() => {
+                                ui.label("No earlier versions.");
+                            }
+                            Ok(rows) => {
+                                for row in rows {
+                                    ui.label(format!(
+                                        "{} UTC — {} — {}",
+                                        row.changed_at,
+                                        row.name,
+                                        row.group.as_deref().unwrap_or("unassigned")
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                            }
+                        }
+                    });
+            }
+        }
+        if let Some(id) = self.editing_ledger {
+            if let Some(ledger) = ledgers.iter().find(|ledger| ledger.id == id) {
+                ui.separator();
+                ui.heading(format!("Edit ledger: {}", ledger.name));
+                ui.small("The group must retain the same accounting category; existing reports use the current ledger name and group.");
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut self.ledger_edit_name);
+                    let group_name = groups
+                        .iter()
+                        .find(|g| Some(g.id) == self.ledger_edit_group)
+                        .map(|g| g.name.as_str())
+                        .unwrap_or("Select group");
+                    egui::ComboBox::from_id_salt("edit-ledger-group")
+                        .selected_text(group_name)
+                        .show_ui(ui, |ui| {
+                            for group in groups.iter().filter(|g| g.category == ledger.category) {
+                                ui.selectable_value(
+                                    &mut self.ledger_edit_group,
+                                    Some(group.id),
+                                    &group.name,
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Save ledger changes").clicked() {
+                        let result = self
+                            .ledger_edit_group
+                            .ok_or_else(|| balance::Error::Validation("Select a group".into()))
+                            .and_then(|group| {
+                                self.store
+                                    .update_ledger(company, id, &self.ledger_edit_name, group)
+                            });
+                        match result {
+                            Ok(()) => {
+                                self.editing_ledger = None;
+                                self.message = "Ledger updated".into();
+                            }
+                            Err(e) => self.failure(e),
+                        }
+                    }
+                    if ui.button("Cancel ledger edit").clicked() {
+                        self.editing_ledger = None;
+                    }
+                });
             }
         }
         ui.separator();
