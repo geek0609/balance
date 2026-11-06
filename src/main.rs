@@ -4,9 +4,9 @@ use balance::banking::{parse_signed_amount, BankEntry, StatementPlan};
 use balance::contacts::LedgerProfile;
 use balance::exchange::ImportPlan;
 use balance::inventory::{
-    format_quantity, line_amount, parse_quantity, InvoiceAdjustment, InvoiceAllocation,
-    InvoiceDraft, InvoiceKind, InvoiceLine, SettlementAllocation, StockBatch, StockItem,
-    StockLocation,
+    discounted_line_amount, format_quantity, parse_quantity, InvoiceAdjustment, InvoiceAllocation,
+    InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine, SettlementAllocation, StockBatch,
+    StockItem, StockLocation,
 };
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
@@ -159,7 +159,15 @@ struct InvoiceLineForm {
     trade_ledger: Option<i64>,
     quantity: String,
     price: String,
+    discount_mode: DiscountMode,
+    discount_value: String,
     extra_allocations: Vec<InvoiceAllocationForm>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscountMode {
+    None,
+    Fixed,
+    Percent,
 }
 struct InvoiceAllocationForm {
     location: Option<i64>,
@@ -175,7 +183,18 @@ impl InvoiceLineForm {
             trade_ledger: None,
             quantity: String::new(),
             price: String::new(),
+            discount_mode: DiscountMode::None,
+            discount_value: String::new(),
             extra_allocations: Vec::new(),
+        }
+    }
+    fn discount(&self) -> balance::Result<InvoiceDiscount> {
+        match self.discount_mode {
+            DiscountMode::None => Ok(InvoiceDiscount::None),
+            DiscountMode::Fixed => Ok(InvoiceDiscount::Fixed(parse_amount(&self.discount_value)?)),
+            DiscountMode::Percent => Ok(InvoiceDiscount::Percent(
+                self.discount_value.trim().to_owned(),
+            )),
         }
     }
 }
@@ -1901,7 +1920,7 @@ impl App {
             ui.label("Tax amount");
             ui.add(egui::TextEdit::singleline(&mut self.invoice_tax_amount).hint_text("0.00"));
         });
-        ui.small("Tax is entered manually; statutory rules and filing are not implemented.");
+        ui.small("Tax is entered manually; statutory rules and filing are not implemented. Percentage discounts apply to the gross line amount after it is rounded to two decimal places.");
         let mut remove = None;
         for (index, line) in self.invoice_lines.iter_mut().enumerate() {
             ui.horizontal(|ui| {
@@ -1952,11 +1971,47 @@ impl App {
                         .hint_text("Unit price")
                         .desired_width(90.0),
                 );
-                if let (Ok(qty), Ok(price)) =
-                    (parse_quantity(&line.quantity), parse_amount(&line.price))
-                {
-                    if let Ok(amount) = line_amount(qty, price) {
-                        ui.label(format!("Amount {}", format_amount(amount)));
+                egui::ComboBox::from_id_salt(("invoice-discount", index))
+                    .selected_text(match line.discount_mode {
+                        DiscountMode::None => "No discount",
+                        DiscountMode::Fixed => "Fixed discount",
+                        DiscountMode::Percent => "Discount %",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut line.discount_mode,
+                            DiscountMode::None,
+                            "No discount",
+                        );
+                        ui.selectable_value(
+                            &mut line.discount_mode,
+                            DiscountMode::Fixed,
+                            "Fixed discount",
+                        );
+                        ui.selectable_value(
+                            &mut line.discount_mode,
+                            DiscountMode::Percent,
+                            "Discount %",
+                        );
+                    });
+                if line.discount_mode != DiscountMode::None {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut line.discount_value)
+                            .hint_text("Discount")
+                            .desired_width(80.0),
+                    );
+                }
+                if let (Ok(qty), Ok(price), Ok(discount)) = (
+                    parse_quantity(&line.quantity),
+                    parse_amount(&line.price),
+                    line.discount(),
+                ) {
+                    if let Ok((amount, applied)) = discounted_line_amount(qty, price, &discount) {
+                        ui.label(format!(
+                            "Discount {} · Amount {}",
+                            format_amount(applied),
+                            format_amount(amount)
+                        ));
                     }
                 }
                 if ui.button("Remove").clicked() {
@@ -2095,6 +2150,7 @@ impl App {
                         })?,
                         batch_id: line.batch,
                         trade_ledger_id: line.trade_ledger,
+                        discount: line.discount()?,
                         extra_allocations: line
                             .extra_allocations
                             .iter()
@@ -2412,24 +2468,39 @@ impl App {
                                 self.invoice_lines = draft
                                     .lines
                                     .into_iter()
-                                    .map(|line| InvoiceLineForm {
-                                        item: Some(line.item_id),
-                                        location: Some(line.location_id),
-                                        batch: line.batch_id,
-                                        trade_ledger: line.trade_ledger_id,
-                                        extra_allocations: line
-                                            .extra_allocations
-                                            .into_iter()
-                                            .map(|allocation| InvoiceAllocationForm {
-                                                location: Some(allocation.location_id),
-                                                batch: allocation.batch_id,
-                                                quantity: format_quantity(i128::from(
-                                                    allocation.quantity,
-                                                )),
-                                            })
-                                            .collect(),
-                                        quantity: format_quantity(i128::from(line.quantity)),
-                                        price: format_amount(line.unit_price),
+                                    .map(|line| {
+                                        let (discount_mode, discount_value) = match line.discount {
+                                            InvoiceDiscount::None => {
+                                                (DiscountMode::None, String::new())
+                                            }
+                                            InvoiceDiscount::Fixed(amount) => {
+                                                (DiscountMode::Fixed, format_amount(amount))
+                                            }
+                                            InvoiceDiscount::Percent(rate) => {
+                                                (DiscountMode::Percent, rate)
+                                            }
+                                        };
+                                        InvoiceLineForm {
+                                            item: Some(line.item_id),
+                                            location: Some(line.location_id),
+                                            batch: line.batch_id,
+                                            trade_ledger: line.trade_ledger_id,
+                                            extra_allocations: line
+                                                .extra_allocations
+                                                .into_iter()
+                                                .map(|allocation| InvoiceAllocationForm {
+                                                    location: Some(allocation.location_id),
+                                                    batch: allocation.batch_id,
+                                                    quantity: format_quantity(i128::from(
+                                                        allocation.quantity,
+                                                    )),
+                                                })
+                                                .collect(),
+                                            quantity: format_quantity(i128::from(line.quantity)),
+                                            price: format_amount(line.unit_price),
+                                            discount_mode,
+                                            discount_value,
+                                        }
                                     })
                                     .collect();
                                 self.invoice_adjustments = draft
@@ -2460,12 +2531,13 @@ impl App {
                     }
                     for line in invoice.lines {
                         ui.label(format!(
-                            "  {} — ledger {}: {} {} × {} = {}",
+                            "  {} — ledger {}: {} {} × {} · {} · net {}",
                             line.item,
                             line.trade_ledger,
                             format_quantity(i128::from(line.quantity)),
                             line.unit,
                             format_amount(line.unit_price),
+                            discount_description(&line.discount, line.discount_amount),
                             format_amount(line.amount)
                         ));
                         for allocation in line.allocations {
@@ -2562,12 +2634,16 @@ impl App {
                                         }
                                         for line in revision.lines {
                                             ui.label(format!(
-                                                "  {} — ledger {}: {} {} × {} = {}",
+                                                "  {} — ledger {}: {} {} × {} · {} · net {}",
                                                 line.item,
                                                 line.trade_ledger,
                                                 format_quantity(i128::from(line.quantity)),
                                                 line.unit,
                                                 format_amount(line.unit_price),
+                                                discount_description(
+                                                    &line.discount,
+                                                    line.discount_amount
+                                                ),
                                                 format_amount(line.amount)
                                             ));
                                             for allocation in line.allocations {
@@ -3592,6 +3668,13 @@ fn pick_account(
                 }
             });
     });
+}
+fn discount_description(discount: &InvoiceDiscount, amount: i64) -> String {
+    match discount {
+        InvoiceDiscount::None => "no discount".into(),
+        InvoiceDiscount::Fixed(_) => format!("discount {}", format_amount(amount)),
+        InvoiceDiscount::Percent(rate) => format!("discount {}% ({})", rate, format_amount(amount)),
+    }
 }
 fn money(value: i128) -> String {
     let n = value.unsigned_abs();

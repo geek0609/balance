@@ -247,7 +247,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=24).contains(&version) {
+    if !(1..=25).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -367,7 +367,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 24 {
+        if version > 25 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -565,6 +565,15 @@ impl Store {
                 INSERT INTO invoice_revision_line_allocations(revision_line_id, location_id, batch_id, quantity) SELECT id, location_id, batch_id, quantity FROM invoice_revision_lines;
                 CREATE INDEX invoice_revision_line_allocations_line ON invoice_revision_line_allocations(revision_line_id, id);
                 PRAGMA user_version = 24;")?;
+        }
+        if version < 25 {
+            tx.execute_batch("ALTER TABLE invoice_lines ADD COLUMN discount_kind TEXT NOT NULL DEFAULT 'None' CHECK(discount_kind IN ('None','Fixed','Percent'));
+                ALTER TABLE invoice_lines ADD COLUMN discount_value TEXT NOT NULL DEFAULT '';
+                ALTER TABLE invoice_lines ADD COLUMN discount_amount INTEGER NOT NULL DEFAULT 0 CHECK(discount_amount >= 0);
+                ALTER TABLE invoice_revision_lines ADD COLUMN discount_kind TEXT NOT NULL DEFAULT 'None' CHECK(discount_kind IN ('None','Fixed','Percent'));
+                ALTER TABLE invoice_revision_lines ADD COLUMN discount_value TEXT NOT NULL DEFAULT '';
+                ALTER TABLE invoice_revision_lines ADD COLUMN discount_amount INTEGER NOT NULL DEFAULT 0 CHECK(discount_amount >= 0);
+                PRAGMA user_version = 25;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1427,7 +1436,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 24);
+        assert_eq!(version, 25);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

@@ -5,7 +5,7 @@ use crate::{
     VoucherKind,
 };
 use rusqlite::{params, Connection};
-use rust_decimal::{prelude::ToPrimitive, Decimal};
+use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     str::FromStr,
@@ -121,6 +121,13 @@ pub struct InvoiceLine {
     pub extra_allocations: Vec<InvoiceAllocation>,
     pub quantity: i64,
     pub unit_price: i64,
+    pub discount: InvoiceDiscount,
+}
+#[derive(Debug, Clone)]
+pub enum InvoiceDiscount {
+    None,
+    Fixed(i64),
+    Percent(String),
 }
 #[derive(Debug, Clone)]
 pub struct InvoiceAllocation {
@@ -240,6 +247,8 @@ pub struct InvoiceDetailLine {
     pub quantity: i64,
     pub unit_price: i64,
     pub amount: i64,
+    pub discount: InvoiceDiscount,
+    pub discount_amount: i64,
 }
 
 pub fn parse_quantity(input: &str) -> Result<i64> {
@@ -277,6 +286,57 @@ pub fn line_amount(quantity: i64, unit_price: i64) -> Result<i64> {
     let amount = (i128::from(quantity) * i128::from(unit_price) + 500) / 1000;
     i64::try_from(amount).map_err(|_| Error::Validation("Invoice line amount is too large".into()))
 }
+/// Discount is applied to the gross line amount after its monetary rounding.
+pub fn discounted_line_amount(
+    quantity: i64,
+    unit_price: i64,
+    discount: &InvoiceDiscount,
+) -> Result<(i64, i64)> {
+    let gross = line_amount(quantity, unit_price)?;
+    let amount = match discount {
+        InvoiceDiscount::None => 0,
+        InvoiceDiscount::Fixed(value) => *value,
+        InvoiceDiscount::Percent(value) => {
+            let rate = Decimal::from_str(value.trim())
+                .map_err(|_| Error::Validation("Enter a valid discount percentage".into()))?;
+            if rate < Decimal::ZERO || rate > Decimal::from(100) || rate.scale() > 4 {
+                return Err(Error::Validation("Discount percentage must be between 0 and 100 with at most four decimal places".into()));
+            }
+            Decimal::from(gross)
+                .checked_mul(rate)
+                .and_then(|value| value.checked_div(Decimal::from(100)))
+                .ok_or_else(|| Error::Validation("Discount is too large".into()))?
+                .round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
+                .to_i64()
+                .ok_or_else(|| Error::Validation("Discount is too large".into()))?
+        }
+    };
+    if amount < 0 || amount > gross {
+        return Err(Error::Validation(
+            "Discount must not exceed the gross item amount".into(),
+        ));
+    }
+    Ok((gross - amount, amount))
+}
+fn discount_parts(discount: &InvoiceDiscount) -> (&'static str, String) {
+    match discount {
+        InvoiceDiscount::None => ("None", String::new()),
+        InvoiceDiscount::Fixed(amount) => ("Fixed", amount.to_string()),
+        InvoiceDiscount::Percent(rate) => ("Percent", rate.trim().to_owned()),
+    }
+}
+fn parse_discount(kind: &str, value: &str) -> Result<InvoiceDiscount> {
+    match kind {
+        "None" if value.is_empty() => Ok(InvoiceDiscount::None),
+        "Fixed" => {
+            Ok(InvoiceDiscount::Fixed(value.parse::<i64>().map_err(
+                |_| Error::Validation("Invalid saved discount".into()),
+            )?))
+        }
+        "Percent" => Ok(InvoiceDiscount::Percent(value.to_owned())),
+        _ => Err(Error::Validation("Invalid saved discount".into())),
+    }
+}
 struct PreparedInvoice {
     date: String,
     due_date: Option<String>,
@@ -284,6 +344,7 @@ struct PreparedInvoice {
     reference: String,
     postings: Vec<Posting>,
     amounts: Vec<i64>,
+    discounts: Vec<i64>,
 }
 fn prepare_invoice(
     conn: &Connection,
@@ -375,6 +436,7 @@ fn prepare_invoice(
         }
     }
     let mut amounts = Vec::with_capacity(draft.lines.len());
+    let mut discounts = Vec::with_capacity(draft.lines.len());
     let mut subtotal = 0_i128;
     let mut trade_totals = BTreeMap::<i64, i128>::new();
     for line in &draft.lines {
@@ -442,10 +504,12 @@ fn prepare_invoice(
                 "An item ledger has an incompatible category".into(),
             ));
         }
-        let amount = line_amount(line.quantity, line.unit_price)?;
+        let (amount, discount) =
+            discounted_line_amount(line.quantity, line.unit_price, &line.discount)?;
         subtotal += i128::from(amount);
         *trade_totals.entry(trade_id).or_default() += i128::from(amount);
         amounts.push(amount);
+        discounts.push(discount);
     }
     let subtotal = i64::try_from(subtotal)
         .map_err(|_| Error::Validation("Invoice amount is too large".into()))?;
@@ -511,6 +575,7 @@ fn prepare_invoice(
         reference,
         postings,
         amounts,
+        discounts,
     })
 }
 fn write_postings(conn: &Connection, voucher: i64, postings: &[Posting]) -> Result<()> {
@@ -527,9 +592,16 @@ fn write_invoice_lines(
     invoice: i64,
     lines: &[InvoiceLine],
     amounts: &[i64],
+    discounts: &[i64],
 ) -> Result<()> {
-    for (line, amount) in lines.iter().zip(amounts) {
-        conn.execute("INSERT INTO invoice_lines(invoice_id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![invoice, line.item_id, line.quantity, line.unit_price, amount, line.location_id, line.batch_id, line.trade_ledger_id])?;
+    if lines.len() != amounts.len() || lines.len() != discounts.len() {
+        return Err(Error::Validation(
+            "Invoice line calculations are inconsistent".into(),
+        ));
+    }
+    for ((line, amount), discount) in lines.iter().zip(amounts).zip(discounts) {
+        let (discount_kind, discount_value) = discount_parts(&line.discount);
+        conn.execute("INSERT INTO invoice_lines(invoice_id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id, discount_kind, discount_value, discount_amount) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)", params![invoice, line.item_id, line.quantity, line.unit_price, amount, line.location_id, line.batch_id, line.trade_ledger_id, discount_kind, discount_value, discount])?;
         let line_id = conn.last_insert_rowid();
         let extras: i128 = line
             .extra_allocations
@@ -619,6 +691,23 @@ fn attach_allocation_details(
     revision: bool,
     mut line: InvoiceDetailLine,
 ) -> Result<InvoiceDetailLine> {
+    let sql = if revision {
+        "SELECT discount_kind, discount_value, discount_amount FROM invoice_revision_lines WHERE id = ?1"
+    } else {
+        "SELECT discount_kind, discount_value, discount_amount FROM invoice_lines WHERE id = ?1"
+    };
+    let (kind, value, saved_amount): (String, String, i64) =
+        conn.query_row(sql, [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let discount = parse_discount(&kind, &value)?;
+    if discounted_line_amount(line.quantity, line.unit_price, &discount)?
+        != (line.amount, saved_amount)
+    {
+        return Err(Error::Validation(
+            "Invoice discount calculation is inconsistent".into(),
+        ));
+    }
+    line.discount = discount;
+    line.discount_amount = saved_amount;
     let allocations = read_allocation_details(conn, id, revision)?;
     if allocations
         .first()
@@ -640,7 +729,7 @@ fn attach_allocation_details(
     Ok(line)
 }
 fn copy_invoice_line_revisions(conn: &Connection, invoice: i64, revision: i64) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+    let mut stmt = conn.prepare("SELECT id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id, discount_kind, discount_value, discount_amount FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
     let lines = stmt
         .query_map([invoice], |r| {
             Ok((
@@ -652,14 +741,36 @@ fn copy_invoice_line_revisions(conn: &Connection, invoice: i64, revision: i64) -
                 r.get::<_, i64>(5)?,
                 r.get::<_, Option<i64>>(6)?,
                 r.get::<_, Option<i64>>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, i64>(10)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    for (id, item, quantity, unit_price, amount, location, batch, trade) in lines {
+    for (
+        id,
+        item,
+        quantity,
+        unit_price,
+        amount,
+        location,
+        batch,
+        trade,
+        discount_kind,
+        discount_value,
+        discount_amount,
+    ) in lines
+    {
         let allocations = read_line_allocations(conn, id, false)?;
         check_line_allocations(&allocations, quantity, location, batch)?;
-        conn.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![revision, item, quantity, unit_price, amount, location, batch, trade])?;
+        let discount = parse_discount(&discount_kind, &discount_value)?;
+        if discounted_line_amount(quantity, unit_price, &discount)? != (amount, discount_amount) {
+            return Err(Error::Validation(
+                "Invoice discount calculation is inconsistent".into(),
+            ));
+        }
+        conn.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id, discount_kind, discount_value, discount_amount) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)", params![revision, item, quantity, unit_price, amount, location, batch, trade, discount_kind, discount_value, discount_amount])?;
         let revision_line = conn.last_insert_rowid();
         for allocation in allocations {
             conn.execute("INSERT INTO invoice_revision_line_allocations(revision_line_id, location_id, batch_id, quantity) VALUES (?1, ?2, ?3, ?4)", params![revision_line, allocation.location_id, allocation.batch_id, allocation.quantity])?;
@@ -711,7 +822,13 @@ pub(crate) fn insert_invoice_on_connection(
     write_postings(conn, voucher_id, &prepared.postings)?;
     conn.execute("INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![company_id, voucher_id, draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount, prepared.due_date, prepared.credit_days])?;
     let invoice_id = conn.last_insert_rowid();
-    write_invoice_lines(conn, invoice_id, &draft.lines, &prepared.amounts)?;
+    write_invoice_lines(
+        conn,
+        invoice_id,
+        &draft.lines,
+        &prepared.amounts,
+        &prepared.discounts,
+    )?;
     write_invoice_adjustments(conn, invoice_id, &draft.adjustments)?;
     Ok((invoice_id, voucher_id))
 }
@@ -1779,7 +1896,7 @@ impl Store {
     /// Return a complete editable draft, scoped to the company.
     pub fn invoice_draft(&self, company_id: i64, invoice_id: i64) -> Result<InvoiceDraft> {
         let (kind, date, reference, narration, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days): (String, String, String, String, i64, i64, Option<i64>, i64, Option<String>, Option<u32>) = self.conn.query_row("SELECT i.kind, v.date, v.reference, v.narration, i.party_ledger_id, i.trade_ledger_id, i.tax_ledger_id, i.tax_amount, i.due_date, i.credit_days FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
-        let mut stmt = self.conn.prepare("SELECT id, item_id, quantity, unit_price, location_id, batch_id, trade_ledger_id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+        let mut stmt = self.conn.prepare("SELECT id, item_id, quantity, unit_price, location_id, batch_id, trade_ledger_id, discount_kind, discount_value, amount, discount_amount FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
         let raw_lines = stmt
             .query_map([invoice_id], |r| {
                 Ok((
@@ -1790,14 +1907,37 @@ impl Store {
                     r.get::<_, i64>(4)?,
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, i64>(9)?,
+                    r.get::<_, i64>(10)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut lines = Vec::with_capacity(raw_lines.len());
-        for (id, item_id, quantity, unit_price, location_id, batch_id, trade_ledger_id) in raw_lines
+        for (
+            id,
+            item_id,
+            quantity,
+            unit_price,
+            location_id,
+            batch_id,
+            trade_ledger_id,
+            discount_kind,
+            discount_value,
+            amount,
+            discount_amount,
+        ) in raw_lines
         {
             let allocations = read_line_allocations(&self.conn, id, false)?;
             check_line_allocations(&allocations, quantity, location_id, batch_id)?;
+            let discount = parse_discount(&discount_kind, &discount_value)?;
+            if discounted_line_amount(quantity, unit_price, &discount)? != (amount, discount_amount)
+            {
+                return Err(Error::Validation(
+                    "Invoice discount calculation is inconsistent".into(),
+                ));
+            }
             lines.push(InvoiceLine {
                 item_id,
                 quantity,
@@ -1806,6 +1946,7 @@ impl Store {
                 batch_id,
                 trade_ledger_id,
                 extra_allocations: allocations.into_iter().skip(1).collect(),
+                discount,
             });
         }
         let mut stmt = self.conn.prepare("SELECT ledger_id, amount, description FROM invoice_adjustments WHERE invoice_id = ?1 ORDER BY id")?;
@@ -1888,7 +2029,13 @@ impl Store {
             [invoice_id],
         )?;
         write_postings(&tx, voucher_id, &prepared.postings)?;
-        write_invoice_lines(&tx, invoice_id, &draft.lines, &prepared.amounts)?;
+        write_invoice_lines(
+            &tx,
+            invoice_id,
+            &draft.lines,
+            &prepared.amounts,
+            &prepared.discounts,
+        )?;
         write_invoice_adjustments(&tx, invoice_id, &draft.adjustments)?;
         tx.commit()?;
         Ok(())
@@ -1955,6 +2102,8 @@ impl Store {
                             unit_price: r.get(3)?,
                             amount: r.get(4)?,
                             allocations: Vec::new(),
+                            discount: InvoiceDiscount::None,
+                            discount_amount: 0,
                         },
                     ))
                 })?
@@ -2013,6 +2162,8 @@ impl Store {
                         unit_price: r.get(3)?,
                         amount: r.get(4)?,
                         allocations: Vec::new(),
+                        discount: InvoiceDiscount::None,
+                        discount_amount: 0,
                     },
                 ))
             })?;

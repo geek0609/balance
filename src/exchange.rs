@@ -4,8 +4,8 @@ use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
     find_stock_batch, insert_invoice_on_connection, insert_settlement_on_connection, line_amount,
-    parse_quantity, InvoiceAdjustment, InvoiceAllocation, InvoiceDraft, InvoiceKind, InvoiceLine,
-    SettlementAllocation,
+    parse_quantity, InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft,
+    InvoiceKind, InvoiceLine, SettlementAllocation,
 };
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
@@ -3210,6 +3210,7 @@ impl Store {
                     location_id: primary.location_id,
                     batch_id: primary.batch_id,
                     extra_allocations: allocations.collect(),
+                    discount: InvoiceDiscount::None,
                     quantity: line.quantity,
                     unit_price: line.unit_price,
                 });
