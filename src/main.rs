@@ -165,6 +165,7 @@ struct App {
     invoice_lines: Vec<InvoiceLineForm>,
     invoice_adjustments: Vec<InvoiceAdjustmentForm>,
     editing_invoice: Option<i64>,
+    copying_invoice: bool,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -385,6 +386,7 @@ impl App {
             invoice_lines: vec![InvoiceLineForm::new()],
             invoice_adjustments: Vec::new(),
             editing_invoice: None,
+            copying_invoice: false,
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -488,6 +490,7 @@ impl App {
         self.invoice_lines = vec![InvoiceLineForm::new()];
         self.invoice_adjustments.clear();
         self.editing_invoice = None;
+        self.copying_invoice = false;
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -529,6 +532,7 @@ impl App {
                     || self.terms_limit != self.terms_original_limit))
             || self.editing_ledger.is_some()
             || self.editing_invoice.is_some()
+            || self.copying_invoice
             || self.stock_editing.is_some();
         if profile_dirty {
             ui.label("Save or discard the current edits before changing company.");
@@ -2492,9 +2496,85 @@ impl App {
             }
         }
     }
+    fn load_invoice_form(&mut self, draft: InvoiceDraft, edit: Option<i64>) {
+        self.editing_invoice = edit;
+        self.copying_invoice = edit.is_none();
+        self.invoice_kind = draft.kind;
+        self.invoice_date = if edit.is_some() {
+            draft.date
+        } else {
+            String::new()
+        };
+        self.invoice_due_date = if edit.is_some() {
+            draft.due_date.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.invoice_credit_days = draft
+            .credit_days
+            .map(|days| days.to_string())
+            .unwrap_or_default();
+        self.invoice_reference = if edit.is_some() {
+            draft.reference
+        } else {
+            String::new()
+        };
+        self.invoice_narration = draft.narration;
+        self.invoice_party = Some(draft.party_ledger_id);
+        self.invoice_trade = Some(draft.trade_ledger_id);
+        self.invoice_tax_ledger = draft.tax_ledger_id;
+        self.invoice_tax_amount = if draft.tax_amount == 0 {
+            String::new()
+        } else {
+            format_amount(draft.tax_amount)
+        };
+        self.invoice_lines = draft
+            .lines
+            .into_iter()
+            .map(|line| {
+                let (discount_mode, discount_value) = match line.discount {
+                    InvoiceDiscount::None => (DiscountMode::None, String::new()),
+                    InvoiceDiscount::Fixed(amount) => (DiscountMode::Fixed, format_amount(amount)),
+                    InvoiceDiscount::Percent(rate) => (DiscountMode::Percent, rate),
+                };
+                InvoiceLineForm {
+                    item: Some(line.item_id),
+                    location: Some(line.location_id),
+                    batch: line.batch_id,
+                    trade_ledger: line.trade_ledger_id,
+                    extra_allocations: line
+                        .extra_allocations
+                        .into_iter()
+                        .map(|allocation| InvoiceAllocationForm {
+                            location: Some(allocation.location_id),
+                            batch: allocation.batch_id,
+                            quantity: format_quantity(i128::from(allocation.quantity)),
+                        })
+                        .collect(),
+                    quantity: format_quantity(i128::from(line.quantity)),
+                    price: format_amount(line.unit_price),
+                    discount_mode,
+                    discount_value,
+                }
+            })
+            .collect();
+        self.invoice_adjustments = draft
+            .adjustments
+            .into_iter()
+            .map(|adjustment| InvoiceAdjustmentForm {
+                ledger: Some(adjustment.ledger_id),
+                amount: format_amount(adjustment.amount)
+                    .trim_start_matches('-')
+                    .to_owned(),
+                increase: adjustment.amount > 0,
+                description: adjustment.description,
+            })
+            .collect();
+    }
     fn invoice_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading(match self.editing_invoice {
             Some(id) => format!("Edit invoice {id}"),
+            None if self.copying_invoice => "New invoice from copy".into(),
             None => "Sales and purchase invoices".into(),
         });
         ui.label("Save an invoice to create its accounting voucher and any stock movements together. For services, remove all item lines and add a positive service / charge line. Item prices are per unit; each line rounds to two decimal places.");
@@ -2877,8 +2957,14 @@ impl App {
             ui.label("Narration");
             ui.text_edit_singleline(&mut self.invoice_narration);
         });
-        if self.editing_invoice.is_some() && ui.button("Cancel invoice edit").clicked() {
+        if (self.editing_invoice.is_some() || self.copying_invoice)
+            && ui.button("Cancel invoice draft").clicked()
+        {
             self.editing_invoice = None;
+            self.copying_invoice = false;
+            self.invoice_date.clear();
+            self.invoice_party = None;
+            self.invoice_trade = None;
             self.invoice_reference.clear();
             self.invoice_narration.clear();
             self.invoice_due_date.clear();
@@ -2991,6 +3077,7 @@ impl App {
                     self.invoice_tax_amount.clear();
                     self.invoice_tax_ledger = None;
                     self.editing_invoice = None;
+                    self.copying_invoice = false;
                 }
                 Err(e) => self.failure(e),
             }
@@ -3188,6 +3275,7 @@ impl App {
                     );
                 });
                 ui.small("Export a saved invoice for review or printing in a browser. Existing files are not overwritten; company and party details are current. This basic layout is not a statutory tax document.");
+                ui.small("Editing or copying an invoice replaces the current invoice form. A copy retains prices, tax and allocations for review; enter a new date and reference before saving.");
                 for invoice in invoices {
                     ui.strong(format!(
                         "{}  {}  {}  {}  Total {}  Paid {}  Outstanding {}",
@@ -3211,82 +3299,32 @@ impl App {
                     }
                     if ui
                         .add_enabled(
-                            !invoice.has_settlement_history && self.editing_invoice.is_none(),
+                            !invoice.has_settlement_history
+                                && self.editing_invoice.is_none()
+                                && !self.copying_invoice,
                             egui::Button::new("Edit invoice"),
                         )
                         .clicked()
                     {
                         match self.store.invoice_draft(company, invoice.id) {
                             Ok(draft) => {
-                                self.editing_invoice = Some(invoice.id);
-                                self.invoice_kind = draft.kind;
-                                self.invoice_date = draft.date;
-                                self.invoice_due_date = draft.due_date.unwrap_or_default();
-                                self.invoice_credit_days = draft
-                                    .credit_days
-                                    .map(|days| days.to_string())
-                                    .unwrap_or_default();
-                                self.invoice_reference = draft.reference;
-                                self.invoice_narration = draft.narration;
-                                self.invoice_party = Some(draft.party_ledger_id);
-                                self.invoice_trade = Some(draft.trade_ledger_id);
-                                self.invoice_tax_ledger = draft.tax_ledger_id;
-                                self.invoice_tax_amount = if draft.tax_amount == 0 {
-                                    String::new()
-                                } else {
-                                    format_amount(draft.tax_amount)
-                                };
-                                self.invoice_lines = draft
-                                    .lines
-                                    .into_iter()
-                                    .map(|line| {
-                                        let (discount_mode, discount_value) = match line.discount {
-                                            InvoiceDiscount::None => {
-                                                (DiscountMode::None, String::new())
-                                            }
-                                            InvoiceDiscount::Fixed(amount) => {
-                                                (DiscountMode::Fixed, format_amount(amount))
-                                            }
-                                            InvoiceDiscount::Percent(rate) => {
-                                                (DiscountMode::Percent, rate)
-                                            }
-                                        };
-                                        InvoiceLineForm {
-                                            item: Some(line.item_id),
-                                            location: Some(line.location_id),
-                                            batch: line.batch_id,
-                                            trade_ledger: line.trade_ledger_id,
-                                            extra_allocations: line
-                                                .extra_allocations
-                                                .into_iter()
-                                                .map(|allocation| InvoiceAllocationForm {
-                                                    location: Some(allocation.location_id),
-                                                    batch: allocation.batch_id,
-                                                    quantity: format_quantity(i128::from(
-                                                        allocation.quantity,
-                                                    )),
-                                                })
-                                                .collect(),
-                                            quantity: format_quantity(i128::from(line.quantity)),
-                                            price: format_amount(line.unit_price),
-                                            discount_mode,
-                                            discount_value,
-                                        }
-                                    })
-                                    .collect();
-                                self.invoice_adjustments = draft
-                                    .adjustments
-                                    .into_iter()
-                                    .map(|adjustment| InvoiceAdjustmentForm {
-                                        ledger: Some(adjustment.ledger_id),
-                                        amount: format_amount(adjustment.amount)
-                                            .trim_start_matches('-')
-                                            .to_owned(),
-                                        increase: adjustment.amount > 0,
-                                        description: adjustment.description,
-                                    })
-                                    .collect();
+                                self.load_invoice_form(draft, Some(invoice.id));
                                 self.message = "Invoice loaded for editing".into();
+                            }
+                            Err(e) => self.failure(e),
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            self.editing_invoice.is_none() && !self.copying_invoice,
+                            egui::Button::new("Prepare copy (replace draft)"),
+                        )
+                        .clicked()
+                    {
+                        match self.store.invoice_draft(company, invoice.id) {
+                            Ok(draft) => {
+                                self.load_invoice_form(draft, None);
+                                self.message = "Copy prepared; review details and enter a new date and reference".into();
                             }
                             Err(e) => self.failure(e),
                         }
