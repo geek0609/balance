@@ -4,7 +4,7 @@ use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
     find_stock_batch, insert_invoice_on_connection, insert_settlement_on_connection, line_amount,
-    parse_quantity, InvoiceAdjustment, InvoiceDraft, InvoiceKind, InvoiceLine,
+    parse_quantity, InvoiceAdjustment, InvoiceAllocation, InvoiceDraft, InvoiceKind, InvoiceLine,
     SettlementAllocation,
 };
 use crate::{
@@ -90,14 +90,19 @@ struct ImportedInvoiceLine {
     existing_item_id: Option<i64>,
     unit: String,
     precision: u8,
-    location: String,
-    existing_location_id: Option<i64>,
-    batch: Option<String>,
-    existing_batch_id: Option<i64>,
+    allocations: Vec<ImportedStockAllocation>,
     trade_ledger: String,
     existing_trade_ledger_id: Option<i64>,
     quantity: i64,
     unit_price: i64,
+}
+#[derive(Debug, Clone)]
+struct ImportedStockAllocation {
+    location: String,
+    existing_location_id: Option<i64>,
+    batch: Option<String>,
+    existing_batch_id: Option<i64>,
+    quantity: i64,
 }
 #[derive(Debug, Clone)]
 struct ImportedInvoiceAdjustment {
@@ -1209,47 +1214,94 @@ fn parse_imported_invoice(
                     && meaningful(*n)
             })
             .collect();
-        if locations_in_line.len() > 1 {
-            return Err(Error::Validation(
-                "multiple location or batch allocations are not supported".into(),
-            ));
-        }
-        let mut batch_name = None;
-        let location = if let Some(location_node) = locations_in_line.first() {
-            let location_node = *location_node;
-            invoice_list_fields(
-                location_node,
-                &[
-                    "GODOWNNAME",
-                    "BATCHNAME",
-                    "ACTUALQTY",
-                    "BILLEDQTY",
-                    "AMOUNT",
-                ],
-                label,
-                issues,
-            );
-            batch_name = direct_text(location_node, "BATCHNAME").filter(|value| !value.is_empty());
-            if xml_stock_quantity(&invoice_field(location_node, "ACTUALQTY")?, unit)? != actual
-                || xml_stock_quantity(&invoice_field(location_node, "BILLEDQTY")?, unit)? != billed
-                || xml_amount(&invoice_field(location_node, "AMOUNT")?)? != expected
-            {
+        let mut stock_allocations = Vec::new();
+        if locations_in_line.is_empty() {
+            let location = "Main".to_owned();
+            let existing_location_id = *locations
+                .get(&normalized(&location))
+                .ok_or_else(|| Error::Validation("default stock location is unavailable".into()))?;
+            stock_allocations.push(ImportedStockAllocation {
+                location,
+                existing_location_id,
+                batch: None,
+                existing_batch_id: None,
+                quantity,
+            });
+        } else {
+            let mut total_quantity = 0_i128;
+            let mut total_amount = 0_i128;
+            for location_node in locations_in_line {
+                invoice_list_fields(
+                    location_node,
+                    &[
+                        "GODOWNNAME",
+                        "BATCHNAME",
+                        "ACTUALQTY",
+                        "BILLEDQTY",
+                        "AMOUNT",
+                    ],
+                    label,
+                    issues,
+                );
+                let allocated_actual =
+                    xml_stock_quantity(&invoice_field(location_node, "ACTUALQTY")?, unit)?;
+                let allocated_billed =
+                    xml_stock_quantity(&invoice_field(location_node, "BILLEDQTY")?, unit)?;
+                if allocated_actual == 0
+                    || allocated_actual != allocated_billed
+                    || (allocated_actual > 0) != (actual > 0)
+                {
+                    return Err(Error::Validation(
+                        "location quantities do not match the item direction".into(),
+                    ));
+                }
+                let allocated_quantity = allocated_actual
+                    .checked_abs()
+                    .ok_or_else(|| Error::Validation("quantity is too large".into()))?;
+                if allocated_quantity % 10_i64.pow(u32::from(3 - *precision)) != 0 {
+                    return Err(Error::Validation(
+                        "allocation exceeds unit precision".into(),
+                    ));
+                }
+                let allocated_amount = line_amount(allocated_quantity, unit_price)?;
+                let expected_amount = if party_debit {
+                    -allocated_amount
+                } else {
+                    allocated_amount
+                };
+                if xml_amount(&invoice_field(location_node, "AMOUNT")?)? != expected_amount {
+                    return Err(Error::Validation(
+                        "allocation amount differs from quantity and rate".into(),
+                    ));
+                }
+                let location = invoice_field(location_node, "GODOWNNAME")?;
+                let existing_location_id =
+                    *locations.get(&normalized(&location)).ok_or_else(|| {
+                        Error::Validation(format!("stock location {location} is unavailable"))
+                    })?;
+                let batch =
+                    direct_text(location_node, "BATCHNAME").filter(|value| !value.is_empty());
+                let existing_batch_id = batch.as_ref().and_then(|batch| {
+                    batches
+                        .get(&(normalized(&name), normalized(batch)))
+                        .copied()
+                });
+                total_quantity += i128::from(allocated_quantity);
+                total_amount += i128::from(allocated_amount);
+                stock_allocations.push(ImportedStockAllocation {
+                    location,
+                    existing_location_id,
+                    batch,
+                    existing_batch_id,
+                    quantity: allocated_quantity,
+                });
+            }
+            if total_quantity != i128::from(quantity) || total_amount != i128::from(amount) {
                 return Err(Error::Validation(
-                    "location allocation does not match the item".into(),
+                    "location allocations do not match the item totals".into(),
                 ));
             }
-            invoice_field(location_node, "GODOWNNAME")?
-        } else {
-            "Main".into()
-        };
-        let existing_location_id = *locations.get(&normalized(&location)).ok_or_else(|| {
-            Error::Validation(format!("stock location {location} is unavailable"))
-        })?;
-        let existing_batch_id = batch_name.as_ref().and_then(|batch| {
-            batches
-                .get(&(normalized(&name), normalized(batch)))
-                .copied()
-        });
+        }
         invoice_side(allocation, "ISDEEMEDPOSITIVE", expected > 0)?;
         if trade.is_none() {
             trade = Some(ledger.clone());
@@ -1260,10 +1312,7 @@ fn parse_imported_invoice(
             existing_item_id: *existing_item_id,
             unit: unit.clone(),
             precision: *precision,
-            location,
-            existing_location_id,
-            batch: batch_name,
-            existing_batch_id,
+            allocations: stock_allocations,
             existing_trade_ledger_id: ledgers[&normalized(&ledger)].0,
             trade_ledger: ledger,
             quantity,
@@ -3085,70 +3134,82 @@ impl Store {
                         line.item
                     )));
                 }
-                let batch_id = if let Some(name) = &line.batch {
-                    let key = (item_id, normalized(name));
-                    let existing = find_stock_batch(&tx, plan.company_id, item_id, name)?;
-                    let id = if let Some(expected) = line.existing_batch_id {
-                        if existing != Some(expected) {
-                            return Err(Error::Validation(format!(
-                                "Batch {name} changed since preview"
-                            )));
-                        }
-                        expected
-                    } else if let Some(created) = created_batches.get(&key) {
-                        if existing != Some(*created) {
-                            return Err(Error::Validation(format!(
-                                "Batch {name} changed since preview"
-                            )));
-                        }
-                        *created
+                let mut allocations = Vec::with_capacity(line.allocations.len());
+                for allocation in &line.allocations {
+                    let location_id =
+                        find_stock_location(&tx, plan.company_id, &allocation.location)?
+                            .ok_or_else(|| {
+                                Error::Validation(format!(
+                                    "Stock location {} is missing",
+                                    allocation.location
+                                ))
+                            })?;
+                    if allocation
+                        .existing_location_id
+                        .is_some_and(|previous| previous != location_id)
+                    {
+                        return Err(Error::Validation(format!(
+                            "Stock location {} changed since preview",
+                            allocation.location
+                        )));
+                    }
+                    let batch_id = if let Some(name) = &allocation.batch {
+                        let key = (item_id, normalized(name));
+                        let existing = find_stock_batch(&tx, plan.company_id, item_id, name)?;
+                        let id = if let Some(expected) = allocation.existing_batch_id {
+                            if existing != Some(expected) {
+                                return Err(Error::Validation(format!(
+                                    "Batch {name} changed since preview"
+                                )));
+                            }
+                            expected
+                        } else if let Some(created) = created_batches.get(&key) {
+                            if existing != Some(*created) {
+                                return Err(Error::Validation(format!(
+                                    "Batch {name} changed since preview"
+                                )));
+                            }
+                            *created
+                        } else {
+                            if existing.is_some() {
+                                return Err(Error::Validation(format!(
+                                    "Batch {name} appeared since preview"
+                                )));
+                            }
+                            let id = create_stock_batch_on_connection(
+                                &tx,
+                                plan.company_id,
+                                item_id,
+                                name,
+                                None,
+                                None,
+                            )?;
+                            created_batches.insert(key, id);
+                            id
+                        };
+                        Some(id)
                     } else {
-                        if existing.is_some() {
-                            return Err(Error::Validation(format!(
-                                "Batch {name} appeared since preview"
-                            )));
-                        }
-                        let id = create_stock_batch_on_connection(
-                            &tx,
-                            plan.company_id,
-                            item_id,
-                            name,
-                            None,
-                            None,
-                        )?;
-                        created_batches.insert(key, id);
-                        id
+                        None
                     };
-                    Some(id)
-                } else {
-                    None
-                };
+                    allocations.push(InvoiceAllocation {
+                        location_id,
+                        batch_id,
+                        quantity: allocation.quantity,
+                    });
+                }
+                let mut allocations = allocations.into_iter();
+                let primary = allocations
+                    .next()
+                    .ok_or_else(|| Error::Validation("Invoice allocation is missing".into()))?;
                 lines.push(InvoiceLine {
                     item_id,
                     trade_ledger_id: {
                         let id = resolve_ledger(&line.trade_ledger, line.existing_trade_ledger_id)?;
                         (id != trade_id).then_some(id)
                     },
-                    location_id: {
-                        let id = find_stock_location(&tx, plan.company_id, &line.location)?
-                            .ok_or_else(|| {
-                                Error::Validation(format!(
-                                    "Stock location {} is missing",
-                                    line.location
-                                ))
-                            })?;
-                        if line
-                            .existing_location_id
-                            .is_some_and(|previous| previous != id)
-                        {
-                            return Err(Error::Validation(format!(
-                                "Stock location {} changed since preview",
-                                line.location
-                            )));
-                        }
-                        id
-                    },
-                    batch_id,
+                    location_id: primary.location_id,
+                    batch_id: primary.batch_id,
+                    extra_allocations: allocations.collect(),
                     quantity: line.quantity,
                     unit_price: line.unit_price,
                 });

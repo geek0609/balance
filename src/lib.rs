@@ -247,7 +247,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=23).contains(&version) {
+    if !(1..=24).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -348,6 +348,8 @@ impl Store {
             "bank_statement_openings",
             "bank_statement_opening_events",
             "settlement_reversals",
+            "invoice_line_allocations",
+            "invoice_revision_line_allocations",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -365,7 +367,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 23 {
+        if version > 24 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -554,6 +556,15 @@ impl Store {
             tx.execute_batch("ALTER TABLE invoice_lines ADD COLUMN trade_ledger_id INTEGER REFERENCES ledgers(id);
                 ALTER TABLE invoice_revision_lines ADD COLUMN trade_ledger_id INTEGER REFERENCES ledgers(id);
                 PRAGMA user_version = 23;")?;
+        }
+        if version < 24 {
+            tx.execute_batch("CREATE TABLE invoice_line_allocations(id INTEGER PRIMARY KEY, line_id INTEGER NOT NULL REFERENCES invoice_lines(id), location_id INTEGER NOT NULL REFERENCES stock_locations(id), batch_id INTEGER REFERENCES stock_batches(id), quantity INTEGER NOT NULL CHECK(quantity > 0));
+                INSERT INTO invoice_line_allocations(line_id, location_id, batch_id, quantity) SELECT id, location_id, batch_id, quantity FROM invoice_lines;
+                CREATE INDEX invoice_line_allocations_line ON invoice_line_allocations(line_id, id);
+                CREATE TABLE invoice_revision_line_allocations(id INTEGER PRIMARY KEY, revision_line_id INTEGER NOT NULL REFERENCES invoice_revision_lines(id), location_id INTEGER NOT NULL REFERENCES stock_locations(id), batch_id INTEGER REFERENCES stock_batches(id), quantity INTEGER NOT NULL CHECK(quantity > 0));
+                INSERT INTO invoice_revision_line_allocations(revision_line_id, location_id, batch_id, quantity) SELECT id, location_id, batch_id, quantity FROM invoice_revision_lines;
+                CREATE INDEX invoice_revision_line_allocations_line ON invoice_revision_line_allocations(revision_line_id, id);
+                PRAGMA user_version = 24;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1416,7 +1427,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

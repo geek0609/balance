@@ -117,8 +117,22 @@ pub struct InvoiceLine {
     pub batch_id: Option<i64>,
     /// None uses the invoice's default sales or purchase ledger.
     pub trade_ledger_id: Option<i64>,
+    /// Additional locations or batches; the first location receives the remainder.
+    pub extra_allocations: Vec<InvoiceAllocation>,
     pub quantity: i64,
     pub unit_price: i64,
+}
+#[derive(Debug, Clone)]
+pub struct InvoiceAllocation {
+    pub location_id: i64,
+    pub batch_id: Option<i64>,
+    pub quantity: i64,
+}
+#[derive(Debug, Clone)]
+pub struct InvoiceAllocationDetail {
+    pub location: String,
+    pub batch: Option<String>,
+    pub quantity: i64,
 }
 #[derive(Debug, Clone)]
 pub struct InvoiceAdjustment {
@@ -222,6 +236,7 @@ pub struct InvoiceDetailLine {
     pub location: String,
     pub batch: Option<String>,
     pub trade_ledger: String,
+    pub allocations: Vec<InvoiceAllocationDetail>,
     pub quantity: i64,
     pub unit_price: i64,
     pub amount: i64,
@@ -385,6 +400,33 @@ fn prepare_invoice(
         }
         check_stock_batch(conn, company_id, line.item_id, line.batch_id)?;
         check_quantity_precision(conn, company_id, line.item_id, line.quantity)?;
+        let mut extra_quantity = 0_i128;
+        for allocation in &line.extra_allocations {
+            if allocation.quantity <= 0 {
+                return Err(Error::Validation(
+                    "Allocation quantity must be positive".into(),
+                ));
+            }
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stock_locations WHERE id = ?1 AND company_id = ?2)",
+                params![allocation.location_id, company_id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(Error::Validation(
+                    "Every allocation location must belong to the selected company".into(),
+                ));
+            }
+            check_stock_batch(conn, company_id, line.item_id, allocation.batch_id)?;
+            check_quantity_precision(conn, company_id, line.item_id, allocation.quantity)?;
+            extra_quantity += i128::from(allocation.quantity);
+        }
+        if extra_quantity >= i128::from(line.quantity) {
+            return Err(Error::Validation(
+                "Additional allocations must leave a positive quantity for the first location"
+                    .into(),
+            ));
+        }
         let trade_id = line.trade_ledger_id.unwrap_or(draft.trade_ledger_id);
         if trade_id == draft.party_ledger_id || draft.tax_ledger_id == Some(trade_id) {
             return Err(Error::Validation(
@@ -488,6 +530,140 @@ fn write_invoice_lines(
 ) -> Result<()> {
     for (line, amount) in lines.iter().zip(amounts) {
         conn.execute("INSERT INTO invoice_lines(invoice_id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![invoice, line.item_id, line.quantity, line.unit_price, amount, line.location_id, line.batch_id, line.trade_ledger_id])?;
+        let line_id = conn.last_insert_rowid();
+        let extras: i128 = line
+            .extra_allocations
+            .iter()
+            .map(|allocation| i128::from(allocation.quantity))
+            .sum();
+        let primary = i64::try_from(i128::from(line.quantity) - extras)
+            .map_err(|_| Error::Validation("Allocation quantity is too large".into()))?;
+        conn.execute("INSERT INTO invoice_line_allocations(line_id, location_id, batch_id, quantity) VALUES (?1, ?2, ?3, ?4)", params![line_id, line.location_id, line.batch_id, primary])?;
+        for allocation in &line.extra_allocations {
+            conn.execute("INSERT INTO invoice_line_allocations(line_id, location_id, batch_id, quantity) VALUES (?1, ?2, ?3, ?4)", params![line_id, allocation.location_id, allocation.batch_id, allocation.quantity])?;
+        }
+    }
+    Ok(())
+}
+fn read_line_allocations(
+    conn: &Connection,
+    line: i64,
+    revision: bool,
+) -> Result<Vec<InvoiceAllocation>> {
+    let sql = if revision {
+        "SELECT location_id, batch_id, quantity FROM invoice_revision_line_allocations WHERE revision_line_id = ?1 ORDER BY id"
+    } else {
+        "SELECT location_id, batch_id, quantity FROM invoice_line_allocations WHERE line_id = ?1 ORDER BY id"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map([line], |r| {
+            Ok(InvoiceAllocation {
+                location_id: r.get(0)?,
+                batch_id: r.get(1)?,
+                quantity: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+fn check_line_allocations(
+    allocations: &[InvoiceAllocation],
+    quantity: i64,
+    location: i64,
+    batch: Option<i64>,
+) -> Result<()> {
+    if allocations
+        .first()
+        .is_none_or(|first| first.location_id != location || first.batch_id != batch)
+        || allocations
+            .iter()
+            .any(|allocation| allocation.quantity <= 0)
+        || allocations
+            .iter()
+            .map(|allocation| i128::from(allocation.quantity))
+            .sum::<i128>()
+            != i128::from(quantity)
+    {
+        return Err(Error::Validation(
+            "Invoice stock allocations are inconsistent".into(),
+        ));
+    }
+    Ok(())
+}
+fn read_allocation_details(
+    conn: &Connection,
+    line: i64,
+    revision: bool,
+) -> Result<Vec<InvoiceAllocationDetail>> {
+    let sql = if revision {
+        "SELECT loc.name, b.name, a.quantity FROM invoice_revision_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.revision_line_id = ?1 ORDER BY a.id"
+    } else {
+        "SELECT loc.name, b.name, a.quantity FROM invoice_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.line_id = ?1 ORDER BY a.id"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map([line], |r| {
+            Ok(InvoiceAllocationDetail {
+                location: r.get(0)?,
+                batch: r.get(1)?,
+                quantity: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+fn attach_allocation_details(
+    conn: &Connection,
+    id: i64,
+    revision: bool,
+    mut line: InvoiceDetailLine,
+) -> Result<InvoiceDetailLine> {
+    let allocations = read_allocation_details(conn, id, revision)?;
+    if allocations
+        .first()
+        .is_none_or(|first| first.location != line.location || first.batch != line.batch)
+        || allocations
+            .iter()
+            .any(|allocation| allocation.quantity <= 0)
+        || allocations
+            .iter()
+            .map(|allocation| i128::from(allocation.quantity))
+            .sum::<i128>()
+            != i128::from(line.quantity)
+    {
+        return Err(Error::Validation(
+            "Invoice stock allocations are inconsistent".into(),
+        ));
+    }
+    line.allocations = allocations;
+    Ok(line)
+}
+fn copy_invoice_line_revisions(conn: &Connection, invoice: i64, revision: i64) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+    let lines = stmt
+        .query_map([invoice], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (id, item, quantity, unit_price, amount, location, batch, trade) in lines {
+        let allocations = read_line_allocations(conn, id, false)?;
+        check_line_allocations(&allocations, quantity, location, batch)?;
+        conn.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![revision, item, quantity, unit_price, amount, location, batch, trade])?;
+        let revision_line = conn.last_insert_rowid();
+        for allocation in allocations {
+            conn.execute("INSERT INTO invoice_revision_line_allocations(revision_line_id, location_id, batch_id, quantity) VALUES (?1, ?2, ?3, ?4)", params![revision_line, allocation.location_id, allocation.batch_id, allocation.quantity])?;
+        }
     }
     Ok(())
 }
@@ -923,7 +1099,7 @@ impl Store {
         }
         let end = as_of.map(parse_date).transpose()?;
         let sql = "SELECT date, quantity FROM stock_adjustments WHERE company_id = ?1 AND item_id = ?2 AND batch_id = ?3 AND (?4 IS NULL OR location_id = ?4)
-            UNION ALL SELECT v.date, CASE i.kind WHEN 'Purchase' THEN l.quantity ELSE -l.quantity END FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND l.batch_id = ?3 AND (?4 IS NULL OR l.location_id = ?4)
+            UNION ALL SELECT v.date, CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND a.batch_id = ?3 AND (?4 IS NULL OR a.location_id = ?4)
             UNION ALL SELECT date, -quantity FROM stock_transfers WHERE company_id = ?1 AND item_id = ?2 AND batch_id = ?3 AND (?4 IS NULL OR from_location_id = ?4)
             UNION ALL SELECT date, quantity FROM stock_transfers WHERE company_id = ?1 AND item_id = ?2 AND batch_id = ?3 AND (?4 IS NULL OR to_location_id = ?4)";
         let mut stmt = self.conn.prepare(sql)?;
@@ -1328,7 +1504,7 @@ impl Store {
                 *sums.entry(item).or_default() += i128::from(quantity);
             }
         }
-        let mut invoices = self.conn.prepare("SELECT l.item_id, v.date, i.kind, l.quantity FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND l.location_id = ?2")?;
+        let mut invoices = self.conn.prepare("SELECT l.item_id, v.date, i.kind, a.quantity FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND a.location_id = ?2")?;
         for row in invoices.query_map(params![company_id, location_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -1501,7 +1677,7 @@ impl Store {
                 qty,
             ));
         }
-        let mut stmt = self.conn.prepare("SELECT l.id, v.date, i.kind, v.reference, l.quantity, loc.name, b.name FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id JOIN stock_locations loc ON loc.id = l.location_id AND loc.company_id = i.company_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND (?3 IS NULL OR l.location_id = ?3)")?;
+        let mut stmt = self.conn.prepare("SELECT a.id, v.date, i.kind, v.reference, a.quantity, loc.name, b.name FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = i.company_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND (?3 IS NULL OR a.location_id = ?3)")?;
         let rows = stmt.query_map(params![company_id, item_id, location_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -1603,19 +1779,35 @@ impl Store {
     /// Return a complete editable draft, scoped to the company.
     pub fn invoice_draft(&self, company_id: i64, invoice_id: i64) -> Result<InvoiceDraft> {
         let (kind, date, reference, narration, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days): (String, String, String, String, i64, i64, Option<i64>, i64, Option<String>, Option<u32>) = self.conn.query_row("SELECT i.kind, v.date, v.reference, v.narration, i.party_ledger_id, i.trade_ledger_id, i.tax_ledger_id, i.tax_amount, i.due_date, i.credit_days FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
-        let mut stmt = self.conn.prepare("SELECT item_id, quantity, unit_price, location_id, batch_id, trade_ledger_id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
-        let lines = stmt
+        let mut stmt = self.conn.prepare("SELECT id, item_id, quantity, unit_price, location_id, batch_id, trade_ledger_id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+        let raw_lines = stmt
             .query_map([invoice_id], |r| {
-                Ok(InvoiceLine {
-                    item_id: r.get(0)?,
-                    location_id: r.get(3)?,
-                    batch_id: r.get(4)?,
-                    trade_ledger_id: r.get(5)?,
-                    quantity: r.get(1)?,
-                    unit_price: r.get(2)?,
-                })
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut lines = Vec::with_capacity(raw_lines.len());
+        for (id, item_id, quantity, unit_price, location_id, batch_id, trade_ledger_id) in raw_lines
+        {
+            let allocations = read_line_allocations(&self.conn, id, false)?;
+            check_line_allocations(&allocations, quantity, location_id, batch_id)?;
+            lines.push(InvoiceLine {
+                item_id,
+                quantity,
+                unit_price,
+                location_id,
+                batch_id,
+                trade_ledger_id,
+                extra_allocations: allocations.into_iter().skip(1).collect(),
+            });
+        }
         let mut stmt = self.conn.prepare("SELECT ledger_id, amount, description FROM invoice_adjustments WHERE invoice_id = ?1 ORDER BY id")?;
         let adjustments = stmt
             .query_map([invoice_id], |r| {
@@ -1681,11 +1873,12 @@ impl Store {
         tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![voucher_revision, voucher_id])?;
         tx.execute("INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days) SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days FROM invoices WHERE id = ?2 AND company_id = ?3", params![voucher_revision, invoice_id, company_id])?;
         let revision_id = tx.last_insert_rowid();
-        tx.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id) SELECT ?1, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id FROM invoice_lines WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
+        copy_invoice_line_revisions(&tx, invoice_id, revision_id)?;
         tx.execute("INSERT INTO invoice_revision_adjustments(revision_id, ledger_id, amount, description) SELECT ?1, ledger_id, amount, description FROM invoice_adjustments WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
         tx.execute("UPDATE vouchers SET kind = ?1, reference = ?2, date = ?3, narration = ?4 WHERE id = ?5 AND company_id = ?6", params![draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim(), voucher_id, company_id])?;
         tx.execute("UPDATE invoices SET kind = ?1, party_ledger_id = ?2, trade_ledger_id = ?3, tax_ledger_id = ?4, tax_amount = ?5, due_date = ?6, credit_days = ?7 WHERE id = ?8 AND company_id = ?9", params![draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount, prepared.due_date, prepared.credit_days, invoice_id, company_id])?;
         tx.execute("DELETE FROM postings WHERE voucher_id = ?1", [voucher_id])?;
+        tx.execute("DELETE FROM invoice_line_allocations WHERE line_id IN (SELECT id FROM invoice_lines WHERE invoice_id = ?1)", [invoice_id])?;
         tx.execute(
             "DELETE FROM invoice_lines WHERE invoice_id = ?1",
             [invoice_id],
@@ -1747,21 +1940,29 @@ impl Store {
             credit_days,
         ) in rows
         {
-            let mut items = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name FROM invoice_revision_lines l JOIN invoice_revisions r ON r.id = l.revision_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, r.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.revision_id = ?1 ORDER BY l.id")?;
-            let lines = items
+            let mut items = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name, l.id FROM invoice_revision_lines l JOIN invoice_revisions r ON r.id = l.revision_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, r.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.revision_id = ?1 ORDER BY l.id")?;
+            let raw_lines = items
                 .query_map([id], |r| {
-                    Ok(InvoiceDetailLine {
-                        item: r.get(0)?,
-                        unit: r.get(1)?,
-                        location: r.get(5)?,
-                        batch: r.get(6)?,
-                        trade_ledger: r.get(7)?,
-                        quantity: r.get(2)?,
-                        unit_price: r.get(3)?,
-                        amount: r.get(4)?,
-                    })
+                    Ok((
+                        r.get::<_, i64>(8)?,
+                        InvoiceDetailLine {
+                            item: r.get(0)?,
+                            unit: r.get(1)?,
+                            location: r.get(5)?,
+                            batch: r.get(6)?,
+                            trade_ledger: r.get(7)?,
+                            quantity: r.get(2)?,
+                            unit_price: r.get(3)?,
+                            amount: r.get(4)?,
+                            allocations: Vec::new(),
+                        },
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut lines = Vec::with_capacity(raw_lines.len());
+            for (line_id, line) in raw_lines {
+                lines.push(attach_allocation_details(&self.conn, line_id, true, line)?);
+            }
             result.push(InvoiceRevision {
                 changed_at,
                 date,
@@ -1798,23 +1999,28 @@ impl Store {
         let mut result = Vec::new();
         for row in rows {
             let (id, voucher_id, kind, date, reference, party, tax, due_date, credit_days) = row?;
-            let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, i.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
+            let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name, l.id FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, i.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
             let line_amounts = amounts.query_map([id], |r| {
-                Ok(InvoiceDetailLine {
-                    item: r.get(0)?,
-                    unit: r.get(1)?,
-                    location: r.get(5)?,
-                    batch: r.get(6)?,
-                    trade_ledger: r.get(7)?,
-                    quantity: r.get(2)?,
-                    unit_price: r.get(3)?,
-                    amount: r.get(4)?,
-                })
+                Ok((
+                    r.get::<_, i64>(8)?,
+                    InvoiceDetailLine {
+                        item: r.get(0)?,
+                        unit: r.get(1)?,
+                        location: r.get(5)?,
+                        batch: r.get(6)?,
+                        trade_ledger: r.get(7)?,
+                        quantity: r.get(2)?,
+                        unit_price: r.get(3)?,
+                        amount: r.get(4)?,
+                        allocations: Vec::new(),
+                    },
+                ))
             })?;
             let mut total = i128::from(tax);
             let mut lines = Vec::new();
             for line in line_amounts {
-                let line = line?;
+                let (line_id, line) = line?;
+                let line = attach_allocation_details(&self.conn, line_id, false, line)?;
                 total += i128::from(line.amount);
                 lines.push(line);
             }
