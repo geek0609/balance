@@ -1578,6 +1578,15 @@ impl App {
         };
         ui.heading("Trial balance");
         ui.label("As of the end date; debit balances are positive, credits negative.");
+        if ui.button("Export trial balance as CSV").clicked() {
+            match self
+                .store
+                .export_trial_balance_csv(company, to, self.report_export_path.trim())
+            {
+                Ok(()) => self.message = "Trial balance exported".into(),
+                Err(e) => self.message = e.to_string(),
+            }
+        }
         egui::Grid::new("trial_balance")
             .striped(true)
             .show(ui, |ui| {
@@ -1592,6 +1601,28 @@ impl App {
                     ui.end_row();
                 }
             });
+        let debit: i128 = report
+            .trial_balance
+            .iter()
+            .map(|balance| i128::from(balance.amount).max(0))
+            .sum();
+        let credit: i128 = report
+            .trial_balance
+            .iter()
+            .map(|balance| (-i128::from(balance.amount)).max(0))
+            .sum();
+        ui.label(format!(
+            "Total debits: {}    Total credits: {}    Difference: {}",
+            money(debit),
+            money(credit),
+            money(debit - credit)
+        ));
+        if debit != credit {
+            ui.colored_label(
+                Color32::from_rgb(155, 55, 35),
+                "Trial balance is out of balance; review the underlying records.",
+            );
+        }
         ui.heading("Trial balance by account group");
         ui.small("Each group total includes its descendants. Do not add parent and child rows together. Balances are grouped by each ledger's current group.");
         if ui.button("Export grouped trial balance as CSV").clicked() {
@@ -4665,7 +4696,7 @@ impl App {
                     .desired_width(350.0),
             );
         });
-        ui.small("Exports include the current report filters and never overwrite existing files. Day-book, invoice-register, outstanding, stock and grouped trial-balance files include a context row; ledger files include opening and closing rows. Potential spreadsheet formulas in text are prefixed with an apostrophe.");
+        ui.small("Exports include the current report filters and never overwrite existing files. Day-book, invoice-register, outstanding, stock and trial-balance files include a context row; ledger files include opening and closing rows. Potential spreadsheet formulas in text are prefixed with an apostrophe.");
     }
     fn backup_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Back up data");

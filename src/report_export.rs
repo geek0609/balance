@@ -549,6 +549,75 @@ impl Store {
         )?;
         save(csv, destination)
     }
+
+    pub fn export_trial_balance_csv(
+        &self,
+        company: i64,
+        end: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let balances = self.balances_in_period(company, None, end)?;
+        let context = vec![self.report_company_name(company)?, optional_date(end)?];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "as_of"]),
+            &strings(&[
+                "row_type",
+                "ledger_id",
+                "ledger",
+                "category",
+                "group_id",
+                "debit",
+                "credit",
+                "balance",
+            ]),
+        )?;
+        contextual_row(
+            &mut csv,
+            &context,
+            &strings(&["context", "", "", "", "", "", "", ""]),
+        )?;
+        let (mut debit, mut credit) = (0_i128, 0_i128);
+        for balance in balances {
+            let amount = i128::from(balance.amount);
+            debit += amount.max(0);
+            credit += (-amount).max(0);
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "ledger".into(),
+                    balance.ledger.id.to_string(),
+                    text_cell(&balance.ledger.name),
+                    balance.ledger.category.as_str().into(),
+                    balance
+                        .ledger
+                        .group_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    money(amount.max(0)),
+                    money((-amount).max(0)),
+                    money(amount),
+                ],
+            )?;
+        }
+        contextual_row(
+            &mut csv,
+            &context,
+            &[
+                "grand_total".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                money(debit),
+                money(credit),
+                money(debit - credit),
+            ],
+        )?;
+        save(csv, destination)
+    }
 }
 
 fn strings(values: &[&str]) -> Vec<String> {
