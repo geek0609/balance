@@ -2231,7 +2231,7 @@ impl App {
             Some(id) => format!("Edit invoice {id}"),
             None => "Sales and purchase invoices".into(),
         });
-        ui.label("Save an invoice to create its accounting voucher and stock movements together. Prices are per unit; each line rounds to two decimal places.");
+        ui.label("Save an invoice to create its accounting voucher and any stock movements together. For services, remove all item lines and add a positive service / charge line. Item prices are per unit; each line rounds to two decimal places.");
         let items = match self.store.stock_items(company) {
             Ok(v) => v,
             Err(e) => {
@@ -2303,7 +2303,7 @@ impl App {
         pick_account(
             ui,
             "invoice-trade",
-            "Sales / purchase ledger",
+            "Default sales / purchase ledger (required)",
             &ledgers,
             &mut self.invoice_trade,
             false,
@@ -2463,17 +2463,13 @@ impl App {
             }
         }
         if let Some(index) = remove {
-            if self.invoice_lines.len() > 1 {
-                self.invoice_lines.remove(index);
-            } else {
-                self.message = "An invoice needs at least one line".into();
-            }
+            self.invoice_lines.remove(index);
         }
         if ui.button("Add item line").clicked() {
             self.invoice_lines.push(InvoiceLineForm::new());
         }
-        ui.heading("Additional charges and deductions");
-        ui.small("Enter each amount manually. These ledger adjustments do not calculate or classify tax.");
+        ui.heading("Services, charges and deductions");
+        ui.small("Enter each amount and description manually. For an invoice without stock items, include a positive line in an income account for a sale, or an expense or asset account for a purchase. These lines do not calculate or classify tax.");
         let mut remove_adjustment = None;
         for (index, adjustment) in self.invoice_adjustments.iter_mut().enumerate() {
             ui.horizontal(|ui| {
@@ -2513,7 +2509,7 @@ impl App {
         if let Some(index) = remove_adjustment {
             self.invoice_adjustments.remove(index);
         }
-        if ui.button("Add charge or deduction").clicked() {
+        if ui.button("Add service, charge or deduction").clicked() {
             self.invoice_adjustments.push(InvoiceAdjustmentForm {
                 ledger: None,
                 amount: String::new(),

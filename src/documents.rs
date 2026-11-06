@@ -133,7 +133,7 @@ impl Store {
         html.push_str("</tbody></table><table class=\"totals\"><tbody>");
         let _ = write!(
             html,
-            "<tr><td>Items after discounts</td><td class=\"num\">{}</td></tr>",
+            "<tr><td>Stock items after discounts</td><td class=\"num\">{}</td></tr>",
             money(subtotal)
         );
         if invoice.tax_amount != 0 {

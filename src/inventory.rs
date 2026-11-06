@@ -373,9 +373,9 @@ fn prepare_invoice(
     }
     .map(|date| date.format("%Y-%m-%d").to_string());
     let reference = required(&draft.reference, "Invoice reference")?.to_owned();
-    if draft.lines.is_empty() {
+    if draft.lines.is_empty() && draft.adjustments.is_empty() {
         return Err(Error::Validation(
-            "An invoice needs at least one item".into(),
+            "An invoice needs at least one item or service / charge line".into(),
         ));
     }
     if draft.tax_amount < 0
@@ -515,6 +515,7 @@ fn prepare_invoice(
     let subtotal = i64::try_from(subtotal)
         .map_err(|_| Error::Validation("Invoice amount is too large".into()))?;
     let mut total = i128::from(subtotal) + i128::from(draft.tax_amount);
+    let mut has_service_base = false;
     for adjustment in &draft.adjustments {
         if adjustment.amount == 0
             || adjustment.amount == i64::MIN
@@ -525,8 +526,20 @@ fn prepare_invoice(
                     .into(),
             ));
         }
-        ledger_category(conn, company_id, adjustment.ledger_id)?;
+        let category = ledger_category(conn, company_id, adjustment.ledger_id)?;
+        if adjustment.amount > 0
+            && ((draft.kind == InvoiceKind::Sale && category == Category::Income)
+                || (draft.kind == InvoiceKind::Purchase
+                    && matches!(category, Category::Expense | Category::Asset)))
+        {
+            has_service_base = true;
+        }
         total += i128::from(adjustment.amount);
+    }
+    if draft.lines.is_empty() && !has_service_base {
+        return Err(Error::Validation(
+            "A non-stock invoice needs a positive service / charge line in a compatible sales or purchase account".into(),
+        ));
     }
     if total <= 0 {
         return Err(Error::Validation(
