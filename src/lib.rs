@@ -247,7 +247,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=22).contains(&version) {
+    if !(1..=23).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -365,7 +365,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 22 {
+        if version > 23 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -549,6 +549,11 @@ impl Store {
         if version < 22 {
             tx.execute_batch("CREATE TABLE settlement_reversals(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), settlement_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), reversal_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
                 PRAGMA user_version = 22;")?;
+        }
+        if version < 23 {
+            tx.execute_batch("ALTER TABLE invoice_lines ADD COLUMN trade_ledger_id INTEGER REFERENCES ledgers(id);
+                ALTER TABLE invoice_revision_lines ADD COLUMN trade_ledger_id INTEGER REFERENCES ledgers(id);
+                PRAGMA user_version = 23;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1411,7 +1416,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, 23);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

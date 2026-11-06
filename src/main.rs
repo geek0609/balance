@@ -155,6 +155,7 @@ struct InvoiceLineForm {
     item: Option<i64>,
     location: Option<i64>,
     batch: Option<i64>,
+    trade_ledger: Option<i64>,
     quantity: String,
     price: String,
 }
@@ -164,6 +165,7 @@ impl InvoiceLineForm {
             item: None,
             location: None,
             batch: None,
+            trade_ledger: None,
             quantity: String::new(),
             price: String::new(),
         }
@@ -1912,6 +1914,23 @@ impl App {
                     &mut line.location,
                     false,
                 );
+                let trade = ledgers
+                    .iter()
+                    .find(|ledger| Some(ledger.id) == line.trade_ledger)
+                    .map(|ledger| ledger.name.as_str())
+                    .unwrap_or("Default ledger");
+                egui::ComboBox::from_id_salt(("invoice-item-ledger", index))
+                    .selected_text(trade)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut line.trade_ledger, None, "Default ledger");
+                        for ledger in &ledgers {
+                            ui.selectable_value(
+                                &mut line.trade_ledger,
+                                Some(ledger.id),
+                                &ledger.name,
+                            );
+                        }
+                    });
                 ui.add(
                     egui::TextEdit::singleline(&mut line.quantity)
                         .hint_text("Quantity")
@@ -2021,6 +2040,7 @@ impl App {
                             balance::Error::Validation("Select a location for every line".into())
                         })?,
                         batch_id: line.batch,
+                        trade_ledger_id: line.trade_ledger,
                         quantity: parse_quantity(&line.quantity)?,
                         unit_price: parse_amount(&line.price)?,
                     });
@@ -2327,6 +2347,7 @@ impl App {
                                         item: Some(line.item_id),
                                         location: Some(line.location_id),
                                         batch: line.batch_id,
+                                        trade_ledger: line.trade_ledger_id,
                                         quantity: format_quantity(i128::from(line.quantity)),
                                         price: format_amount(line.unit_price),
                                     })
@@ -2359,10 +2380,11 @@ impl App {
                     }
                     for line in invoice.lines {
                         ui.label(format!(
-                            "  {} at {}, batch {}: {} {} × {} = {}",
+                            "  {} at {}, batch {}, ledger {}: {} {} × {} = {}",
                             line.item,
                             line.location,
                             line.batch.as_deref().unwrap_or("unbatched"),
+                            line.trade_ledger,
                             format_quantity(i128::from(line.quantity)),
                             line.unit,
                             format_amount(line.unit_price),
@@ -2453,10 +2475,11 @@ impl App {
                                         }
                                         for line in revision.lines {
                                             ui.label(format!(
-                                                "  {} at {}, batch {}: {} {} × {} = {}",
+                                                "  {} at {}, batch {}, ledger {}: {} {} × {} = {}",
                                                 line.item,
                                                 line.location,
                                                 line.batch.as_deref().unwrap_or("unbatched"),
+                                                line.trade_ledger,
                                                 format_quantity(i128::from(line.quantity)),
                                                 line.unit,
                                                 format_amount(line.unit_price),
@@ -2579,7 +2602,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, unvalued stock items, restricted item invoices and simple receipts or payments against invoices. Unvalued opening quantities can be allocated by location and batch, including manufacture dates. Invoices require one matching new bill reference and one trade ledger; additional ledger postings become unclassified charges or deductions. Settlements require one party, one asset ledger and references to available invoices. Only one location and batch allocation per invoice item is supported. Tax details, expiry dates, invoice batch dates, nested locations, advances, other bill allocations, valued opening stock and other unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, unvalued stock items, restricted item invoices and simple receipts or payments against invoices. Unvalued opening quantities can be allocated by location and batch, including manufacture dates. Invoices require one matching new bill reference and one accounting allocation per item; additional ledger postings become unclassified charges or deductions. Settlements require one party, one asset ledger and references to available invoices. Only one location and batch allocation per invoice item is supported. Tax details, expiry dates, invoice batch dates, nested locations, advances, other bill allocations, valued opening stock and other unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Bank clearance");

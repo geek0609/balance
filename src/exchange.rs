@@ -94,6 +94,8 @@ struct ImportedInvoiceLine {
     existing_location_id: Option<i64>,
     batch: Option<String>,
     existing_batch_id: Option<i64>,
+    trade_ledger: String,
+    existing_trade_ledger_id: Option<i64>,
     quantity: i64,
     unit_price: i64,
 }
@@ -1249,15 +1251,9 @@ fn parse_imported_invoice(
                 .copied()
         });
         invoice_side(allocation, "ISDEEMEDPOSITIVE", expected > 0)?;
-        if trade
-            .as_ref()
-            .is_some_and(|existing| normalized(existing) != normalized(&ledger))
-        {
-            return Err(Error::Validation(
-                "multiple trade ledgers are not supported".into(),
-            ));
+        if trade.is_none() {
+            trade = Some(ledger.clone());
         }
-        trade = Some(ledger);
         subtotal += i128::from(amount);
         lines.push(ImportedInvoiceLine {
             item: name,
@@ -1268,6 +1264,8 @@ fn parse_imported_invoice(
             existing_location_id,
             batch: batch_name,
             existing_batch_id,
+            existing_trade_ledger_id: ledgers[&normalized(&ledger)].0,
+            trade_ledger: ledger,
             quantity,
             unit_price,
         });
@@ -1287,6 +1285,14 @@ fn parse_imported_invoice(
     if normalized(&party_name) == normalized(&trade) {
         return Err(Error::Validation(
             "party and trade ledgers must be different".into(),
+        ));
+    }
+    if lines
+        .iter()
+        .any(|line| normalized(&line.trade_ledger) == normalized(&party_name))
+    {
+        return Err(Error::Validation(
+            "item ledger must differ from the party".into(),
         ));
     }
     if adjustments
@@ -3119,6 +3125,10 @@ impl Store {
                 };
                 lines.push(InvoiceLine {
                     item_id,
+                    trade_ledger_id: {
+                        let id = resolve_ledger(&line.trade_ledger, line.existing_trade_ledger_id)?;
+                        (id != trade_id).then_some(id)
+                    },
                     location_id: {
                         let id = find_stock_location(&tx, plan.company_id, &line.location)?
                             .ok_or_else(|| {

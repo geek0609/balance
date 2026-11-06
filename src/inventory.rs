@@ -7,7 +7,7 @@ use crate::{
 use rusqlite::{params, Connection};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     str::FromStr,
 };
 
@@ -115,6 +115,8 @@ pub struct InvoiceLine {
     pub item_id: i64,
     pub location_id: i64,
     pub batch_id: Option<i64>,
+    /// None uses the invoice's default sales or purchase ledger.
+    pub trade_ledger_id: Option<i64>,
     pub quantity: i64,
     pub unit_price: i64,
 }
@@ -219,6 +221,7 @@ pub struct InvoiceDetailLine {
     pub unit: String,
     pub location: String,
     pub batch: Option<String>,
+    pub trade_ledger: String,
     pub quantity: i64,
     pub unit_price: i64,
     pub amount: i64,
@@ -358,6 +361,7 @@ fn prepare_invoice(
     }
     let mut amounts = Vec::with_capacity(draft.lines.len());
     let mut subtotal = 0_i128;
+    let mut trade_totals = BTreeMap::<i64, i128>::new();
     for line in &draft.lines {
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM stock_items WHERE id = ?1 AND company_id = ?2)",
@@ -381,8 +385,24 @@ fn prepare_invoice(
         }
         check_stock_batch(conn, company_id, line.item_id, line.batch_id)?;
         check_quantity_precision(conn, company_id, line.item_id, line.quantity)?;
+        let trade_id = line.trade_ledger_id.unwrap_or(draft.trade_ledger_id);
+        if trade_id == draft.party_ledger_id || draft.tax_ledger_id == Some(trade_id) {
+            return Err(Error::Validation(
+                "An item ledger must differ from the party and tax ledgers".into(),
+            ));
+        }
+        let category = ledger_category(conn, company_id, trade_id)?;
+        if (draft.kind == InvoiceKind::Sale && category != Category::Income)
+            || (draft.kind == InvoiceKind::Purchase
+                && !matches!(category, Category::Expense | Category::Asset))
+        {
+            return Err(Error::Validation(
+                "An item ledger has an incompatible category".into(),
+            ));
+        }
         let amount = line_amount(line.quantity, line.unit_price)?;
         subtotal += i128::from(amount);
+        *trade_totals.entry(trade_id).or_default() += i128::from(amount);
         amounts.push(amount);
     }
     let subtotal = i64::try_from(subtotal)
@@ -417,11 +437,15 @@ fn prepare_invoice(
         ledger_id: draft.party_ledger_id,
         amount: direction * total,
     }];
-    if subtotal != 0 {
-        postings.push(Posting {
-            ledger_id: draft.trade_ledger_id,
-            amount: -direction * subtotal,
-        });
+    for (ledger_id, amount) in trade_totals {
+        if amount != 0 {
+            let amount = i64::try_from(amount)
+                .map_err(|_| Error::Validation("Item ledger total is too large".into()))?;
+            postings.push(Posting {
+                ledger_id,
+                amount: -direction * amount,
+            });
+        }
     }
     if let Some(tax_id) = draft.tax_ledger_id {
         postings.push(Posting {
@@ -463,7 +487,7 @@ fn write_invoice_lines(
     amounts: &[i64],
 ) -> Result<()> {
     for (line, amount) in lines.iter().zip(amounts) {
-        conn.execute("INSERT INTO invoice_lines(invoice_id, item_id, quantity, unit_price, amount, location_id, batch_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![invoice, line.item_id, line.quantity, line.unit_price, amount, line.location_id, line.batch_id])?;
+        conn.execute("INSERT INTO invoice_lines(invoice_id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![invoice, line.item_id, line.quantity, line.unit_price, amount, line.location_id, line.batch_id, line.trade_ledger_id])?;
     }
     Ok(())
 }
@@ -1579,13 +1603,14 @@ impl Store {
     /// Return a complete editable draft, scoped to the company.
     pub fn invoice_draft(&self, company_id: i64, invoice_id: i64) -> Result<InvoiceDraft> {
         let (kind, date, reference, narration, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days): (String, String, String, String, i64, i64, Option<i64>, i64, Option<String>, Option<u32>) = self.conn.query_row("SELECT i.kind, v.date, v.reference, v.narration, i.party_ledger_id, i.trade_ledger_id, i.tax_ledger_id, i.tax_amount, i.due_date, i.credit_days FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
-        let mut stmt = self.conn.prepare("SELECT item_id, quantity, unit_price, location_id, batch_id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+        let mut stmt = self.conn.prepare("SELECT item_id, quantity, unit_price, location_id, batch_id, trade_ledger_id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
         let lines = stmt
             .query_map([invoice_id], |r| {
                 Ok(InvoiceLine {
                     item_id: r.get(0)?,
                     location_id: r.get(3)?,
                     batch_id: r.get(4)?,
+                    trade_ledger_id: r.get(5)?,
                     quantity: r.get(1)?,
                     unit_price: r.get(2)?,
                 })
@@ -1656,7 +1681,7 @@ impl Store {
         tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![voucher_revision, voucher_id])?;
         tx.execute("INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days) SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days FROM invoices WHERE id = ?2 AND company_id = ?3", params![voucher_revision, invoice_id, company_id])?;
         let revision_id = tx.last_insert_rowid();
-        tx.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount, location_id, batch_id) SELECT ?1, item_id, quantity, unit_price, amount, location_id, batch_id FROM invoice_lines WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
+        tx.execute("INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id) SELECT ?1, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id FROM invoice_lines WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
         tx.execute("INSERT INTO invoice_revision_adjustments(revision_id, ledger_id, amount, description) SELECT ?1, ledger_id, amount, description FROM invoice_adjustments WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
         tx.execute("UPDATE vouchers SET kind = ?1, reference = ?2, date = ?3, narration = ?4 WHERE id = ?5 AND company_id = ?6", params![draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim(), voucher_id, company_id])?;
         tx.execute("UPDATE invoices SET kind = ?1, party_ledger_id = ?2, trade_ledger_id = ?3, tax_ledger_id = ?4, tax_amount = ?5, due_date = ?6, credit_days = ?7 WHERE id = ?8 AND company_id = ?9", params![draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id, draft.tax_amount, prepared.due_date, prepared.credit_days, invoice_id, company_id])?;
@@ -1722,7 +1747,7 @@ impl Store {
             credit_days,
         ) in rows
         {
-            let mut items = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name FROM invoice_revision_lines l JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.revision_id = ?1 ORDER BY l.id")?;
+            let mut items = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name FROM invoice_revision_lines l JOIN invoice_revisions r ON r.id = l.revision_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, r.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.revision_id = ?1 ORDER BY l.id")?;
             let lines = items
                 .query_map([id], |r| {
                     Ok(InvoiceDetailLine {
@@ -1730,6 +1755,7 @@ impl Store {
                         unit: r.get(1)?,
                         location: r.get(5)?,
                         batch: r.get(6)?,
+                        trade_ledger: r.get(7)?,
                         quantity: r.get(2)?,
                         unit_price: r.get(3)?,
                         amount: r.get(4)?,
@@ -1772,13 +1798,14 @@ impl Store {
         let mut result = Vec::new();
         for row in rows {
             let (id, voucher_id, kind, date, reference, party, tax, due_date, credit_days) = row?;
-            let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name FROM invoice_lines l JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
+            let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, i.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
             let line_amounts = amounts.query_map([id], |r| {
                 Ok(InvoiceDetailLine {
                     item: r.get(0)?,
                     unit: r.get(1)?,
                     location: r.get(5)?,
                     batch: r.get(6)?,
+                    trade_ledger: r.get(7)?,
                     quantity: r.get(2)?,
                     unit_price: r.get(3)?,
                     amount: r.get(4)?,
