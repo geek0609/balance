@@ -457,6 +457,98 @@ impl Store {
         }
         save(csv, destination)
     }
+
+    pub fn export_group_trial_balance_csv(
+        &self,
+        company: i64,
+        end: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.grouped_trial_balance(company, end)?;
+        let context = vec![self.report_company_name(company)?, optional_date(end)?];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "as_of"]),
+            &strings(&[
+                "row_type",
+                "group_id",
+                "parent_id",
+                "group_path",
+                "category",
+                "ledger_id",
+                "ledger_name",
+                "direct_debit",
+                "direct_credit",
+                "including_descendants_debit",
+                "including_descendants_credit",
+            ]),
+        )?;
+        let mut heading = vec!["context".into()];
+        heading.resize(11, String::new());
+        contextual_row(&mut csv, &context, &heading)?;
+        for group in report.groups {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "group".into(),
+                    group.group.id.to_string(),
+                    group
+                        .group
+                        .parent_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    text_cell(&group.path.join(" / ")),
+                    group.group.category.as_str().into(),
+                    String::new(),
+                    String::new(),
+                    money(group.direct_debit),
+                    money(group.direct_credit),
+                    money(group.total_debit),
+                    money(group.total_credit),
+                ],
+            )?;
+        }
+        for balance in report.ungrouped {
+            let amount = i128::from(balance.amount);
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "ungrouped_ledger".into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    balance.ledger.category.as_str().into(),
+                    balance.ledger.id.to_string(),
+                    text_cell(&balance.ledger.name),
+                    money(amount.max(0)),
+                    money((-amount).max(0)),
+                    String::new(),
+                    String::new(),
+                ],
+            )?;
+        }
+        contextual_row(
+            &mut csv,
+            &context,
+            &[
+                "grand_total".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                money(report.debit),
+                money(report.credit),
+            ],
+        )?;
+        save(csv, destination)
+    }
 }
 
 fn strings(values: &[&str]) -> Vec<String> {

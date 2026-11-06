@@ -1543,6 +1543,7 @@ impl App {
     }
     fn reports_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Financial reports");
+        self.report_export_path_field(ui);
         ui.label("Dates are inclusive. Leave a field blank for an open boundary.");
         ui.horizontal(|ui| {
             ui.label("Profit and loss from");
@@ -1593,6 +1594,16 @@ impl App {
             });
         ui.heading("Trial balance by account group");
         ui.small("Each group total includes its descendants. Do not add parent and child rows together. Balances are grouped by each ledger's current group.");
+        if ui.button("Export grouped trial balance as CSV").clicked() {
+            match self.store.export_group_trial_balance_csv(
+                company,
+                to,
+                self.report_export_path.trim(),
+            ) {
+                Ok(()) => self.message = "Grouped trial balance exported".into(),
+                Err(e) => self.message = e.to_string(),
+            }
+        }
         match self.store.grouped_trial_balance(company, to) {
             Ok(grouped) => {
                 ui.label(format!(
@@ -4654,7 +4665,7 @@ impl App {
                     .desired_width(350.0),
             );
         });
-        ui.small("Exports include the current report filters and never overwrite existing files. Day-book, invoice-register, outstanding and stock files include a context row; ledger files include opening and closing rows. Potential spreadsheet formulas in text are prefixed with an apostrophe.");
+        ui.small("Exports include the current report filters and never overwrite existing files. Day-book, invoice-register, outstanding, stock and grouped trial-balance files include a context row; ledger files include opening and closing rows. Potential spreadsheet formulas in text are prefixed with an apostrophe.");
     }
     fn backup_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Back up data");
