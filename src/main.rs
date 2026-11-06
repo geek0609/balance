@@ -10,6 +10,7 @@ use balance::inventory::{
     StockItem, StockLocation,
 };
 use balance::pricing::PriceList;
+use balance::reorder::ReorderRule;
 use balance::terms::LedgerTerms;
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
@@ -138,6 +139,11 @@ struct App {
     transfer_quantity: String,
     transfer_reason: String,
     stock_as_of: String,
+    reorder_selection: Option<i64>,
+    reorder_editing: Option<i64>,
+    reorder_enabled: bool,
+    reorder_level: String,
+    reorder_quantity: String,
     price_list_name: String,
     price_list: Option<i64>,
     price_item: Option<i64>,
@@ -359,6 +365,11 @@ impl App {
             transfer_quantity: String::new(),
             transfer_reason: String::new(),
             stock_as_of: String::new(),
+            reorder_selection: None,
+            reorder_editing: None,
+            reorder_enabled: true,
+            reorder_level: String::new(),
+            reorder_quantity: String::new(),
             price_list_name: String::new(),
             price_list: None,
             price_item: None,
@@ -464,6 +475,10 @@ impl App {
         self.stock_edit_description.clear();
         self.stock_group_parent = None;
         self.stock_balance_location = None;
+        self.reorder_selection = None;
+        self.reorder_editing = None;
+        self.reorder_level.clear();
+        self.reorder_quantity.clear();
         self.price_list_name.clear();
         self.price_list = None;
         self.price_item = None;
@@ -534,6 +549,7 @@ impl App {
             || self.editing_invoice.is_some()
             || self.copying_invoice
             || self.stock_editing.is_some();
+        let profile_dirty = profile_dirty || self.reorder_editing.is_some();
         if profile_dirty {
             ui.label("Save or discard the current edits before changing company.");
         }
@@ -2033,6 +2049,105 @@ impl App {
                 });
         }
         ui.separator();
+        ui.heading("Reorder settings");
+        ui.small("Warnings compare company-wide on-hand quantities with current rules; they do not include future orders or create purchase orders.");
+        pick_stock(
+            ui,
+            "reorder-item",
+            "Item",
+            &items,
+            &mut self.reorder_selection,
+        );
+        if ui
+            .add_enabled(
+                self.reorder_editing.is_none() && self.reorder_selection.is_some(),
+                egui::Button::new("Open reorder settings"),
+            )
+            .clicked()
+        {
+            if let Some(item) = self.reorder_selection {
+                match self.store.reorder_rule(company, item) {
+                    Ok(rule) => {
+                        self.reorder_editing = Some(item);
+                        self.reorder_enabled = rule.as_ref().is_none_or(|value| value.enabled);
+                        self.reorder_level = rule
+                            .as_ref()
+                            .map(|value| format_quantity(i128::from(value.level)))
+                            .unwrap_or_default();
+                        self.reorder_quantity = rule
+                            .as_ref()
+                            .map(|value| format_quantity(i128::from(value.quantity)))
+                            .unwrap_or_default();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        }
+        if let Some(item) = self.reorder_editing {
+            let name = items
+                .iter()
+                .find(|value| value.id == item)
+                .map(|value| value.name.as_str())
+                .unwrap_or("Unknown item");
+            ui.label(format!("Editing reorder settings for {name}"));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.reorder_enabled, "Enable warning");
+                ui.label("Reorder at or below");
+                ui.text_edit_singleline(&mut self.reorder_level);
+                ui.label("Suggested quantity");
+                ui.text_edit_singleline(&mut self.reorder_quantity);
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Save reorder settings").clicked() {
+                    let result = (|| -> balance::Result<()> {
+                        let rule = ReorderRule {
+                            enabled: self.reorder_enabled,
+                            level: parse_quantity(&self.reorder_level)?,
+                            quantity: parse_quantity(&self.reorder_quantity)?,
+                        };
+                        self.store.save_reorder_rule(company, item, &rule)
+                    })();
+                    match result {
+                        Ok(()) => {
+                            self.reorder_editing = None;
+                            self.message = "Reorder settings saved".into();
+                        }
+                        Err(e) => self.failure(e),
+                    }
+                }
+                if ui.button("Cancel reorder settings").clicked() {
+                    self.reorder_editing = None;
+                }
+            });
+            egui::CollapsingHeader::new("Reorder setting history")
+                .id_salt(("reorder-history", item))
+                .show(ui, |ui| {
+                    match self.store.reorder_rule_history(company, item) {
+                        Ok(rows) if rows.is_empty() => {
+                            ui.label("No earlier versions.");
+                        }
+                        Ok(rows) => {
+                            for row in rows {
+                                ui.label(format!(
+                                    "{} UTC — {} · level {} · quantity {}",
+                                    row.changed_at,
+                                    if row.rule.enabled {
+                                        "enabled"
+                                    } else {
+                                        "disabled"
+                                    },
+                                    format_quantity(i128::from(row.rule.level)),
+                                    format_quantity(i128::from(row.rule.quantity))
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                        }
+                    }
+                });
+        }
+        ui.separator();
         ui.heading("Stock batches");
         pick_stock(ui, "batch-item", "Item", &items, &mut self.batch_item);
         ui.horizontal(|ui| {
@@ -2424,6 +2539,29 @@ impl App {
         ui.small(
             "Quantities may be negative. Stock valuation and cost of goods are not calculated.",
         );
+        ui.heading("Low stock across all locations");
+        ui.small("Uses the as-of date above and current reorder settings, regardless of the location filter. Suggested quantities are fixed and do not account for pending orders.");
+        match self.store.low_stock(company, end) {
+            Ok(rows) if rows.is_empty() => {
+                ui.label("No enabled reorder thresholds reached.");
+            }
+            Ok(rows) => {
+                for row in rows {
+                    ui.label(format!(
+                        "{}: {} {} on hand · level {} · suggested {} {}",
+                        row.item.name,
+                        format_quantity(row.on_hand),
+                        row.item.unit,
+                        format_quantity(i128::from(row.rule.level)),
+                        format_quantity(i128::from(row.rule.quantity)),
+                        row.item.unit
+                    ));
+                }
+            }
+            Err(e) => {
+                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+            }
+        }
         ui.separator();
         ui.heading("Stock activity");
         ui.small("The location filter above also applies to stock activity; transfers are shown when a location is selected.");

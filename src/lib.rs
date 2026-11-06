@@ -17,6 +17,7 @@ pub mod invoice_register;
 pub mod ledgers;
 pub mod opening;
 pub mod pricing;
+pub mod reorder;
 pub mod report_export;
 pub mod reversals;
 pub mod terms;
@@ -256,7 +257,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=31).contains(&version) {
+    if !(1..=32).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -368,6 +369,8 @@ impl Store {
             "stock_prices",
             "ledger_terms",
             "ledger_term_revisions",
+            "stock_reorder_rules",
+            "stock_reorder_revisions",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -385,7 +388,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 31 {
+        if version > 32 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -624,6 +627,12 @@ impl Store {
                 CREATE TABLE ledger_term_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), credit_days INTEGER, credit_limit INTEGER, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
                 CREATE INDEX ledger_term_revisions_ledger ON ledger_term_revisions(company_id, ledger_id, id);
                 PRAGMA user_version = 31;")?;
+        }
+        if version < 32 {
+            tx.execute_batch("CREATE TABLE stock_reorder_rules(item_id INTEGER PRIMARY KEY REFERENCES stock_items(id), company_id INTEGER NOT NULL REFERENCES companies(id), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), reorder_level INTEGER NOT NULL CHECK(reorder_level >= 0), reorder_quantity INTEGER NOT NULL CHECK(reorder_quantity > 0));
+                CREATE TABLE stock_reorder_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), reorder_level INTEGER NOT NULL, reorder_quantity INTEGER NOT NULL, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE INDEX stock_reorder_revisions_item ON stock_reorder_revisions(company_id, item_id, id);
+                PRAGMA user_version = 32;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1486,7 +1495,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 31);
+        assert_eq!(version, 32);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
