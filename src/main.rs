@@ -51,6 +51,10 @@ struct App {
     opening_debit: bool,
     lines: Vec<VoucherLine>,
     editing_voucher: Option<i64>,
+    voucher_reversal_target: Option<i64>,
+    voucher_reversal_date: String,
+    voucher_reversal_reference: String,
+    voucher_reversal_reason: String,
     voucher_kind: VoucherKind,
     voucher_reference: String,
     date: String,
@@ -244,6 +248,10 @@ impl App {
             opening_debit: true,
             lines: vec![VoucherLine::new(true), VoucherLine::new(false)],
             editing_voucher: None,
+            voucher_reversal_target: None,
+            voucher_reversal_date: String::new(),
+            voucher_reversal_reference: String::new(),
+            voucher_reversal_reason: String::new(),
             voucher_kind: VoucherKind::Journal,
             voucher_reference: String::new(),
             date: String::new(),
@@ -357,6 +365,10 @@ impl App {
         self.company_profile = CompanyProfile::default();
         self.company_profile_original = CompanyProfile::default();
         self.clear_voucher();
+        self.voucher_reversal_target = None;
+        self.voucher_reversal_date.clear();
+        self.voucher_reversal_reference.clear();
+        self.voucher_reversal_reason.clear();
         self.register_ledger = None;
         self.ledger_group = None;
         self.group_parent = None;
@@ -1001,6 +1013,49 @@ impl App {
         }
         ui.separator();
         ui.heading("Voucher history");
+        if let Some(target) = self.voucher_reversal_target {
+            ui.label(format!(
+                "Reverse ordinary voucher #{target} with a separate journal entry"
+            ));
+            ui.horizontal(|ui| {
+                ui.label("Date (YYYY-MM-DD)");
+                ui.text_edit_singleline(&mut self.voucher_reversal_date);
+                ui.label("Reference");
+                ui.text_edit_singleline(&mut self.voucher_reversal_reference);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Reason");
+                ui.text_edit_singleline(&mut self.voucher_reversal_reason);
+                if ui
+                    .add_enabled(
+                        self.editing_voucher.is_none(),
+                        egui::Button::new("Post voucher reversal"),
+                    )
+                    .clicked()
+                {
+                    match self.store.reverse_voucher(
+                        company,
+                        target,
+                        &self.voucher_reversal_date,
+                        &self.voucher_reversal_reference,
+                        &self.voucher_reversal_reason,
+                    ) {
+                        Ok(id) => {
+                            self.voucher_reversal_target = None;
+                            self.voucher_reversal_date.clear();
+                            self.voucher_reversal_reference.clear();
+                            self.voucher_reversal_reason.clear();
+                            self.message = format!("Reversal voucher {id} posted");
+                        }
+                        Err(e) => self.failure(e),
+                    }
+                }
+                if ui.button("Cancel reversal").clicked() {
+                    self.voucher_reversal_target = None;
+                }
+            });
+            ui.small("The original remains in the books. The new entry reverses its postings on the chosen date; it does not change invoice, stock or settlement records.");
+        }
         match self.store.vouchers(company) {
             Ok(vouchers) => {
                 for voucher in vouchers {
@@ -1008,6 +1063,14 @@ impl App {
                         .store
                         .is_invoice_voucher(company, voucher.id)
                         .unwrap_or(true);
+                    let reversal = match self.store.voucher_reversal(company, voucher.id) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            self.failure(e);
+                            return;
+                        }
+                    };
+                    let protected = invoice_backed || reversal.is_some();
                     ui.horizontal(|ui| {
                         ui.label(format!(
                             "{}  #{}  {}",
@@ -1018,7 +1081,7 @@ impl App {
                             ui.label(format!("Ref: {}", voucher.reference));
                         }
                         if ui
-                            .add_enabled(!invoice_backed, egui::Button::new("Edit"))
+                            .add_enabled(!protected, egui::Button::new("Edit"))
                             .clicked()
                         {
                             self.editing_voucher = Some(voucher.id);
@@ -1039,10 +1102,28 @@ impl App {
                                 .collect();
                             self.message.clear();
                         }
-                        if invoice_backed {
-                            ui.small("Linked postings cannot be edited here");
+                        if ui
+                            .add_enabled(
+                                !protected && self.editing_voucher.is_none(),
+                                egui::Button::new("Select for reversal"),
+                            )
+                            .clicked()
+                        {
+                            self.voucher_reversal_target = Some(voucher.id);
+                        }
+                        if protected {
+                            ui.small("Linked or reversed postings cannot be edited here");
                         }
                     });
+                    if let Some(reversal) = reversal {
+                        ui.small(format!(
+                            "Original #{} · reversal #{} on {} · {}",
+                            reversal.original_voucher_id,
+                            reversal.reversal_voucher_id,
+                            reversal.date,
+                            reversal.reason
+                        ));
+                    }
                     for p in &voucher.postings {
                         let name = ledgers
                             .iter()

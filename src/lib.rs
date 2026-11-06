@@ -14,6 +14,7 @@ pub mod exchange;
 pub mod inventory;
 pub mod opening;
 pub mod report_export;
+pub mod reversals;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -250,7 +251,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=26).contains(&version) {
+    if !(1..=27).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -355,6 +356,7 @@ impl Store {
             "invoice_revision_line_allocations",
             "company_profiles",
             "company_profile_revisions",
+            "voucher_reversals",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -372,7 +374,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 26 {
+        if version > 27 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -585,6 +587,10 @@ impl Store {
                 CREATE TABLE company_profile_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, address TEXT NOT NULL, region TEXT NOT NULL, postal_code TEXT NOT NULL, country TEXT NOT NULL, email TEXT NOT NULL, phone TEXT NOT NULL, tax_id TEXT NOT NULL, registration_type TEXT NOT NULL, financial_year_start TEXT NOT NULL, books_start TEXT NOT NULL);
                 CREATE INDEX company_profile_revisions_company ON company_profile_revisions(company_id, id);
                 PRAGMA user_version = 26;")?;
+        }
+        if version < 27 {
+            tx.execute_batch("CREATE TABLE voucher_reversals(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), original_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), reversal_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK(original_voucher_id != reversal_voucher_id));
+                PRAGMA user_version = 27;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -833,7 +839,7 @@ impl Store {
         check_ledgers(&tx, company_id, postings)?;
         opening::check_no_control_postings(&tx, company_id, postings)?;
         let invoice_backed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?2 AND (original_voucher_id = ?1 OR reversal_voucher_id = ?1))",
             params![voucher_id, company_id],
             |r| r.get(0),
         )?;
@@ -1447,7 +1453,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 26);
+        assert_eq!(version, 27);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
