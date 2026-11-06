@@ -130,6 +130,7 @@ struct App {
     invoice_lines: Vec<InvoiceLineForm>,
     invoice_adjustments: Vec<InvoiceAdjustmentForm>,
     editing_invoice: Option<i64>,
+    invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
     settlement_date: String,
@@ -318,6 +319,7 @@ impl App {
             invoice_lines: vec![InvoiceLineForm::new()],
             invoice_adjustments: Vec::new(),
             editing_invoice: None,
+            invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
             settlement_date: String::new(),
@@ -2427,6 +2429,15 @@ impl App {
                     }
                 }
                 ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("New invoice HTML file");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.invoice_document_path)
+                            .hint_text("Absolute path ending in .html")
+                            .desired_width(350.0),
+                    );
+                });
+                ui.small("Export a saved invoice for review or printing in a browser. Existing files are not overwritten; party details are current. This basic layout is not a statutory tax document.");
                 for invoice in invoices {
                     ui.strong(format!(
                         "{}  {}  {}  {}  Total {}  Paid {}  Outstanding {}",
@@ -2438,6 +2449,16 @@ impl App {
                         money(invoice.settled),
                         money(invoice.outstanding)
                     ));
+                    if ui.button("Export printable invoice").clicked() {
+                        match self.store.export_invoice_html(
+                            company,
+                            invoice.id,
+                            self.invoice_document_path.trim(),
+                        ) {
+                            Ok(()) => self.message = "Invoice document created".into(),
+                            Err(e) => self.failure(e),
+                        }
+                    }
                     if ui
                         .add_enabled(
                             !invoice.has_settlement_history && self.editing_invoice.is_none(),

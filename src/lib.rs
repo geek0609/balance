@@ -8,6 +8,7 @@ use std::{collections::HashMap, path::Path, str::FromStr};
 use thiserror::Error;
 pub mod banking;
 pub mod contacts;
+pub mod documents;
 pub mod exchange;
 pub mod inventory;
 pub mod opening;
