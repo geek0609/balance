@@ -1544,7 +1544,7 @@ impl App {
     fn reports_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Financial reports");
         self.report_export_path_field(ui);
-        ui.label("Dates are inclusive. Leave a field blank for an open boundary.");
+        ui.label("Dates are inclusive. Leave a field blank for an open boundary; an empty end date includes future-dated entries.");
         ui.horizontal(|ui| {
             ui.label("Profit and loss from");
             ui.add(
@@ -2543,6 +2543,9 @@ impl App {
         ui.separator();
         ui.heading("Stock quantities");
         self.report_export_path_field(ui);
+        ui.small(
+            "An empty as-of date includes all saved movements, including future-dated entries.",
+        );
         ui.horizontal(|ui| {
             ui.label("As of (optional)");
             ui.add(egui::TextEdit::singleline(&mut self.stock_as_of).hint_text("YYYY-MM-DD"));

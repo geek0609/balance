@@ -48,6 +48,8 @@ For the restricted bank statement import, prepare a UTF-8 CSV with columns `id,d
 
 Report CSV exports include the company and selected date filters. Day-book, invoice-register, trial-balance, outstanding and company-wide stock files contain a `context` row even when no entries match; ledger files contain opening and closing rows. Group trial-balance parent totals include their descendants, so parent and child totals must not be added together. Stock exports use current reorder settings even for a historical quantity date and do not include pending orders or valuation. Debit and credit columns are positive; ledger balances use debit-positive, credit-negative signs. Text that could be interpreted as a spreadsheet formula is prefixed with an apostrophe, which changes those exported text values. Exported reports and spreadsheet handling still need runtime verification.
 
+An open-ended report or stock quantity view includes all saved entries, including entries dated in the future. Supply an end or as-of date when a cutoff is needed.
+
 ## Planned feature coverage
 
 The roadmap covers the breadth required for a mature, full-featured accounting and business-management system. Individual items may require substantial design, implementation and verification; the list will be expanded as remaining workflows and edge cases are identified.
