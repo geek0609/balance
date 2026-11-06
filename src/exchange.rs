@@ -927,7 +927,7 @@ fn parse_imported_settlement(
         metadata,
     })
 }
-/// Parse only invoices whose party, item accounting, amounts and bill reference
+/// Parse only invoices whose party, accounting, amounts and bill reference
 /// can all be represented without dropping information.
 fn parse_imported_invoice(
     node: Node<'_, '_>,
@@ -962,10 +962,17 @@ fn parse_imported_invoice(
     {
         issues.push(format!("{label}: voucher name attribute is not supported"));
     }
+    let has_inventory = node.children().any(|child| {
+        child.is_element()
+            && local_name(child).eq_ignore_ascii_case("ALLINVENTORYENTRIES.LIST")
+            && meaningful(child)
+    });
     for field in ["PERSISTEDVIEW", "OBJVIEW"] {
-        if direct_text(node, field)
-            .is_some_and(|v| !v.is_empty() && !v.eq_ignore_ascii_case("Invoice Voucher View"))
-        {
+        if direct_text(node, field).is_some_and(|v| {
+            !v.is_empty()
+                && !v.eq_ignore_ascii_case("Invoice Voucher View")
+                && !(!has_inventory && v.eq_ignore_ascii_case("Accounting Voucher View"))
+        }) {
             return Err(Error::Validation(format!("unsupported {field}")));
         }
     }
@@ -976,7 +983,7 @@ fn parse_imported_invoice(
         VoucherKind::Purchase => InvoiceKind::Purchase,
         _ => {
             return Err(Error::Validation(
-                "only sales and purchase item invoices are supported".into(),
+                "only sales and purchase invoices are supported".into(),
             ))
         }
     };
@@ -1359,7 +1366,28 @@ fn parse_imported_invoice(
             discount,
         });
     }
-    let trade = trade.ok_or_else(|| Error::Validation("at least one item is required".into()))?;
+    let trade = match trade {
+        Some(trade) => trade,
+        None => adjustments
+            .iter()
+            .find(|adjustment| {
+                if adjustment.amount <= 0 {
+                    return false;
+                }
+                let category = ledgers
+                    .get(&normalized(&adjustment.ledger))
+                    .map(|entry| entry.1);
+                (kind == InvoiceKind::Sale && category == Some(Category::Income))
+                    || (kind == InvoiceKind::Purchase
+                        && matches!(category, Some(Category::Expense | Category::Asset)))
+            })
+            .map(|adjustment| adjustment.ledger.clone())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "a non-stock invoice needs a positive sales or purchase ledger line".into(),
+                )
+            })?,
+    };
     i64::try_from(subtotal).map_err(|_| Error::Validation("invoice amount is too large".into()))?;
     let total = subtotal
         + adjustments
