@@ -9,6 +9,7 @@ use balance::inventory::{
     InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine, SettlementAllocation, StockBatch,
     StockItem, StockLocation,
 };
+use balance::pricing::PriceList;
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
 
@@ -124,6 +125,12 @@ struct App {
     transfer_quantity: String,
     transfer_reason: String,
     stock_as_of: String,
+    price_list_name: String,
+    price_list: Option<i64>,
+    price_item: Option<i64>,
+    price_date: String,
+    price_amount: String,
+    price_reason: String,
     stock_register_item: Option<i64>,
     stock_register_from: String,
     stock_register_to: String,
@@ -327,6 +334,12 @@ impl App {
             transfer_quantity: String::new(),
             transfer_reason: String::new(),
             stock_as_of: String::new(),
+            price_list_name: String::new(),
+            price_list: None,
+            price_item: None,
+            price_date: String::new(),
+            price_amount: String::new(),
+            price_reason: String::new(),
             stock_register_item: None,
             stock_register_from: String::new(),
             stock_register_to: String::new(),
@@ -418,6 +431,12 @@ impl App {
         self.stock_edit_description.clear();
         self.stock_group_parent = None;
         self.stock_balance_location = None;
+        self.price_list_name.clear();
+        self.price_list = None;
+        self.price_item = None;
+        self.price_date.clear();
+        self.price_amount.clear();
+        self.price_reason.clear();
         self.batch_item = None;
         self.batch_name.clear();
         self.batch_manufactured.clear();
@@ -1763,6 +1782,90 @@ impl App {
             }
         };
         ui.separator();
+        ui.heading("Stock price lists");
+        ui.small("Prices are per base unit. A later entry for the same item and effective date replaces the earlier value for lookup; both remain in history. Invoice prices are saved independently.");
+        ui.horizontal(|ui| {
+            ui.label("New price list");
+            ui.text_edit_singleline(&mut self.price_list_name);
+            if ui.button("Create price list").clicked() {
+                match self.store.create_price_list(company, &self.price_list_name) {
+                    Ok(id) => {
+                        self.price_list = Some(id);
+                        self.price_list_name.clear();
+                        self.message = "Price list created".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        });
+        let lists = match self.store.price_lists(company) {
+            Ok(lists) => lists,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        pick_price_list(ui, "stock-price-list", &lists, &mut self.price_list);
+        pick_stock(ui, "stock-price-item", "Item", &items, &mut self.price_item);
+        ui.horizontal(|ui| {
+            ui.label("Effective date");
+            ui.add(egui::TextEdit::singleline(&mut self.price_date).hint_text("YYYY-MM-DD"));
+            ui.label("Price");
+            ui.add(egui::TextEdit::singleline(&mut self.price_amount).hint_text("0.00"));
+            ui.label("Reason");
+            ui.text_edit_singleline(&mut self.price_reason);
+            if ui.button("Record price").clicked() {
+                let result = (|| -> balance::Result<i64> {
+                    self.store.record_stock_price(
+                        company,
+                        self.price_list.ok_or_else(|| {
+                            balance::Error::Validation("Select a price list".into())
+                        })?,
+                        self.price_item
+                            .ok_or_else(|| balance::Error::Validation("Select an item".into()))?,
+                        &self.price_date,
+                        parse_amount(&self.price_amount)?,
+                        &self.price_reason,
+                    )
+                })();
+                match result {
+                    Ok(_) => {
+                        self.price_amount.clear();
+                        self.price_reason.clear();
+                        self.message = "Price recorded".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        });
+        if let Some(list) = self.price_list {
+            egui::CollapsingHeader::new("Price history")
+                .id_salt(("price-history", list))
+                .show(ui, |ui| {
+                    match self.store.stock_price_history(company, list) {
+                        Ok(rows) if rows.is_empty() => {
+                            ui.label("No prices recorded.");
+                        }
+                        Ok(rows) => {
+                            for entry in rows {
+                                ui.label(format!(
+                                    "{} — {}: {} per {} · {} (recorded {} UTC)",
+                                    entry.effective_date,
+                                    entry.item,
+                                    format_amount(entry.unit_price),
+                                    entry.unit,
+                                    entry.reason,
+                                    entry.recorded_at
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                        }
+                    }
+                });
+        }
+        ui.separator();
         ui.heading("Stock batches");
         pick_stock(ui, "batch-item", "Item", &items, &mut self.batch_item);
         ui.horizontal(|ui| {
@@ -2292,6 +2395,62 @@ impl App {
             ui.label("Reference");
             ui.text_edit_singleline(&mut self.invoice_reference);
         });
+        let lists = match self.store.price_lists(company) {
+            Ok(lists) => lists,
+            Err(e) => {
+                self.failure(e);
+                return;
+            }
+        };
+        ui.horizontal(|ui| {
+            pick_price_list(ui, "invoice-price-list", &lists, &mut self.price_list);
+            if ui.button("Fill blank item prices").clicked() {
+                let prices = (|| -> balance::Result<Vec<(usize, i64)>> {
+                    let list = self
+                        .price_list
+                        .ok_or_else(|| balance::Error::Validation("Select a price list".into()))?;
+                    let mut result = Vec::new();
+                    for (index, line) in self
+                        .invoice_lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| line.price.trim().is_empty())
+                    {
+                        let item = line.item.ok_or_else(|| {
+                            balance::Error::Validation(
+                                "Select an item on every blank-price line".into(),
+                            )
+                        })?;
+                        let price = self
+                            .store
+                            .stock_price(company, list, item, &self.invoice_date)?
+                            .ok_or_else(|| {
+                                balance::Error::Validation(format!(
+                                    "No applicable price for item line {}",
+                                    index + 1
+                                ))
+                            })?;
+                        result.push((index, price));
+                    }
+                    if result.is_empty() {
+                        return Err(balance::Error::Validation(
+                            "There are no blank item prices to fill".into(),
+                        ));
+                    }
+                    Ok(result)
+                })();
+                match prices {
+                    Ok(prices) => {
+                        for (index, price) in prices {
+                            self.invoice_lines[index].price = format_amount(price);
+                        }
+                        self.message = "Blank item prices filled for the invoice date".into();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        });
+        ui.small("Price lookup uses the invoice date and only fills blank prices. A saved invoice keeps its entered price, not the price-list link.");
         pick_account(
             ui,
             "invoice-party",
@@ -4040,6 +4199,26 @@ fn pick_batch(
             ui.selectable_value(selected, None, "Unbatched");
             for batch in batches {
                 ui.selectable_value(selected, Some(batch.id), &batch.name);
+            }
+        });
+}
+fn pick_price_list(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    lists: &[PriceList],
+    selected: &mut Option<i64>,
+) {
+    ui.label("Price list");
+    let name = lists
+        .iter()
+        .find(|list| Some(list.id) == *selected)
+        .map(|list| list.name.as_str())
+        .unwrap_or("Select list");
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(name)
+        .show_ui(ui, |ui| {
+            for list in lists {
+                ui.selectable_value(selected, Some(list.id), &list.name);
             }
         });
 }

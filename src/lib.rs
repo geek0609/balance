@@ -15,6 +15,7 @@ pub mod grouped_reports;
 pub mod inventory;
 pub mod ledgers;
 pub mod opening;
+pub mod pricing;
 pub mod report_export;
 pub mod reversals;
 
@@ -253,7 +254,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=29).contains(&version) {
+    if !(1..=30).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -361,6 +362,8 @@ impl Store {
             "voucher_reversals",
             "ledger_revisions",
             "opening_balance_clears",
+            "price_lists",
+            "stock_prices",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -378,7 +381,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 29 {
+        if version > 30 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -605,6 +608,12 @@ impl Store {
             tx.execute_batch("CREATE TABLE opening_balance_clears(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), original_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), clearing_voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id), reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK(original_voucher_id != clearing_voucher_id));
                 CREATE INDEX opening_balance_clears_ledger ON opening_balance_clears(company_id, ledger_id, id);
                 PRAGMA user_version = 29;")?;
+        }
+        if version < 30 {
+            tx.execute_batch("CREATE TABLE price_lists(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), name TEXT NOT NULL, UNIQUE(company_id, name));
+                CREATE TABLE stock_prices(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), price_list_id INTEGER NOT NULL REFERENCES price_lists(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), effective_date TEXT NOT NULL, unit_price INTEGER NOT NULL CHECK(unit_price >= 0), reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE INDEX stock_prices_lookup ON stock_prices(company_id, price_list_id, item_id, effective_date, id);
+                PRAGMA user_version = 30;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1467,7 +1476,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 29);
+        assert_eq!(version, 30);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
