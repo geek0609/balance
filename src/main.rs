@@ -1389,6 +1389,58 @@ impl App {
                     ui.end_row();
                 }
             });
+        ui.heading("Trial balance by account group");
+        ui.small("Each group total includes its descendants. Do not add parent and child rows together. Balances are grouped by each ledger's current group.");
+        match self.store.grouped_trial_balance(company, to) {
+            Ok(grouped) => {
+                ui.label(format!(
+                    "Total debit: {}    Total credit: {}",
+                    money(grouped.debit),
+                    money(grouped.credit)
+                ));
+                egui::Grid::new("group-trial-balance")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for label in [
+                            "Group",
+                            "Category",
+                            "Direct debit",
+                            "Direct credit",
+                            "Including subgroups debit",
+                            "Including subgroups credit",
+                        ] {
+                            ui.strong(label);
+                        }
+                        ui.end_row();
+                        for group in grouped
+                            .groups
+                            .iter()
+                            .filter(|g| g.total_debit != 0 || g.total_credit != 0)
+                        {
+                            ui.label(group.path.join(" / "));
+                            ui.label(group.group.category.as_str());
+                            ui.label(money(group.direct_debit));
+                            ui.label(money(group.direct_credit));
+                            ui.label(money(group.total_debit));
+                            ui.label(money(group.total_credit));
+                            ui.end_row();
+                        }
+                    });
+                if !grouped.ungrouped.is_empty() {
+                    ui.label("Ungrouped ledgers:");
+                    for balance in grouped.ungrouped {
+                        ui.label(format!(
+                            "{}: {}",
+                            balance.ledger.name,
+                            format_amount(balance.amount)
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+            }
+        }
         ui.separator();
         ui.heading("Profit and loss");
         ui.label(format!(

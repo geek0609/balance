@@ -11,6 +11,7 @@ pub mod company;
 pub mod contacts;
 pub mod documents;
 pub mod exchange;
+pub mod grouped_reports;
 pub mod inventory;
 pub mod ledgers;
 pub mod opening;
