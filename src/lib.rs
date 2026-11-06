@@ -18,6 +18,7 @@ pub mod opening;
 pub mod pricing;
 pub mod report_export;
 pub mod reversals;
+pub mod terms;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -254,7 +255,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=30).contains(&version) {
+    if !(1..=31).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -364,6 +365,8 @@ impl Store {
             "opening_balance_clears",
             "price_lists",
             "stock_prices",
+            "ledger_terms",
+            "ledger_term_revisions",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -381,7 +384,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 30 {
+        if version > 31 {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -614,6 +617,12 @@ impl Store {
                 CREATE TABLE stock_prices(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), price_list_id INTEGER NOT NULL REFERENCES price_lists(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), effective_date TEXT NOT NULL, unit_price INTEGER NOT NULL CHECK(unit_price >= 0), reason TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
                 CREATE INDEX stock_prices_lookup ON stock_prices(company_id, price_list_id, item_id, effective_date, id);
                 PRAGMA user_version = 30;")?;
+        }
+        if version < 31 {
+            tx.execute_batch("CREATE TABLE ledger_terms(ledger_id INTEGER PRIMARY KEY REFERENCES ledgers(id), company_id INTEGER NOT NULL REFERENCES companies(id), credit_days INTEGER CHECK(credit_days BETWEEN 0 AND 4294967295), credit_limit INTEGER CHECK(credit_limit >= 0));
+                CREATE TABLE ledger_term_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), ledger_id INTEGER NOT NULL REFERENCES ledgers(id), credit_days INTEGER, credit_limit INTEGER, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE INDEX ledger_term_revisions_ledger ON ledger_term_revisions(company_id, ledger_id, id);
+                PRAGMA user_version = 31;")?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1476,7 +1485,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 30);
+        assert_eq!(version, 31);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {

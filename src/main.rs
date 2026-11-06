@@ -10,6 +10,7 @@ use balance::inventory::{
     StockItem, StockLocation,
 };
 use balance::pricing::PriceList;
+use balance::terms::LedgerTerms;
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
 
@@ -49,6 +50,12 @@ struct App {
     profile_selection: Option<i64>,
     ledger_profile: LedgerProfile,
     profile_original: LedgerProfile,
+    terms_selection: Option<i64>,
+    terms_ledger: Option<i64>,
+    terms_days: String,
+    terms_limit: String,
+    terms_original_days: String,
+    terms_original_limit: String,
     opening_ledger: Option<i64>,
     opening_date: String,
     opening_amount: String,
@@ -258,6 +265,12 @@ impl App {
             profile_selection: None,
             ledger_profile: LedgerProfile::default(),
             profile_original: LedgerProfile::default(),
+            terms_selection: None,
+            terms_ledger: None,
+            terms_days: String::new(),
+            terms_limit: String::new(),
+            terms_original_days: String::new(),
+            terms_original_limit: String::new(),
             opening_ledger: None,
             opening_date: String::new(),
             opening_amount: String::new(),
@@ -404,6 +417,12 @@ impl App {
         self.profile_selection = None;
         self.ledger_profile = LedgerProfile::default();
         self.profile_original = LedgerProfile::default();
+        self.terms_selection = None;
+        self.terms_ledger = None;
+        self.terms_days.clear();
+        self.terms_limit.clear();
+        self.terms_original_days.clear();
+        self.terms_original_limit.clear();
         self.opening_ledger = None;
         self.bank_ledger = None;
         self.bank_posting = None;
@@ -493,6 +512,9 @@ impl App {
         let profile_dirty = (self.profile_ledger.is_some()
             && self.ledger_profile != self.profile_original)
             || self.company_profile != self.company_profile_original
+            || (self.terms_ledger.is_some()
+                && (self.terms_days != self.terms_original_days
+                    || self.terms_limit != self.terms_original_limit))
             || self.editing_ledger.is_some()
             || self.editing_invoice.is_some()
             || self.stock_editing.is_some();
@@ -989,6 +1011,135 @@ impl App {
                                     revision.profile.mobile,
                                     revision.profile.tax_id,
                                     revision.profile.tax_registration_type
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                        }
+                    }
+                });
+        }
+        ui.separator();
+        ui.heading("Party payment terms");
+        ui.small("Defaults are optional. Credit limits are informational and do not prevent invoicing or payments.");
+        let party_ledgers: Vec<_> = ledgers
+            .iter()
+            .filter(|ledger| matches!(ledger.category, Category::Asset | Category::Liability))
+            .cloned()
+            .collect();
+        pick_account(
+            ui,
+            "terms-ledger",
+            "Ledger",
+            &party_ledgers,
+            &mut self.terms_selection,
+            false,
+        );
+        let terms_dirty = self.terms_ledger.is_some()
+            && (self.terms_days != self.terms_original_days
+                || self.terms_limit != self.terms_original_limit);
+        if ui
+            .add_enabled(
+                !terms_dirty && self.terms_selection.is_some(),
+                egui::Button::new("Open payment terms"),
+            )
+            .clicked()
+        {
+            if let Some(id) = self.terms_selection {
+                match self.store.ledger_terms(company, id) {
+                    Ok(terms) => {
+                        self.terms_ledger = Some(id);
+                        self.terms_days = terms
+                            .credit_days
+                            .map(|days| days.to_string())
+                            .unwrap_or_default();
+                        self.terms_limit =
+                            terms.credit_limit.map(format_amount).unwrap_or_default();
+                        self.terms_original_days = self.terms_days.clone();
+                        self.terms_original_limit = self.terms_limit.clone();
+                    }
+                    Err(e) => self.failure(e),
+                }
+            }
+        }
+        if let Some(id) = self.terms_ledger {
+            let name = party_ledgers
+                .iter()
+                .find(|l| l.id == id)
+                .map(|l| l.name.as_str())
+                .unwrap_or("Unknown ledger");
+            ui.label(format!("Editing payment terms for {name}"));
+            ui.horizontal(|ui| {
+                ui.label("Default credit days");
+                ui.text_edit_singleline(&mut self.terms_days);
+                ui.label("Informational credit limit");
+                ui.text_edit_singleline(&mut self.terms_limit);
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Save payment terms").clicked() {
+                    let result = (|| -> balance::Result<()> {
+                        let credit_days = if self.terms_days.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.terms_days.trim().parse::<u32>().map_err(|_| {
+                                balance::Error::Validation(
+                                    "Credit days must be a non-negative whole number".into(),
+                                )
+                            })?)
+                        };
+                        let credit_limit = if self.terms_limit.trim().is_empty() {
+                            None
+                        } else {
+                            Some(parse_amount(&self.terms_limit)?)
+                        };
+                        self.store.save_ledger_terms(
+                            company,
+                            id,
+                            &LedgerTerms {
+                                credit_days,
+                                credit_limit,
+                            },
+                        )?;
+                        self.terms_days =
+                            credit_days.map(|days| days.to_string()).unwrap_or_default();
+                        self.terms_limit = credit_limit.map(format_amount).unwrap_or_default();
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            self.terms_original_days = self.terms_days.clone();
+                            self.terms_original_limit = self.terms_limit.clone();
+                            self.message = "Payment terms saved".into();
+                        }
+                        Err(e) => self.failure(e),
+                    }
+                }
+                if ui.button("Discard payment term edits").clicked() {
+                    self.terms_days = self.terms_original_days.clone();
+                    self.terms_limit = self.terms_original_limit.clone();
+                }
+            });
+            egui::CollapsingHeader::new("Payment term history")
+                .id_salt(("term-history", id))
+                .show(ui, |ui| {
+                    match self.store.ledger_terms_history(company, id) {
+                        Ok(rows) if rows.is_empty() => {
+                            ui.label("No earlier versions.");
+                        }
+                        Ok(rows) => {
+                            for row in rows {
+                                ui.label(format!(
+                                    "{} UTC — credit days: {} · limit: {}",
+                                    row.changed_at,
+                                    row.terms
+                                        .credit_days
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_else(|| "none".into()),
+                                    row.terms
+                                        .credit_limit
+                                        .map(format_amount)
+                                        .unwrap_or_else(|| "none".into())
                                 ));
                             }
                         }
@@ -2459,6 +2610,40 @@ impl App {
             &mut self.invoice_party,
             false,
         );
+        if let Some(party) = self.invoice_party {
+            if ledgers.iter().any(|ledger| {
+                ledger.id == party
+                    && matches!(ledger.category, Category::Asset | Category::Liability)
+            }) {
+                match self.store.ledger_terms(company, party) {
+                    Ok(terms) => {
+                        if let Some(limit) = terms.credit_limit {
+                            ui.small(format!(
+                                "Party credit limit: {} (informational; not enforced)",
+                                format_amount(limit)
+                            ));
+                        }
+                        if let Some(days) = terms.credit_days {
+                            if ui
+                                .add_enabled(
+                                    self.invoice_due_date.trim().is_empty()
+                                        && self.invoice_credit_days.trim().is_empty(),
+                                    egui::Button::new(format!(
+                                        "Apply default credit period: {days} days"
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                self.invoice_credit_days = days.to_string();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                    }
+                }
+            }
+        }
         pick_account(
             ui,
             "invoice-trade",
