@@ -1853,6 +1853,11 @@ impl Store {
             if !known_ledgers.insert(normalized(&name)) {
                 plan.issues.push(format!("Ledger {name}: duplicate name"));
             }
+            if crate::opening::is_control_name(&name) {
+                plan.issues.push(format!(
+                    "Ledger {name}: name is reserved for opening balances"
+                ));
+            }
             plan.accounts.push(Account {
                 name,
                 group,
@@ -2985,6 +2990,11 @@ impl Store {
             )?;
         }
         for account in &plan.accounts {
+            if crate::opening::is_control_name(&account.name) {
+                return Err(Error::Validation(
+                    "A ledger name is reserved for opening balances".into(),
+                ));
+            }
             if find_ledger(&tx, plan.company_id, &account.name)?.is_some() {
                 return Err(Error::Validation(format!(
                     "Ledger {} already exists",

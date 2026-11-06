@@ -37,7 +37,7 @@ impl Store {
                 "The opening difference ledger is maintained automatically".into(),
             ));
         }
-        if name.to_lowercase() == "opening balance difference" {
+        if crate::opening::is_control_name(name) {
             return Err(Error::Validation("That ledger name is reserved".into()));
         }
         let group_category: String = tx

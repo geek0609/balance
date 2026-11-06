@@ -673,6 +673,11 @@ impl Store {
         group_id: i64,
     ) -> Result<i64> {
         let name = required(name, "Ledger name")?;
+        if opening::is_control_name(name) {
+            return Err(Error::Validation(
+                "That ledger name is reserved for opening balances".into(),
+            ));
+        }
         let category: String = self
             .conn
             .query_row(

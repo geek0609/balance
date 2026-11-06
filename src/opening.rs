@@ -7,6 +7,9 @@ use crate::{
 use rusqlite::{params, Connection, OptionalExtension};
 
 const DIFFERENCE_NAME: &str = "Opening Balance Difference";
+pub(crate) fn is_control_name(name: &str) -> bool {
+    name.trim().to_lowercase() == DIFFERENCE_NAME.to_lowercase()
+}
 #[derive(Debug, Clone)]
 pub struct OpeningBalance {
     pub date: String,
@@ -42,7 +45,7 @@ fn ensure_control(conn: &Connection, company: i64) -> Result<i64> {
     }
     let mut stmt = conn.prepare("SELECT name FROM ledgers WHERE company_id = ?1")?;
     for name in stmt.query_map([company], |r| r.get::<_, String>(0))? {
-        if name?.trim().to_lowercase() == DIFFERENCE_NAME.to_lowercase() {
+        if is_control_name(&name?) {
             return Err(Error::Validation(
                 "The reserved opening difference ledger name is already in use".into(),
             ));
