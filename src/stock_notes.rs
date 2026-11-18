@@ -8,6 +8,7 @@ use crate::{parse_date, required, Category, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -76,6 +77,30 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_partial_invoicing(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX stock_note_invoice_lines_note ON stock_note_invoice_lines(note_line_id);
+         CREATE TABLE stock_note_invoice_spans(
+            invoice_line_id INTEGER NOT NULL REFERENCES stock_note_invoice_lines(invoice_line_id),
+            start_quantity INTEGER NOT NULL CHECK(start_quantity >= 0),
+            quantity INTEGER NOT NULL CHECK(quantity > 0),
+            PRIMARY KEY(invoice_line_id, start_quantity)
+         );
+         INSERT INTO stock_note_invoice_spans(invoice_line_id, start_quantity, quantity)
+         SELECT link.invoice_line_id, 0, l.quantity
+         FROM stock_note_invoice_lines link JOIN invoice_lines l ON l.id = link.invoice_line_id;
+         CREATE VIEW stock_note_billed_quantities AS
+         SELECT n.id AS note_line_id, COALESCE((
+            SELECT SUM(l.quantity)
+            FROM stock_note_invoice_lines link JOIN invoice_lines l ON l.id = link.invoice_line_id
+            WHERE link.note_line_id = n.id
+              AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = l.invoice_id)
+         ), 0) AS billed
+         FROM stock_note_lines n;",
+    )?;
+    Ok(())
+}
+
 pub fn note_label(kind: InvoiceKind) -> &'static str {
     match kind {
         InvoiceKind::Sale => "Delivery note",
@@ -119,7 +144,8 @@ pub struct StockNote {
     pub party_ledger_id: i64,
     pub order_id: Option<i64>,
     pub narration: String,
-    pub active_invoice_id: Option<i64>,
+    pub has_active_invoices: bool,
+    pub has_unbilled_stock: bool,
     pub reversed_on: Option<String>,
     pub reversal_reason: Option<String>,
 }
@@ -128,8 +154,10 @@ impl StockNote {
     pub fn status(&self) -> &'static str {
         if self.reversed_on.is_some() {
             "Reversed"
-        } else if self.active_invoice_id.is_some() {
+        } else if !self.has_unbilled_stock {
             "Invoiced"
+        } else if self.has_active_invoices {
+            "Partially invoiced"
         } else {
             "Awaiting invoice"
         }
@@ -144,6 +172,13 @@ pub struct StockNoteLine {
     pub unit: String,
     pub location: String,
     pub batch: Option<String>,
+    pub billed: i64,
+}
+
+impl StockNoteLine {
+    pub fn unbilled(&self) -> i64 {
+        self.values.quantity - self.billed
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -157,9 +192,12 @@ pub struct StockNoteInvoice {
 const NOTES: &str =
     "SELECT n.id, n.kind, n.date, n.reference, p.name, n.party_ledger_id,
             n.order_id, n.narration, n.reversed_on, n.reversal_reason,
-            (SELECT link.invoice_id FROM stock_note_invoices link
+            EXISTS(SELECT 1 FROM stock_note_invoices link
              WHERE link.note_id = n.id
-               AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id))
+               AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id)),
+            EXISTS(SELECT 1 FROM stock_note_lines l
+                   LEFT JOIN stock_note_billed_quantities b ON b.note_line_id = l.id
+                   WHERE l.note_id = n.id AND l.quantity > COALESCE(b.billed, 0))
      FROM stock_notes n JOIN ledgers p ON p.id = n.party_ledger_id AND p.company_id = n.company_id
      WHERE n.company_id = ?1";
 
@@ -175,7 +213,8 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<StockNote> {
         narration: row.get(7)?,
         reversed_on: row.get(8)?,
         reversal_reason: row.get(9)?,
-        active_invoice_id: row.get(10)?,
+        has_active_invoices: row.get(10)?,
+        has_unbilled_stock: row.get(11)?,
     })
 }
 
@@ -191,11 +230,12 @@ pub(crate) fn get_note(conn: &Connection, company: i64, note: i64) -> Result<Sto
 fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<Vec<StockNoteLine>> {
     let mut stmt = conn.prepare(
         "SELECT l.id, l.item_id, l.location_id, l.batch_id, l.quantity, l.unit_price,
-                i.name, i.unit, loc.name, b.name
+                i.name, i.unit, loc.name, b.name, COALESCE(q.billed, 0)
          FROM stock_note_lines l JOIN stock_notes n ON n.id = l.note_id
          JOIN stock_items i ON i.id = l.item_id AND i.company_id = n.company_id
          JOIN stock_locations loc ON loc.id = l.location_id AND loc.company_id = n.company_id
          LEFT JOIN stock_batches b ON b.id = l.batch_id
+         LEFT JOIN stock_note_billed_quantities q ON q.note_line_id = l.id
          WHERE n.company_id = ?1 AND n.id = ?2 ORDER BY l.id",
     )?;
     let rows = stmt
@@ -213,6 +253,7 @@ fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<Vec<StockNot
                 unit: row.get(7)?,
                 location: row.get(8)?,
                 batch: row.get(9)?,
+                billed: row.get(10)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -248,8 +289,12 @@ fn check_after_invoice_reversals(
     company: i64,
     note: i64,
     date: NaiveDate,
+    allow_active: bool,
 ) -> Result<()> {
     for invoice in invoice_history(conn, company, note)? {
+        if allow_active && invoice.reversed_on.is_none() {
+            continue;
+        }
         let reversed = invoice.reversed_on.ok_or_else(|| {
             Error::Validation("Reverse the active invoice before changing this stock note".into())
         })?;
@@ -260,6 +305,61 @@ fn check_after_invoice_reversals(
         }
     }
     Ok(())
+}
+
+fn allocate_spans(
+    conn: &Connection,
+    note_line: &StockNoteLine,
+    quantity: i64,
+) -> Result<Vec<Range<i64>>> {
+    let capacity = note_line.values.quantity;
+    let mut stmt = conn.prepare(
+        "SELECT s.start_quantity, s.quantity
+         FROM stock_note_invoice_lines link
+         JOIN stock_note_invoice_spans s ON s.invoice_line_id = link.invoice_line_id
+         JOIN invoice_lines l ON l.id = link.invoice_line_id
+         WHERE link.note_line_id = ?1
+           AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = l.invoice_id)
+         ORDER BY s.start_quantity",
+    )?;
+    let rows = stmt.query_map([note_line.id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut spans = Vec::new();
+    let mut remaining = quantity;
+    let mut cursor = 0;
+    let mut already_billed = 0;
+    for row in rows {
+        let (start, used) = row?;
+        let end = start.checked_add(used).ok_or_else(invalid_spans)?;
+        if start < cursor || used <= 0 || end > capacity {
+            return Err(invalid_spans());
+        }
+        let available = (start - cursor).min(remaining);
+        if available > 0 {
+            spans.push(cursor..cursor + available);
+            remaining -= available;
+        }
+        cursor = end;
+        already_billed += used;
+    }
+    if already_billed != note_line.billed {
+        return Err(invalid_spans());
+    }
+    if remaining > capacity - cursor {
+        return Err(Error::Validation(format!(
+            "Quantity exceeds the unbilled amount for {}",
+            note_line.item
+        )));
+    }
+    if remaining > 0 {
+        spans.push(cursor..cursor + remaining);
+    }
+    Ok(spans)
+}
+
+fn invalid_spans() -> Error {
+    Error::Validation("Stock note invoice quantities do not reconcile".into())
 }
 
 pub(crate) fn linked_note(conn: &Connection, invoice: i64) -> Result<Option<i64>> {
@@ -428,7 +528,7 @@ impl Store {
                 "Reversal date cannot precede the stock note date".into(),
             ));
         }
-        check_after_invoice_reversals(&tx, company, id, date)?;
+        check_after_invoice_reversals(&tx, company, id, date, false)?;
         let movement_reason = format!(
             "{} {} (#{id}) reversal: {reason}",
             note_label(note.kind),
@@ -462,7 +562,7 @@ impl Store {
         Ok(())
     }
 
-    /// Bill the full physical note once. Its stock remains at the original movement date.
+    /// Bill unbilled quantities from a note. Stock stays on the movement date.
     pub fn invoice_stock_note(
         &mut self,
         company: i64,
@@ -474,7 +574,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let note = get_note(&tx, company, id)?;
-        if note.reversed_on.is_some() || note.active_invoice_id.is_some() {
+        if note.reversed_on.is_some() || !note.has_unbilled_stock {
             return Err(Error::Validation(
                 "Select a stock note awaiting invoice".into(),
             ));
@@ -489,26 +589,32 @@ impl Store {
                 "Invoice type and party must match the stock note".into(),
             ));
         }
-        check_after_invoice_reversals(&tx, company, id, date)?;
+        check_after_invoice_reversals(&tx, company, id, date, true)?;
 
         let lines = note_lines(&tx, company, id)?;
         let mut expected: HashMap<_, _> = lines
             .iter()
-            .map(|line| (line.values.bucket(), line.values.quantity))
+            .map(|line| (line.values.bucket(), line))
             .collect();
-        if lines.is_empty() || lines.len() != draft.lines.len() {
+        if draft.lines.is_empty() {
             return Err(Error::Validation(
-                "Invoice all stock note lines together".into(),
+                "Include at least one unbilled stock note line".into(),
             ));
         }
+        let mut plan = Vec::with_capacity(draft.lines.len());
         for line in &draft.lines {
             let key = (line.item_id, line.location_id, line.batch_id);
-            if !line.extra_allocations.is_empty() || expected.remove(&key) != Some(line.quantity) {
+            if !line.extra_allocations.is_empty() || line.quantity <= 0 {
                 return Err(Error::Validation(
-                    "Invoice items, quantities, locations and batches must match the stock note"
-                        .into(),
+                    "Each stock note line needs a positive quantity at its recorded location and batch".into(),
                 ));
             }
+            let note_line = expected.remove(&key).ok_or_else(|| {
+                Error::Validation(
+                    "Use each stock note item, location and batch at most once per invoice".into(),
+                )
+            })?;
+            plan.push((note_line.id, allocate_spans(&tx, note_line, line.quantity)?));
         }
 
         let (invoice, _) = insert_invoice_on_connection(&tx, company, draft)?;
@@ -516,17 +622,28 @@ impl Store {
             "INSERT INTO stock_note_invoices(invoice_id, note_id) VALUES (?1, ?2)",
             params![invoice, id],
         )?;
-        let linked = tx.execute(
-            "INSERT INTO stock_note_invoice_lines(invoice_line_id, note_line_id)
-             SELECT l.id, nl.id FROM invoice_lines l JOIN stock_note_lines nl
-                 ON l.item_id = nl.item_id AND l.location_id = nl.location_id AND l.batch_id IS nl.batch_id
-             WHERE l.invoice_id = ?1 AND nl.note_id = ?2",
-            params![invoice, id],
-        )?;
-        if linked != lines.len() {
-            return Err(Error::Validation(
-                "Invoice lines could not be linked to the stock note".into(),
-            ));
+        {
+            let mut stmt =
+                tx.prepare("SELECT id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+            let invoice_lines = stmt
+                .query_map([invoice], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if invoice_lines.len() != plan.len() {
+                return Err(invalid_spans());
+            }
+            for (invoice_line, (note_line, spans)) in invoice_lines.into_iter().zip(plan) {
+                tx.execute(
+                    "INSERT INTO stock_note_invoice_lines(invoice_line_id, note_line_id) VALUES (?1, ?2)",
+                    params![invoice_line, note_line],
+                )?;
+                for span in spans {
+                    tx.execute(
+                        "INSERT INTO stock_note_invoice_spans(invoice_line_id, start_quantity, quantity)
+                         VALUES (?1, ?2, ?3)",
+                        params![invoice_line, span.start, span.end - span.start],
+                    )?;
+                }
+            }
         }
         if let Some(order) = note.order_id {
             tx.execute(

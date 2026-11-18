@@ -42,7 +42,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 56;
+const SCHEMA_VERSION: i64 = 57;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -457,6 +457,7 @@ impl Store {
             "stock_note_lines",
             "stock_note_invoices",
             "stock_note_invoice_lines",
+            "stock_note_invoice_spans",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -820,6 +821,10 @@ impl Store {
         if version < 56 {
             stock_notes::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 56)?;
+        }
+        if version < 57 {
+            stock_notes::migrate_partial_invoicing(&tx)?;
+            tx.pragma_update(None, "user_version", 57)?;
         }
         tx.commit()?;
         Ok(Self { conn })

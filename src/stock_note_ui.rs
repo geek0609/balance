@@ -302,7 +302,15 @@ impl App {
         egui::Grid::new(("stock-note-lines", note.id))
             .striped(true)
             .show(ui, |ui| {
-                for heading in ["Item", "Location", "Batch", "Quantity", "Unit price"] {
+                for heading in [
+                    "Item",
+                    "Location",
+                    "Batch",
+                    "Quantity",
+                    "Invoiced",
+                    "Unbilled",
+                    "Unit price",
+                ] {
                     ui.strong(heading);
                 }
                 ui.end_row();
@@ -315,6 +323,12 @@ impl App {
                         format_quantity(i128::from(line.values.quantity)),
                         line.unit
                     ));
+                    ui.label(format_quantity(i128::from(line.billed)));
+                    if note.reversed_on.is_none() {
+                        ui.label(format_quantity(i128::from(line.unbilled())));
+                    } else {
+                        ui.label("—");
+                    }
                     ui.label(format_amount(line.values.unit_price));
                     ui.end_row();
                 }
@@ -353,16 +367,19 @@ impl App {
                 "Stock reversed {date} · {}",
                 note.reversal_reason.as_deref().unwrap_or_default()
             ));
-        } else if note.active_invoice_id.is_none() {
-            if ui
+        }
+        if note.reversed_on.is_none()
+            && note.has_unbilled_stock
+            && ui
                 .add_enabled(
                     !self.invoice_draft_in_use(),
-                    egui::Button::new("Prepare invoice"),
+                    egui::Button::new("Prepare invoice (replace draft)"),
                 )
                 .clicked()
-            {
-                self.prepare_stock_note_invoice(note, &lines);
-            }
+        {
+            self.prepare_stock_note_invoice(note, &lines);
+        }
+        if note.reversed_on.is_none() && !note.has_active_invoices {
             ui.collapsing("Reverse stock movement", |ui| -> Result<()> {
                 let form = &mut self.stock_note_screen;
                 ui.horizontal(|ui| {
@@ -394,12 +411,13 @@ impl App {
     fn prepare_stock_note_invoice(&mut self, note: &StockNote, lines: &[StockNoteLine]) {
         let lines = lines
             .iter()
+            .filter(|line| line.unbilled() > 0)
             .map(|line| {
                 let mut form = InvoiceLineForm::new();
                 form.item = Some(line.values.item_id);
                 form.location = Some(line.values.location_id);
                 form.batch = line.values.batch_id;
-                form.quantity = format_quantity(i128::from(line.values.quantity));
+                form.quantity = format_quantity(i128::from(line.unbilled()));
                 form.price = format_amount(line.values.unit_price);
                 form
             })

@@ -3152,7 +3152,7 @@ impl App {
                 ));
             }
             Some(InvoiceSource::StockNote(note)) => {
-                ui.label(format!("Stock note {note}. Quantities, locations and batches come from the note. Review prices and tax before posting the invoice."));
+                ui.label(format!("Stock note {note}. Reduce quantities or remove lines to bill part of the note. Review prices and tax before posting."));
             }
             None => {
                 ui.label("Save an invoice to create its accounting voucher and any stock movements together. For services, remove all item lines and add a positive service / charge line. Item prices are per unit; each line rounds to two decimal places.");
@@ -3414,13 +3414,11 @@ impl App {
                             );
                         }
                     });
-                ui.add_enabled_ui(!from_note, |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut line.quantity)
-                            .hint_text("Quantity")
-                            .desired_width(90.0),
-                    );
-                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut line.quantity)
+                        .hint_text("Quantity")
+                        .desired_width(90.0),
+                );
                 ui.add(
                     egui::TextEdit::singleline(&mut line.price)
                         .hint_text("Unit price")
@@ -3469,7 +3467,7 @@ impl App {
                         ));
                     }
                 }
-                if !from_note && ui.button("Remove").clicked() {
+                if ui.button("Remove").clicked() {
                     remove = Some(index);
                 }
             });

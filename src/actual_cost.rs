@@ -649,10 +649,9 @@ impl Store {
                 .net_sales
                 .checked_add(sale.net_sales)
                 .ok_or_else(amount_too_large)?;
-            let cost =
-                costs
-                    .get(&sale.cost_origin)
-                    .map(|&amount| if sale.reversal { -amount } else { amount });
+            let cost = costs
+                .get(&sale.cost_origin)
+                .map(|&amount| sale.allocated_issue_cost(amount));
             let mut issue = None;
             if let Some(cost) = cost {
                 report.costed_net_sales = report
