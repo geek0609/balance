@@ -24,6 +24,7 @@ mod cash_flow_ui;
 mod cost_ui;
 mod currency_ui;
 mod invoice_credit_ui;
+mod invoice_refund_ui;
 mod manufacturing_ui;
 mod opening_bill_ui;
 mod order_ui;
@@ -272,6 +273,7 @@ struct App {
     reversal_reason: String,
     invoice_reversal: Option<InvoiceReversalForm>,
     invoice_credit: Option<invoice_credit_ui::NoteForm>,
+    invoice_refund: Option<invoice_refund_ui::RefundForm>,
     message: String,
 }
 struct InvoiceReversalForm {
@@ -541,6 +543,7 @@ impl App {
             reversal_reason: String::new(),
             invoice_reversal: None,
             invoice_credit: None,
+            invoice_refund: None,
             message: String::new(),
         }
     }
@@ -678,6 +681,7 @@ impl App {
         self.reversal_reason.clear();
         self.invoice_reversal = None;
         self.invoice_credit = None;
+        self.invoice_refund = None;
     }
     /// Whether a form holds edits that would be lost by switching company.
     fn has_unsaved_edits(&self) -> bool {
@@ -688,6 +692,7 @@ impl App {
                     || self.terms_limit != self.terms_original_limit))
             || self.editing_ledger.is_some()
             || self.invoice_draft_in_use()
+            || self.invoice_refund.is_some()
             || self.stock_count_screen.preview_pending()
             || self.cost_screen.has_pending_changes()
             || self.currency_screen.has_preview()
@@ -4285,7 +4290,7 @@ impl App {
         };
         let can_reverse = invoice.settled == 0
             && invoice.advance_applied == 0
-            && invoice.credited == 0
+            && invoice.credit_total == 0
             && self.editing_invoice != Some(invoice.id);
         if self.invoice_reversal.is_none()
             && ui
@@ -5158,6 +5163,7 @@ impl App {
             ui.label("Enter an as-of date.");
             return;
         }
+        self.refund_balances_panel(ui, company);
         match self
             .store
             .outstanding_invoices(company, &self.outstanding_date)

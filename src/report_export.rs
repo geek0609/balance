@@ -950,6 +950,57 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_refund_balances_csv(
+        &self,
+        company: i64,
+        as_of: &str,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let date = parse_date(as_of)?.to_string();
+        let entries = self.invoice_refund_balances(company, &date)?;
+        let context = vec![self.report_company_name(company)?, date];
+        let headings = strings(&[
+            "row_type",
+            "party",
+            "invoice_id",
+            "invoice_reference",
+            "note_id",
+            "note_reference",
+            "note_date",
+            "direction",
+            "issued_credit",
+            "outstanding_refund",
+        ]);
+        let mut csv = writer();
+        contextual_row(&mut csv, &strings(&["company", "as_of"]), &headings)?;
+        let mut empty = vec![String::new(); headings.len()];
+        empty[0] = "context".into();
+        contextual_row(&mut csv, &context, &empty)?;
+        for row in entries {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "refund_balance".into(),
+                    text_cell(&row.party),
+                    row.invoice_id.to_string(),
+                    text_cell(&row.invoice_reference),
+                    row.note_id.to_string(),
+                    text_cell(&row.note_reference),
+                    row.note_date,
+                    match row.kind {
+                        InvoiceKind::Sale => "pay",
+                        InvoiceKind::Purchase => "receive",
+                    }
+                    .into(),
+                    money(row.credit.into()),
+                    money(row.outstanding.into()),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
     pub fn export_outstanding_csv(
         &self,
         company: i64,

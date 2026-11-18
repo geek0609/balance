@@ -79,7 +79,7 @@ impl App {
             .is_some_and(|form| form.invoice == invoice.id);
         if !has_draft
             && !invoice.has_credit_history
-            && (invoice.outstanding == 0 || invoice.reversal.is_some())
+            && (invoice.credit_total >= invoice.total || invoice.reversal.is_some())
         {
             return;
         }
@@ -128,6 +128,10 @@ impl App {
                                 Err(e) => self.failure(e),
                             }
                         }
+                        let has_refunds = match self.invoice_refund_panel(ui, company, invoice, &note) {
+                            Ok(active) => active,
+                            Err(e) => { self.failure(e); return; }
+                        };
                         if let Some(voucher) = note.reversal_voucher_id {
                             ui.label(format!(
                                 "Reversed {} · Voucher {} · {}",
@@ -137,9 +141,10 @@ impl App {
                             ));
                         } else if ui
                             .add_enabled(
-                                self.invoice_credit.is_none(),
+                                self.invoice_credit.is_none() && self.invoice_refund.is_none() && !has_refunds,
                                 egui::Button::new("Reverse note"),
                             )
+                            .on_disabled_hover_text("Reverse active refunds and finish editing before reversing the note.")
                             .clicked()
                         {
                             self.invoice_credit =
@@ -148,7 +153,7 @@ impl App {
                     });
                 }
                 let can_add = self.invoice_credit.is_none()
-                    && invoice.outstanding > 0
+                    && invoice.credit_total < invoice.total
                     && invoice.reversal.is_none()
                     && self.editing_invoice != Some(invoice.id);
                 if ui
@@ -241,7 +246,7 @@ impl App {
                 }
             }
             ui.small(format!(
-                "Unpaid balance {}. Enter positive amounts for any components to adjust.",
+                "Unpaid balance {}. Any credit above this amount is available for refund.",
                 money(invoice.outstanding)
             ));
             if !form.lines.is_empty() {

@@ -249,9 +249,9 @@ impl Store {
     ) -> Result<()> {
         let destination = html_destination(destination.as_ref())?;
         let tx = self.conn.unchecked_transaction()?;
-        let (business, party, kind, invoice, invoice_date, voucher, date, reference, amount, reason, reversed_on, reversal_reference, reversal_reason) = tx.query_row(
+        let (business, party, kind, invoice, invoice_date, voucher, date, reference, amount, reason, reversed_on, reversal_reference, reversal_reason, refundable) = tx.query_row(
             "SELECT c.name, p.name, i.kind, iv.reference, iv.date, nv.id, nv.date, nv.reference,
-                    n.amount, n.reason, rv.date, rv.reference, n.reversal_reason
+                    n.amount, n.reason, rv.date, rv.reference, n.reversal_reason, COALESCE(cash.amount, 0)
              FROM invoice_credit_notes n
              JOIN companies c ON c.id = n.company_id
              JOIN invoices i ON i.id = n.invoice_id AND i.company_id = n.company_id
@@ -259,6 +259,7 @@ impl Store {
              JOIN vouchers iv ON iv.id = i.voucher_id AND iv.company_id = n.company_id
              JOIN vouchers nv ON nv.id = n.voucher_id AND nv.company_id = n.company_id
              LEFT JOIN vouchers rv ON rv.id = n.reversal_voucher_id AND rv.company_id = n.company_id
+             LEFT JOIN invoice_refund_credits cash ON cash.note_id = n.id
              WHERE n.company_id = ?1 AND n.id = ?2",
             params![company, note],
             |r| Ok((
@@ -266,7 +267,7 @@ impl Store {
                 r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?,
                 r.get::<_, String>(6)?, r.get::<_, String>(7)?, r.get::<_, i64>(8)?,
                 r.get::<_, String>(9)?, r.get::<_, Option<String>>(10)?,
-                r.get::<_, Option<String>>(11)?, r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<String>>(11)?, r.get::<_, Option<String>>(12)?, r.get::<_, i64>(13)?,
             )),
         ).optional()?.ok_or_else(|| Error::Validation("Invoice note not found in the selected company".into()))?;
         let label = match InvoiceKind::parse(&kind)? {
@@ -288,6 +289,14 @@ impl Store {
                 escape(&date),
                 escape(reversal_reference.as_deref().unwrap_or_default()),
                 escape(reversal_reason.as_deref().unwrap_or_default())
+            );
+        }
+        if refundable > 0 {
+            let _ = write!(
+                html,
+                "<p>Applied to invoice {}<br>Refundable credit issued {}</p>",
+                format_amount(amount - refundable),
+                format_amount(refundable)
             );
         }
         let returned = self.invoice_return_lines(company, note)?;

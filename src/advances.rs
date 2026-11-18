@@ -339,6 +339,7 @@ pub(crate) struct AllocationState {
     pub applied: i128,
     pub has_history: bool,
     pub latest_release: Option<NaiveDate>,
+    pub latest_active_date: Option<NaiveDate>,
 }
 
 enum AllocationTarget {
@@ -378,6 +379,7 @@ fn allocation_state(
         };
         if active {
             state.applied += i128::from(amount);
+            state.latest_active_date = state.latest_active_date.max(Some(date));
         }
     }
     Ok(state)

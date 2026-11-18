@@ -59,6 +59,7 @@ pub struct CreditNote {
     pub date: String,
     pub reference: String,
     pub amount: i64,
+    pub refundable: i64,
     pub reason: String,
     pub reversal_voucher_id: Option<i64>,
     pub reversal_date: Option<String>,
@@ -68,16 +69,20 @@ pub struct CreditNote {
 #[derive(Default)]
 pub(crate) struct CreditState {
     pub(crate) applied: i128,
+    pub(crate) total: i128,
     pub(crate) latest_reversal: Option<NaiveDate>,
+    latest_active_date: Option<NaiveDate>,
     pub(crate) has_history: bool,
 }
 
 fn notes(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<CreditNote>> {
     let mut stmt = conn.prepare(
-        "SELECT n.id, v.id, v.date, v.reference, n.amount, n.reason, rv.id, rv.date, n.reversal_reason
+        "SELECT n.id, v.id, v.date, v.reference, n.amount, n.reason, rv.id, rv.date, n.reversal_reason,
+                COALESCE(c.amount, 0)
          FROM invoice_credit_notes n
          JOIN vouchers v ON v.id = n.voucher_id AND v.company_id = n.company_id
          LEFT JOIN vouchers rv ON rv.id = n.reversal_voucher_id AND rv.company_id = n.company_id
+         LEFT JOIN invoice_refund_credits c ON c.note_id = n.id
          WHERE n.company_id = ?1 AND n.invoice_id = ?2 ORDER BY v.date, v.id",
     )?;
     let rows = stmt
@@ -92,6 +97,7 @@ fn notes(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<CreditNote
                 reversal_voucher_id: r.get(6)?,
                 reversal_date: r.get(7)?,
                 reversal_reason: r.get(8)?,
+                refundable: r.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -113,7 +119,9 @@ pub(crate) fn state(
         if as_of.is_none_or(|end| date <= end)
             && reversal.is_none_or(|date| as_of.is_some_and(|end| date > end))
         {
-            result.applied += i128::from(note.amount);
+            result.total += i128::from(note.amount);
+            result.applied += i128::from(note.amount) - i128::from(note.refundable);
+            result.latest_active_date = result.latest_active_date.max(Some(date));
         }
     }
     Ok(result)
@@ -122,6 +130,8 @@ pub(crate) fn state(
 pub(crate) fn is_linked_voucher(conn: &Connection, company: i64, voucher: i64) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM invoice_credit_notes
+              WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id)
+              UNION ALL SELECT 1 FROM invoice_credit_refunds
               WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id))",
         params![company, voucher],
         |row| row.get(0),
@@ -254,13 +264,19 @@ fn components(
     Ok(result)
 }
 
+struct CreditCapacity {
+    unpaid: i128,
+    remaining_total: i128,
+    earliest_refundable_date: Option<NaiveDate>,
+}
+
 fn available_for_credit(
     conn: &Connection,
     company: i64,
     id: i64,
     invoice: &Invoice,
     date: NaiveDate,
-) -> Result<i128> {
+) -> Result<CreditCapacity> {
     if date < parse_date(&invoice.date)? {
         return Err(Error::Validation(
             "Credit date cannot precede the invoice date".into(),
@@ -269,21 +285,28 @@ fn available_for_credit(
     let credits = state(conn, company, id, None)?;
     let advances = crate::advances::invoice_allocation_state(conn, company, id, None)?;
     let mut latest_release = credits.latest_reversal.max(advances.latest_release);
+    let mut latest_payment = advances.latest_active_date;
     let mut paid = 0_i128;
     let mut stmt = conn.prepare(
-        "SELECT s.amount, v.date FROM invoice_settlements s
+        "SELECT s.amount, v.date, original.date FROM invoice_settlements s
+         JOIN vouchers original ON original.id = s.voucher_id AND original.company_id = s.company_id
          LEFT JOIN settlement_reversals r ON r.settlement_voucher_id = s.voucher_id AND r.company_id = s.company_id
          LEFT JOIN vouchers v ON v.id = r.reversal_voucher_id
          WHERE s.company_id = ?1 AND s.invoice_id = ?2",
     )?;
     for row in stmt.query_map(params![company, id], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })? {
-        let (amount, reversal) = row?;
+        let (amount, reversal, payment_date) = row?;
         if let Some(reversal) = reversal {
             latest_release = latest_release.max(Some(parse_date(&reversal)?));
         } else {
             paid += i128::from(amount);
+            latest_payment = latest_payment.max(Some(parse_date(&payment_date)?));
         }
     }
     if latest_release.is_some_and(|released| date < released) {
@@ -291,7 +314,18 @@ fn available_for_credit(
             "Credit date cannot precede a reversal or advance release on this invoice".into(),
         ));
     }
-    Ok(invoice_total(conn, id, invoice.tax_amount)? - credits.applied - advances.applied - paid)
+    let total = invoice_total(conn, id, invoice.tax_amount)?;
+    let unpaid = total - credits.applied - advances.applied - paid;
+    if unpaid < 0 {
+        return Err(Error::Validation(
+            "Allocations exceed the original invoice amount".into(),
+        ));
+    }
+    Ok(CreditCapacity {
+        unpaid,
+        remaining_total: total - credits.total,
+        earliest_refundable_date: latest_payment.max(credits.latest_active_date),
+    })
 }
 
 pub(crate) fn insert_invoice_credit(
@@ -311,7 +345,7 @@ pub(crate) fn insert_invoice_credit(
         ));
     }
     let invoice = invoice_header(tx, company, id)?;
-    let maximum = available_for_credit(tx, company, id, &invoice, date)?;
+    let capacity = available_for_credit(tx, company, id, &invoice, date)?;
     let parts = components(tx, company, id, &invoice)?;
     let mut seen = HashSet::new();
     let mut reductions = Vec::new();
@@ -344,11 +378,19 @@ pub(crate) fn insert_invoice_credit(
             invoice.reduction_sign() * i128::from(reduction);
         total += i128::from(reduction);
     }
-    if total <= 0 || total > maximum {
+    if total <= 0 || total > capacity.remaining_total {
         return Err(Error::Validation(
-            "The note must reduce the invoice by a positive amount within its unpaid balance"
+            "The note must be positive and total credits cannot exceed the original invoice amount"
                 .into(),
         ));
+    }
+    let refundable = total - total.min(capacity.unpaid);
+    if refundable > 0
+        && capacity
+            .earliest_refundable_date
+            .is_some_and(|day| date < day)
+    {
+        return Err(Error::Validation("A refundable credit cannot precede an active payment, advance allocation or note on the invoice".into()));
     }
     let total_amount = i64::try_from(total)
         .map_err(|_| Error::Validation("Note amount exceeds the supported range".into()))?;
@@ -387,6 +429,12 @@ pub(crate) fn insert_invoice_credit(
         return Err(Error::Validation("This invoice already has a note with that reference".into()));
     }
     let note = tx.last_insert_rowid();
+    if refundable > 0 {
+        tx.execute(
+            "INSERT INTO invoice_refund_credits(note_id, amount) VALUES (?1, ?2)",
+            params![note, refundable as i64],
+        )?;
+    }
     for (ledger, tax, reduction) in reductions {
         tx.execute(
             "INSERT INTO invoice_credit_lines(note_id, ledger_id, is_tax, reduction)
@@ -456,6 +504,7 @@ impl Store {
                 "Reversal date cannot precede the note date".into(),
             ));
         }
+        crate::invoice_refunds::check_note_reversal(&tx, company, note, date)?;
         let date_text = date.to_string();
         let postings = crate::reversals::counter_postings(&tx, company, original, &date_text)?;
         tx.execute(
