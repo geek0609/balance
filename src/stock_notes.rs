@@ -108,6 +108,63 @@ pub fn note_label(kind: InvoiceKind) -> &'static str {
     }
 }
 
+pub(crate) fn migrate_combined_billing(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP VIEW order_line_progress;
+        DROP VIEW physical_invoice_lines;
+        CREATE TABLE combined_stock_note_invoices(
+            invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+            note_id INTEGER NOT NULL REFERENCES stock_notes(id),
+            PRIMARY KEY(invoice_id, note_id)
+        );
+        INSERT INTO combined_stock_note_invoices SELECT invoice_id, note_id FROM stock_note_invoices;
+        DROP TABLE stock_note_invoices;
+        ALTER TABLE combined_stock_note_invoices RENAME TO stock_note_invoices;
+        CREATE INDEX stock_note_invoices_note ON stock_note_invoices(note_id, invoice_id);
+        CREATE VIEW physical_invoice_lines AS
+            SELECT l.* FROM invoice_lines l
+            WHERE NOT EXISTS(SELECT 1 FROM stock_note_invoices n WHERE n.invoice_id = l.invoice_id);
+        CREATE VIEW invoice_orders AS
+            SELECT invoice_id, order_id FROM invoice_order_links
+            UNION
+            SELECT link.invoice_id, n.order_id FROM stock_note_invoices link
+            JOIN stock_notes n ON n.id = link.note_id WHERE n.order_id IS NOT NULL;
+        CREATE VIEW order_line_progress AS
+            SELECT ol.id, ol.order_id, ol.item_id, ol.quantity, ol.unit_price,
+                COALESCE((
+                    SELECT SUM(il.quantity - COALESCE(rq.returned, 0))
+                    FROM invoice_order_links link JOIN physical_invoice_lines il ON il.invoice_id = link.invoice_id
+                    LEFT JOIN invoice_returned_quantities rq ON rq.line_id = il.id
+                    WHERE link.order_id = ol.order_id AND il.item_id = ol.item_id
+                      AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id)
+                ), 0) + COALESCE((
+                    SELECT SUM(nl.quantity - COALESCE(r.returned, 0) - COALESCE((
+                        SELECT SUM(rq.returned) FROM invoice_returned_quantities rq WHERE rq.delivery_line = nl.id
+                    ), 0))
+                    FROM stock_notes n JOIN stock_note_lines nl ON nl.note_id = n.id
+                    LEFT JOIN stock_note_returned_quantities r ON r.note_line_id = nl.id
+                    WHERE n.order_id = ol.order_id AND nl.item_id = ol.item_id AND n.reversed_on IS NULL
+                ), 0) AS fulfilled,
+                COALESCE((
+                    SELECT SUM(il.quantity - COALESCE(rq.returned, 0))
+                    FROM invoice_order_links link JOIN physical_invoice_lines il ON il.invoice_id = link.invoice_id
+                    LEFT JOIN invoice_returned_quantities rq ON rq.line_id = il.id
+                    WHERE link.order_id = ol.order_id AND il.item_id = ol.item_id
+                      AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id)
+                ), 0) + COALESCE((
+                    SELECT SUM(il.quantity - COALESCE(rq.returned, 0))
+                    FROM stock_notes n JOIN stock_note_lines nl ON nl.note_id = n.id
+                    JOIN stock_note_invoice_lines link ON link.note_line_id = nl.id
+                    JOIN invoice_lines il ON il.id = link.invoice_line_id
+                    LEFT JOIN invoice_returned_quantities rq ON rq.line_id = il.id
+                    WHERE n.order_id = ol.order_id AND nl.item_id = ol.item_id
+                      AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = il.invoice_id)
+                ), 0) AS billed
+            FROM order_lines ol;",
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct StockNoteLineDraft {
     pub item_id: i64,
@@ -502,13 +559,17 @@ pub(crate) fn invalid_spans() -> Error {
 }
 
 pub(crate) fn linked_note(conn: &Connection, invoice: i64) -> Result<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT note_id FROM stock_note_invoices WHERE invoice_id = ?1",
-            [invoice],
-            |row| row.get(0),
-        )
-        .optional()?)
+    Ok(linked_notes(conn, invoice)?.first().copied())
+}
+
+pub(crate) fn linked_notes(conn: &Connection, invoice: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT note_id FROM stock_note_invoices WHERE invoice_id = ?1 ORDER BY note_id",
+    )?;
+    let rows = stmt
+        .query_map([invoice], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 pub(crate) fn insert_movement(
@@ -703,97 +764,342 @@ impl Store {
         Ok(())
     }
 
-    /// Bill unbilled quantities from a note. Stock stays on the movement date.
+    /// Bill unbilled quantities from one note, matched by item, location and batch.
     pub fn invoice_stock_note(
         &mut self,
         company: i64,
         id: i64,
         draft: &InvoiceDraft,
     ) -> Result<i64> {
-        let date = parse_date(&draft.date)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let note = get_note(&tx, company, id)?;
-        if note.reversed_on.is_some() || !note.has_unbilled_stock {
-            return Err(Error::Validation(
-                "Select a stock note awaiting invoice".into(),
-            ));
-        }
-        if date < parse_date(&note.date)? {
-            return Err(Error::Validation(
-                "Invoice date cannot precede the stock note date".into(),
-            ));
-        }
-        if draft.kind != note.kind || draft.party_ledger_id != note.party_ledger_id {
-            return Err(Error::Validation(
-                "Invoice type and party must match the stock note".into(),
-            ));
-        }
-        check_after_invoice_reversals(&tx, company, id, date, true)?;
-        crate::stock_returns::check_after_returns(&tx, company, id, date, true)?;
-
         let lines = note_lines(&tx, company, id)?;
-        let mut expected: HashMap<_, _> = lines
+        let expected: HashMap<_, _> = lines
             .iter()
-            .map(|line| (line.values.bucket(), line))
+            .map(|line| (line.values.bucket(), line.id))
             .collect();
-        if draft.lines.is_empty() {
-            return Err(Error::Validation(
-                "Include at least one unbilled stock note line".into(),
-            ));
-        }
-        let mut plan = Vec::with_capacity(draft.lines.len());
-        for line in &draft.lines {
-            let key = (line.item_id, line.location_id, line.batch_id);
-            if !line.extra_allocations.is_empty() || line.quantity <= 0 {
+        let sources = draft
+            .lines
+            .iter()
+            .map(|line| {
+                expected
+                    .get(&(line.item_id, line.location_id, line.batch_id))
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::Validation("Use lines from the selected stock note".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let invoice = bill_stock_notes(&tx, company, &sources, draft)?;
+        tx.commit()?;
+        Ok(invoice)
+    }
+
+    /// Bill one or more notes for the same party and type. IDs correspond to the
+    /// draft lines in order, and identify the stock note line for each quantity.
+    pub fn invoice_stock_notes(
+        &mut self,
+        company: i64,
+        sources: &[i64],
+        draft: &InvoiceDraft,
+    ) -> Result<i64> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let invoice = bill_stock_notes(&tx, company, sources, draft)?;
+        tx.commit()?;
+        Ok(invoice)
+    }
+}
+
+fn bill_stock_notes(
+    conn: &Connection,
+    company: i64,
+    sources: &[i64],
+    draft: &InvoiceDraft,
+) -> Result<i64> {
+    if sources.is_empty() || sources.len() != draft.lines.len() {
+        return Err(Error::Validation(
+            "Select the source stock note line for every invoice line".into(),
+        ));
+    }
+    let date = parse_date(&draft.date)?;
+    let mut note_ids = std::collections::BTreeSet::new();
+    let mut source_lines = HashMap::new();
+    let mut plan = Vec::with_capacity(sources.len());
+    let mut lookup = conn.prepare_cached("SELECT note_id FROM stock_note_lines WHERE id = ?1")?;
+    for (&source, line) in sources.iter().zip(&draft.lines) {
+        let id: i64 = lookup
+            .query_row([source], |row| row.get(0))
+            .optional()?
+            .ok_or_else(|| Error::Validation("A source stock note line was not found".into()))?;
+        if note_ids.insert(id) {
+            let note = get_note(conn, company, id)?;
+            if note.reversed_on.is_some() || !note.has_unbilled_stock {
                 return Err(Error::Validation(
-                    "Each stock note line needs a positive quantity at its recorded location and batch".into(),
+                    "Select stock notes with quantities available to invoice".into(),
                 ));
             }
-            let note_line = expected.remove(&key).ok_or_else(|| {
-                Error::Validation(
-                    "Use each stock note item, location and batch at most once per invoice".into(),
-                )
-            })?;
-            plan.push((note_line.id, allocate_spans(&tx, note_line, line.quantity)?));
+            if date < parse_date(&note.date)? {
+                return Err(Error::Validation(
+                    "Invoice date cannot precede any source stock note date".into(),
+                ));
+            }
+            if draft.kind != note.kind || draft.party_ledger_id != note.party_ledger_id {
+                return Err(Error::Validation(
+                    "All source stock notes must match the invoice type and party".into(),
+                ));
+            }
+            check_after_invoice_reversals(conn, company, id, date, true)?;
+            crate::stock_returns::check_after_returns(conn, company, id, date, true)?;
+            source_lines.extend(
+                note_lines(conn, company, id)?
+                    .into_iter()
+                    .map(|line| (line.id, line)),
+            );
         }
+        let note_line = source_lines.remove(&source).ok_or_else(|| {
+            Error::Validation("Use each source stock note line once per invoice".into())
+        })?;
+        if line.quantity <= 0
+            || !line.extra_allocations.is_empty()
+            || (line.item_id, line.location_id, line.batch_id) != note_line.values.bucket()
+        {
+            return Err(Error::Validation("Use a positive quantity and the original item, location and batch on each stock note line".into()));
+        }
+        plan.push((source, allocate_spans(conn, &note_line, line.quantity)?));
+    }
 
-        let (invoice, _) = insert_invoice_on_connection(&tx, company, draft)?;
-        tx.execute(
+    let (invoice, _) = insert_invoice_on_connection(conn, company, draft)?;
+    for id in note_ids {
+        conn.execute(
             "INSERT INTO stock_note_invoices(invoice_id, note_id) VALUES (?1, ?2)",
             params![invoice, id],
         )?;
-        {
-            let mut stmt =
-                tx.prepare("SELECT id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
-            let invoice_lines = stmt
-                .query_map([invoice], |row| row.get::<_, i64>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            if invoice_lines.len() != plan.len() {
-                return Err(invalid_spans());
-            }
-            for (invoice_line, (note_line, spans)) in invoice_lines.into_iter().zip(plan) {
-                tx.execute(
-                    "INSERT INTO stock_note_invoice_lines(invoice_line_id, note_line_id) VALUES (?1, ?2)",
-                    params![invoice_line, note_line],
-                )?;
-                for span in spans {
-                    tx.execute(
-                        "INSERT INTO stock_note_invoice_spans(invoice_line_id, start_quantity, quantity)
-                         VALUES (?1, ?2, ?3)",
-                        params![invoice_line, span.start, span.end - span.start],
-                    )?;
-                }
-            }
-        }
-        if let Some(order) = note.order_id {
-            tx.execute(
-                "INSERT INTO invoice_order_links(invoice_id, order_id) VALUES (?1, ?2)",
-                params![invoice, order],
+    }
+    let mut stmt =
+        conn.prepare("SELECT id FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+    let invoice_lines = stmt
+        .query_map([invoice], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if invoice_lines.len() != plan.len() {
+        return Err(invalid_spans());
+    }
+    for (invoice_line, (note_line, spans)) in invoice_lines.into_iter().zip(plan) {
+        conn.execute(
+            "INSERT INTO stock_note_invoice_lines(invoice_line_id, note_line_id) VALUES (?1, ?2)",
+            params![invoice_line, note_line],
+        )?;
+        for span in spans {
+            conn.execute(
+                "INSERT INTO stock_note_invoice_spans(invoice_line_id, start_quantity, quantity) VALUES (?1, ?2, ?3)",
+                params![invoice_line, span.start, span.end - span.start],
             )?;
         }
-        tx.commit()?;
-        Ok(invoice)
+    }
+    Ok(invoice)
+}
+
+#[cfg(test)]
+mod combined_billing_tests {
+    use super::{StockNoteDraft, StockNoteLineDraft};
+    use crate::actual_cost::ActualCostMethod;
+    use crate::inventory::{InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine};
+    use crate::invoice_returns::ReturnLineDraft;
+    use crate::orders::{OrderDraft, OrderLine};
+    use crate::{Category, Store};
+
+    #[test]
+    fn one_invoice_keeps_quantities_and_costs_with_each_note_and_order() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Demo").unwrap();
+        let customer = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        let supplier = store
+            .create_ledger(company, "Supplier", Category::Liability)
+            .unwrap();
+        let sales = store
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        let item = store.create_stock_item(company, "Part", "Each").unwrap();
+        let location = store.stock_locations(company).unwrap()[0].id;
+        let line = |quantity, unit_price| StockNoteLineDraft {
+            item_id: item,
+            location_id: location,
+            batch_id: None,
+            quantity,
+            unit_price,
+        };
+        for (reference, quantity, cost) in [("REC-A", 2000, 500), ("REC-B", 3000, 700)] {
+            store
+                .post_stock_note(
+                    company,
+                    &StockNoteDraft {
+                        kind: InvoiceKind::Purchase,
+                        date: "2026-04-01".into(),
+                        reference: reference.into(),
+                        party_ledger_id: supplier,
+                        order_id: None,
+                        narration: String::new(),
+                        lines: vec![line(quantity, cost)],
+                    },
+                )
+                .unwrap();
+        }
+        let mut orders = Vec::new();
+        let mut notes = Vec::new();
+        let mut sources = Vec::new();
+        for (reference, date, quantity) in [("A", "2026-04-02", 2000), ("B", "2026-04-03", 3000)] {
+            let order = store
+                .create_order(
+                    company,
+                    &OrderDraft {
+                        kind: InvoiceKind::Sale,
+                        party_ledger_id: customer,
+                        reference: format!("SO-{reference}"),
+                        date: "2026-04-01".into(),
+                        expected_on: None,
+                        notes: String::new(),
+                        lines: vec![OrderLine {
+                            item_id: item,
+                            quantity,
+                            unit_price: 1000,
+                        }],
+                    },
+                )
+                .unwrap();
+            let note = store
+                .post_stock_note(
+                    company,
+                    &StockNoteDraft {
+                        kind: InvoiceKind::Sale,
+                        date: date.into(),
+                        reference: format!("DEL-{reference}"),
+                        party_ledger_id: customer,
+                        order_id: Some(order),
+                        narration: String::new(),
+                        lines: vec![line(quantity, 1000)],
+                    },
+                )
+                .unwrap();
+            orders.push(order);
+            notes.push(note);
+            sources.push(store.stock_note_lines(company, note).unwrap()[0].id);
+        }
+        let mut draft = InvoiceDraft {
+            kind: InvoiceKind::Sale,
+            date: "2026-04-02".into(),
+            due_date: None,
+            credit_days: None,
+            reference: "INV-01".into(),
+            narration: String::new(),
+            party_ledger_id: customer,
+            trade_ledger_id: sales,
+            tax_ledger_id: None,
+            tax_amount: 0,
+            additional_taxes: vec![],
+            tax_calculation: None,
+            adjustments: vec![],
+            lines: [1000, 3000]
+                .into_iter()
+                .map(|quantity| InvoiceLine {
+                    item_id: item,
+                    location_id: location,
+                    batch_id: None,
+                    trade_ledger_id: None,
+                    extra_allocations: vec![],
+                    quantity,
+                    unit_price: 1000,
+                    discount: InvoiceDiscount::None,
+                })
+                .collect(),
+        };
+        assert!(store
+            .invoice_stock_notes(company, &sources, &draft)
+            .is_err());
+        draft.date = "2026-04-04".into();
+        assert!(store
+            .invoice_stock_notes(company, &[sources[0], sources[0]], &draft)
+            .is_err());
+        assert!(store.invoices(company).unwrap().is_empty());
+        let invoice = store
+            .invoice_stock_notes(company, &sources, &draft)
+            .unwrap();
+        let posted = &store.invoices(company).unwrap()[0];
+        assert_eq!(posted.stock_note_ids, notes);
+        assert_eq!(posted.order_ids, orders);
+        for (index, billed) in [1000, 3000].into_iter().enumerate() {
+            let detail = store.order_detail(company, orders[index]).unwrap();
+            assert_eq!(detail.lines[0].billed, billed);
+            assert_eq!(detail.invoices[0].id, invoice);
+            assert_eq!(
+                store.stock_note_invoices(company, notes[index]).unwrap()[0].invoice_id,
+                invoice
+            );
+            assert!(store
+                .reverse_stock_note(company, notes[index], "2026-04-04", "Already billed")
+                .is_err());
+        }
+        let margin = store
+            .sales_at_actual_cost(company, None, Some("2026-04-04"), ActualCostMethod::Fifo)
+            .unwrap();
+        assert_eq!(
+            (margin.rows.len(), margin.net_sales, margin.cost_of_sales),
+            (2, 4000, 2600)
+        );
+        let allocations = store.invoice_return_allocations(company, invoice).unwrap();
+        let credit = store
+            .post_invoice_stock_return(
+                company,
+                invoice,
+                "2026-04-05",
+                "RET-01",
+                "Two items returned",
+                &[
+                    ReturnLineDraft {
+                        allocation: allocations[0].id,
+                        quantity: 1000,
+                    },
+                    ReturnLineDraft {
+                        allocation: allocations[1].id,
+                        quantity: 1000,
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            store.order_detail(company, orders[0]).unwrap().lines[0].billed,
+            0
+        );
+        assert_eq!(
+            store.order_detail(company, orders[1]).unwrap().lines[0].billed,
+            2000
+        );
+        store
+            .reverse_invoice_credit(company, credit, "2026-04-06", "RET-REV", "Reaccepted parts")
+            .unwrap();
+        assert_eq!(
+            store.order_detail(company, orders[0]).unwrap().lines[0].billed,
+            1000
+        );
+        assert_eq!(
+            store.order_detail(company, orders[1]).unwrap().lines[0].billed,
+            3000
+        );
+        store
+            .reverse_invoice(company, invoice, "2026-04-07", "INV-REV", "Replace invoice")
+            .unwrap();
+        assert_eq!(
+            store.stock_note_lines(company, notes[0]).unwrap()[0].unbilled(),
+            2000
+        );
+        assert_eq!(
+            store.stock_note_lines(company, notes[1]).unwrap()[0].unbilled(),
+            3000
+        );
+        assert_eq!(store.stock_balances(company, None).unwrap()[0].quantity, 0);
     }
 }

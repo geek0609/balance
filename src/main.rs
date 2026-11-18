@@ -86,7 +86,7 @@ enum Page {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InvoiceSource {
     Order(i64),
-    StockNote(i64),
+    StockNotes,
 }
 
 struct App {
@@ -299,6 +299,7 @@ struct InvoiceAdjustmentForm {
 }
 struct InvoiceLineForm {
     item: Option<i64>,
+    stock_note_line: Option<(i64, String)>,
     location: Option<i64>,
     batch: Option<i64>,
     trade_ledger: Option<i64>,
@@ -323,6 +324,7 @@ impl InvoiceLineForm {
     fn new() -> Self {
         Self {
             item: None,
+            stock_note_line: None,
             location: None,
             batch: None,
             trade_ledger: None,
@@ -3167,6 +3169,7 @@ impl App {
                 };
                 InvoiceLineForm {
                     item: Some(line.item_id),
+                    stock_note_line: None,
                     location: Some(line.location_id),
                     batch: line.batch_id,
                     trade_ledger: line.trade_ledger_id,
@@ -3209,15 +3212,15 @@ impl App {
                 None => "Sales and purchase invoices".into(),
             },
         );
-        let from_note = matches!(self.invoice_source, Some(InvoiceSource::StockNote(_)));
+        let from_note = self.invoice_source == Some(InvoiceSource::StockNotes);
         match self.invoice_source {
             Some(InvoiceSource::Order(order)) => {
                 ui.label(format!(
                     "Order {order}. Review quantities and prices before saving."
                 ));
             }
-            Some(InvoiceSource::StockNote(note)) => {
-                ui.label(format!("Stock note {note}. Reduce quantities or remove lines to bill part of the note. Review prices and tax before posting."));
+            Some(InvoiceSource::StockNotes) => {
+                ui.label("Reduce quantities or remove lines to bill selected stock notes in part. Review prices and tax before posting.");
             }
             None => {
                 ui.label("Save an invoice to create its accounting voucher and any stock movements together. For services, remove all item lines and add a positive service / charge line. Item prices are per unit; each line rounds to two decimal places.");
@@ -3440,7 +3443,11 @@ impl App {
         let mut remove = None;
         for (index, line) in self.invoice_lines.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                ui.label(format!("{}.", index + 1));
+                if let Some((_, reference)) = &line.stock_note_line {
+                    ui.label(reference);
+                } else {
+                    ui.label(format!("{}.", index + 1));
+                }
                 ui.add_enabled_ui(!from_note, |ui| {
                     let previous_item = line.item;
                     pick_stock(ui, ("invoice-item", index), "Item", &items, &mut line.item);
@@ -3773,8 +3780,21 @@ impl App {
                         Some(InvoiceSource::Order(order)) => {
                             self.store.invoice_order(company, order, &draft)
                         }
-                        Some(InvoiceSource::StockNote(note)) => {
-                            self.store.invoice_stock_note(company, note, &draft)
+                        Some(InvoiceSource::StockNotes) => {
+                            let sources = self
+                                .invoice_lines
+                                .iter()
+                                .map(|line| {
+                                    line.stock_note_line.as_ref().map(|(id, _)| *id).ok_or_else(
+                                        || {
+                                            balance::Error::Validation(
+                                                "Select a stock note source for each line".into(),
+                                            )
+                                        },
+                                    )
+                                })
+                                .collect::<balance::Result<Vec<_>>>()?;
+                            self.store.invoice_stock_notes(company, &sources, &draft)
                         }
                         None => self.store.create_invoice(company, &draft),
                     }
@@ -4061,12 +4081,12 @@ impl App {
                     }
                     self.invoice_reversal_form(ui, company, &invoice);
                     self.invoice_credit_panel(ui, company, &invoice);
-                    if let Some(note) = invoice.stock_note_id {
+                    for &note in &invoice.stock_note_ids {
                         if ui.link(format!("View stock note {note}")).clicked() {
                             self.open_stock_note(note);
                         }
                     }
-                    if let Some(order) = invoice.order_id {
+                    for &order in &invoice.order_ids {
                         if ui.link(format!("View linked order {order}")).clicked() {
                             self.order_screen.select(order);
                             self.page = Page::Orders;

@@ -649,6 +649,16 @@ impl Store {
         if let Some(days) = invoice.credit_days {
             let _ = write!(html, "<br>Credit period: {days} days");
         }
+        for id in &invoice.stock_note_ids {
+            let note = get_note(&self.conn, company_id, *id)?;
+            let _ = write!(
+                html,
+                "<br>{} {} ({})",
+                note_label(note.kind),
+                escape(&note.reference),
+                escape(&note.date)
+            );
+        }
         if let Some(reversal) = &invoice.reversal {
             let _ = write!(
                 html,

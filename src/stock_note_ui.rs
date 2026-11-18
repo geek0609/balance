@@ -90,6 +90,7 @@ impl NoteForm {
 pub(super) struct StockNoteScreen {
     form: NoteForm,
     selected: Option<i64>,
+    additional_billing_notes: std::collections::BTreeSet<i64>,
     reverse_date: String,
     reverse_reason: String,
     document_path: String,
@@ -100,6 +101,7 @@ pub(super) struct StockNoteScreen {
 impl StockNoteScreen {
     fn select(&mut self, id: Option<i64>) {
         self.selected = id;
+        self.additional_billing_notes.clear();
         self.reverse_date.clear();
         self.reverse_reason.clear();
         self.return_draft = None;
@@ -487,7 +489,67 @@ impl App {
                 )
                 .clicked()
         {
-            self.prepare_stock_note_invoice(note, &lines);
+            self.prepare_stock_notes_invoice(company, std::iter::once(note))?;
+        }
+        if note.reversed_on.is_none() && note.has_unbilled_stock {
+            let eligible: Vec<_> = notes
+                .iter()
+                .filter(|other| {
+                    other.id != note.id
+                        && other.kind == note.kind
+                        && other.party_ledger_id == note.party_ledger_id
+                        && other.reversed_on.is_none()
+                        && other.has_unbilled_stock
+                })
+                .collect();
+            if !eligible.is_empty() {
+                ui.collapsing("Combine stock notes on one invoice", |ui| -> Result<()> {
+                    for other in &eligible {
+                        let mut chosen = self
+                            .stock_note_screen
+                            .additional_billing_notes
+                            .contains(&other.id);
+                        if ui
+                            .checkbox(&mut chosen, format!("{} · {}", other.date, other.reference))
+                            .changed()
+                        {
+                            if chosen {
+                                self.stock_note_screen
+                                    .additional_billing_notes
+                                    .insert(other.id);
+                            } else {
+                                self.stock_note_screen
+                                    .additional_billing_notes
+                                    .remove(&other.id);
+                            }
+                        }
+                    }
+                    let sources: Vec<_> = eligible
+                        .iter()
+                        .copied()
+                        .filter(|other| {
+                            self.stock_note_screen
+                                .additional_billing_notes
+                                .contains(&other.id)
+                        })
+                        .collect();
+                    if ui
+                        .add_enabled(
+                            !self.invoice_draft_in_use() && !sources.is_empty(),
+                            egui::Button::new("Prepare combined invoice"),
+                        )
+                        .clicked()
+                    {
+                        self.prepare_stock_notes_invoice(
+                            company,
+                            std::iter::once(note).chain(sources),
+                        )?;
+                    }
+                    Ok(())
+                })
+                .body_returned
+                .transpose()?;
+            }
         }
         if note.reversed_on.is_none() && !note.has_active_invoices && !note.has_active_returns {
             ui.collapsing("Reverse stock movement", |ui| -> Result<()> {
@@ -676,25 +738,39 @@ impl App {
         Ok(())
     }
 
-    fn prepare_stock_note_invoice(&mut self, note: &StockNote, lines: &[StockNoteLine]) {
-        let lines = lines
-            .iter()
-            .filter(|line| line.unbilled() > 0)
-            .map(|line| {
+    fn prepare_stock_notes_invoice<'a>(
+        &mut self,
+        company: i64,
+        notes: impl IntoIterator<Item = &'a StockNote>,
+    ) -> Result<()> {
+        let mut notes = notes.into_iter();
+        let first = notes
+            .next()
+            .ok_or_else(|| Error::Validation("Select a stock note".into()))?;
+        let mut lines = Vec::new();
+        for note in std::iter::once(first).chain(notes) {
+            for line in self
+                .store
+                .stock_note_lines(company, note.id)?
+                .into_iter()
+                .filter(|line| line.unbilled() > 0)
+            {
                 let mut form = InvoiceLineForm::new();
+                form.stock_note_line = Some((line.id, note.reference.clone()));
                 form.item = Some(line.values.item_id);
                 form.location = Some(line.values.location_id);
                 form.batch = line.values.batch_id;
                 form.quantity = format_quantity(i128::from(line.unbilled()));
                 form.price = format_amount(line.values.unit_price);
-                form
-            })
-            .collect();
+                lines.push(form);
+            }
+        }
         self.prepare_linked_invoice(
-            InvoiceSource::StockNote(note.id),
-            note.kind,
-            note.party_ledger_id,
+            InvoiceSource::StockNotes,
+            first.kind,
+            first.party_ledger_id,
             lines,
         );
+        Ok(())
     }
 }

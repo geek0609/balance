@@ -88,8 +88,7 @@ pub(crate) fn stock_sales(
          LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
          LEFT JOIN stock_note_invoice_lines nl ON nl.invoice_line_id = l.id
          LEFT JOIN stock_note_lines delivered ON delivered.id = nl.note_line_id
-         LEFT JOIN stock_note_invoices sn ON sn.invoice_id = i.id
-         LEFT JOIN stock_notes note ON note.id = sn.note_id AND note.company_id = i.company_id
+         LEFT JOIN stock_notes note ON note.id = delivered.note_id AND note.company_id = i.company_id
          WHERE i.company_id = ?1 AND i.kind = 'Sale' ORDER BY v.id, l.id",
     )?;
     let mut rows = stmt.query([company])?;

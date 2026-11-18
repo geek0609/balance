@@ -49,7 +49,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 63;
+const SCHEMA_VERSION: i64 = 64;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -868,6 +868,10 @@ impl Store {
         if version < 63 {
             invoice_credit_allocations::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 63)?;
+        }
+        if version < 64 {
+            stock_notes::migrate_combined_billing(&tx)?;
+            tx.pragma_update(None, "user_version", 64)?;
         }
         tx.commit()?;
         Ok(Self { conn })

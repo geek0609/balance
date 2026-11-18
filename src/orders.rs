@@ -251,13 +251,17 @@ fn order_lines(conn: &Connection, order: i64) -> Result<Vec<OrderLineProgress>> 
 }
 
 pub(crate) fn linked_order(conn: &Connection, invoice: i64) -> Result<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT order_id FROM invoice_order_links WHERE invoice_id = ?1",
-            [invoice],
-            |row| row.get(0),
-        )
-        .optional()?)
+    Ok(linked_orders(conn, invoice)?.first().copied())
+}
+
+pub(crate) fn linked_orders(conn: &Connection, invoice: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT order_id FROM invoice_orders WHERE invoice_id = ?1 ORDER BY order_id",
+    )?;
+    let rows = stmt
+        .query_map([invoice], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 pub(crate) fn validate_order_draft(
@@ -364,7 +368,10 @@ pub(crate) fn check_fulfilment(
          SELECT r.date FROM stock_returns r JOIN stock_notes n ON n.id = r.note_id WHERE n.order_id = ?1
          UNION ALL
          SELECT DISTINCT r.date FROM invoice_stock_return_history r
-         JOIN invoice_order_links i ON i.invoice_id = r.invoice_id WHERE i.order_id = ?1",
+         LEFT JOIN stock_note_lines nl ON nl.id = r.delivery_line
+         LEFT JOIN stock_notes n ON n.id = nl.note_id
+         LEFT JOIN invoice_order_links i ON i.invoice_id = r.invoice_id AND r.delivery_line IS NULL
+         WHERE COALESCE(n.order_id, i.order_id) = ?1",
     )?;
     for row in stmt.query_map([id], |row| row.get::<_, String>(0))? {
         if date < parse_date(&row?)? {
@@ -534,7 +541,7 @@ impl Store {
         let lines = order_lines(&tx, id)?;
         let invoices = {
             let mut stmt = tx.prepare(
-                "SELECT i.id, v.date, v.reference, rv.date FROM invoice_order_links link
+                "SELECT i.id, v.date, v.reference, rv.date FROM invoice_orders link
                  JOIN invoices i ON i.id = link.invoice_id AND i.company_id = ?1
                  JOIN vouchers v ON v.id = i.voucher_id
                  LEFT JOIN invoice_reversals r ON r.invoice_id = i.id

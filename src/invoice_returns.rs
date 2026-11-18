@@ -381,9 +381,11 @@ pub(crate) fn reverse_movements(
 ) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT ret.id, ret.kind, ret.item_id, ret.location_id, ret.batch_id, ret.quantity,
-                link.order_id, i.party_ledger_id
+                COALESCE(n.order_id, link.order_id), i.party_ledger_id
          FROM invoice_stock_return_history ret JOIN invoices i ON i.id = ret.invoice_id
-         LEFT JOIN invoice_order_links link ON link.invoice_id = i.id
+         LEFT JOIN stock_note_lines src ON src.id = ret.delivery_line
+         LEFT JOIN stock_notes n ON n.id = src.note_id
+         LEFT JOIN invoice_order_links link ON link.invoice_id = i.id AND ret.delivery_line IS NULL
          WHERE ret.company_id = ?1 AND ret.note_id = ?2 ORDER BY ret.id",
     )?;
     let rows = stmt
@@ -403,21 +405,29 @@ pub(crate) fn reverse_movements(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let Some((_, kind, _, order, party)) = rows.first() else {
+    let Some((_, kind, _, _, party)) = rows.first() else {
         return Ok(());
     };
     let kind = InvoiceKind::parse(kind)?;
-    if let Some(order) = order {
+    let mut quantities = BTreeMap::<_, Vec<_>>::new();
+    for (_, _, stock, order, _) in &rows {
+        if let Some(order) = order {
+            quantities
+                .entry(*order)
+                .or_default()
+                .push((stock.item_id, stock.quantity));
+        }
+    }
+    for (order, items) in quantities {
         crate::orders::check_fulfilment(
             conn,
             company,
-            *order,
+            order,
             kind,
             *party,
             date,
             crate::orders::FulfilmentChange::ReverseReturn,
-            rows.iter()
-                .map(|(_, _, stock, _, _)| (stock.item_id, stock.quantity)),
+            items,
         )?;
     }
     for (id, _, stock, _, _) in rows {

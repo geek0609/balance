@@ -220,6 +220,8 @@ pub struct InvoiceSummary {
     pub has_credit_history: bool,
     pub order_id: Option<i64>,
     pub stock_note_id: Option<i64>,
+    pub stock_note_ids: Vec<i64>,
+    pub order_ids: Vec<i64>,
     pub opening_bill: Option<crate::opening_bills::OpeningBill>,
     pub reversal: Option<crate::invoice_reversals::InvoiceReversal>,
     pub lines: Vec<InvoiceDetailLine>,
@@ -2487,6 +2489,8 @@ impl Store {
             } else {
                 total - settled - advances.applied - credits.applied
             };
+            let order_ids = crate::orders::linked_orders(&self.conn, id)?;
+            let stock_note_ids = crate::stock_notes::linked_notes(&self.conn, id)?;
             result.push(InvoiceSummary {
                 id,
                 voucher_id,
@@ -2510,8 +2514,10 @@ impl Store {
                 credited: credits.applied,
                 credit_total: credits.total,
                 has_credit_history: credits.has_history,
-                order_id: crate::orders::linked_order(&self.conn, id)?,
-                stock_note_id: crate::stock_notes::linked_note(&self.conn, id)?,
+                order_id: order_ids.first().copied(),
+                stock_note_id: stock_note_ids.first().copied(),
+                order_ids,
+                stock_note_ids,
                 opening_bill,
                 lines,
                 adjustments,
