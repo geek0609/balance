@@ -1,7 +1,8 @@
-//! Printable orders, invoices, adjustment notes, quotations, stock notes and payroll records.
+//! Printable account statements, trade documents and payroll records.
 use crate::{
     format_amount,
     inventory::{format_quantity, line_amount, InvoiceDiscount, InvoiceKind},
+    parse_date,
     quotations::quotation,
     stock_notes::{get_note, note_label},
     Error, Result, Store,
@@ -34,6 +35,15 @@ fn money(value: i128) -> String {
     )
 }
 
+fn statement_balance(value: i128) -> String {
+    let amount = money(value);
+    match value.cmp(&0) {
+        std::cmp::Ordering::Less => format!("{} Cr", amount.trim_start_matches('-')),
+        std::cmp::Ordering::Equal => amount,
+        std::cmp::Ordering::Greater => format!("{amount} Dr"),
+    }
+}
+
 fn printable_html(title: &str) -> String {
     ["<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>", &escape(title), "</title><style>body{font:14px system-ui,sans-serif;color:#182431;max-width:900px;margin:2rem auto;padding:0 1rem}h1{margin-bottom:.2rem}p{white-space:pre-line}table{border-collapse:collapse;width:100%;margin:1.5rem 0}th,td{text-align:left;border-bottom:1px solid #ccd3db;padding:.55rem;vertical-align:top}.num{text-align:right;white-space:nowrap}.totals{margin-left:auto;width:min(100%,360px)}.totals td{border:0}.total{font-weight:bold;border-top:2px solid #182431}.note{color:#4c5b68;font-size:12px}@media print{body{margin:0;max-width:none}}</style></head><body>"].concat()
 }
@@ -63,7 +73,174 @@ fn write_html(destination: &Path, html: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod statement_tests {
+    use crate::{Category, Posting, Store, VoucherKind};
+
+    #[test]
+    fn ledger_statement_prints_escaped_references_and_dated_balances() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Demo & Co").unwrap();
+        let ledger = store
+            .create_ledger(company, "Test account", Category::Asset)
+            .unwrap();
+        let offset = store
+            .create_ledger(company, "Offset", Category::Income)
+            .unwrap();
+        for (date, reference, amount) in [
+            ("2026-01-01", "OPENING", -2500),
+            ("2026-01-02", "DEMO <2>", 3000),
+            ("2026-01-03", "AFTER-CUTOFF", 1000),
+        ] {
+            store
+                .post_voucher_with_reference(
+                    company,
+                    VoucherKind::Journal,
+                    reference,
+                    date,
+                    "Demo <entry>",
+                    &[
+                        Posting {
+                            ledger_id: ledger,
+                            amount,
+                        },
+                        Posting {
+                            ledger_id: offset,
+                            amount: -amount,
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "balance-statement-{}-{nonce}.html",
+            std::process::id()
+        ));
+        let start = Some("2026-01-02");
+        let end = Some("2026-01-02");
+        store
+            .export_ledger_statement_html(company, ledger, start, end, &path)
+            .unwrap();
+        let rejected_overwrite = store
+            .export_ledger_statement_html(company, ledger, start, end, &path)
+            .is_err();
+        let html = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(rejected_overwrite);
+        assert!(html.contains("Demo &amp; Co"));
+        assert!(html.contains("DEMO &lt;2&gt;"));
+        assert!(html.contains("Demo &lt;entry&gt;"));
+        assert!(!html.contains("OPENING"));
+        assert!(!html.contains("AFTER-CUTOFF"));
+        assert!(html.contains("25.00 Cr"));
+        assert!(html.contains("5.00 Dr"));
+    }
+}
+
 impl Store {
+    pub fn export_ledger_statement_html(
+        &self,
+        company_id: i64,
+        ledger_id: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let destination = html_destination(destination.as_ref())?;
+        let tx = self.conn.unchecked_transaction()?;
+        let register = self.ledger_register(company_id, ledger_id, start, end)?;
+        let company = self
+            .companies()?
+            .into_iter()
+            .find(|c| c.id == company_id)
+            .ok_or_else(|| Error::Validation("Company not found".into()))?;
+        let party = self.ledger_profile(company_id, ledger_id)?;
+        let business = self.company_profile(company_id)?;
+        let currency = self.company_base_currency(company_id)?;
+        tx.commit()?;
+
+        let mut html = printable_html("Statement of account");
+        let _ = write!(
+            html,
+            "<h1>Statement of account</h1><p><strong>{}</strong>",
+            escape(&company.name)
+        );
+        for value in [
+            &business.address,
+            &business.region,
+            &business.postal_code,
+            &business.country,
+        ] {
+            if !value.trim().is_empty() {
+                let _ = write!(html, "<br>{}", escape(value));
+            }
+        }
+        let _ = write!(
+            html,
+            "</p><p>Account <strong>{}</strong>",
+            escape(&register.ledger.name)
+        );
+        for value in [
+            &party.mailing_name,
+            &party.address,
+            &party.region,
+            &party.postal_code,
+            &party.country,
+        ] {
+            if !value.trim().is_empty() && value.trim() != register.ledger.name {
+                let _ = write!(html, "<br>{}", escape(value));
+            }
+        }
+        let from = start
+            .map(parse_date)
+            .transpose()?
+            .map(|date| date.to_string());
+        let through = end
+            .map(parse_date)
+            .transpose()?
+            .map(|date| date.to_string());
+        let _ = write!(
+            html,
+            "</p><p>{} through {}",
+            from.as_deref().unwrap_or("First entry"),
+            through.as_deref().unwrap_or("last saved date")
+        );
+        if let Some(code) = currency {
+            let _ = write!(html, "<br>Currency {}", escape(&code));
+        }
+        html.push_str("</p><table><thead><tr><th>Date</th><th>Reference</th><th>Narration</th><th class=\"num\">Debit</th><th class=\"num\">Credit</th><th class=\"num\">Balance</th></tr></thead><tbody>");
+        let _ = write!(
+            html,
+            "<tr><th colspan=\"5\">Opening balance</th><td class=\"num\">{}</td></tr>",
+            statement_balance(register.opening_balance)
+        );
+        for entry in register.entries {
+            let amount = i128::from(entry.amount);
+            let debit = if amount > 0 {
+                money(amount)
+            } else {
+                String::new()
+            };
+            let credit = if amount < 0 {
+                money(-amount)
+            } else {
+                String::new()
+            };
+            let reference = if entry.reference.is_empty() {
+                format!("Voucher {}", entry.voucher_id)
+            } else {
+                escape(&entry.reference)
+            };
+            let _ = write!(html, "<tr><td>{}</td><td>{reference}</td><td>{}</td><td class=\"num\">{debit}</td><td class=\"num\">{credit}</td><td class=\"num\">{}</td></tr>", escape(&entry.date), escape(&entry.narration), statement_balance(entry.running_balance));
+        }
+        let _ = write!(html, "</tbody><tfoot><tr class=\"total\"><th colspan=\"5\">Closing balance</th><td class=\"num\">{}</td></tr></tfoot></table></body></html>", statement_balance(register.closing_balance));
+        write_html(destination, &html)
+    }
+
     pub fn export_invoice_credit_html(
         &self,
         company: i64,

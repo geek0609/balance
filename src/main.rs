@@ -141,6 +141,7 @@ struct App {
     report_from: String,
     report_to: String,
     register_ledger: Option<i64>,
+    ledger_statement_path: String,
     register_from: String,
     register_to: String,
     day_from: String,
@@ -409,6 +410,7 @@ impl App {
             report_from: String::new(),
             report_to: String::new(),
             register_ledger: None,
+            ledger_statement_path: String::new(),
             register_from: String::new(),
             register_to: String::new(),
             day_from: String::new(),
@@ -2046,15 +2048,47 @@ impl App {
                 return;
             }
         };
-        if ui.button("Export ledger activity as CSV").clicked() {
-            match self.store.export_ledger_register_csv(
-                company,
-                ledger,
-                from,
-                to,
-                self.report_export_path.trim(),
-            ) {
-                Ok(()) => self.message = "Ledger report exported".into(),
+        let export_csv = ui.button("Export ledger activity as CSV").clicked();
+        let export_html = ui
+            .horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.ledger_statement_path)
+                        .hint_text("Absolute path to a new .html file")
+                        .desired_width(350.0),
+                );
+                ui.button("Export printable statement").clicked()
+            })
+            .inner;
+        let export = if export_csv {
+            Some(
+                self.store
+                    .export_ledger_register_csv(
+                        company,
+                        ledger,
+                        from,
+                        to,
+                        self.report_export_path.trim(),
+                    )
+                    .map(|()| "Ledger report exported"),
+            )
+        } else if export_html {
+            Some(
+                self.store
+                    .export_ledger_statement_html(
+                        company,
+                        ledger,
+                        from,
+                        to,
+                        self.ledger_statement_path.trim(),
+                    )
+                    .map(|()| "Ledger statement exported"),
+            )
+        } else {
+            None
+        };
+        if let Some(result) = export {
+            match result {
+                Ok(text) => self.message = text.into(),
                 Err(e) => self.failure(e),
             }
         }

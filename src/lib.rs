@@ -193,6 +193,7 @@ pub struct DayBookEntry {
 #[derive(Debug, Clone)]
 pub struct LedgerEntry {
     pub voucher_id: i64,
+    pub reference: String,
     pub date: String,
     pub narration: String,
     pub amount: i64,
@@ -1295,6 +1296,7 @@ impl Store {
                 } else {
                     entries.push(LedgerEntry {
                         voucher_id: voucher.id,
+                        reference: voucher.reference.clone(),
                         date: voucher.date.clone(),
                         narration: voucher.narration.clone(),
                         amount: posting.amount,
