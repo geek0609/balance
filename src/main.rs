@@ -21,6 +21,7 @@ mod actual_cost_ui;
 mod advance_ui;
 mod budget_ui;
 mod cost_ui;
+mod currency_ui;
 mod manufacturing_ui;
 mod order_ui;
 mod payroll_ui;
@@ -31,6 +32,7 @@ use actual_cost_ui::ActualCostScreen;
 use advance_ui::AdvanceScreen;
 use budget_ui::BudgetScreen;
 use cost_ui::CostScreen;
+use currency_ui::CurrencyScreen;
 use manufacturing_ui::ManufacturingScreen;
 use order_ui::OrderScreen;
 use payroll_ui::PayrollScreen;
@@ -62,6 +64,7 @@ enum Page {
     Budgets,
     TaxRegister,
     Payroll,
+    Currencies,
 }
 struct App {
     store: Store,
@@ -223,6 +226,7 @@ struct App {
     tax_register_screen: TaxRegisterScreen,
     tax_profile_screen: TaxProfileScreen,
     payroll_screen: PayrollScreen,
+    currency_screen: CurrencyScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -480,6 +484,7 @@ impl App {
             tax_register_screen: TaxRegisterScreen::default(),
             tax_profile_screen: TaxProfileScreen::default(),
             payroll_screen: PayrollScreen::default(),
+            currency_screen: CurrencyScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -603,6 +608,7 @@ impl App {
         self.tax_register_screen = TaxRegisterScreen::default();
         self.tax_profile_screen = TaxProfileScreen::default();
         self.payroll_screen = PayrollScreen::default();
+        self.currency_screen = CurrencyScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -649,6 +655,7 @@ impl App {
             || self.invoice_draft_in_use()
             || self.stock_count_screen.preview_pending()
             || self.cost_screen.has_pending_changes()
+            || self.currency_screen.has_preview()
             || self.stock_editing.is_some();
         let profile_dirty = profile_dirty || self.reorder_editing.is_some();
         if profile_dirty {
@@ -1617,6 +1624,10 @@ impl App {
                         }
                     };
                     let protected = invoice_backed || reversal.is_some();
+                    let foreign = self
+                        .store
+                        .is_foreign_voucher(company, voucher.id)
+                        .unwrap_or(true);
                     ui.horizontal(|ui| {
                         ui.label(format!(
                             "{}  #{}  {}",
@@ -1627,7 +1638,7 @@ impl App {
                             ui.label(format!("Ref: {}", voucher.reference));
                         }
                         if ui
-                            .add_enabled(!protected, egui::Button::new("Edit"))
+                            .add_enabled(!protected && !foreign, egui::Button::new("Edit"))
                             .clicked()
                         {
                             self.editing_voucher = Some(voucher.id);
@@ -1657,8 +1668,10 @@ impl App {
                         {
                             self.voucher_reversal_target = Some(voucher.id);
                         }
-                        if protected {
-                            ui.small("Linked or reversed postings cannot be edited here");
+                        if foreign {
+                            ui.small("Foreign amounts are in Currencies.");
+                        } else if protected {
+                            ui.small("Linked or reversed postings cannot be edited here.");
                         }
                     });
                     if let Some(reversal) = reversal {
@@ -5354,6 +5367,11 @@ impl eframe::App for App {
                 ui.heading(RichText::new("Balance").color(Color32::from_rgb(30, 75, 115)));
                 ui.label("Early accounting prototype");
             });
+            if let Some(company) = self.company {
+                if let Ok(Some(code)) = self.store.company_base_currency(company) {
+                    ui.small(format!("Base currency: {code}"));
+                }
+            }
             ui.small(format!("Database: {}", self.database_path.display()));
         });
         egui::SidePanel::left("navigation").show(ctx, |ui| {
@@ -5362,6 +5380,7 @@ impl eframe::App for App {
                 ("Companies", Page::Company),
                 ("Ledgers", Page::Ledger),
                 ("Voucher", Page::Voucher),
+                ("Currencies", Page::Currencies),
                 ("Ledger activity", Page::Register),
                 ("Day book", Page::DayBook),
                 ("Outstanding", Page::Outstanding),
@@ -5410,6 +5429,7 @@ impl eframe::App for App {
                     Page::Company => {}
                     Page::Ledger => self.ledger_page(ui, company),
                     Page::Voucher => self.voucher_page(ui, company),
+                    Page::Currencies => self.currency_page(ui, company),
                     Page::Register => self.register_page(ui, company),
                     Page::DayBook => self.day_book_page(ui, company),
                     Page::Outstanding => self.outstanding_page(ui, company),

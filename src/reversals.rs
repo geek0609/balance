@@ -59,6 +59,7 @@ impl Store {
         tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, VoucherKind::Journal.as_str(), reference, date, format!("Reversal of voucher {original}: {reason}")])?;
         let reversal = tx.last_insert_rowid();
         write_counter_postings(&tx, company, original, reversal, &reversed)?;
+        crate::currencies::copy_foreign_reversal(&tx, company, original, reversal)?;
         tx.execute("INSERT INTO voucher_reversals(company_id, original_voucher_id, reversal_voucher_id, reason) VALUES (?1, ?2, ?3, ?4)", params![company, original, reversal, reason])?;
         tx.commit()?;
         Ok(reversal)
