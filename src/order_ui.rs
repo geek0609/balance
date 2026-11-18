@@ -12,9 +12,11 @@ struct LineForm {
 }
 
 struct CreateOrderForm {
+    quotation: bool,
     kind: InvoiceKind,
     date: String,
     expected_on: String,
+    valid_through: String,
     party: Option<i64>,
     reference: String,
     notes: String,
@@ -24,9 +26,11 @@ struct CreateOrderForm {
 impl Default for CreateOrderForm {
     fn default() -> Self {
         Self {
+            quotation: false,
             kind: InvoiceKind::Sale,
             date: String::new(),
             expected_on: String::new(),
+            valid_through: String::new(),
             party: None,
             reference: String::new(),
             notes: String::new(),
@@ -66,6 +70,15 @@ impl CreateOrderForm {
 }
 
 #[derive(Default)]
+struct QuotationForm {
+    selected: Option<i64>,
+    order_reference: String,
+    order_date: String,
+    expected_on: String,
+    close_reason: String,
+}
+
+#[derive(Default)]
 pub(super) struct OrderScreen {
     form: CreateOrderForm,
     kind: Option<InvoiceKind>,
@@ -75,6 +88,7 @@ pub(super) struct OrderScreen {
     close_reason: String,
     schedule_kind: Option<InvoiceKind>,
     schedule_through: String,
+    quotation: QuotationForm,
 }
 
 impl OrderScreen {
@@ -87,8 +101,13 @@ impl OrderScreen {
 impl App {
     pub(super) fn orders_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Sales and purchase orders");
-        egui::CollapsingHeader::new("Create order")
+        egui::CollapsingHeader::new("Create order or quotation")
             .show(ui, |ui| self.create_order_form(ui, company));
+        egui::CollapsingHeader::new("Quotations").show(ui, |ui| {
+            if let Err(error) = self.quotation_register(ui, company) {
+                self.failure(error);
+            }
+        });
         egui::CollapsingHeader::new("Stock availability")
             .show(ui, |ui| self.order_availability_view(ui, company));
         egui::CollapsingHeader::new("Pending order schedule")
@@ -340,6 +359,7 @@ impl App {
             }
         };
         let form = &mut self.order_screen.form;
+        ui.checkbox(&mut form.quotation, "Save as quotation");
         egui::ComboBox::from_id_salt("order-kind")
             .selected_text(form.kind.as_str())
             .show_ui(ui, |ui| {
@@ -349,14 +369,24 @@ impl App {
             });
         pick_account(ui, "order-party", "Party", &ledgers, &mut form.party, false);
         egui::Grid::new("order-fields").show(ui, |ui| {
+            let date_label = if form.quotation {
+                "Quotation date (YYYY-MM-DD)"
+            } else {
+                "Order date (YYYY-MM-DD)"
+            };
             for (label, value) in [
                 ("Reference", &mut form.reference),
-                ("Order date (YYYY-MM-DD)", &mut form.date),
+                (date_label, &mut form.date),
                 ("Expected date (optional)", &mut form.expected_on),
                 ("Notes", &mut form.notes),
             ] {
                 ui.label(label);
                 ui.text_edit_singleline(value);
+                ui.end_row();
+            }
+            if form.quotation {
+                ui.label("Valid through (optional)");
+                ui.add(egui::TextEdit::singleline(&mut form.valid_through).hint_text("YYYY-MM-DD"));
                 ui.end_row();
             }
         });
@@ -385,11 +415,38 @@ impl App {
         if ui.button("Add item").clicked() {
             form.lines.push(LineForm::default());
         }
-        if ui.button("Save order").clicked() {
-            match form
-                .draft()
-                .and_then(|draft| self.store.create_order(company, &draft))
-            {
+        let quotation = form.quotation;
+        if ui
+            .button(if quotation {
+                "Save quotation"
+            } else {
+                "Save order"
+            })
+            .clicked()
+        {
+            let result = form.draft().and_then(|draft| {
+                if quotation {
+                    let expiry = form.valid_through.trim();
+                    self.store.create_quotation(
+                        company,
+                        &draft,
+                        (!expiry.is_empty()).then_some(expiry),
+                    )
+                } else {
+                    self.store.create_order(company, &draft)
+                }
+            });
+            match result {
+                Ok(id) if quotation => {
+                    self.order_screen.quotation = QuotationForm {
+                        selected: Some(id),
+                        order_reference: form.reference.trim().to_owned(),
+                        expected_on: form.expected_on.trim().to_owned(),
+                        ..QuotationForm::default()
+                    };
+                    self.order_screen.form = CreateOrderForm::default();
+                    self.message = format!("Quotation {id} saved");
+                }
                 Ok(order) => {
                     self.order_screen.form = CreateOrderForm::default();
                     self.order_screen.select(order);
@@ -400,6 +457,141 @@ impl App {
         }
     }
 
+    fn quotation_register(&mut self, ui: &mut egui::Ui, company: i64) -> Result<()> {
+        let quotes = self.store.quotations(company)?;
+        if quotes.is_empty() {
+            ui.label("No quotations saved.");
+            return Ok(());
+        }
+        let form = &mut self.order_screen.quotation;
+        let mut selected = form.selected;
+        let picked = quotes.iter().find(|quote| Some(quote.id) == selected);
+        egui::ComboBox::from_label("Quotation")
+            .selected_text(
+                picked
+                    .map(|quote| quote.reference.as_str())
+                    .unwrap_or("Select quotation"),
+            )
+            .show_ui(ui, |ui| {
+                for quote in &quotes {
+                    ui.selectable_value(
+                        &mut selected,
+                        Some(quote.id),
+                        format!(
+                            "{} {} · {} · {}",
+                            quote.kind.as_str(),
+                            quote.reference,
+                            quote.party,
+                            quote.status()
+                        ),
+                    );
+                }
+            });
+        let Some(quote) = quotes.iter().find(|quote| Some(quote.id) == selected) else {
+            return Ok(());
+        };
+        if form.selected != selected {
+            *form = QuotationForm {
+                selected,
+                order_reference: quote.reference.clone(),
+                expected_on: quote.expected_on.clone().unwrap_or_default(),
+                ..QuotationForm::default()
+            };
+        }
+        ui.label(format!(
+            "{} · {} · {}",
+            quote.party,
+            quote.date,
+            quote.status()
+        ));
+        if let Some(expiry) = &quote.valid_through {
+            ui.label(format!("Valid through {expiry}"));
+        }
+        if let Some(expected) = &quote.expected_on {
+            ui.label(format!("Expected {expected}"));
+        }
+        if !quote.notes.is_empty() {
+            ui.label(&quote.notes);
+        }
+        let items = self.store.stock_items(company)?;
+        let lines = self.store.quotation_lines(company, quote.id)?;
+        egui::Grid::new("quotation-lines")
+            .striped(true)
+            .show(ui, |ui| {
+                for heading in ["Item", "Quantity", "Unit price"] {
+                    ui.strong(heading);
+                }
+                ui.end_row();
+                for line in lines {
+                    let item = items.iter().find(|item| item.id == line.item_id);
+                    ui.label(
+                        item.map(|item| item.name.as_str())
+                            .unwrap_or("Unavailable item"),
+                    );
+                    ui.label(format!(
+                        "{} {}",
+                        format_quantity(i128::from(line.quantity)),
+                        item.map(|item| item.unit.as_str()).unwrap_or(""),
+                    ));
+                    ui.label(format_amount(line.unit_price));
+                    ui.end_row();
+                }
+            });
+        if let Some(order) = quote.order_id {
+            if let Some(converted) = &quote.converted_at {
+                ui.label(format!("Converted {converted} UTC"));
+            }
+            if ui.button(format!("View order #{order}")).clicked() {
+                self.order_screen.select(order);
+            }
+            return Ok(());
+        }
+        if let Some(closed) = &quote.closed_at {
+            ui.label(format!("Closed {closed} UTC"));
+            if let Some(reason) = &quote.close_reason {
+                ui.label(reason);
+            }
+            return Ok(());
+        }
+
+        egui::Grid::new("quotation-conversion").show(ui, |ui| {
+            for (label, value) in [
+                ("Order reference", &mut form.order_reference),
+                ("Order date (YYYY-MM-DD)", &mut form.order_date),
+                ("Expected date (optional)", &mut form.expected_on),
+            ] {
+                ui.label(label);
+                ui.text_edit_singleline(value);
+                ui.end_row();
+            }
+        });
+        if ui.button("Convert to order").clicked() {
+            let delivery = form.expected_on.trim();
+            let order = self.store.convert_quotation(
+                company,
+                quote.id,
+                &form.order_reference,
+                &form.order_date,
+                (!delivery.is_empty()).then_some(delivery),
+            )?;
+            self.order_screen.select(order);
+            self.message = format!("Order {order} created from quotation {}", quote.reference);
+            return Ok(());
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Close reason");
+            ui.text_edit_singleline(&mut form.close_reason);
+        });
+        if ui.button("Close quotation").clicked() {
+            self.store
+                .close_quotation(company, quote.id, &form.close_reason)?;
+            form.close_reason.clear();
+            self.message = "Quotation closed".into();
+        }
+        Ok(())
+    }
+
     fn order_detail_view(&mut self, ui: &mut egui::Ui, company: i64, detail: &OrderDetail) {
         let order = &detail.summary;
         ui.heading(format!(
@@ -408,6 +600,13 @@ impl App {
             order.reference,
             order.status.label()
         ));
+        match self.store.order_quotation(company, order.id) {
+            Ok(Some(reference)) => {
+                ui.label(format!("Quotation {reference}"));
+            }
+            Ok(None) => {}
+            Err(error) => self.failure(error),
+        }
         if ui.button("Hide order details").clicked() {
             self.order_screen.selected = None;
             self.order_screen.close_reason.clear();

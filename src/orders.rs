@@ -258,6 +258,66 @@ pub(crate) fn linked_order(conn: &Connection, invoice: i64) -> Result<Option<i64
         .optional()?)
 }
 
+pub(crate) fn validate_order_draft(
+    conn: &Connection,
+    company: i64,
+    draft: &OrderDraft,
+) -> Result<(NaiveDate, Option<NaiveDate>)> {
+    let date = parse_date(&draft.date)?;
+    let expected = draft.expected_on.as_deref().map(parse_date).transpose()?;
+    if expected.is_some_and(|expected| expected < date) {
+        return Err(Error::Validation(
+            "Expected date cannot precede the order date".into(),
+        ));
+    }
+    if draft.lines.is_empty() {
+        return Err(Error::Validation("Enter at least one stock item".into()));
+    }
+    if !matches!(
+        ledger_category(conn, company, draft.party_ledger_id)?,
+        Category::Asset | Category::Liability
+    ) {
+        return Err(Error::Validation(
+            "The party ledger must be an asset or liability".into(),
+        ));
+    }
+    let mut items = HashSet::new();
+    for line in &draft.lines {
+        if !items.insert(line.item_id) {
+            return Err(Error::Validation("Enter each item once per order".into()));
+        }
+        line_amount(line.quantity, line.unit_price)?;
+        check_quantity_precision(conn, company, line.item_id, line.quantity)?;
+    }
+    Ok((date, expected))
+}
+
+pub(crate) fn insert_order(conn: &Connection, company: i64, draft: &OrderDraft) -> Result<i64> {
+    let reference = required(&draft.reference, "Order reference")?;
+    let reference_key = reference.to_lowercase();
+    let (date, expected) = validate_order_draft(conn, company, draft)?;
+    let inserted = conn.execute(
+            "INSERT INTO orders(company_id, kind, party_ledger_id, reference, reference_key, date, expected_on, notes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(company_id, kind, party_ledger_id, reference_key) DO NOTHING",
+            params![company, draft.kind.as_str(), draft.party_ledger_id, reference, reference_key,
+                date.format("%Y-%m-%d").to_string(), expected.map(|d| d.format("%Y-%m-%d").to_string()), draft.notes.trim()],
+        )?;
+    if inserted == 0 {
+        return Err(Error::Validation(
+            "An order with this type, party and reference already exists".into(),
+        ));
+    }
+    let order = conn.last_insert_rowid();
+    for line in &draft.lines {
+        conn.execute(
+                "INSERT INTO order_lines(order_id, item_id, quantity, unit_price) VALUES (?1, ?2, ?3, ?4)",
+                params![order, line.item_id, line.quantity, line.unit_price],
+            )?;
+    }
+    Ok(order)
+}
+
 impl Store {
     /// Stock quantities and open order remainders across all saved dates.
     pub fn order_availability(&self, company: i64) -> Result<Vec<OrderAvailability>> {
@@ -374,56 +434,10 @@ impl Store {
     }
 
     pub fn create_order(&mut self, company: i64, draft: &OrderDraft) -> Result<i64> {
-        let reference = required(&draft.reference, "Order reference")?;
-        let reference_key = reference.to_lowercase();
-        let date = parse_date(&draft.date)?;
-        let expected = draft.expected_on.as_deref().map(parse_date).transpose()?;
-        if expected.is_some_and(|expected| expected < date) {
-            return Err(Error::Validation(
-                "Expected date cannot precede the order date".into(),
-            ));
-        }
-        if draft.lines.is_empty() {
-            return Err(Error::Validation("Enter at least one stock item".into()));
-        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !matches!(
-            ledger_category(&tx, company, draft.party_ledger_id)?,
-            Category::Asset | Category::Liability
-        ) {
-            return Err(Error::Validation(
-                "The party ledger must be an asset or liability".into(),
-            ));
-        }
-        let mut items = HashSet::new();
-        for line in &draft.lines {
-            if !items.insert(line.item_id) {
-                return Err(Error::Validation("Enter each item once per order".into()));
-            }
-            line_amount(line.quantity, line.unit_price)?;
-            check_quantity_precision(&tx, company, line.item_id, line.quantity)?;
-        }
-        let inserted = tx.execute(
-            "INSERT INTO orders(company_id, kind, party_ledger_id, reference, reference_key, date, expected_on, notes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(company_id, kind, party_ledger_id, reference_key) DO NOTHING",
-            params![company, draft.kind.as_str(), draft.party_ledger_id, reference, reference_key,
-                date.format("%Y-%m-%d").to_string(), expected.map(|d| d.format("%Y-%m-%d").to_string()), draft.notes.trim()],
-        )?;
-        if inserted == 0 {
-            return Err(Error::Validation(
-                "An order with this type, party and reference already exists".into(),
-            ));
-        }
-        let order = tx.last_insert_rowid();
-        for line in &draft.lines {
-            tx.execute(
-                "INSERT INTO order_lines(order_id, item_id, quantity, unit_price) VALUES (?1, ?2, ?3, ?4)",
-                params![order, line.item_id, line.quantity, line.unit_price],
-            )?;
-        }
+        let order = insert_order(&tx, company, draft)?;
         tx.commit()?;
         Ok(order)
     }

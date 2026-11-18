@@ -29,6 +29,7 @@ pub mod payroll;
 pub mod payroll_payments;
 pub mod periods;
 pub mod pricing;
+pub mod quotations;
 pub mod recurring;
 pub mod reorder;
 pub mod report_export;
@@ -40,7 +41,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 54;
+const SCHEMA_VERSION: i64 = 55;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -449,6 +450,8 @@ impl Store {
             "recurring_journals",
             "recurring_journal_lines",
             "recurring_journal_occurrences",
+            "quotations",
+            "quotation_lines",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -804,6 +807,10 @@ impl Store {
         if version < 54 {
             recurring::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 54)?;
+        }
+        if version < 55 {
+            quotations::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 55)?;
         }
         tx.commit()?;
         Ok(Self { conn })
