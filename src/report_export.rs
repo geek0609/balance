@@ -1,5 +1,6 @@
 //! Narrow CSV exports of the reports shown in the application.
 use crate::{
+    actual_cost::ActualCostMethod,
     inventory::{format_quantity, InvoiceKind},
     parse_date, Error, Result, Store, VoucherKind,
 };
@@ -228,7 +229,26 @@ impl Store {
         as_of: &str,
         destination: impl AsRef<Path>,
     ) -> Result<()> {
-        let report = self.stock_valuation_at_average_cost(company, as_of)?;
+        self.export_actual_stock_valuation_csv(
+            company,
+            as_of,
+            ActualCostMethod::WeightedAverage,
+            destination,
+        )
+    }
+
+    pub fn export_actual_stock_valuation_csv(
+        &self,
+        company: i64,
+        as_of: &str,
+        method: ActualCostMethod,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.stock_valuation_at_actual_cost(company, as_of, method)?;
+        let value_column = match method {
+            ActualCostMethod::WeightedAverage => "weighted_average_stock_value",
+            ActualCostMethod::Fifo => "fifo_stock_value",
+        };
         let context = [self.report_company_name(company)?, report.date.to_string()];
         let mut csv = writer();
         contextual_row(
@@ -240,7 +260,7 @@ impl Store {
                 "item",
                 "unit",
                 "quantity",
-                "weighted_average_stock_value",
+                value_column,
                 "issue",
                 "items_unavailable",
             ]),

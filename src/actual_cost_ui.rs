@@ -1,5 +1,5 @@
 use super::{money, App};
-use balance::actual_cost::{ActualCostIssue, AverageCostValuation, StockReceipt};
+use balance::actual_cost::{ActualCostIssue, ActualCostMethod, ActualCostValuation, StockReceipt};
 use balance::inventory::format_quantity;
 use balance::parse_amount;
 use eframe::egui;
@@ -7,7 +7,8 @@ use eframe::egui;
 #[derive(Default)]
 pub(super) struct ActualCostScreen {
     as_of: String,
-    report: Option<AverageCostValuation>,
+    method: ActualCostMethod,
+    report: Option<ActualCostValuation>,
     receipt_search: String,
     selected: Option<StockReceipt>,
     amount: String,
@@ -22,7 +23,7 @@ impl ActualCostScreen {
 }
 
 impl App {
-    pub(super) fn average_cost_view(&mut self, ui: &mut egui::Ui, company: i64) {
+    pub(super) fn actual_cost_view(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.small("Net purchase amounts and recorded acquisition costs determine stock value across all locations.");
         egui::CollapsingHeader::new("Acquisition costs for stock adjustments")
             .open(self.actual_cost_screen.selected.is_some().then_some(true))
@@ -32,6 +33,21 @@ impl App {
         let mut run = false;
         let mut export = false;
         ui.horizontal_wrapped(|ui| {
+            let previous = self.actual_cost_screen.method;
+            egui::ComboBox::from_id_salt("actual-stock-cost-method")
+                .selected_text(previous.label())
+                .show_ui(ui, |ui| {
+                    for method in ActualCostMethod::ALL {
+                        ui.selectable_value(
+                            &mut self.actual_cost_screen.method,
+                            method,
+                            method.label(),
+                        );
+                    }
+                });
+            if previous != self.actual_cost_screen.method {
+                self.actual_cost_screen.report = None;
+            }
             ui.label("As of");
             if ui
                 .add(
@@ -43,12 +59,16 @@ impl App {
             {
                 self.actual_cost_screen.report = None;
             }
-            run = ui.button("Run weighted average valuation").clicked();
-            export = ui.button("Export weighted average CSV").clicked();
+            run = ui.button("Run stock valuation").clicked();
+            export = ui.button("Export actual cost CSV").clicked();
         });
         let date = self.actual_cost_screen.as_of.trim();
+        let method = self.actual_cost_screen.method;
         if run {
-            match self.store.stock_valuation_at_average_cost(company, date) {
+            match self
+                .store
+                .stock_valuation_at_actual_cost(company, date, method)
+            {
                 Ok(report) => {
                     self.actual_cost_screen.report = Some(report);
                     self.message.clear();
@@ -60,12 +80,13 @@ impl App {
             }
         }
         if export {
-            match self.store.export_average_stock_valuation_csv(
+            match self.store.export_actual_stock_valuation_csv(
                 company,
                 date,
+                method,
                 self.report_export_path.trim(),
             ) {
-                Ok(()) => self.message = "Weighted average valuation exported".into(),
+                Ok(()) => self.message = format!("{} valuation exported", method.label()),
                 Err(error) => self.message = error.to_string(),
             }
         }
@@ -77,8 +98,9 @@ impl App {
             return;
         };
         ui.label(format!(
-            "{} | Known stock value {} | {} items unavailable",
+            "{} | {} | Known stock value {} | {} items unavailable",
             report.date,
+            report.method.label(),
             money(report.known_value),
             report.unavailable
         ));

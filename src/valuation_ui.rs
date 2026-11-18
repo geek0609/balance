@@ -28,8 +28,8 @@ impl App {
             });
         ui.separator();
         self.report_export_path_field(ui);
-        egui::CollapsingHeader::new("Weighted average stock value").show(ui, |ui| {
-            self.average_cost_view(ui, company);
+        egui::CollapsingHeader::new("Stock value at actual cost").show(ui, |ui| {
+            self.actual_cost_view(ui, company);
         });
         egui::CollapsingHeader::new("Stock value at standard cost").show(ui, |ui| {
             self.standard_stock_view(ui, company);

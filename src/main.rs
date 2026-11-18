@@ -2724,7 +2724,7 @@ impl App {
                 ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
             }
         }
-        ui.small("Quantities may be negative. See Stock valuation for standard and weighted average costs.");
+        ui.small("Quantities may be negative. See Stock valuation for standard cost, weighted average and FIFO reports.");
         ui.heading("Low stock across all locations");
         ui.small("Uses the as-of date above and current reorder settings, regardless of the location filter. Suggested quantities are fixed and do not account for pending orders.");
         match self.store.low_stock(company, end) {

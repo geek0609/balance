@@ -1,9 +1,9 @@
-//! Company-wide weighted average inventory costs for receipts and issues.
+//! Company-wide inventory costs for receipts and issues.
 use crate::inventory::{InvoiceKind, StockItem};
 use crate::{parse_date, required, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -60,8 +60,25 @@ impl std::fmt::Display for ActualCostIssue {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActualCostMethod {
+    #[default]
+    WeightedAverage,
+    Fifo,
+}
+impl ActualCostMethod {
+    pub const ALL: [Self; 2] = [Self::WeightedAverage, Self::Fifo];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WeightedAverage => "Weighted average",
+            Self::Fifo => "FIFO",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct AverageCostRow {
+pub struct ActualCostRow {
     pub item: StockItem,
     pub quantity: i128,
     pub value: Option<i128>,
@@ -69,17 +86,22 @@ pub struct AverageCostRow {
 }
 
 #[derive(Debug, Clone)]
-pub struct AverageCostValuation {
+pub struct ActualCostValuation {
     pub date: NaiveDate,
-    pub rows: Vec<AverageCostRow>,
+    pub method: ActualCostMethod,
+    pub rows: Vec<ActualCostRow>,
     pub known_value: i128,
     pub unavailable: usize,
 }
 
+pub type AverageCostRow = ActualCostRow;
+pub type AverageCostValuation = ActualCostValuation;
+
 #[derive(Debug, Clone, Copy)]
 enum Movement {
     Receipt(Option<i64>),
-    Sale,
+    Purchase(i64),
+    Sale { reversed: bool },
     SaleReversal,
     PurchaseReversal,
     AdjustmentOut,
@@ -88,10 +110,11 @@ impl Movement {
     fn priority(self) -> u8 {
         match self {
             Self::Receipt(_) => 0,
-            Self::SaleReversal => 1,
-            Self::Sale => 2,
-            Self::PurchaseReversal => 3,
-            Self::AdjustmentOut => 4,
+            Self::Purchase(_) => 1,
+            Self::SaleReversal => 2,
+            Self::Sale { .. } => 3,
+            Self::PurchaseReversal => 4,
+            Self::AdjustmentOut => 5,
         }
     }
 }
@@ -103,31 +126,15 @@ struct Event {
     movement: Movement,
 }
 
-#[derive(Default)]
-struct Pool {
+#[derive(Default, Clone, Copy)]
+struct Layer {
     quantity: i128,
     value: i128,
-    sale_costs: HashMap<i64, i128>,
 }
-
-fn amount_too_large() -> Error {
-    Error::Validation("Weighted average stock value is too large".into())
-}
-
-impl Pool {
-    fn receive(&mut self, quantity: i128, value: i128) -> Result<()> {
-        self.quantity = self
-            .quantity
-            .checked_add(quantity)
-            .ok_or_else(amount_too_large)?;
-        self.value = self.value.checked_add(value).ok_or_else(amount_too_large)?;
-        Ok(())
-    }
-
-    /// Release a proportional share of available value, rounding to the nearest
-    /// hundredth. Issuing the remaining units clears the entire remaining value.
-    fn issue(&mut self, quantity: i128) -> Result<i128> {
-        let cost = if quantity == self.quantity {
+impl Layer {
+    /// Release a proportional share of the remaining value in this layer.
+    fn take(&mut self, quantity: i128) -> Result<Self> {
+        let value = if quantity == self.quantity {
             self.value
         } else {
             let numerator = self
@@ -139,17 +146,82 @@ impl Pool {
             quotient + i128::from(remainder >= self.quantity - remainder)
         };
         self.quantity -= quantity;
-        self.value -= cost;
-        Ok(cost)
+        self.value -= value;
+        Ok(Self { quantity, value })
     }
 }
 
-fn calculate(events: &mut [Event]) -> Result<std::result::Result<Pool, ActualCostIssue>> {
+#[derive(Default)]
+struct Pool {
+    available: Layer,
+    // Weighted average has a single combined layer, represented by None.
+    fifo_layers: Option<VecDeque<Layer>>,
+    sale_costs: HashMap<i64, Vec<Layer>>,
+}
+
+fn amount_too_large() -> Error {
+    Error::Validation("Inventory cost report amount is too large".into())
+}
+
+impl Pool {
+    fn receive(&mut self, layer: Layer) -> Result<()> {
+        self.available.quantity = self
+            .available
+            .quantity
+            .checked_add(layer.quantity)
+            .ok_or_else(amount_too_large)?;
+        self.available.value = self
+            .available
+            .value
+            .checked_add(layer.value)
+            .ok_or_else(amount_too_large)?;
+        if let Some(layers) = &mut self.fifo_layers {
+            layers.push_back(layer);
+        }
+        Ok(())
+    }
+
+    fn issue(&mut self, quantity: i128) -> Result<Vec<Layer>> {
+        let Some(layers) = &mut self.fifo_layers else {
+            return Ok(vec![self.available.take(quantity)?]);
+        };
+        let mut unfilled = quantity;
+        let mut portions = Vec::new();
+        while unfilled > 0 {
+            let layer = layers.front_mut().ok_or_else(|| {
+                Error::Validation("FIFO layers do not cover the available units".into())
+            })?;
+            let take = unfilled.min(layer.quantity);
+            let portion = layer.take(take)?;
+            self.available.quantity -= portion.quantity;
+            self.available.value -= portion.value;
+            unfilled -= take;
+            portions.push(portion);
+            if layer.quantity == 0 {
+                layers.pop_front();
+            }
+        }
+        Ok(portions)
+    }
+}
+
+fn calculate(
+    events: &mut [Event],
+    method: ActualCostMethod,
+) -> Result<std::result::Result<Pool, ActualCostIssue>> {
     events.sort_by_key(|event| (event.date, event.movement.priority(), event.source_id));
-    let mut pool = Pool::default();
+    let mut pool = Pool {
+        fifo_layers: (method == ActualCostMethod::Fifo).then(VecDeque::new),
+        ..Pool::default()
+    };
     for event in events {
         match event.movement {
-            Movement::Receipt(Some(value)) => pool.receive(event.quantity, i128::from(value))?,
+            Movement::Receipt(Some(value)) | Movement::Purchase(value) => {
+                pool.receive(Layer {
+                    quantity: event.quantity,
+                    value: i128::from(value),
+                })?;
+            }
             Movement::Receipt(None) => {
                 return Ok(Err(ActualCostIssue::MissingReceiptCost {
                     date: event.date,
@@ -160,12 +232,14 @@ fn calculate(events: &mut [Event]) -> Result<std::result::Result<Pool, ActualCos
                 let restored = pool.sale_costs.remove(&event.source_id).ok_or_else(|| {
                     Error::Validation("Original sale cost is missing for a reversal".into())
                 })?;
-                pool.receive(event.quantity, restored)?;
+                for layer in restored {
+                    pool.receive(layer)?;
+                }
             }
             issue => {
-                if event.quantity > pool.quantity {
+                if event.quantity > pool.available.quantity {
                     let source = match issue {
-                        Movement::Sale => format!("Sale line {}", event.source_id),
+                        Movement::Sale { .. } => format!("Sale line {}", event.source_id),
                         Movement::PurchaseReversal => {
                             format!("Purchase reversal for line {}", event.source_id)
                         }
@@ -177,9 +251,9 @@ fn calculate(events: &mut [Event]) -> Result<std::result::Result<Pool, ActualCos
                         source,
                     }));
                 }
-                let cost = pool.issue(event.quantity)?;
-                if matches!(issue, Movement::Sale) {
-                    pool.sale_costs.insert(event.source_id, cost);
+                let portions = pool.issue(event.quantity)?;
+                if matches!(issue, Movement::Sale { reversed: true }) {
+                    pool.sale_costs.insert(event.source_id, portions);
                 }
             }
         }
@@ -250,8 +324,10 @@ fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64
                 source_id: line,
                 quantity,
                 movement: match kind {
-                    InvoiceKind::Sale => Movement::Sale,
-                    InvoiceKind::Purchase => Movement::Receipt(Some(row.get(5)?)),
+                    InvoiceKind::Sale => Movement::Sale {
+                        reversed: reversal.is_some_and(|date| date <= end),
+                    },
+                    InvoiceKind::Purchase => Movement::Purchase(row.get(5)?),
                 },
             });
             if let Some(date) = reversal.filter(|date| *date <= end) {
@@ -374,38 +450,50 @@ impl Store {
         company: i64,
         date: &str,
     ) -> Result<AverageCostValuation> {
+        self.stock_valuation_at_actual_cost(company, date, ActualCostMethod::WeightedAverage)
+    }
+
+    pub fn stock_valuation_at_actual_cost(
+        &self,
+        company: i64,
+        date: &str,
+        method: ActualCostMethod,
+    ) -> Result<ActualCostValuation> {
         let end = parse_date(date)?;
         let tx = self.conn.unchecked_transaction()?;
         let mut events = events(&tx, company, end)?;
         let balances = self.stock_balances(company, Some(date))?;
-        let mut report = AverageCostValuation {
+        let mut report = ActualCostValuation {
             date: end,
+            method,
             rows: Vec::with_capacity(balances.len()),
             known_value: 0,
             unavailable: 0,
         };
         for balance in balances {
-            let (value, issue) =
-                match calculate(&mut events.remove(&balance.item.id).unwrap_or_default())? {
-                    Ok(pool) => {
-                        if pool.quantity != balance.quantity {
-                            return Err(Error::Validation(format!(
-                                "Stock movements do not reconcile for {}",
-                                balance.item.name
-                            )));
-                        }
-                        report.known_value = report
-                            .known_value
-                            .checked_add(pool.value)
-                            .ok_or_else(amount_too_large)?;
-                        (Some(pool.value), None)
+            let (value, issue) = match calculate(
+                &mut events.remove(&balance.item.id).unwrap_or_default(),
+                method,
+            )? {
+                Ok(pool) => {
+                    if pool.available.quantity != balance.quantity {
+                        return Err(Error::Validation(format!(
+                            "Stock movements do not reconcile for {}",
+                            balance.item.name
+                        )));
                     }
-                    Err(issue) => {
-                        report.unavailable += 1;
-                        (None, Some(issue))
-                    }
-                };
-            report.rows.push(AverageCostRow {
+                    report.known_value = report
+                        .known_value
+                        .checked_add(pool.available.value)
+                        .ok_or_else(amount_too_large)?;
+                    (Some(pool.available.value), None)
+                }
+                Err(issue) => {
+                    report.unavailable += 1;
+                    (None, Some(issue))
+                }
+            };
+            report.rows.push(ActualCostRow {
                 item: balance.item,
                 quantity: balance.quantity,
                 value,
