@@ -12,6 +12,8 @@ const RELEASE_VERSION: &str = match option_env!("BALANCE_UPDATE_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+const CHECK_INTERVAL_SECONDS: c_int = 60 * 60;
+
 static APP_CONTEXT: OnceLock<egui::Context> = OnceLock::new();
 
 #[derive(Default)]
@@ -98,6 +100,8 @@ impl Sparkle {
                 symbol(&library, c"win_sparkle_set_app_details")?;
             let set_build: unsafe extern "C" fn(*const u16) =
                 symbol(&library, c"win_sparkle_set_app_build_version")?;
+            let set_interval: unsafe extern "C" fn(c_int) =
+                symbol(&library, c"win_sparkle_set_update_check_interval")?;
             let set_can_shutdown: unsafe extern "C" fn(extern "C" fn() -> c_int) =
                 symbol(&library, c"win_sparkle_set_can_shutdown_callback")?;
             let set_shutdown: unsafe extern "C" fn(extern "C" fn()) =
@@ -110,6 +114,9 @@ impl Sparkle {
             set_build(build.as_ptr());
             set_feed(FEED.as_ptr());
             set_registry(REGISTRY_PATH.as_ptr());
+            // Preview builds ship several times a day; the default is daily.
+            // One hour is the shortest interval WinSparkle accepts.
+            set_interval(CHECK_INTERVAL_SECONDS);
             APP_CONTEXT
                 .set(ctx.clone())
                 .map_err(|_| "Updater already initialized")?;

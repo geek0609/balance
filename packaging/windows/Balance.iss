@@ -45,7 +45,9 @@ Root: HKCU; Subkey: "Software\Balance\Installed"; ValueType: dword; ValueName: "
 Root: HKCU; Subkey: "Software\Balance\Updates"; ValueType: string; ValueName: "CheckForUpdates"; ValueData: "1"; Flags: createvalueifdoesntexist
 
 [Run]
-Filename: "{app}\balance.exe"; Description: "Open Balance"; Flags: nowait postinstall skipifsilent
+; Not skipped in silent mode: WinSparkle runs updates with /SILENT, and Balance
+; should reopen once the update is installed.
+Filename: "{app}\balance.exe"; Description: "Open Balance"; Flags: nowait postinstall
 
 [Code]
 function InitializeSetup(): Boolean;

@@ -152,7 +152,6 @@ try {
       <pubDate>$published</pubDate>
       <sparkle:version>$($metadata.build)</sparkle:version>
       <sparkle:shortVersionString>$($metadata.version)</sparkle:shortVersionString>
-      <sparkle:minimumSystemVersion>10.0</sparkle:minimumSystemVersion>
       <enclosure url="$assetUrl" length="$($metadata.length)" type="application/octet-stream"
         sparkle:os="windows-x64" sparkle:edSignature="$($metadata.signature)"
         sparkle:installerArguments="/SILENT /SP- /NORESTART" />
