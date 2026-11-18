@@ -1,7 +1,7 @@
 //! Sales and purchase orders fulfilled by linked invoices.
 use crate::inventory::{
     check_quantity_precision, insert_invoice_on_connection, ledger_category, line_amount,
-    InvoiceDraft, InvoiceKind,
+    InvoiceDraft, InvoiceKind, StockItem,
 };
 use crate::{parse_date, required, Category, Error, Result, Store};
 use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
@@ -112,6 +112,24 @@ pub struct OrderLineProgress {
     pub item: String,
     pub unit: String,
     pub fulfilled: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderAvailability {
+    pub item: StockItem,
+    pub on_hand: i128,
+    pub open_sales: i128,
+    pub open_purchases: i128,
+}
+
+impl OrderAvailability {
+    pub fn after_sales(&self) -> i128 {
+        self.on_hand - self.open_sales
+    }
+
+    pub fn projected(&self) -> i128 {
+        self.after_sales() + self.open_purchases
+    }
 }
 impl OrderLineProgress {
     pub fn unfulfilled(&self) -> i64 {
@@ -227,6 +245,58 @@ pub(crate) fn linked_order(conn: &Connection, invoice: i64) -> Result<Option<i64
 }
 
 impl Store {
+    /// Stock quantities and open order remainders across all saved dates.
+    pub fn order_availability(&self, company: i64) -> Result<Vec<OrderAvailability>> {
+        let snapshot = self.conn.unchecked_transaction()?;
+        let balances = self.stock_balances(company, None)?;
+        let mut commitments = HashMap::<i64, (i128, i128)>::new();
+        {
+            let mut stmt = snapshot.prepare(
+                "SELECT p.item_id, o.kind, p.quantity, p.fulfilled
+                 FROM orders o JOIN order_line_progress p ON p.order_id = o.id
+                 WHERE o.company_id = ?1 AND o.closed_at IS NULL",
+            )?;
+            let rows = stmt.query_map([company], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (item, kind, ordered, fulfilled) = row?;
+                if !(0..=ordered).contains(&fulfilled) {
+                    return Err(Error::Validation(
+                        "Order quantities are inconsistent".into(),
+                    ));
+                }
+                let (sales, purchases) = commitments.entry(item).or_default();
+                let remaining = i128::from(ordered - fulfilled);
+                match InvoiceKind::parse(&kind)? {
+                    InvoiceKind::Sale => *sales += remaining,
+                    InvoiceKind::Purchase => *purchases += remaining,
+                }
+            }
+        }
+        snapshot.commit()?;
+        Ok(balances
+            .into_iter()
+            .map(|balance| {
+                let (open_sales, open_purchases) = commitments
+                    .get(&balance.item.id)
+                    .copied()
+                    .unwrap_or_default();
+                OrderAvailability {
+                    item: balance.item,
+                    on_hand: balance.quantity,
+                    open_sales,
+                    open_purchases,
+                }
+            })
+            .collect())
+    }
+
     pub fn create_order(&mut self, company: i64, draft: &OrderDraft) -> Result<i64> {
         let reference = required(&draft.reference, "Order reference")?;
         let reference_key = reference.to_lowercase();

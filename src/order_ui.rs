@@ -87,6 +87,8 @@ impl App {
         ui.heading("Sales and purchase orders");
         egui::CollapsingHeader::new("Create order")
             .show(ui, |ui| self.create_order_form(ui, company));
+        egui::CollapsingHeader::new("Stock availability")
+            .show(ui, |ui| self.order_availability_view(ui, company));
         ui.separator();
         if let Some(selected) = self.order_screen.selected {
             match self.store.order_detail(company, selected) {
@@ -172,6 +174,61 @@ impl App {
                 self.order_screen.select(order.id);
             }
         }
+    }
+
+    fn order_availability_view(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.small("Uses stock movements and open order quantities across all saved dates, including future dates. The projection adds open purchases and subtracts open sales from on-hand stock.");
+        self.report_export_path_field(ui);
+        if ui.button("Export availability as CSV").clicked() {
+            match self
+                .store
+                .export_order_availability_csv(company, self.report_export_path.trim())
+            {
+                Ok(()) => self.message = "Stock availability report exported".into(),
+                Err(error) => self.failure(error),
+            }
+        }
+        let availability = match self.store.order_availability(company) {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.failure(error);
+                return;
+            }
+        };
+        if availability.is_empty() {
+            ui.label("Create a stock item to see availability.");
+            return;
+        }
+        egui::Grid::new("order-stock-availability")
+            .striped(true)
+            .show(ui, |ui| {
+                for label in [
+                    "Item",
+                    "Unit",
+                    "On hand",
+                    "Open sales",
+                    "Open purchases",
+                    "After sales",
+                    "Projected",
+                ] {
+                    ui.strong(label);
+                }
+                ui.end_row();
+                for row in availability {
+                    ui.label(&row.item.name);
+                    ui.label(&row.item.unit);
+                    for quantity in [
+                        row.on_hand,
+                        row.open_sales,
+                        row.open_purchases,
+                        row.after_sales(),
+                        row.projected(),
+                    ] {
+                        ui.label(format_quantity(quantity));
+                    }
+                    ui.end_row();
+                }
+            });
     }
 
     fn create_order_form(&mut self, ui: &mut egui::Ui, company: i64) {

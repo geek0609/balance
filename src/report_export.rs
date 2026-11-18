@@ -1122,6 +1122,53 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_order_availability_csv(
+        &self,
+        company: i64,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let context = [self.report_company_name(company)?, "all saved dates".into()];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "date_scope"]),
+            &strings(&[
+                "row_type",
+                "item_id",
+                "item",
+                "unit",
+                "on_hand",
+                "open_sales",
+                "open_purchases",
+                "after_sales",
+                "projected",
+            ]),
+        )?;
+        contextual_row(
+            &mut csv,
+            &context,
+            &strings(&["context", "", "", "", "", "", "", "", ""]),
+        )?;
+        for availability in self.order_availability(company)? {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "item".into(),
+                    availability.item.id.to_string(),
+                    text_cell(&availability.item.name),
+                    text_cell(&availability.item.unit),
+                    format_quantity(availability.on_hand),
+                    format_quantity(availability.open_sales),
+                    format_quantity(availability.open_purchases),
+                    format_quantity(availability.after_sales()),
+                    format_quantity(availability.projected()),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
     /// Export direct or rolled-up quantities for a selected location.
     pub fn export_stock_location_csv(
         &self,
