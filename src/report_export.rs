@@ -668,6 +668,8 @@ impl Store {
             "employer_contributions",
             "paid",
             "outstanding",
+            "reversal_date",
+            "reversal_voucher_id",
         ]);
         contextual_row(
             &mut csv,
@@ -676,15 +678,17 @@ impl Store {
         )?;
         let mut totals = [0_i128; 6];
         for row in entries {
-            for (total, value) in totals.iter_mut().zip([
-                i128::from(row.gross),
-                i128::from(row.deductions),
-                i128::from(row.net),
-                i128::from(row.employer_contributions),
-                row.paid,
-                row.outstanding,
-            ]) {
-                *total += value;
+            if row.reversal.is_none() {
+                for (total, value) in totals.iter_mut().zip([
+                    i128::from(row.gross),
+                    i128::from(row.deductions),
+                    i128::from(row.net),
+                    i128::from(row.employer_contributions),
+                    row.paid,
+                    row.outstanding,
+                ]) {
+                    *total += value;
+                }
             }
             contextual_row(
                 &mut csv,
@@ -707,11 +711,19 @@ impl Store {
                     money(row.employer_contributions.into()),
                     money(row.paid),
                     money(row.outstanding),
+                    row.reversal
+                        .as_ref()
+                        .map(|r| r.date.clone())
+                        .unwrap_or_default(),
+                    row.reversal
+                        .as_ref()
+                        .map(|r| r.voucher_id.to_string())
+                        .unwrap_or_default(),
                 ],
             )?;
         }
         let mut summary = vec![String::new(); details.len()];
-        summary[0] = "total".into();
+        summary[0] = "active_total".into();
         for (index, total) in totals.into_iter().enumerate() {
             summary[11 + index] = money(total);
         }

@@ -1,5 +1,6 @@
 //! Payroll accruals from explicitly entered amounts.
 use crate::inventory::ledger_category;
+use crate::reversals::{counter_postings, write_counter_postings};
 use crate::{
     check_ledgers, parse_date, required, validate_voucher, Category, Error, Posting, Result, Store,
     VoucherKind,
@@ -151,10 +152,20 @@ pub struct PayrollAccrual {
     pub employer_contributions: i64,
     pub paid: i128,
     pub outstanding: i128,
+    pub reversal: Option<PayrollReversal>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PayrollReversal {
+    pub voucher_id: i64,
+    pub date: String,
+    pub reference: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct PayrollLine {
+    pub head_id: i64,
     pub head: String,
     pub kind: PayHeadKind,
     pub amount: i64,
@@ -380,9 +391,25 @@ impl Store {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let date = date.format("%Y-%m-%d").to_string();
         let from = from.format("%Y-%m-%d").to_string();
         let to = to.format("%Y-%m-%d").to_string();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT v.date FROM payroll_accruals a JOIN vouchers v ON v.id = a.reversal_voucher_id
+                 WHERE a.company_id = ?1 AND a.employee_id = ?2 AND a.period_start = ?3 AND a.period_end = ?4"
+            )?;
+            let rows = stmt.query_map(params![company, draft.employee_id, from, to], |row| {
+                row.get::<_, String>(0)
+            })?;
+            for row in rows {
+                if date < parse_date(&row?)? {
+                    return Err(Error::Validation(
+                        "Replacement payroll cannot precede a reversal for this period".into(),
+                    ));
+                }
+            }
+        }
+        let date = date.format("%Y-%m-%d").to_string();
         validate_voucher(&date, &postings)?;
         check_ledgers(&tx, company, &postings)?;
         crate::opening::check_no_control_postings(&tx, company, &postings)?;
@@ -436,9 +463,11 @@ impl Store {
         }
         let mut stmt = self.conn.prepare(
             "SELECT a.id, e.id, e.code, e.name, e.department, v.id, v.date, a.period_start, a.period_end,
-                    v.reference, v.narration, a.gross, a.deductions, a.net, a.employer_contributions
+                    v.reference, v.narration, a.gross, a.deductions, a.net, a.employer_contributions,
+                    rv.id, rv.date, rv.reference, a.reversal_reason
              FROM payroll_accruals a JOIN payroll_employees e ON e.id = a.employee_id
              JOIN vouchers v ON v.id = a.voucher_id
+             LEFT JOIN vouchers rv ON rv.id = a.reversal_voucher_id AND rv.company_id = a.company_id
              WHERE a.company_id = ?1 AND (?2 IS NULL OR e.id = ?2)",
         )?;
         let mut rows = stmt.query(params![company, employee])?;
@@ -452,7 +481,27 @@ impl Store {
             let id = row.get(0)?;
             let net = row.get::<_, i64>(13)?;
             let paid = crate::payroll_payments::payment_state(&self.conn, company, id, end)?.paid;
-            let outstanding = i128::from(net) - paid;
+            let reversal = if let Some(voucher_id) = row.get::<_, Option<i64>>(15)? {
+                let date: String = row.get(16)?;
+                let parsed = parse_date(&date)?;
+                if end.is_none_or(|end| parsed <= end) {
+                    Some(PayrollReversal {
+                        voucher_id,
+                        date,
+                        reference: row.get(17)?,
+                        reason: row.get(18)?,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let outstanding = if reversal.is_some() {
+                0
+            } else {
+                i128::from(net) - paid
+            };
             if outstanding < 0 {
                 return Err(Error::Validation(
                     "Payroll payments exceed the accrued amount".into(),
@@ -477,6 +526,7 @@ impl Store {
                     net,
                     paid,
                     outstanding,
+                    reversal,
                     employer_contributions: row.get(14)?,
                 },
             ));
@@ -487,7 +537,7 @@ impl Store {
 
     pub fn payroll_lines(&self, company: i64, accrual: i64) -> Result<Vec<PayrollLine>> {
         let mut stmt = self.conn.prepare(
-            "SELECT h.name, h.kind, l.amount FROM payroll_lines l
+            "SELECT h.name, h.kind, l.amount, l.head_id FROM payroll_lines l
              JOIN payroll_heads h ON h.id = l.head_id JOIN payroll_accruals a ON a.id = l.accrual_id
              WHERE a.company_id = ?1 AND a.id = ?2 ORDER BY l.id",
         )?;
@@ -495,11 +545,145 @@ impl Store {
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
             result.push(PayrollLine {
+                head_id: row.get(3)?,
                 head: row.get(0)?,
                 kind: PayHeadKind::parse(&row.get::<_, String>(1)?)?,
                 amount: row.get(2)?,
             });
         }
         Ok(result)
+    }
+}
+
+pub(crate) fn migrate_reversals(conn: &Connection) -> Result<()> {
+    // Preserve all three tables' IDs while replacing the original period constraint.
+    // Build the new foreign key chain before removing the old tables.
+    conn.execute_batch(
+        "CREATE TABLE payroll_accruals_new(
+            id INTEGER PRIMARY KEY,
+            company_id INTEGER NOT NULL REFERENCES companies(id),
+            employee_id INTEGER NOT NULL REFERENCES payroll_employees(id),
+            voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id),
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            reference_key TEXT NOT NULL,
+            gross INTEGER NOT NULL CHECK(gross > 0),
+            deductions INTEGER NOT NULL CHECK(deductions >= 0),
+            net INTEGER NOT NULL CHECK(net >= 0 AND net = gross - deductions),
+            employer_contributions INTEGER NOT NULL CHECK(employer_contributions >= 0),
+            payable_ledger_id INTEGER NOT NULL REFERENCES ledgers(id),
+            reversal_voucher_id INTEGER UNIQUE REFERENCES vouchers(id),
+            reversal_reason TEXT,
+            CHECK((reversal_voucher_id IS NULL) = (reversal_reason IS NULL)),
+            UNIQUE(company_id, reference_key)
+        );
+        INSERT INTO payroll_accruals_new(id, company_id, employee_id, voucher_id, period_start, period_end,
+            reference_key, gross, deductions, net, employer_contributions, payable_ledger_id)
+        SELECT id, company_id, employee_id, voucher_id, period_start, period_end,
+            reference_key, gross, deductions, net, employer_contributions, payable_ledger_id FROM payroll_accruals;
+        CREATE TABLE payroll_lines_new(
+            id INTEGER PRIMARY KEY,
+            accrual_id INTEGER NOT NULL REFERENCES payroll_accruals_new(id),
+            head_id INTEGER NOT NULL REFERENCES payroll_heads(id),
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            UNIQUE(accrual_id, head_id)
+        );
+        INSERT INTO payroll_lines_new(id, accrual_id, head_id, amount)
+        SELECT id, accrual_id, head_id, amount FROM payroll_lines;
+        CREATE TABLE payroll_payments_new(
+            id INTEGER PRIMARY KEY,
+            company_id INTEGER NOT NULL REFERENCES companies(id),
+            accrual_id INTEGER NOT NULL REFERENCES payroll_accruals_new(id),
+            voucher_id INTEGER NOT NULL UNIQUE REFERENCES vouchers(id),
+            bank_ledger_id INTEGER NOT NULL REFERENCES ledgers(id),
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            reference_key TEXT NOT NULL,
+            reversal_voucher_id INTEGER UNIQUE REFERENCES vouchers(id),
+            reversal_reason TEXT,
+            CHECK((reversal_voucher_id IS NULL) = (reversal_reason IS NULL)),
+            UNIQUE(accrual_id, reference_key)
+        );
+        INSERT INTO payroll_payments_new(id, company_id, accrual_id, voucher_id, bank_ledger_id,
+            amount, reference_key, reversal_voucher_id, reversal_reason)
+        SELECT id, company_id, accrual_id, voucher_id, bank_ledger_id,
+            amount, reference_key, reversal_voucher_id, reversal_reason FROM payroll_payments;
+        DROP TABLE payroll_lines;
+        DROP TABLE payroll_payments;
+        DROP TABLE payroll_accruals;
+        ALTER TABLE payroll_accruals_new RENAME TO payroll_accruals;
+        ALTER TABLE payroll_lines_new RENAME TO payroll_lines;
+        ALTER TABLE payroll_payments_new RENAME TO payroll_payments;
+        CREATE INDEX payroll_accruals_company ON payroll_accruals(company_id, id);
+        CREATE UNIQUE INDEX payroll_active_period ON payroll_accruals(company_id, employee_id, period_start, period_end)
+            WHERE reversal_voucher_id IS NULL;
+        CREATE INDEX payroll_payments_accrual ON payroll_payments(company_id, accrual_id, id);",
+    )?;
+    Ok(())
+}
+
+impl Store {
+    pub fn reverse_payroll_accrual(
+        &mut self,
+        company: i64,
+        accrual: i64,
+        date: &str,
+        reference: &str,
+        reason: &str,
+    ) -> Result<i64> {
+        let date = parse_date(date)?;
+        let reference = required(reference, "Reversal reference")?;
+        let reason = required(reason, "Reason for reversing the payroll accrual")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (voucher, original_date, reversed): (i64, String, bool) = tx
+            .query_row(
+                "SELECT v.id, v.date, a.reversal_voucher_id IS NOT NULL FROM payroll_accruals a
+             JOIN vouchers v ON v.id = a.voucher_id AND v.company_id = a.company_id
+             WHERE a.company_id = ?1 AND a.id = ?2",
+                params![company, accrual],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| Error::Validation("Payroll accrual not found in this company".into()))?;
+        if reversed {
+            return Err(Error::Validation(
+                "This accrual has already been reversed".into(),
+            ));
+        }
+        if date < parse_date(&original_date)? {
+            return Err(Error::Validation(
+                "Reversal date cannot precede the accrual date".into(),
+            ));
+        }
+        let payments = crate::payroll_payments::payment_state(&tx, company, accrual, None)?;
+        if payments.paid > 0 {
+            return Err(Error::Validation(
+                "Reverse the active salary payments first".into(),
+            ));
+        }
+        if payments
+            .latest_reversal
+            .is_some_and(|reversed| date < reversed)
+        {
+            return Err(Error::Validation(
+                "Accrual reversal cannot precede a salary payment reversal".into(),
+            ));
+        }
+        let date = date.format("%Y-%m-%d").to_string();
+        let postings = counter_postings(&tx, company, voucher, &date)?;
+        tx.execute(
+            "INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![company, VoucherKind::Journal.as_str(), reference, date, format!("Payroll accrual {accrual} reversal: {reason}")],
+        )?;
+        let reversal = tx.last_insert_rowid();
+        write_counter_postings(&tx, company, voucher, reversal, &postings)?;
+        tx.execute(
+            "UPDATE payroll_accruals SET reversal_voucher_id = ?1, reversal_reason = ?2
+             WHERE company_id = ?3 AND id = ?4",
+            params![reversal, reason, company, accrual],
+        )?;
+        tx.commit()?;
+        Ok(reversal)
     }
 }

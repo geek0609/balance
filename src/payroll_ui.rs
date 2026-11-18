@@ -4,7 +4,7 @@ use balance::payroll::{
     PayrollDraft,
 };
 use balance::payroll_payments::PayrollPaymentDraft;
-use balance::{parse_amount, Category, Error, Ledger, Result};
+use balance::{format_amount, parse_amount, Category, Error, Ledger, Result};
 use eframe::egui;
 
 #[derive(Default)]
@@ -126,9 +126,13 @@ impl PaymentForm {
     }
 }
 
-#[derive(Default)]
-struct PaymentReversalForm {
-    payment: i64,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReversalTarget {
+    Payment(i64),
+    Accrual(i64),
+}
+struct PayrollReversalForm {
+    target: ReversalTarget,
     date: String,
     reference: String,
     reason: String,
@@ -146,7 +150,7 @@ pub(super) struct PayrollScreen {
     selected: Option<i64>,
     register_loaded: bool,
     payment: PaymentForm,
-    reversal: Option<PaymentReversalForm>,
+    reversal: Option<PayrollReversalForm>,
 }
 
 impl App {
@@ -482,20 +486,26 @@ impl App {
         let mut paid = 0_i128;
         let mut outstanding = 0_i128;
         for row in &form.entries {
-            net += i128::from(row.net);
-            paid += row.paid;
-            outstanding += row.outstanding;
+            if row.reversal.is_none() {
+                net += i128::from(row.net);
+                paid += row.paid;
+                outstanding += row.outstanding;
+            }
             let selected = form.selected == Some(row.id);
             if ui
                 .selectable_label(
                     selected,
                     format!(
-                        "{} | {} {} | {} | Outstanding {}",
+                        "{} | {} {} | {} | {}",
                         row.date,
                         row.code,
                         row.employee,
                         row.reference,
-                        money(row.outstanding)
+                        if row.reversal.is_some() {
+                            "Reversed".into()
+                        } else {
+                            format!("Outstanding {}", money(row.outstanding))
+                        }
                     ),
                 )
                 .clicked()
@@ -551,7 +561,7 @@ impl App {
         }
         match self.store.payroll_lines(company, row.id) {
             Ok(lines) => {
-                for line in lines {
+                for line in &lines {
                     ui.label(format!(
                         "{} | {} | {}",
                         line.head,
@@ -559,8 +569,37 @@ impl App {
                         money(line.amount.into())
                     ));
                 }
+                if let Some(reversal) = &row.reversal {
+                    ui.label(format!(
+                        "Accrual reversed {} | {} (voucher {}) | {}",
+                        reversal.date, reversal.reference, reversal.voucher_id, reversal.reason
+                    ));
+                    if end.is_none() && ui.button("Prepare replacement accrual").clicked() {
+                        self.payroll_screen.accrual = AccrualForm {
+                            employee: Some(row.employee_id),
+                            date: reversal.date.clone(),
+                            from: row.period_start.clone(),
+                            to: row.period_end.clone(),
+                            reference: String::new(),
+                            narration: row.narration.clone(),
+                            lines: lines
+                                .iter()
+                                .map(|line| PayForm {
+                                    head: Some(line.head_id),
+                                    amount: format_amount(line.amount),
+                                })
+                                .collect(),
+                        };
+                        self.message =
+                            "Replacement prepared. Check the amounts and enter a new reference."
+                                .into();
+                    }
+                }
             }
             Err(error) => self.failure(error),
+        }
+        if end.is_none() && row.reversal.is_none() {
+            self.payroll_reversal_form(ui, company, ReversalTarget::Accrual(row.id), row.paid == 0);
         }
         ui.separator();
         ui.strong("Salary payments");
@@ -585,7 +624,12 @@ impl App {
                         ));
                     } else if end.is_none() {
                         ui.push_id(payment.id, |ui| {
-                            self.payroll_reversal_form(ui, company, payment.id)
+                            self.payroll_reversal_form(
+                                ui,
+                                company,
+                                ReversalTarget::Payment(payment.id),
+                                true,
+                            )
                         });
                     }
                 }
@@ -643,20 +687,36 @@ impl App {
             });
     }
 
-    fn payroll_reversal_form(&mut self, ui: &mut egui::Ui, company: i64, payment: i64) {
-        if ui.button("Reverse payment").clicked() {
-            self.payroll_screen.reversal = Some(PaymentReversalForm {
-                payment,
-                ..PaymentReversalForm::default()
+    fn payroll_reversal_form(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        target: ReversalTarget,
+        enabled: bool,
+    ) {
+        let label = match target {
+            ReversalTarget::Accrual(_) => "Reverse accrual",
+            ReversalTarget::Payment(_) => "Reverse payment",
+        };
+        if ui
+            .add_enabled(enabled, egui::Button::new(label))
+            .on_disabled_hover_text("Reverse active salary payments first.")
+            .clicked()
+        {
+            self.payroll_screen.reversal = Some(PayrollReversalForm {
+                target,
+                date: String::new(),
+                reference: String::new(),
+                reason: String::new(),
             });
         }
         let Some(form) = &mut self.payroll_screen.reversal else {
             return;
         };
-        if form.payment != payment {
+        if form.target != target {
             return;
         }
-        egui::Grid::new("salary-reversal-fields").show(ui, |ui| {
+        egui::Grid::new("payroll-reversal-fields").show(ui, |ui| {
             for (label, field) in [
                 ("Date (YYYY-MM-DD)", &mut form.date),
                 ("Reference", &mut form.reference),
@@ -670,22 +730,34 @@ impl App {
         let mut post = false;
         let mut cancel = false;
         ui.horizontal(|ui| {
-            post = ui.button("Post reversal").clicked();
+            post = ui
+                .add_enabled(enabled, egui::Button::new("Post reversal"))
+                .clicked();
             cancel = ui.button("Cancel").clicked();
         });
         if post {
-            match self.store.reverse_payroll_payment(
-                company,
-                payment,
-                &form.date,
-                &form.reference,
-                &form.reason,
-            ) {
+            let result = match target {
+                ReversalTarget::Accrual(accrual) => self.store.reverse_payroll_accrual(
+                    company,
+                    accrual,
+                    &form.date,
+                    &form.reference,
+                    &form.reason,
+                ),
+                ReversalTarget::Payment(payment) => self.store.reverse_payroll_payment(
+                    company,
+                    payment,
+                    &form.date,
+                    &form.reference,
+                    &form.reason,
+                ),
+            };
+            match result {
                 Ok(voucher) => {
                     cancel = true;
                     self.reload_payroll_after_change(
                         company,
-                        format!("Salary payment reversed with voucher {voucher}"),
+                        format!("Reversal voucher {voucher} recorded"),
                     );
                 }
                 Err(error) => self.failure(error),

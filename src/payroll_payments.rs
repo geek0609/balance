@@ -38,13 +38,7 @@ pub struct PayrollPaymentDraft {
     pub narration: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct PayrollPaymentReversal {
-    pub voucher_id: i64,
-    pub date: String,
-    pub reference: String,
-    pub reason: String,
-}
+pub type PayrollPaymentReversal = crate::payroll::PayrollReversal;
 
 #[derive(Debug, Clone)]
 pub struct PayrollPayment {
@@ -112,16 +106,21 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (accrued_on, payable, net): (String, i64, i64) = tx
+        let (accrued_on, payable, net, reversed): (String, i64, i64, bool) = tx
             .query_row(
-                "SELECT v.date, a.payable_ledger_id, a.net FROM payroll_accruals a
+                "SELECT v.date, a.payable_ledger_id, a.net, a.reversal_voucher_id IS NOT NULL FROM payroll_accruals a
              JOIN vouchers v ON v.id = a.voucher_id AND v.company_id = a.company_id
              WHERE a.company_id = ?1 AND a.id = ?2",
                 params![company, accrual],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?
             .ok_or_else(|| Error::Validation("Payroll accrual not found in this company".into()))?;
+        if reversed {
+            return Err(Error::Validation(
+                "A reversed accrual cannot accept a payment".into(),
+            ));
+        }
         if date < parse_date(&accrued_on)? {
             return Err(Error::Validation(
                 "Payment date cannot precede the accrual date".into(),

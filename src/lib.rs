@@ -37,7 +37,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 49;
+const SCHEMA_VERSION: i64 = 50;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -770,6 +770,10 @@ impl Store {
             payroll_payments::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 49)?;
         }
+        if version < 50 {
+            payroll::migrate_reversals(&tx)?;
+            tx.pragma_update(None, "user_version", 50)?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
@@ -1022,7 +1026,7 @@ impl Store {
         check_ledgers(&tx, company_id, postings)?;
         opening::check_no_control_postings(&tx, company_id, postings)?;
         let invoice_backed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM party_advances WHERE company_id = ?2 AND ?1 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_accruals WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM payroll_payments WHERE company_id = ?2 AND ?1 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?2 AND (original_voucher_id = ?1 OR reversal_voucher_id = ?1) UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?2 AND (original_voucher_id = ?1 OR clearing_voucher_id = ?1))",
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM party_advances WHERE company_id = ?2 AND ?1 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_accruals WHERE company_id = ?2 AND ?1 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_payments WHERE company_id = ?2 AND ?1 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?2 AND (original_voucher_id = ?1 OR reversal_voucher_id = ?1) UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?2 AND (original_voucher_id = ?1 OR clearing_voucher_id = ?1))",
             params![voucher_id, company_id],
             |r| r.get(0),
         )?;
