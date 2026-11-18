@@ -18,9 +18,11 @@ use eframe::egui::{self, Color32, RichText};
 mod cost_ui;
 mod order_ui;
 mod stock_count_ui;
+mod valuation_ui;
 use cost_ui::CostScreen;
 use order_ui::OrderScreen;
 use stock_count_ui::StockCountScreen;
+use valuation_ui::ValuationScreen;
 
 #[derive(PartialEq)]
 enum Page {
@@ -31,6 +33,7 @@ enum Page {
     Import,
     Stock,
     StockCounts,
+    Valuation,
     Invoice,
     InvoiceRegister,
     Orders,
@@ -188,6 +191,7 @@ struct App {
     order_screen: OrderScreen,
     stock_count_screen: StockCountScreen,
     cost_screen: CostScreen,
+    valuation_screen: ValuationScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -427,6 +431,7 @@ impl App {
             order_screen: OrderScreen::default(),
             stock_count_screen: StockCountScreen::default(),
             cost_screen: CostScreen::default(),
+            valuation_screen: ValuationScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -542,6 +547,7 @@ impl App {
         self.order_screen = OrderScreen::default();
         self.stock_count_screen = StockCountScreen::default();
         self.cost_screen = CostScreen::default();
+        self.valuation_screen = ValuationScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -2713,9 +2719,7 @@ impl App {
                 ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
             }
         }
-        ui.small(
-            "Quantities may be negative. Stock valuation and cost of goods are not calculated.",
-        );
+        ui.small("Quantities may be negative. See Stock valuation for standard cost estimates.");
         ui.heading("Low stock across all locations");
         ui.small("Uses the as-of date above and current reorder settings, regardless of the location filter. Suggested quantities are fixed and do not account for pending orders.");
         match self.store.low_stock(company, end) {
@@ -5194,6 +5198,7 @@ impl eframe::App for App {
                 ("Bank clearance", Page::Bank),
                 ("Stock", Page::Stock),
                 ("Stock counts", Page::StockCounts),
+                ("Stock valuation", Page::Valuation),
                 ("Invoices", Page::Invoice),
                 ("Orders", Page::Orders),
                 ("Import XML", Page::Import),
@@ -5236,6 +5241,7 @@ impl eframe::App for App {
                     Page::Bank => self.bank_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),
                     Page::StockCounts => self.stock_counts_page(ui, company),
+                    Page::Valuation => self.valuation_page(ui, company),
                     Page::Invoice => self.invoice_page(ui, company),
                     Page::Orders => self.orders_page(ui, company),
                     Page::Import => self.import_page(ui, company),

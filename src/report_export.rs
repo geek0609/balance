@@ -163,6 +163,141 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_stock_valuation_csv(
+        &self,
+        company: i64,
+        as_of: &str,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.stock_valuation_at_standard_cost(company, as_of)?;
+        let context = [self.report_company_name(company)?, report.date.to_string()];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "as_of"]),
+            &strings(&[
+                "row_type",
+                "item_id",
+                "item",
+                "unit",
+                "quantity",
+                "standard_cost_per_unit",
+                "standard_stock_value",
+                "items_without_cost",
+            ]),
+        )?;
+        for entry in report.rows {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "item".into(),
+                    entry.item.id.to_string(),
+                    text_cell(&entry.item.name),
+                    text_cell(&entry.item.unit),
+                    format_quantity(entry.quantity),
+                    entry
+                        .unit_cost
+                        .map(|cost| money(cost.into()))
+                        .unwrap_or_default(),
+                    entry.value.map(money).unwrap_or_default(),
+                    String::new(),
+                ],
+            )?;
+        }
+        contextual_row(
+            &mut csv,
+            &context,
+            &[
+                "known_value".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                money(report.known_value),
+                report.missing_rates.to_string(),
+            ],
+        )?;
+        save(csv, destination)
+    }
+
+    pub fn export_standard_sales_cost_csv(
+        &self,
+        company: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.sales_at_standard_cost(company, start, end)?;
+        let context = [
+            self.report_company_name(company)?,
+            optional_date(start)?,
+            optional_date(end)?,
+        ];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "period_start", "period_end"]),
+            &strings(&[
+                "row_type",
+                "invoice_id",
+                "voucher_id",
+                "date",
+                "reference",
+                "item",
+                "unit",
+                "quantity",
+                "net_item_sales",
+                "standard_cost_per_unit",
+                "standard_cost",
+                "standard_margin",
+                "lines_without_cost",
+            ]),
+        )?;
+        for entry in report.rows {
+            let margin = entry.margin().map(money).unwrap_or_default();
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    if entry.reversal {
+                        "reversal".into()
+                    } else {
+                        "sale".into()
+                    },
+                    entry.invoice_id.to_string(),
+                    entry.voucher_id.to_string(),
+                    entry.date.to_string(),
+                    text_cell(&entry.reference),
+                    text_cell(&entry.item),
+                    text_cell(&entry.unit),
+                    format_quantity(entry.quantity),
+                    money(entry.net_sales),
+                    entry
+                        .unit_cost
+                        .map(|cost| money(cost.into()))
+                        .unwrap_or_default(),
+                    entry.standard_cost.map(money).unwrap_or_default(),
+                    margin,
+                    String::new(),
+                ],
+            )?;
+        }
+        let mut summary = vec![String::new(); 13];
+        summary[0] = "all_sales".into();
+        summary[8] = money(report.net_sales);
+        summary[12] = report.missing_rates.to_string();
+        contextual_row(&mut csv, &context, &summary)?;
+        summary[0] = "costed_sales".into();
+        summary[8] = money(report.costed_net_sales);
+        summary[10] = money(report.standard_cost);
+        summary[11] = money(report.costed_margin);
+        summary[12].clear();
+        contextual_row(&mut csv, &context, &summary)?;
+        save(csv, destination)
+    }
+
     pub fn export_day_book_csv(
         &self,
         company: i64,
