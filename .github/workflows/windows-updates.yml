@@ -1,0 +1,110 @@
+name: Windows updates
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: balance-windows-updates
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'geek0609/balance' && github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the Windows installer
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tools = & ./packaging/windows/Get-CiTools.ps1
+          $toolchain = '1.92.0-x86_64-pc-windows-msvc'
+          rustup toolchain install $toolchain --profile minimal
+          $env:RUSTUP_TOOLCHAIN = $toolchain
+          $attempt = [int]$env:GITHUB_RUN_ATTEMPT
+          if ($attempt -ge 100) { throw 'Start a fresh workflow run.' }
+          $build = 1000000 + [int]$env:GITHUB_RUN_NUMBER * 100 + $attempt
+          $suffix = "ci.$env:GITHUB_RUN_NUMBER.$attempt"
+          $output = Join-Path $env:RUNNER_TEMP 'balance-build'
+          & ./packaging/windows/Build-Release.ps1 -Build $build -VersionSuffix $suffix -OutputDirectory $output -BuildOnly @tools
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: balance-windows-x64
+          path: |
+            ${{ runner.temp }}/balance-build/*-setup.exe
+            ${{ runner.temp }}/balance-build/release.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  publish:
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 15
+    environment: windows-updates
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: balance-windows-x64
+          path: ${{ runner.temp }}/balance-build
+
+      - name: Check the source and prepare the signing tool
+        id: source
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $head = (git ls-remote origin refs/heads/main) -split '\s+' | Select-Object -First 1
+          if ($head -cne $env:GITHUB_SHA) {
+            Write-Output 'A newer main commit is available. Its workflow will publish the update.'
+            'current=false' >> $env:GITHUB_OUTPUT
+            return
+          }
+          $tools = & ./packaging/windows/Get-CiTools.ps1 -SignerOnly
+          "sparkle=$($tools.WinSparkle)" >> $env:GITHUB_OUTPUT
+          'current=true' >> $env:GITHUB_OUTPUT
+
+      - name: Sign the installer
+        if: steps.source.outputs.current == 'true'
+        shell: pwsh
+        env:
+          BALANCE_UPDATE_SIGNING_KEY: ${{ secrets.BALANCE_UPDATE_SIGNING_KEY }}
+          BALANCE_SPARKLE: ${{ steps.source.outputs.sparkle }}
+        run: |
+          & ./packaging/windows/Sign-Release.ps1 -BuildDirectory (Join-Path $env:RUNNER_TEMP 'balance-build') -WinSparkle $env:BALANCE_SPARKLE
+
+      - name: Publish the release and advance the signed feed
+        if: steps.source.outputs.current == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BALANCE_SPARKLE: ${{ steps.source.outputs.sparkle }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          $notes = Join-Path $env:RUNNER_TEMP 'balance-release-notes.md'
+          @"
+          Windows x64 preview built from [source commit]($env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/commit/$env:GITHUB_SHA).
+
+          Run the setup executable to install Balance. Installed copies check for updates automatically and verify the installer before running it.
+
+          [Build log]($env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID)
+          [Feature list and roadmap]($env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY#feature-status-at-a-glance)
+          "@ | Set-Content -LiteralPath $notes -Encoding utf8
+          & ./packaging/windows/Publish-Release.ps1 -BuildDirectory (Join-Path $env:RUNNER_TEMP 'balance-build') -NotesFile $notes -WinSparkle $env:BALANCE_SPARKLE

@@ -4,7 +4,13 @@ The Windows x64 installer bundles Balance, the WinSparkle runtime and third-part
 
 Installed builds are configured for the public Windows update feed on the repository's [updates branch](https://github.com/geek0609/balance/tree/updates). The installer enables automatic checks for a new user and preserves the user's choice on upgrade. WinSparkle verifies the Ed25519 signature of the installer before running it. A user approves the update and reopens Balance after setup completes.
 
-## Build and publish
+## Automatic releases
+
+The [Windows updates workflow](https://github.com/geek0609/balance/actions/workflows/windows-updates.yml) publishes a signed Windows preview after a successful build from `main`. It appends `.ci.<run>.<attempt>` to the preview version and publishes the installer and SHA-256 file before advancing the update feed. When pushes queue up, the newest commit is eligible for publishing.
+
+The build job has read-only repository access. A separate publish job uses the `windows-updates` environment, restricted to `main`, and reads the encrypted `BALANCE_UPDATE_SIGNING_KEY` secret only while signing. The secret contains the base64-encoded bytes of the WinSparkle private key matching [update-public-key.txt](update-public-key.txt). Local signing still uses the protected release workstation key.
+
+## Local builds
 
 Build from a clean checkout. Use PowerShell 7.3 or newer, Git, GitHub CLI, Python 3, Rust with the `x86_64-pc-windows-msvc` target and the Visual Studio C++ build tools, Inno Setup 6.7.3 and WinSparkle 0.9.4. Install the latter tools from their upstream releases.
 
@@ -13,11 +19,11 @@ Build from a clean checkout. Use PowerShell 7.3 or newer, Git, GitHub CLI, Pytho
 
 The scripts default to the per-user Inno Setup installation and the official WinSparkle binary ZIP extracted to `%LOCALAPPDATA%\BalanceReleaseTools\WinSparkle-0.9.4`. Set `-InnoCompiler` and `-WinSparkle` to select other paths. The WinSparkle ZIP has SHA-256 `6037df37fc263bd1650a1c4949681a9d40ffe991d01f35892a406cb5d103c976`.
 
-Set the public release version in `Cargo.toml`, refresh `Cargo.lock`, and push that commit to `main`. Choose a positive build number greater than the one in the update feed, including for prereleases. Build number 2 corresponds to 0.1.0-alpha.2.
+Choose a positive build number for a local installer. This example rebuilds 0.1.0-alpha.2 from its source revision.
 
     pwsh -File packaging/windows/Build-Release.ps1 -Build 2
 
-The script produces the installer, its SHA-256 file and signed release metadata under `target/windows-release`. Pass the resulting directory and a Markdown release notes file to the publisher.
+The script produces the installer, its SHA-256 file and signed release metadata under `target/windows-release`. The publisher can also take a manually signed build and a Markdown release notes file. A public release must use a unique version and a build number that advances the feed. The workflow is the default publisher for `main`.
 
     pwsh -File packaging/windows/Publish-Release.ps1 -BuildDirectory <output-directory> -NotesFile <notes.md>
 

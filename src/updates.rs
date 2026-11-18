@@ -7,6 +7,10 @@ use std::sync::OnceLock;
 
 const FEED: &CStr = c"https://raw.githubusercontent.com/geek0609/balance/updates/windows-x64.xml";
 const REGISTRY_PATH: &CStr = c"Software\\Balance\\Updates";
+const RELEASE_VERSION: &str = match option_env!("BALANCE_UPDATE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 static APP_CONTEXT: OnceLock<egui::Context> = OnceLock::new();
 
@@ -21,7 +25,7 @@ impl Updates {
             .sparkle
             .get_or_insert_with(|| Sparkle::start(ui.ctx()).map_err(|error| error.to_string()));
         ui.menu_button("Updates", |ui| {
-            ui.label(format!("Balance {}", env!("CARGO_PKG_VERSION")));
+            ui.label(format!("Balance {RELEASE_VERSION}"));
             match sparkle {
                 Ok(api) => {
                     let mut automatic = unsafe { (api.get_automatic)() != 0 };
@@ -61,7 +65,7 @@ impl Sparkle {
         let key = option_env!("BALANCE_UPDATE_PUBLIC_KEY").ok_or("Missing update public key")?;
         let build = option_env!("BALANCE_UPDATE_BUILD").ok_or("Missing update build number")?;
         let key = CString::new(key)?;
-        let version = wide(env!("CARGO_PKG_VERSION"));
+        let version = wide(RELEASE_VERSION);
         let build = wide(build);
         let publisher = wide("Balance");
         let path = std::env::current_exe()?.with_file_name("WinSparkle.dll");
