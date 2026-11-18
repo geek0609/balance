@@ -6,6 +6,7 @@ use crate::{
     check_ledgers, parse_date, required, validate_voucher, Category, Error, Posting, Result, Store,
     VoucherKind,
 };
+use chrono::NaiveDate;
 use rusqlite::{params, Connection};
 use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use std::{
@@ -938,11 +939,17 @@ fn invoice_stock_allocations(
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+pub(crate) enum StockInvoicePosting {
+    Direct,
+    Order(i64),
+    Import,
+}
+
 pub(crate) fn insert_direct_invoice(
     conn: &Connection,
     company: i64,
     draft: &InvoiceDraft,
-    order: Option<i64>,
+    posting: StockInvoicePosting,
 ) -> Result<(i64, i64)> {
     let ids = insert_invoice_on_connection(conn, company, draft)?;
     if draft.kind == InvoiceKind::Sale {
@@ -950,7 +957,7 @@ pub(crate) fn insert_direct_invoice(
         let mut buckets = HashSet::new();
         let reference = format!("Invoice {} (#{})", draft.reference.trim(), ids.0);
         for (item, location, batch, quantity) in allocations {
-            if let Some(order) = order {
+            if let StockInvoicePosting::Order(order) = posting {
                 crate::stock_reservations::consume_reservations(
                     conn, order, item, location, batch, quantity, &reference,
                 )?;
@@ -959,6 +966,9 @@ pub(crate) fn insert_direct_invoice(
         }
         for (item, location, batch) in buckets {
             crate::stock_reservations::check_stock_coverage(conn, company, item, location, batch)?;
+            if !matches!(posting, StockInvoicePosting::Import) {
+                crate::stock_policy::check_bucket(conn, company, item, location, batch)?;
+            }
         }
     }
     Ok(ids)
@@ -1329,19 +1339,9 @@ pub(crate) fn stock_bucket_quantity(
 fn stock_bucket_movements(conn: &Connection) -> rusqlite::Result<rusqlite::CachedStatement<'_>> {
     let sql = format!(
         "{STOCK_LOCATION_BRANCH}
-         SELECT date, quantity FROM stock_adjustments
+         SELECT date, quantity FROM warehouse_stock_movements
          WHERE company_id = ?1 AND item_id = ?4 AND batch_id IS ?5
-           AND (?2 IS NULL OR location_id IN (SELECT id FROM branch))
-         UNION ALL
-         SELECT v.date, CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END
-         FROM invoice_line_allocations a JOIN physical_invoice_lines l ON l.id = a.line_id
-         JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id
-         WHERE i.company_id = ?1 AND l.item_id = ?4 AND a.batch_id IS ?5
-           AND (?2 IS NULL OR a.location_id IN (SELECT id FROM branch))
-         UNION ALL
-         SELECT date, quantity FROM stock_transfer_location_movements
-         WHERE company_id = ?1 AND item_id = ?4 AND batch_id IS ?5
-           AND location_id IN (SELECT id FROM branch)"
+           AND ((?2 IS NULL AND location_only = 0) OR location_id IN (SELECT id FROM branch))"
     );
     conn.prepare_cached(&sql)
 }
@@ -1371,6 +1371,55 @@ fn stock_bucket_quantity_in_scope(
     Ok(total)
 }
 
+#[derive(Default)]
+pub(crate) struct StockChanges {
+    opening: i128,
+    later: BTreeMap<NaiveDate, i128>,
+}
+
+impl StockChanges {
+    pub(crate) fn add(&mut self, from: NaiveDate, date: NaiveDate, quantity: i64) {
+        if date <= from {
+            self.opening += i128::from(quantity);
+        } else {
+            *self.later.entry(date).or_default() += i128::from(quantity);
+        }
+    }
+
+    pub(crate) fn closing_balances(
+        self,
+        from: NaiveDate,
+    ) -> impl Iterator<Item = (NaiveDate, i128)> {
+        let mut running = self.opening;
+        std::iter::once((from, running)).chain(self.later.into_iter().map(
+            move |(date, movement)| {
+                running += movement;
+                (date, running)
+            },
+        ))
+    }
+}
+
+pub(crate) fn stock_bucket_changes(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    location: i64,
+    batch: Option<i64>,
+    from: NaiveDate,
+) -> Result<StockChanges> {
+    let mut stmt = stock_bucket_movements(conn)?;
+    let mut changes = StockChanges::default();
+    let rows = stmt.query_map(params![company, location, false, item, batch], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (date, quantity) = row?;
+        changes.add(from, parse_date(&date)?, quantity);
+    }
+    Ok(changes)
+}
+
 /// Lowest closing balance from today through the last recorded stock movement.
 pub(crate) fn stock_available_to_reserve(
     conn: &Connection,
@@ -1381,31 +1430,46 @@ pub(crate) fn stock_available_to_reserve(
 ) -> Result<i128> {
     let today: String = conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))?;
     let today = parse_date(&today)?;
-    let mut stmt = stock_bucket_movements(conn)?;
-    let mut on_hand = 0_i128;
-    let mut future = BTreeMap::<_, i128>::new();
-    let rows = stmt.query_map(params![company, location, false, item, batch], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-    })?;
-    for row in rows {
-        let (date, quantity) = row?;
-        let date = parse_date(&date)?;
-        if date <= today {
-            on_hand += i128::from(quantity);
-        } else {
-            *future.entry(date).or_default() += i128::from(quantity);
-        }
-    }
-    let mut available = on_hand;
-    for quantity in future.values() {
-        on_hand += quantity;
-        available = available.min(on_hand);
-    }
-    Ok(available)
+    Ok(
+        stock_bucket_changes(conn, company, item, location, batch, today)?
+            .closing_balances(today)
+            .map(|(_, quantity)| quantity)
+            .min()
+            .unwrap_or_default(),
+    )
+}
+
+pub(crate) fn check_stock_after_decrease(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    location: i64,
+    batch: Option<i64>,
+) -> Result<()> {
+    crate::stock_reservations::check_stock_coverage(conn, company, item, location, batch)?;
+    crate::stock_policy::check_bucket(conn, company, item, location, batch)
 }
 
 /// Record an adjustment inside the caller's transaction.
 pub(crate) fn record_stock_adjustment(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    location: i64,
+    batch: Option<i64>,
+    date: &str,
+    quantity: i64,
+    reason: &str,
+) -> Result<i64> {
+    let id = insert_stock_adjustment(conn, company, item, location, batch, date, quantity, reason)?;
+    if quantity < 0 {
+        check_stock_after_decrease(conn, company, item, location, batch)?;
+    }
+    Ok(id)
+}
+
+/// In a bulk import, the negative-stock policy checks the final transaction state.
+pub(crate) fn insert_stock_adjustment(
     conn: &Connection,
     company: i64,
     item: i64,
@@ -1420,11 +1484,7 @@ pub(crate) fn record_stock_adjustment(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![company, item, date, quantity, reason, location, batch],
     )?;
-    let id = conn.last_insert_rowid();
-    if quantity < 0 {
-        crate::stock_reservations::check_stock_coverage(conn, company, item, location, batch)?;
-    }
-    Ok(id)
+    Ok(conn.last_insert_rowid())
 }
 
 impl Store {
@@ -1599,7 +1659,7 @@ impl Store {
         )?;
         tx.execute("INSERT INTO stock_transfers(company_id, item_id, from_location_id, to_location_id, date, quantity, reason, batch_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![company_id, item_id, from, to, date, quantity, reason, batch_id])?;
         let id = tx.last_insert_rowid();
-        crate::stock_reservations::check_stock_coverage(&tx, company_id, item_id, from, batch_id)?;
+        check_stock_after_decrease(&tx, company_id, item_id, from, batch_id)?;
         tx.commit()?;
         Ok(id)
     }
@@ -1927,18 +1987,7 @@ impl Store {
         let mut sums = HashMap::<i64, i128>::new();
         let mut stmt = self.conn.prepare(&format!(
             "{STOCK_LOCATION_BRANCH}
-             SELECT a.item_id, a.date, a.quantity
-             FROM stock_adjustments a
-             WHERE a.company_id = ?1 AND a.location_id IN (SELECT id FROM branch)
-             UNION ALL
-             SELECT l.item_id, v.date, CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END
-             FROM invoice_line_allocations a
-             JOIN physical_invoice_lines l ON l.id = a.line_id
-             JOIN invoices i ON i.id = l.invoice_id
-             JOIN vouchers v ON v.id = i.voucher_id
-             WHERE i.company_id = ?1 AND a.location_id IN (SELECT id FROM branch)
-             UNION ALL
-             SELECT item_id, date, quantity FROM stock_transfer_location_movements
+             SELECT item_id, date, quantity FROM warehouse_stock_movements
              WHERE company_id = ?1 AND location_id IN (SELECT id FROM branch)",
         ))?;
         let movements = stmt.query_map(
@@ -2234,7 +2283,8 @@ impl Store {
     /// Atomically creates the invoice, stock movements and balanced voucher.
     pub fn create_invoice(&mut self, company_id: i64, draft: &InvoiceDraft) -> Result<i64> {
         let tx = self.conn.transaction()?;
-        let (invoice_id, _) = insert_direct_invoice(&tx, company_id, draft, None)?;
+        let (invoice_id, _) =
+            insert_direct_invoice(&tx, company_id, draft, StockInvoicePosting::Direct)?;
         tx.commit()?;
         Ok(invoice_id)
     }
@@ -2444,9 +2494,7 @@ impl Store {
                 .map(|(item, location, batch, _)| (item, location, batch)),
         );
         for (item, location, batch) in affected_buckets {
-            crate::stock_reservations::check_stock_coverage(
-                &tx, company_id, item, location, batch,
-            )?;
+            check_stock_after_decrease(&tx, company_id, item, location, batch)?;
         }
         tx.commit()?;
         Ok(())

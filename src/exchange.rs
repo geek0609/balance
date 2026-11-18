@@ -5,9 +5,9 @@ use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
     discounted_line_amount, find_stock_batch, insert_direct_invoice,
-    insert_settlement_on_connection, invoice_total, parse_quantity, InvoiceAdjustment,
-    InvoiceAllocation, InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine,
-    SettlementAllocation,
+    insert_settlement_on_connection, insert_stock_adjustment, invoice_total, parse_quantity,
+    InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine,
+    SettlementAllocation, StockInvoicePosting,
 };
 use crate::opening_bills::OpeningBillDraft;
 use crate::{
@@ -3717,7 +3717,7 @@ impl Store {
                         .opening_date
                         .as_deref()
                         .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
-                    let adjustment = crate::inventory::record_stock_adjustment(
+                    let adjustment = insert_stock_adjustment(
                         &tx,
                         plan.company_id,
                         item_id,
@@ -3727,6 +3727,15 @@ impl Store {
                         opening.quantity,
                         "Imported opening quantity",
                     )?;
+                    if opening.quantity < 0 {
+                        crate::stock_reservations::check_stock_coverage(
+                            &tx,
+                            plan.company_id,
+                            item_id,
+                            location,
+                            batch,
+                        )?;
+                    }
                     if let Some(cost) = opening.cost {
                         crate::actual_cost::insert_receipt_cost(
                             &tx,
@@ -3961,7 +3970,8 @@ impl Store {
                     })
                     .collect::<Result<Vec<_>>>()?,
             };
-            let (_, voucher_id) = insert_direct_invoice(&tx, plan.company_id, &draft, None)?;
+            let (_, voucher_id) =
+                insert_direct_invoice(&tx, plan.company_id, &draft, StockInvoicePosting::Import)?;
             save_metadata(
                 &tx,
                 plan.company_id,
@@ -4138,6 +4148,7 @@ impl Store {
                 &settlement.metadata,
             )?;
         }
+        crate::stock_policy::check_import(&tx, plan.company_id)?;
         tx.commit()?;
         Ok(ImportCounts {
             groups: plan.groups.len(),
@@ -4152,5 +4163,108 @@ impl Store {
             locations: plan.locations.len(),
             items: plan.items.len(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_checks_final_daily_stock_balances_before_committing() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let customer = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        let supplier = store
+            .create_ledger(company, "Supplier", Category::Liability)
+            .unwrap();
+        let sales = store
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        let purchases = store
+            .create_ledger(company, "Purchases", Category::Expense)
+            .unwrap();
+        let item = store.create_stock_item(company, "Part", "Each").unwrap();
+        let location = store.stock_locations(company).unwrap()[0].id;
+        let date = "2026-01-02";
+        store
+            .set_negative_stock_policy(company, Some(date), "Keep stock nonnegative")
+            .unwrap();
+        let sale = ImportedInvoice {
+            kind: InvoiceKind::Sale,
+            date: date.into(),
+            credit_days: None,
+            reference: "SELL-01".into(),
+            narration: String::new(),
+            party: "Customer".into(),
+            existing_party_id: Some(customer),
+            trade: "Sales".into(),
+            existing_trade_id: Some(sales),
+            adjustments: Vec::new(),
+            metadata: SourceMetadata::default(),
+            lines: vec![ImportedInvoiceLine {
+                item: "Part".into(),
+                existing_item_id: Some(item),
+                unit: "Each".into(),
+                precision: 3,
+                trade_ledger: "Sales".into(),
+                existing_trade_ledger_id: Some(sales),
+                quantity: 3000,
+                unit_price: 1000,
+                discount: InvoiceDiscount::None,
+                allocations: vec![ImportedStockAllocation {
+                    location: "Main".into(),
+                    existing_location_id: Some(location),
+                    batch: None,
+                    existing_batch_id: None,
+                    quantity: 3000,
+                }],
+            }],
+        };
+        let mut purchase = sale.clone();
+        purchase.kind = InvoiceKind::Purchase;
+        purchase.reference = "BUY-01".into();
+        purchase.party = "Supplier".into();
+        purchase.existing_party_id = Some(supplier);
+        purchase.trade = "Purchases".into();
+        purchase.existing_trade_id = Some(purchases);
+        purchase.lines[0].trade_ledger = "Purchases".into();
+        purchase.lines[0].existing_trade_ledger_id = Some(purchases);
+        let mut plan = ImportPlan {
+            company_id: company,
+            opening_date: None,
+            existing_group_metadata: Vec::new(),
+            existing_unit_metadata: Vec::new(),
+            existing_stock_group_metadata: Vec::new(),
+            existing_location_metadata: Vec::new(),
+            groups: Vec::new(),
+            accounts: Vec::new(),
+            units: Vec::new(),
+            stock_groups: Vec::new(),
+            locations: Vec::new(),
+            items: Vec::new(),
+            transactions: Vec::new(),
+            invoices: vec![sale],
+            settlements: Vec::new(),
+            issues: Vec::new(),
+        };
+        assert!(store
+            .apply_xml_import(&plan)
+            .unwrap_err()
+            .to_string()
+            .contains("Negative stock is blocked"));
+        assert!(store.vouchers(company).unwrap().is_empty());
+        plan.invoices.push(purchase);
+        let counts = store.apply_xml_import(&plan).unwrap();
+        assert_eq!(counts.invoices, 2);
+        assert_eq!(
+            store
+                .stock_location_balances(company, location, Some(date))
+                .unwrap()[0]
+                .quantity,
+            0
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! Dated dispatches, partial receipts and returns for internal stock transfers.
 use crate::inventory::{
-    check_quantity_precision, check_stock_batch, check_stock_location, stock_bucket_quantity,
+    check_quantity_precision, check_stock_after_decrease, check_stock_batch, check_stock_location,
+    stock_bucket_quantity,
 };
 use crate::{parse_date, required, Error, Result, Store};
 use chrono::NaiveDate;
@@ -219,7 +220,7 @@ impl Store {
             ));
         }
         let dispatch = tx.last_insert_rowid();
-        crate::stock_reservations::check_stock_coverage(
+        check_stock_after_decrease(
             &tx,
             company,
             draft.item_id,
@@ -436,7 +437,9 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP VIEW stock_transfer_location_movements;
+                "DROP VIEW warehouse_stock_movements;
+             DROP TABLE negative_stock_policy_changes;
+             DROP VIEW stock_transfer_location_movements;
              DROP TABLE stock_transfer_arrivals;
              DROP TABLE stock_transfer_dispatches;
              PRAGMA user_version = 67;",

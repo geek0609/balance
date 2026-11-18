@@ -1,7 +1,7 @@
 //! Sales and purchase orders fulfilled by linked invoices.
 use crate::inventory::{
     check_quantity_precision, insert_direct_invoice, ledger_category, line_amount,
-    InvoiceAllocation, InvoiceDraft, InvoiceKind, StockItem,
+    InvoiceAllocation, InvoiceDraft, InvoiceKind, StockInvoicePosting, StockItem,
 };
 use crate::{parse_date, required, Category, Error, Result, Store};
 use chrono::NaiveDate;
@@ -1063,7 +1063,8 @@ impl Store {
             FulfilmentChange::NewDocument,
             draft.lines.iter().map(|line| (line.item_id, line.quantity)),
         )?;
-        let (invoice, _) = insert_direct_invoice(&tx, company, draft, Some(id))?;
+        let (invoice, _) =
+            insert_direct_invoice(&tx, company, draft, StockInvoicePosting::Order(id))?;
         tx.execute(
             "INSERT INTO invoice_order_links(invoice_id, order_id) VALUES (?1, ?2)",
             params![invoice, id],
@@ -1158,7 +1159,9 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP VIEW stock_transfer_location_movements;
+                "DROP VIEW warehouse_stock_movements;
+             DROP TABLE negative_stock_policy_changes;
+             DROP VIEW stock_transfer_location_movements;
              DROP TABLE stock_transfer_arrivals;
              DROP TABLE stock_transfer_dispatches;
              DROP TABLE order_revision_lines;
@@ -1316,7 +1319,9 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP VIEW stock_transfer_location_movements;
+                "DROP VIEW warehouse_stock_movements;
+                 DROP TABLE negative_stock_policy_changes;
+                 DROP VIEW stock_transfer_location_movements;
                  DROP TABLE stock_transfer_arrivals;
                  DROP TABLE stock_transfer_dispatches;
                  DROP TABLE order_revision_lines;

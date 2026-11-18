@@ -33,6 +33,7 @@ mod recurring_ui;
 mod shell;
 mod stock_count_ui;
 mod stock_note_ui;
+mod stock_policy_ui;
 mod stock_transit_ui;
 mod tax_ui;
 mod theme;
@@ -207,6 +208,7 @@ struct App {
     transfer_quantity: String,
     transfer_reason: String,
     stock_transit_screen: stock_transit_ui::StockTransitScreen,
+    negative_stock_screen: stock_policy_ui::NegativeStockScreen,
     stock_as_of: String,
     reorder_selection: Option<i64>,
     reorder_editing: Option<i64>,
@@ -480,6 +482,7 @@ impl App {
             transfer_quantity: String::new(),
             transfer_reason: String::new(),
             stock_transit_screen: stock_transit_ui::StockTransitScreen::default(),
+            negative_stock_screen: stock_policy_ui::NegativeStockScreen::default(),
             stock_as_of: String::new(),
             reorder_selection: None,
             reorder_editing: None,
@@ -645,6 +648,7 @@ impl App {
         self.transfer_quantity.clear();
         self.transfer_reason.clear();
         self.stock_transit_screen = stock_transit_ui::StockTransitScreen::default();
+        self.negative_stock_screen = stock_policy_ui::NegativeStockScreen::default();
         self.stock_register_item = None;
         self.invoice_party = None;
         self.invoice_trade = None;
@@ -2144,6 +2148,11 @@ impl App {
         );
     }
     fn stock_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        egui::CollapsingHeader::new("Negative stock control").show(ui, |ui| {
+            if let Err(error) = self.negative_stock_view(ui, company) {
+                self.failure(error);
+            }
+        });
         let locations = match self.store.stock_locations(company) {
             Ok(v) => v,
             Err(e) => {
@@ -3033,7 +3042,7 @@ impl App {
                 ui.colored_label(crate::theme::DANGER, e.to_string());
             }
         }
-        ui.small("Quantities may be negative. See Stock valuation for standard cost, weighted average and FIFO reports.");
+        ui.small("See Stock valuation for ageing and cost reports.");
         crate::theme::section(ui, "Low stock across all locations");
         ui.small("Uses the as-of date above and current reorder settings, regardless of the location filter. Suggested quantities are fixed and do not account for pending orders.");
         match self.store.low_stock(company, end) {
