@@ -16,11 +16,13 @@ use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, Vou
 use eframe::egui::{self, Color32, RichText};
 
 mod actual_cost_ui;
+mod advance_ui;
 mod cost_ui;
 mod order_ui;
 mod stock_count_ui;
 mod valuation_ui;
 use actual_cost_ui::ActualCostScreen;
+use advance_ui::AdvanceScreen;
 use cost_ui::CostScreen;
 use order_ui::OrderScreen;
 use stock_count_ui::StockCountScreen;
@@ -42,6 +44,7 @@ enum Page {
     Backup,
     DayBook,
     Outstanding,
+    Advances,
     Bank,
     Reports,
     CostCentres,
@@ -195,6 +198,7 @@ struct App {
     cost_screen: CostScreen,
     valuation_screen: ValuationScreen,
     actual_cost_screen: ActualCostScreen,
+    advance_screen: AdvanceScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -436,6 +440,7 @@ impl App {
             cost_screen: CostScreen::default(),
             valuation_screen: ValuationScreen::default(),
             actual_cost_screen: ActualCostScreen::default(),
+            advance_screen: AdvanceScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -553,6 +558,7 @@ impl App {
         self.cost_screen = CostScreen::default();
         self.valuation_screen = ValuationScreen::default();
         self.actual_cost_screen = ActualCostScreen::default();
+        self.advance_screen = AdvanceScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -5199,6 +5205,7 @@ impl eframe::App for App {
                 ("Ledger activity", Page::Register),
                 ("Day book", Page::DayBook),
                 ("Outstanding", Page::Outstanding),
+                ("Advances", Page::Advances),
                 ("Invoice register", Page::InvoiceRegister),
                 ("Bank clearance", Page::Bank),
                 ("Stock", Page::Stock),
@@ -5242,6 +5249,7 @@ impl eframe::App for App {
                     Page::Register => self.register_page(ui, company),
                     Page::DayBook => self.day_book_page(ui, company),
                     Page::Outstanding => self.outstanding_page(ui, company),
+                    Page::Advances => self.advances_page(ui, company),
                     Page::InvoiceRegister => self.invoice_register_page(ui, company),
                     Page::Bank => self.bank_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),

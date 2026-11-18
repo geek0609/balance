@@ -7,6 +7,7 @@ use rust_decimal::{prelude::ToPrimitive, Decimal};
 use std::{collections::HashMap, path::Path, str::FromStr};
 use thiserror::Error;
 pub mod actual_cost;
+pub mod advances;
 pub mod banking;
 pub mod company;
 pub mod contacts;
@@ -30,7 +31,7 @@ pub mod stock_sales;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 40;
+const SCHEMA_VERSION: i64 = 41;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -407,6 +408,7 @@ impl Store {
             "cost_allocation_change_lines",
             "standard_stock_costs",
             "stock_receipt_costs",
+            "party_advances",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -705,6 +707,10 @@ impl Store {
             actual_cost::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 40)?;
         }
+        if version < 41 {
+            advances::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 41)?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
@@ -957,7 +963,7 @@ impl Store {
         check_ledgers(&tx, company_id, postings)?;
         opening::check_no_control_postings(&tx, company_id, postings)?;
         let invoice_backed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?2 AND (original_voucher_id = ?1 OR reversal_voucher_id = ?1) UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?2 AND (original_voucher_id = ?1 OR clearing_voucher_id = ?1))",
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM party_advances WHERE company_id = ?2 AND ?1 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?2 AND (original_voucher_id = ?1 OR reversal_voucher_id = ?1) UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?2 AND (original_voucher_id = ?1 OR clearing_voucher_id = ?1))",
             params![voucher_id, company_id],
             |r| r.get(0),
         )?;
