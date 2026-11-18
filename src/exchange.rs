@@ -15,7 +15,9 @@ use crate::{
 use chrono::NaiveDate;
 use roxmltree::{Document, Node, ParsingOptions};
 use rusqlite::{params, Connection, OptionalExtension};
+use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 const MAX_BYTES: usize = 50 * 1024 * 1024;
 
@@ -70,6 +72,7 @@ struct StockOpening {
     batch: Option<String>,
     manufactured_on: Option<String>,
     quantity: i64,
+    cost: Option<i64>,
 }
 #[derive(Debug, Clone)]
 struct Line {
@@ -254,6 +257,16 @@ impl ImportPlan {
             .filter(|opening| opening.quantity != 0)
             .count()
     }
+    pub fn opening_stock_value(&self) -> (usize, i128) {
+        self.items
+            .iter()
+            .flat_map(|item| &item.openings)
+            .filter_map(|opening| opening.cost)
+            .fold((0, 0), |(count, value), amount| {
+                (count + 1, value + i128::from(amount))
+            })
+    }
+
     pub fn company_id(&self) -> i64 {
         self.company_id
     }
@@ -674,17 +687,113 @@ fn xml_stock_quantity(value: &str, unit: &str) -> Result<i64> {
         parse_quantity(number)
     }
 }
-fn unvalued_opening_rate(value: &str, unit: &str) -> bool {
-    let value = value.trim();
-    if value.is_empty() {
-        return true;
+fn stock_opening_cost(node: Node<'_, '_>, quantity: i64, unit: &str) -> Result<Option<i64>> {
+    let value = direct_text(node, "OPENINGVALUE")
+        .filter(|value| !value.is_empty())
+        .map(|value| xml_amount(&value))
+        .transpose()?;
+    let rate_text = direct_text(node, "OPENINGRATE").filter(|value| !value.is_empty());
+    let rate = rate_text
+        .as_deref()
+        .map(|text| {
+            let (number, suffix) = text
+                .split_once('/')
+                .map_or((text, None), |(n, u)| (n, Some(u)));
+            if suffix.is_some_and(|suffix| normalized(suffix) != normalized(unit)) {
+                return Err(Error::Validation(
+                    "opening rate uses a different unit".into(),
+                ));
+            }
+            let rate = Decimal::from_str(number.trim())
+                .map_err(|_| Error::Validation("opening rate is invalid".into()))?;
+            if rate < Decimal::ZERO || (!rate.is_zero() && rate.scale() > 5) {
+                return Err(Error::Validation(
+                    "opening rate must be non-negative with at most five decimal places".into(),
+                ));
+            }
+            Ok(rate)
+        })
+        .transpose()?;
+    if value.is_none_or(|value| value == 0) && rate.is_none_or(|rate| rate.is_zero()) {
+        // Legacy files use zero fields for quantity-only openings.
+        return Ok(None);
     }
-    let (number, suffix) = value
-        .split_once('/')
-        .map_or((value, None), |(n, u)| (n, Some(u)));
-    suffix.is_none_or(|suffix| normalized(suffix) == normalized(unit))
-        && matches!(parse_amount(number), Ok(0))
+    if quantity <= 0 {
+        return Err(Error::Validation(
+            "opening valuation requires a positive quantity".into(),
+        ));
+    }
+    let nonzero_rate = rate.filter(|rate| !rate.is_zero());
+    if value.is_some_and(|value| value < 0) && nonzero_rate.is_none() {
+        return Err(Error::Validation(
+            "a negative opening value needs a matching positive rate".into(),
+        ));
+    }
+    let too_large = || Error::Validation("opening value is too large".into());
+    let units = Decimal::new(quantity, 3);
+    if let Some(value) = value {
+        let value = value.checked_abs().ok_or_else(too_large)?;
+        if let Some(rate) = nonzero_rate {
+            let calculated = units.checked_mul(rate).ok_or_else(too_large)?;
+            // A total may be more precise than the displayed rate. Accept only
+            // amounts consistent with half a last-place rate unit plus rounding.
+            let tolerance = Decimal::new(5, rate.scale() + 1)
+                .checked_mul(units)
+                .and_then(|value| value.checked_add(Decimal::new(5, 3)))
+                .ok_or_else(too_large)?;
+            if (Decimal::new(value, 2) - calculated).abs() > tolerance {
+                return Err(Error::Validation(
+                    "opening value conflicts with quantity and rate".into(),
+                ));
+            }
+        }
+        return Ok(Some(value));
+    }
+    let Some(rate) = nonzero_rate else {
+        return Ok(None);
+    };
+    let minor = units
+        .checked_mul(rate)
+        .and_then(|value| value.checked_mul(Decimal::new(100, 0)))
+        .ok_or_else(too_large)?
+        .round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
+        .to_i64()
+        .ok_or_else(too_large)?;
+    Ok(Some(minor))
 }
+
+fn opening_cost_or_issue(
+    node: Node<'_, '_>,
+    quantity: i64,
+    unit: &str,
+    label: &str,
+    issues: &mut Vec<String>,
+) -> Option<i64> {
+    match stock_opening_cost(node, quantity, unit) {
+        Ok(cost) => cost,
+        Err(error) => {
+            issues.push(format!("{label}: {error}"));
+            None
+        }
+    }
+}
+
+fn opening_location(
+    requested: &str,
+    known: &HashMap<String, Option<i64>>,
+) -> Option<(String, Option<i64>)> {
+    let name = if requested.trim().is_empty()
+        || (requested.eq_ignore_ascii_case("Main Location") && !known.contains_key("main location"))
+    {
+        "Main"
+    } else {
+        requested
+    };
+    known
+        .get(&normalized(name))
+        .map(|id| (name.to_owned(), *id))
+}
+
 fn invoice_field(node: Node<'_, '_>, field: &str) -> Result<String> {
     direct_text(node, field)
         .filter(|v| !v.is_empty())
@@ -2162,6 +2271,9 @@ impl Store {
                     "OPENINGBALANCE",
                     "OPENINGRATE",
                     "OPENINGVALUE",
+                    "GODOWN",
+                    "GODOWNNAME",
+                    "BATCHNAME",
                     "BATCHALLOCATIONS.LIST",
                 ],
                 &label,
@@ -2200,14 +2312,6 @@ impl Store {
             if !known_items.insert(normalized(&name)) {
                 plan.issues.push(format!("{label}: duplicate name"));
             }
-            if direct_text(node, "OPENINGVALUE")
-                .is_some_and(|v| !v.is_empty() && !matches!(xml_amount(&v), Ok(0)))
-                || direct_text(node, "OPENINGRATE")
-                    .is_some_and(|v| !unvalued_opening_rate(&v, &unit))
-            {
-                plan.issues
-                    .push(format!("{label}: opening valuation is not supported"));
-            }
             let top_opening = match direct_text(node, "OPENINGBALANCE").filter(|v| !v.is_empty()) {
                 Some(value) => match xml_stock_quantity(&value, &unit) {
                     Ok(quantity) => Some(quantity),
@@ -2220,6 +2324,25 @@ impl Store {
                 },
                 None => None,
             };
+            let top_cost = opening_cost_or_issue(
+                node,
+                top_opening.unwrap_or(0),
+                &unit,
+                &label,
+                &mut plan.issues,
+            );
+            let top_location = direct_text(node, "GODOWN").filter(|value| !value.is_empty());
+            let location_name = direct_text(node, "GODOWNNAME").filter(|value| !value.is_empty());
+            if top_location
+                .as_ref()
+                .zip(location_name.as_ref())
+                .is_some_and(|(a, b)| normalized(a) != normalized(b))
+            {
+                plan.issues
+                    .push(format!("{label}: opening locations conflict"));
+            }
+            let top_location = top_location.or(location_name);
+            let top_batch = direct_text(node, "BATCHNAME").filter(|value| !value.is_empty());
             let allocations: Vec<_> = node
                 .children()
                 .filter(|n| {
@@ -2254,25 +2377,36 @@ impl Store {
                 {
                     plan.issues.push(format!("{label}: batch names conflict"));
                 }
-                let batch = second.or(first);
-                let location = direct_text(*allocation, "GODOWNNAME")
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_default();
-                let existing_location_id = match known_locations.get(&normalized(&location)) {
-                    Some(id) => *id,
-                    None => {
-                        plan.issues
-                            .push(format!("{label}: stock location {location} is unavailable"));
-                        None
-                    }
-                };
-                if direct_text(*allocation, "OPENINGVALUE")
-                    .is_some_and(|v| !v.is_empty() && !matches!(xml_amount(&v), Ok(0)))
-                    || direct_text(*allocation, "OPENINGRATE")
-                        .is_some_and(|v| !unvalued_opening_rate(&v, &unit))
+                let batch = second.or(first).or_else(|| top_batch.clone());
+                if top_batch
+                    .as_ref()
+                    .zip(batch.as_ref())
+                    .is_some_and(|(a, b)| normalized(a) != normalized(b))
                 {
                     plan.issues
-                        .push(format!("{label}: batch opening valuation is not supported"));
+                        .push(format!("{label}: item and allocation batch names conflict"));
+                }
+                let requested_location = direct_text(*allocation, "GODOWNNAME")
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| top_location.clone())
+                    .unwrap_or_default();
+                let (location, existing_location_id) =
+                    match opening_location(&requested_location, &known_locations) {
+                        Some(location) => location,
+                        None => {
+                            plan.issues.push(format!(
+                                "{label}: stock location {requested_location} is unavailable"
+                            ));
+                            continue;
+                        }
+                    };
+                if let Some(expected) = &top_location {
+                    if !opening_location(expected, &known_locations)
+                        .is_some_and(|(name, _)| normalized(&name) == normalized(&location))
+                    {
+                        plan.issues
+                            .push(format!("{label}: item and allocation locations conflict"));
+                    }
                 }
                 let manufactured = match direct_text(*allocation, "MFDON").filter(|v| !v.is_empty())
                 {
@@ -2319,12 +2453,21 @@ impl Store {
                             0
                         }
                     };
+                let allocation_label = format!("{label}, opening at {location}");
+                let cost = opening_cost_or_issue(
+                    *allocation,
+                    quantity,
+                    &unit,
+                    &allocation_label,
+                    &mut plan.issues,
+                );
                 openings.push(StockOpening {
                     location,
                     existing_location_id,
                     batch,
                     manufactured_on: manufactured,
                     quantity,
+                    cost,
                 });
             }
             for opening in &mut openings {
@@ -2335,18 +2478,25 @@ impl Store {
             }
             if allocations.is_empty() {
                 if let Some(quantity) = top_opening.filter(|quantity| *quantity != 0) {
-                    let existing_location_id = known_locations.get("main").copied().flatten();
-                    if !known_locations.contains_key("main") {
-                        plan.issues
-                            .push(format!("{label}: default stock location is missing"));
-                    }
+                    let request = top_location.as_deref().unwrap_or("Main");
+                    let (location, existing_location_id) =
+                        opening_location(request, &known_locations).unwrap_or_else(|| {
+                            plan.issues
+                                .push(format!("{label}: stock location {request} is unavailable"));
+                            (request.to_owned(), None)
+                        });
                     openings.push(StockOpening {
-                        location: "Main".into(),
+                        location,
                         existing_location_id,
-                        batch: None,
+                        batch: top_batch,
                         manufactured_on: None,
                         quantity,
+                        cost: top_cost,
                     });
+                } else if top_location.is_some() || top_batch.is_some() {
+                    plan.issues.push(format!(
+                        "{label}: a location or batch requires an opening quantity"
+                    ));
                 }
             } else {
                 let sum: i128 = openings
@@ -2357,6 +2507,28 @@ impl Store {
                     plan.issues.push(format!(
                         "{label}: batch quantities do not match the opening quantity"
                     ));
+                }
+                if let Some(cost) = top_cost {
+                    let costed: i128 = openings
+                        .iter()
+                        .filter_map(|opening| opening.cost)
+                        .map(i128::from)
+                        .sum();
+                    let mut missing = openings
+                        .iter_mut()
+                        .filter(|opening| opening.quantity != 0 && opening.cost.is_none());
+                    match (missing.next(), missing.next()) {
+                        (Some(opening), None)
+                            if opening.quantity > 0 && costed <= i128::from(cost) =>
+                        {
+                            // Exactly one allocation remains, so its residual cost is determined.
+                            opening.cost = Some(cost - costed as i64);
+                        }
+                        (None, None) if costed == i128::from(cost) => {}
+                        _ => plan.issues.push(format!(
+                            "{label}: batch opening costs do not reconcile to the item value"
+                        )),
+                    }
                 }
             }
             for opening in &openings {
@@ -3134,6 +3306,14 @@ impl Store {
                         .as_deref()
                         .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
                     tx.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id, batch_id) VALUES (?1, ?2, ?3, ?4, 'Imported opening quantity', ?5, ?6)", params![plan.company_id, item_id, date, opening.quantity, location, batch])?;
+                    if let Some(cost) = opening.cost {
+                        crate::actual_cost::insert_receipt_cost(
+                            &tx,
+                            tx.last_insert_rowid(),
+                            cost,
+                            "Imported stock opening cost",
+                        )?;
+                    }
                 }
             }
         }

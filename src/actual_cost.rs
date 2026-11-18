@@ -380,6 +380,19 @@ fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64
     Ok(events)
 }
 
+pub(crate) fn insert_receipt_cost(
+    conn: &Connection,
+    receipt: i64,
+    amount: i64,
+    reason: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO stock_receipt_costs(adjustment_id, amount, reason) VALUES (?1, ?2, ?3)",
+        params![receipt, amount, reason],
+    )?;
+    Ok(())
+}
+
 impl Store {
     /// List up to 100 quantity increases, optionally finding one by its adjustment ID.
     pub fn stock_receipts(
@@ -450,10 +463,7 @@ impl Store {
                 "This acquisition cost is already saved".into(),
             ));
         }
-        tx.execute(
-            "INSERT INTO stock_receipt_costs(adjustment_id, amount, reason) VALUES (?1, ?2, ?3)",
-            params![receipt, amount, reason],
-        )?;
+        insert_receipt_cost(&tx, receipt, amount, reason)?;
         tx.commit()?;
         Ok(())
     }

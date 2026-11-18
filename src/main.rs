@@ -3998,6 +3998,13 @@ impl App {
                 plan.voucher_count(), plan.invoice_count(), plan.settlement_count()
                 , plan.unit_count(), plan.stock_group_count(), plan.location_count(), plan.item_count(), plan.stock_opening_count()
             ));
+            let (valued_openings, value) = plan.opening_stock_value();
+            if valued_openings > 0 {
+                ui.label(format!(
+                    "{valued_openings} opening stock receipts with acquisition costs totalling {}",
+                    money(value)
+                ));
+            }
             if plan.issues().is_empty() {
                 ui.label("Preview found no issues. Review the limitations below before importing.");
             } else {
@@ -4029,7 +4036,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, unvalued stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Unvalued opening quantities can be allocated by location and batch, including manufacture dates. Invoices require one matching new bill reference and one accounting allocation per item; additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Settlements require one party, one asset ledger and references to available invoices. Tax details, expiry dates, invoice batch dates, nested locations, advances, other bill allocations, valued opening stock and other unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. Invoices require one matching new bill reference and one accounting allocation per item; additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Settlements require one party, one asset ledger and references to available invoices. Tax details, expiry dates, invoice batch dates, nested locations, advances, other bill allocations and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Bank clearance");
