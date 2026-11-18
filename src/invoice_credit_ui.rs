@@ -144,7 +144,7 @@ impl App {
                                 self.invoice_credit.is_none() && self.invoice_refund.is_none() && !has_refunds,
                                 egui::Button::new("Reverse note"),
                             )
-                            .on_disabled_hover_text("Reverse active refunds and finish editing before reversing the note.")
+                            .on_disabled_hover_text("Reverse refunds and release applied credit before reversing the note.")
                             .clicked()
                         {
                             self.invoice_credit =
@@ -246,7 +246,7 @@ impl App {
                 }
             }
             ui.small(format!(
-                "Unpaid balance {}. Any credit above this amount is available for refund.",
+                "Unpaid balance {}. Any excess can be refunded or applied to another bill.",
                 money(invoice.outstanding)
             ));
             if !form.lines.is_empty() {

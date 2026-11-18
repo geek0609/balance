@@ -359,7 +359,14 @@ fn allocation_state(
     let mut stmt = conn.prepare(&format!(
         "SELECT date, amount, released_on FROM advance_allocations WHERE company_id = ?1 AND {column} = ?2"
     ))?;
-    let mut rows = stmt.query(params![company, id])?;
+    let rows = stmt.query(params![company, id])?;
+    read_allocation_state(rows, through)
+}
+
+pub(crate) fn read_allocation_state(
+    mut rows: rusqlite::Rows<'_>,
+    through: Option<NaiveDate>,
+) -> Result<AllocationState> {
     let mut state = AllocationState::default();
     while let Some(row) = rows.next()? {
         state.has_history = true;
@@ -394,7 +401,7 @@ pub(crate) fn invoice_allocation_state(
     allocation_state(conn, company, AllocationTarget::Invoice(invoice), through)
 }
 
-fn check_open_date(conn: &Connection, company: i64, date: NaiveDate) -> Result<()> {
+pub(crate) fn check_open_date(conn: &Connection, company: i64, date: NaiveDate) -> Result<()> {
     if crate::periods::cutoff(conn, company)?.is_some_and(|cutoff| date <= cutoff) {
         return Err(Error::Validation(
             crate::periods::LOCKED_PERIOD_MESSAGE.into(),

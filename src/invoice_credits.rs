@@ -124,6 +124,11 @@ pub(crate) fn state(
             result.latest_active_date = result.latest_active_date.max(Some(date));
         }
     }
+    let incoming = crate::invoice_credit_allocations::state(conn, company, invoice, as_of)?;
+    result.applied += incoming.applied;
+    result.latest_reversal = result.latest_reversal.max(incoming.latest_release);
+    result.latest_active_date = result.latest_active_date.max(incoming.latest_active_date);
+    result.has_history |= incoming.has_history;
     Ok(result)
 }
 
@@ -326,6 +331,26 @@ fn available_for_credit(
         remaining_total: total - credits.total,
         earliest_refundable_date: latest_payment.max(credits.latest_active_date),
     })
+}
+
+pub(crate) fn unpaid_for_allocation(
+    conn: &Connection,
+    company: i64,
+    invoice: i64,
+    kind: InvoiceKind,
+    party: i64,
+    date: NaiveDate,
+) -> Result<i128> {
+    let header = invoice_header(conn, company, invoice)?;
+    if header.kind != kind
+        || header.party != party
+        || crate::invoice_reversals::for_invoice(conn, company, invoice)?.is_some()
+    {
+        return Err(Error::Validation(
+            "Select an active bill of the same type and party as the credit".into(),
+        ));
+    }
+    Ok(available_for_credit(conn, company, invoice, &header, date)?.unpaid)
 }
 
 pub(crate) fn insert_invoice_credit(

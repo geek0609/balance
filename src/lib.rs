@@ -19,6 +19,7 @@ pub mod documents;
 pub mod exchange;
 pub mod grouped_reports;
 pub mod inventory;
+pub mod invoice_credit_allocations;
 pub mod invoice_credits;
 pub mod invoice_refunds;
 pub mod invoice_register;
@@ -48,7 +49,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 62;
+const SCHEMA_VERSION: i64 = 63;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -475,6 +476,7 @@ impl Store {
             "invoice_return_spans",
             "invoice_refund_credits",
             "invoice_credit_refunds",
+            "invoice_credit_allocations",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -862,6 +864,10 @@ impl Store {
         if version < 62 {
             invoice_refunds::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 62)?;
+        }
+        if version < 63 {
+            invoice_credit_allocations::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 63)?;
         }
         tx.commit()?;
         Ok(Self { conn })

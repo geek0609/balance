@@ -98,9 +98,10 @@ impl Store {
             ));
         }
         let credits = crate::invoice_credits::state(&tx, company, invoice, None)?;
-        if credits.total > 0 {
+        if credits.total > 0 || credits.applied > 0 {
             return Err(Error::Validation(
-                "Reverse the active credit or debit notes before reversing this invoice".into(),
+                "Reverse active notes and release applied credit before reversing the invoice"
+                    .into(),
             ));
         }
         if credits

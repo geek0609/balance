@@ -4291,6 +4291,7 @@ impl App {
         let can_reverse = invoice.settled == 0
             && invoice.advance_applied == 0
             && invoice.credit_total == 0
+            && invoice.credited == 0
             && self.editing_invoice != Some(invoice.id);
         if self.invoice_reversal.is_none()
             && ui
@@ -5103,7 +5104,7 @@ impl App {
                             "Reversed on",
                             "Cash settled",
                             "Advances",
-                            "Notes",
+                            "Credits",
                             "Outstanding",
                         ] {
                             ui.strong(label);
@@ -5195,7 +5196,7 @@ impl App {
                         "Total",
                         "Cash settled",
                         "Advances",
-                        "Notes",
+                        "Credits",
                         "Outstanding",
                         "Age (days)",
                         "Overdue (days)",

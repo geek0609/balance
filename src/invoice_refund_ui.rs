@@ -4,11 +4,21 @@ use balance::invoice_credits::CreditNote;
 use balance::{parse_amount, Category, Error, Result};
 use eframe::egui;
 
+#[derive(Clone, Copy, Default)]
+enum CreditAction {
+    #[default]
+    Refund,
+    ReverseRefund(i64),
+    Apply,
+    Release(i64),
+}
+
 #[derive(Default)]
 pub(crate) struct RefundForm {
     note: i64,
-    reversal: Option<i64>,
+    action: CreditAction,
     bank: Option<i64>,
+    invoice: Option<i64>,
     date: String,
     reference: String,
     amount: String,
@@ -32,15 +42,23 @@ impl App {
             .filter(|refund| refund.reversal_date.is_none())
             .map(|refund| i128::from(refund.amount))
             .sum();
+        let applications = self.store.invoice_credit_allocations(company, note.id)?;
+        let applied: i128 = applications
+            .iter()
+            .filter(|row| row.released_on.is_none())
+            .map(|row| i128::from(row.amount))
+            .sum();
         let available = if note.reversal_voucher_id.is_none() {
-            i128::from(note.refundable) - refunded
+            i128::from(note.refundable) - refunded - applied
         } else {
             0
         };
         ui.label(format!(
-            "Applied to invoice {} · Refundable credit {} · Remaining {}",
+            "Original bill reduction {} · Credit issued {} · Applied {} · Refunded {} · Available {}",
             money(i128::from(note.amount - note.refundable)),
             money(note.refundable.into()),
+            money(applied),
+            money(refunded),
             money(available)
         ));
         for refund in history {
@@ -62,7 +80,29 @@ impl App {
                 } else if self.invoice_refund.is_none() && ui.button("Reverse refund").clicked() {
                     self.invoice_refund = Some(RefundForm {
                         note: note.id,
-                        reversal: Some(refund.id),
+                        action: CreditAction::ReverseRefund(refund.id),
+                        ..Default::default()
+                    });
+                }
+            });
+        }
+        for application in applications {
+            ui.push_id(("credit-allocation", application.id), |ui| {
+                ui.label(format!(
+                    "Applied {} to {} on {}",
+                    money(application.amount.into()),
+                    application.invoice_reference,
+                    application.date
+                ));
+                if let Some(date) = application.released_on {
+                    ui.label(format!(
+                        "Released {date} · {}",
+                        application.release_reason.as_deref().unwrap_or_default()
+                    ));
+                } else if self.invoice_refund.is_none() && ui.button("Release credit").clicked() {
+                    self.invoice_refund = Some(RefundForm {
+                        note: note.id,
+                        action: CreditAction::Release(application.id),
                         ..Default::default()
                     });
                 }
@@ -75,8 +115,19 @@ impl App {
                 ..Default::default()
             });
         }
+        if available > 0
+            && self.invoice_refund.is_none()
+            && ui.button("Apply credit to a bill").clicked()
+        {
+            self.invoice_refund = Some(RefundForm {
+                note: note.id,
+                action: CreditAction::Apply,
+                amount: money(available),
+                ..Default::default()
+            });
+        }
         self.edit_invoice_refund(ui, company, invoice, note.id)?;
-        Ok(refunded > 0)
+        Ok(refunded > 0 || applied > 0)
     }
 
     fn edit_invoice_refund(
@@ -93,7 +144,7 @@ impl App {
         else {
             return Ok(());
         };
-        if form.reversal.is_none() {
+        if matches!(form.action, CreditAction::Refund) {
             let ledgers = self
                 .store
                 .ledgers(company)?
@@ -111,16 +162,55 @@ impl App {
                 false,
             );
         }
+        if matches!(form.action, CreditAction::Apply) {
+            let bills: Vec<_> = self
+                .store
+                .invoices(company)?
+                .into_iter()
+                .filter(|bill| {
+                    bill.kind == invoice.kind
+                        && bill.party_ledger_id == invoice.party_ledger_id
+                        && bill.outstanding > 0
+                })
+                .collect();
+            let label = |bill: &InvoiceSummary| {
+                format!(
+                    "{} · {} · Due {}",
+                    bill.reference,
+                    bill.date,
+                    money(bill.outstanding)
+                )
+            };
+            egui::ComboBox::from_id_salt(("credit-target", note))
+                .selected_text(
+                    bills
+                        .iter()
+                        .find(|bill| Some(bill.id) == form.invoice)
+                        .map(label)
+                        .unwrap_or_else(|| "Select an outstanding bill".into()),
+                )
+                .show_ui(ui, |ui| {
+                    for bill in &bills {
+                        ui.selectable_value(&mut form.invoice, Some(bill.id), label(bill));
+                    }
+                });
+        }
         egui::Grid::new(("invoice-refund", note)).show(ui, |ui| {
-            for (label, value) in [
-                ("Date (YYYY-MM-DD)", &mut form.date),
-                ("Reference", &mut form.reference),
-            ] {
-                ui.label(label);
-                ui.text_edit_singleline(value);
+            ui.label("Date (YYYY-MM-DD)");
+            ui.text_edit_singleline(&mut form.date);
+            ui.end_row();
+            if matches!(
+                form.action,
+                CreditAction::Refund | CreditAction::ReverseRefund(_)
+            ) {
+                ui.label("Reference");
+                ui.text_edit_singleline(&mut form.reference);
                 ui.end_row();
             }
-            if form.reversal.is_some() {
+            if matches!(
+                form.action,
+                CreditAction::ReverseRefund(_) | CreditAction::Release(_)
+            ) {
                 ui.label("Reason");
                 ui.text_edit_singleline(&mut form.reason);
             } else {
@@ -129,37 +219,65 @@ impl App {
             }
             ui.end_row();
         });
-        let label = match (form.reversal, invoice.kind) {
-            (Some(_), _) => "Post refund reversal",
-            (None, InvoiceKind::Sale) => "Record payment to customer",
-            (None, InvoiceKind::Purchase) => "Record receipt from supplier",
+        let label = match (form.action, invoice.kind) {
+            (CreditAction::ReverseRefund(_), _) => "Post refund reversal",
+            (CreditAction::Apply, _) => "Apply credit",
+            (CreditAction::Release(_), _) => "Release allocation",
+            (CreditAction::Refund, InvoiceKind::Sale) => "Record payment to customer",
+            (CreditAction::Refund, InvoiceKind::Purchase) => "Record receipt from supplier",
         };
         let (save, cancel) = ui
             .horizontal(|ui| (ui.button(label).clicked(), ui.button("Cancel").clicked()))
             .inner;
         if save {
-            let voucher = if let Some(refund) = form.reversal {
-                self.store.reverse_invoice_refund(
-                    company,
-                    refund,
-                    &form.date,
-                    &form.reference,
-                    &form.reason,
-                )?
-            } else {
-                let bank = form
-                    .bank
-                    .ok_or_else(|| Error::Validation("Select a cash or bank ledger".into()))?;
-                self.store.post_invoice_refund(
-                    company,
-                    note,
-                    bank,
-                    &form.date,
-                    &form.reference,
-                    parse_amount(&form.amount)?,
-                )?
+            self.message = match form.action {
+                CreditAction::ReverseRefund(refund) => {
+                    let voucher = self.store.reverse_invoice_refund(
+                        company,
+                        refund,
+                        &form.date,
+                        &form.reference,
+                        &form.reason,
+                    )?;
+                    format!("Refund reversal voucher {voucher} posted")
+                }
+                CreditAction::Refund => {
+                    let bank = form
+                        .bank
+                        .ok_or_else(|| Error::Validation("Select a cash or bank ledger".into()))?;
+                    let voucher = self.store.post_invoice_refund(
+                        company,
+                        note,
+                        bank,
+                        &form.date,
+                        &form.reference,
+                        parse_amount(&form.amount)?,
+                    )?;
+                    format!("Refund voucher {voucher} posted")
+                }
+                CreditAction::Apply => {
+                    let bill = form
+                        .invoice
+                        .ok_or_else(|| Error::Validation("Select an outstanding bill".into()))?;
+                    self.store.apply_invoice_credit(
+                        company,
+                        note,
+                        bill,
+                        &form.date,
+                        parse_amount(&form.amount)?,
+                    )?;
+                    "Credit allocation saved".into()
+                }
+                CreditAction::Release(allocation) => {
+                    self.store.release_invoice_credit(
+                        company,
+                        allocation,
+                        &form.date,
+                        &form.reason,
+                    )?;
+                    "Credit allocation released".into()
+                }
             };
-            self.message = format!("Refund voucher {voucher} posted");
             self.invoice_refund = None;
         } else if cancel {
             self.invoice_refund = None;

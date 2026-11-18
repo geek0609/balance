@@ -58,7 +58,7 @@ pub struct RefundBalance {
 
 #[derive(Default)]
 struct RefundState {
-    refunded: i128,
+    spent: i128,
     latest_reversal: Option<NaiveDate>,
 }
 
@@ -72,7 +72,9 @@ fn state(
         "SELECT r.amount, v.date, rv.date FROM invoice_credit_refunds r
          JOIN vouchers v ON v.id = r.voucher_id AND v.company_id = r.company_id
          LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id AND rv.company_id = r.company_id
-         WHERE r.company_id = ?1 AND r.note_id = ?2",
+         WHERE r.company_id = ?1 AND r.note_id = ?2
+         UNION ALL SELECT a.amount, a.date, a.released_on FROM invoice_credit_allocations a
+         WHERE a.company_id = ?1 AND a.note_id = ?2",
     )?;
     let mut rows = stmt.query(params![company, note])?;
     let mut state = RefundState::default();
@@ -87,7 +89,7 @@ fn state(
         if through.is_none_or(|end| date <= end)
             && reversed.is_none_or(|day| through.is_some_and(|end| end < day))
         {
-            state.refunded += i128::from(row.get::<_, i64>(0)?);
+            state.spent += i128::from(row.get::<_, i64>(0)?);
         }
     }
     Ok(state)
@@ -100,17 +102,48 @@ pub(crate) fn check_note_reversal(
     date: NaiveDate,
 ) -> Result<()> {
     let refunds = state(conn, company, note, None)?;
-    if refunds.refunded > 0 {
+    if refunds.spent > 0 {
         return Err(Error::Validation(
-            "Reverse the recorded refunds before reversing this note".into(),
+            "Reverse refunds and release applied credit before reversing this note".into(),
         ));
     }
     if refunds.latest_reversal.is_some_and(|day| date < day) {
         return Err(Error::Validation(
-            "The note reversal cannot precede a refund reversal".into(),
+            "The note reversal cannot precede a refund reversal or credit release".into(),
         ));
     }
     Ok(())
+}
+
+pub(crate) fn available_credit(
+    conn: &Connection,
+    company: i64,
+    note: i64,
+    date: NaiveDate,
+) -> Result<(InvoiceKind, i64, i128)> {
+    let (credit, note_date, kind, party): (i64, String, String, i64) = conn
+        .query_row(
+            "SELECT c.amount, v.date, i.kind, i.party_ledger_id FROM invoice_refund_credits c
+         JOIN invoice_credit_notes n ON n.id = c.note_id AND n.company_id = ?1
+         JOIN invoices i ON i.id = n.invoice_id AND i.company_id = n.company_id
+         JOIN vouchers v ON v.id = n.voucher_id AND v.company_id = n.company_id
+         WHERE n.id = ?2 AND n.reversal_voucher_id IS NULL",
+            params![company, note],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::Validation("Select an active note with refundable credit".into()))?;
+    let refund = state(conn, company, note, None)?;
+    if date < parse_date(&note_date)? || refund.latest_reversal.is_some_and(|day| date < day) {
+        return Err(Error::Validation(
+            "Date cannot precede the note, refund reversal or credit release".into(),
+        ));
+    }
+    Ok((
+        InvoiceKind::parse(&kind)?,
+        party,
+        i128::from(credit) - refund.spent,
+    ))
 }
 
 impl Store {
@@ -173,12 +206,12 @@ impl Store {
                 let note = row.get(0)?;
                 let credit: i64 = row.get(7)?;
                 let outstanding = i64::try_from(
-                    i128::from(credit) - state(&snapshot, company, note, Some(through))?.refunded,
+                    i128::from(credit) - state(&snapshot, company, note, Some(through))?.spent,
                 )
                 .map_err(|_| Error::Validation("Refund balance is out of range".into()))?;
                 if outstanding < 0 {
                     return Err(Error::Validation(
-                        "Refunds exceed the credit on an invoice note".into(),
+                        "Refunds and allocations exceed the credit on an invoice note".into(),
                     ));
                 }
                 if outstanding == 0 {
@@ -216,27 +249,8 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (credit, note_date, kind, party): (i64, String, String, i64) = tx
-            .query_row(
-                "SELECT c.amount, v.date, i.kind, i.party_ledger_id FROM invoice_refund_credits c
-             JOIN invoice_credit_notes n ON n.id = c.note_id AND n.company_id = ?1
-             JOIN invoices i ON i.id = n.invoice_id AND i.company_id = n.company_id
-             JOIN vouchers v ON v.id = n.voucher_id AND v.company_id = n.company_id
-             WHERE n.id = ?2 AND n.reversal_voucher_id IS NULL",
-                params![company, note],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                Error::Validation("Select an active note with refundable credit".into())
-            })?;
-        let refund = state(&tx, company, note, None)?;
-        if date < parse_date(&note_date)? || refund.latest_reversal.is_some_and(|day| date < day) {
-            return Err(Error::Validation(
-                "Refund date cannot precede the note or a prior refund reversal".into(),
-            ));
-        }
-        if amount <= 0 || i128::from(amount) > i128::from(credit) - refund.refunded {
+        let (kind, party, available) = available_credit(&tx, company, note, date)?;
+        if amount <= 0 || i128::from(amount) > available {
             return Err(Error::Validation(
                 "Enter a positive refund within the remaining credit".into(),
             ));
@@ -246,7 +260,7 @@ impl Store {
                 "Select a cash or bank asset ledger different from the party".into(),
             ));
         }
-        let (kind, cash_amount) = match InvoiceKind::parse(&kind)? {
+        let (kind, cash_amount) = match kind {
             InvoiceKind::Sale => (VoucherKind::Payment, -amount),
             InvoiceKind::Purchase => (VoucherKind::Receipt, amount),
         };
@@ -547,5 +561,118 @@ mod tests {
         assert!(store
             .reverse_invoice(company, invoice, "2026-03-04", "VOID-01", "Active return")
             .is_err());
+    }
+
+    #[test]
+    fn credit_application_reduces_a_bill_without_a_cash_entry_and_releases_by_date() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Demo").unwrap();
+        let party = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        let other = store
+            .create_ledger(company, "Other customer", Category::Asset)
+            .unwrap();
+        let bank = store
+            .create_ledger(company, "Cash", Category::Asset)
+            .unwrap();
+        let sales = store
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        let mut draft = invoice(InvoiceKind::Sale, party, sales);
+        draft.adjustments.push(InvoiceAdjustment {
+            ledger_id: sales,
+            amount: 1000,
+            description: "Service".into(),
+        });
+        let original = store.create_invoice(company, &draft).unwrap();
+        store
+            .settle_invoice(company, original, bank, "2026-03-02", "PAY-01", 700)
+            .unwrap();
+        let note = store
+            .post_invoice_credit(
+                company,
+                original,
+                "2026-03-03",
+                "CR-01",
+                "Allowance",
+                &[CreditLineDraft {
+                    ledger_id: sales,
+                    amount: 400,
+                    is_tax: false,
+                }],
+            )
+            .unwrap();
+        draft.reference = "INV-02".into();
+        draft.adjustments[0].amount = 200;
+        let target = store.create_invoice(company, &draft).unwrap();
+        draft.party_ledger_id = other;
+        let wrong_party = store.create_invoice(company, &draft).unwrap();
+        let vouchers = store.vouchers(company).unwrap().len();
+        assert!(store
+            .apply_invoice_credit(company, note, wrong_party, "2026-03-04", 60)
+            .is_err());
+        assert!(store
+            .apply_invoice_credit(company, note, target, "2026-03-02", 60)
+            .is_err());
+        let allocation = store
+            .apply_invoice_credit(company, note, target, "2026-03-04", 60)
+            .unwrap();
+        assert_eq!(store.vouchers(company).unwrap().len(), vouchers);
+        let due = |store: &Store, date: &str| {
+            store
+                .outstanding_invoices(company, date)
+                .unwrap()
+                .iter()
+                .find(|row| row.invoice_id == target)
+                .unwrap()
+                .outstanding
+        };
+        assert_eq!(due(&store, "2026-03-03"), 200);
+        assert_eq!(due(&store, "2026-03-04"), 140);
+        assert_eq!(
+            store
+                .invoice_refund_balances(company, "2026-03-04")
+                .unwrap()[0]
+                .outstanding,
+            40
+        );
+        assert!(store
+            .settle_invoice(company, target, bank, "2026-03-04", "PAY-02", 141)
+            .is_err());
+        assert!(store
+            .post_invoice_refund(company, note, bank, "2026-03-04", "REF-01", 41)
+            .is_err());
+        assert!(store
+            .reverse_invoice_credit(company, note, "2026-03-04", "REV-01", "Undo")
+            .is_err());
+        assert!(store
+            .reverse_invoice(company, target, "2026-03-04", "REV-02", "Undo")
+            .is_err());
+        store
+            .set_period_lock(company, Some("2026-03-04"), "Close books")
+            .unwrap();
+        assert!(store
+            .release_invoice_credit(company, allocation, "2026-03-04", "Moved")
+            .is_err());
+        store
+            .release_invoice_credit(company, allocation, "2026-03-05", "Moved")
+            .unwrap();
+        assert_eq!(due(&store, "2026-03-04"), 140);
+        assert_eq!(due(&store, "2026-03-05"), 200);
+        assert_eq!(
+            store
+                .invoice_refund_balances(company, "2026-03-05")
+                .unwrap()[0]
+                .outstanding,
+            100
+        );
+        store
+            .post_invoice_refund(company, note, bank, "2026-03-05", "REF-01", 100)
+            .unwrap();
+        assert!(store
+            .invoice_refund_balances(company, "2026-03-05")
+            .unwrap()
+            .is_empty());
     }
 }
