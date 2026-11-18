@@ -149,6 +149,7 @@ pub(super) struct PayrollScreen {
     entries: Vec<PayrollAccrual>,
     selected: Option<i64>,
     register_loaded: bool,
+    statement_path: String,
     payment: PaymentForm,
     reversal: Option<PayrollReversalForm>,
 }
@@ -602,6 +603,24 @@ impl App {
             self.payroll_reversal_form(ui, company, ReversalTarget::Accrual(row.id), row.paid == 0);
         }
         ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.payroll_screen.statement_path)
+                    .hint_text("Absolute path to a new .html file")
+                    .desired_width(300.0),
+            );
+            if ui.button("Export printable pay statement").clicked() {
+                match self.store.export_pay_statement_html(
+                    company,
+                    row.id,
+                    end,
+                    self.payroll_screen.statement_path.trim(),
+                ) {
+                    Ok(()) => self.message = "Pay statement created".into(),
+                    Err(error) => self.failure(error),
+                }
+            }
+        });
         ui.strong("Salary payments");
         match self.store.payroll_payments(company, row.id, end) {
             Ok(payments) if payments.is_empty() => {

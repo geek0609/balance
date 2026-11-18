@@ -1,4 +1,4 @@
-//! Simple printable documents built from saved invoice records.
+//! Printable invoice and payroll records.
 use crate::{
     format_amount,
     inventory::{format_quantity, InvoiceDiscount},
@@ -31,6 +31,35 @@ fn money(value: i128) -> String {
     )
 }
 
+fn printable_html(title: &str) -> String {
+    ["<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>", &escape(title), "</title><style>body{font:14px system-ui,sans-serif;color:#182431;max-width:900px;margin:2rem auto;padding:0 1rem}h1{margin-bottom:.2rem}p{white-space:pre-line}table{border-collapse:collapse;width:100%;margin:1.5rem 0}th,td{text-align:left;border-bottom:1px solid #ccd3db;padding:.55rem;vertical-align:top}.num{text-align:right;white-space:nowrap}.totals{margin-left:auto;width:min(100%,360px)}.totals td{border:0}.total{font-weight:bold;border-top:2px solid #182431}.note{color:#4c5b68;font-size:12px}@media print{body{margin:0;max-width:none}}</style></head><body>"].concat()
+}
+
+fn html_destination(destination: &Path) -> Result<&Path> {
+    if !destination.is_absolute()
+        || !destination
+            .extension()
+            .is_some_and(|value| value.eq_ignore_ascii_case("html"))
+    {
+        return Err(Error::Validation(
+            "Enter an absolute path to a new .html file".into(),
+        ));
+    }
+    Ok(destination)
+}
+
+fn write_html(destination: &Path, html: &str) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| Error::Validation(format!("Cannot create document file: {error}")))?;
+    file.write_all(html.as_bytes())
+        .and_then(|_| file.flush())
+        .map_err(|error| Error::Validation(format!("Cannot finish document file: {error}")))?;
+    Ok(())
+}
+
 impl Store {
     /// Export the current invoice and party details to a new, printable HTML file.
     /// No tax compliance, historical master snapshot, or payment status is implied.
@@ -40,16 +69,7 @@ impl Store {
         invoice_id: i64,
         destination: impl AsRef<Path>,
     ) -> Result<()> {
-        let destination = destination.as_ref();
-        if !destination.is_absolute()
-            || !destination
-                .extension()
-                .is_some_and(|v| v.eq_ignore_ascii_case("html"))
-        {
-            return Err(Error::Validation(
-                "Enter an absolute path to a new .html file".into(),
-            ));
-        }
+        let destination = html_destination(destination.as_ref())?;
         let company = self
             .companies()?
             .into_iter()
@@ -63,7 +83,7 @@ impl Store {
         let draft = self.invoice_draft(company_id, invoice_id)?;
         let profile = self.ledger_profile(company_id, draft.party_ledger_id)?;
         let business = self.company_profile(company_id)?;
-        let mut html = String::from("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>Invoice record</title><style>body{font:14px system-ui,sans-serif;color:#182431;max-width:900px;margin:2rem auto;padding:0 1rem}h1{margin-bottom:.2rem}p{white-space:pre-line}table{border-collapse:collapse;width:100%;margin:1.5rem 0}th,td{text-align:left;border-bottom:1px solid #ccd3db;padding:.55rem;vertical-align:top}.num{text-align:right;white-space:nowrap}.totals{margin-left:auto;width:min(100%,360px)}.totals td{border:0}.total{font-weight:bold;border-top:2px solid #182431}.note{color:#4c5b68;font-size:12px}@media print{body{margin:0;max-width:none}}</style></head><body>");
+        let mut html = printable_html("Invoice record");
         let _ = write!(html, "<h1>{}</h1><p>", escape(&company.name));
         for value in [
             &business.address,
@@ -184,14 +204,98 @@ impl Store {
             );
         }
         html.push_str("<p class=\"note\">Basic invoice record. Company and party details reflect their current profiles. Review before use; this layout does not establish tax or statutory compliance.</p></body></html>");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination)
-            .map_err(|e| Error::Validation(format!("Cannot create invoice document: {e}")))?;
-        file.write_all(html.as_bytes())
-            .and_then(|_| file.flush())
-            .map_err(|e| Error::Validation(format!("Cannot finish invoice document: {e}")))?;
-        Ok(())
+        write_html(destination, &html)
+    }
+
+    /// Export a printable payroll record through the selected reporting cutoff.
+    pub fn export_pay_statement_html(
+        &self,
+        company_id: i64,
+        accrual_id: i64,
+        through: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let destination = html_destination(destination.as_ref())?;
+        let company = self
+            .companies()?
+            .into_iter()
+            .find(|company| company.id == company_id)
+            .ok_or_else(|| Error::Validation("Company not found".into()))?;
+        let accrual = self
+            .payroll_register(company_id, None, through, None)?
+            .into_iter()
+            .find(|row| row.id == accrual_id)
+            .ok_or_else(|| {
+                Error::Validation("Payroll entry not found through the selected date".into())
+            })?;
+        let lines = self.payroll_lines(company_id, accrual_id)?;
+        let mut html = printable_html("Pay statement");
+        let _ = write!(
+            html,
+            "<h1>{}</h1><p><strong>Pay statement</strong><br>Employee {} · {}",
+            escape(&company.name),
+            escape(&accrual.code),
+            escape(&accrual.employee)
+        );
+        if !accrual.department.is_empty() {
+            let _ = write!(html, "<br>Department {}", escape(&accrual.department));
+        }
+        let _ = write!(
+            html,
+            "<br>Period {} to {}<br>Accrual reference {} · Posted {}<br>Voucher {}</p>",
+            escape(&accrual.period_start),
+            escape(&accrual.period_end),
+            escape(&accrual.reference),
+            escape(&accrual.date),
+            accrual.voucher_id
+        );
+        if let Some(reversal) = &accrual.reversal {
+            let _ = write!(
+                html,
+                "<p><strong>Accrual reversed {}</strong><br>Voucher {} · {}</p>",
+                escape(&reversal.date),
+                reversal.voucher_id,
+                escape(&reversal.reference)
+            );
+        }
+        html.push_str("<table><thead><tr><th>Pay head</th><th>Type</th><th class=\"num\">Amount</th></tr></thead><tbody>");
+        for line in lines {
+            let _ = write!(
+                html,
+                "<tr><td>{}</td><td>{}</td><td class=\"num\">{}</td></tr>",
+                escape(&line.head),
+                line.kind.label(),
+                format_amount(line.amount)
+            );
+        }
+        html.push_str("</tbody></table><table class=\"totals\"><tbody>");
+        for (label, amount) in [
+            ("Gross earnings", i128::from(accrual.gross)),
+            ("Deductions", i128::from(accrual.deductions)),
+            ("Net accrued", i128::from(accrual.net)),
+            (
+                "Employer contributions",
+                i128::from(accrual.employer_contributions),
+            ),
+            ("Paid", accrual.paid),
+            ("Outstanding", accrual.outstanding),
+        ] {
+            let _ = write!(
+                html,
+                "<tr><td>{label}</td><td class=\"num\">{}</td></tr>",
+                money(amount)
+            );
+        }
+        html.push_str("</tbody></table>");
+        if let Some(date) = through {
+            let date = crate::parse_date(date)?;
+            let _ = write!(html, "<p>Payment and reversal status through {date}.</p>");
+        } else {
+            html.push_str("<p>Payment and reversal status includes all saved dates.</p>");
+        }
+        html.push_str(
+            "<p class=\"note\">Pay statement from recorded payroll amounts.</p></body></html>",
+        );
+        write_html(destination, &html)
     }
 }
