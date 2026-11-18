@@ -1,9 +1,12 @@
 [package]
 name = "balance"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "An independent accounting application written in Rust"
+
+[features]
+windows-updater = ["dep:libloading"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std"] }
@@ -14,3 +17,6 @@ roxmltree = "0.21"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rust_decimal = "1.39"
 thiserror = "2"
+
+[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+libloading = { version = "0.8.9", optional = true }

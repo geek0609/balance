@@ -29,6 +29,8 @@ mod payroll_ui;
 mod recurring_ui;
 mod stock_count_ui;
 mod tax_ui;
+#[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
+mod updates;
 mod valuation_ui;
 use actual_cost_ui::ActualCostScreen;
 use advance_ui::AdvanceScreen;
@@ -74,6 +76,8 @@ enum Page {
 }
 struct App {
     store: Store,
+    #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
+    updates: updates::Updates,
     database_path: std::path::PathBuf,
     page: Page,
     company: Option<i64>,
@@ -336,6 +340,8 @@ impl App {
     fn new(store: Store, database_path: std::path::PathBuf) -> Self {
         Self {
             store,
+            #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
+            updates: updates::Updates::default(),
             database_path,
             page: Page::Company,
             company: None,
@@ -5478,6 +5484,8 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("Balance").color(Color32::from_rgb(30, 75, 115)));
                 ui.label("Early accounting prototype");
+                #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
+                self.updates.show(ui);
             });
             if let Some(company) = self.company {
                 if let Ok(Some(code)) = self.store.company_base_currency(company) {

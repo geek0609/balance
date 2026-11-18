@@ -6,7 +6,9 @@ Balance is an open-source accounting and business-management application written
 
 ## Run the prototype
 
-Download the Windows x64 ZIP from [Releases](https://github.com/geek0609/balance/releases), extract it and open `balance.exe`. To build from source on Windows, install a Rust toolchain and run `cargo run`.
+Download and run the Windows x64 setup executable from [Releases](https://github.com/geek0609/balance/releases). It installs for the current Windows user and adds Balance to the Start menu. To build from source on Windows, install a Rust toolchain and run `cargo run`.
+
+Installed copies check for updates automatically when Balance runs. Use **Updates** to change that preference or check manually. When a new version is available, save your work and select **Install update**. Balance verifies the downloaded installer, closes for installation and can then be reopened. Install and uninstall leave the accounting database in its separate local application-data directory.
 
 The feature list below describes the source on `main`. Each release page describes the packaged build.
 
