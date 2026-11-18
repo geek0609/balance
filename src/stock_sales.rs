@@ -1,8 +1,8 @@
 //! Stock lines on sale invoices and their full reversals.
-use crate::{parse_date, Error, Result};
+use crate::stock_notes::{invoice_quantity_share, InvoiceQuantityShare};
+use crate::{parse_date, Result};
 use chrono::NaiveDate;
 use rusqlite::Connection;
-use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SaleCostOrigin {
@@ -17,7 +17,7 @@ pub struct StockSale {
     pub original_date: NaiveDate,
     pub(crate) cost_date: NaiveDate,
     pub(crate) cost_origin: SaleCostOrigin,
-    delivery_share: Option<DeliveryCostShare>,
+    delivery_share: Option<InvoiceQuantityShare>,
     pub invoice_id: i64,
     pub voucher_id: i64,
     pub date: NaiveDate,
@@ -30,77 +30,24 @@ pub struct StockSale {
     pub net_sales: i128,
 }
 
-#[derive(Debug, Clone)]
-struct DeliveryCostShare {
-    delivered: i64,
-    spans: Vec<Range<i64>>,
-}
-
 impl StockSale {
     pub(crate) fn issue_quantity(&self) -> i128 {
         self.delivery_share
             .as_ref()
-            .map_or(self.quantity.abs(), |share| i128::from(share.delivered))
+            .map_or(self.quantity.abs(), |share| i128::from(share.quantity()))
     }
 
     pub(crate) fn allocated_issue_cost(&self, total: i128) -> i128 {
-        let portion = self.delivery_share.as_ref().map_or(total, |share| {
-            let delivered = i128::from(share.delivered);
-            let boundary = |quantity: i64| {
-                let position = i128::from(quantity);
-                let scaled_remainder = (total % delivered) * position;
-                let remainder = scaled_remainder % delivered;
-                // Divide before multiplying to keep the full monetary range.
-                // Differences of rounded endpoints conserve the whole cost.
-                (total / delivered) * position
-                    + scaled_remainder / delivered
-                    + i128::from(remainder >= delivered - remainder)
-            };
-            share
-                .spans
-                .iter()
-                .map(|span| boundary(span.end) - boundary(span.start))
-                .sum()
-        });
+        let portion = self
+            .delivery_share
+            .as_ref()
+            .map_or(total, |share| share.apportion(total));
         if self.reversal {
             -portion
         } else {
             portion
         }
     }
-}
-
-fn delivery_share(
-    conn: &Connection,
-    invoice_line: i64,
-    delivered: i64,
-    billed: i64,
-) -> Result<DeliveryCostShare> {
-    let mismatch =
-        || Error::Validation("Invoiced quantities do not reconcile with the delivery line".into());
-    let mut stmt = conn.prepare_cached(
-        "SELECT start_quantity, quantity FROM stock_note_invoice_spans
-         WHERE invoice_line_id = ?1 ORDER BY start_quantity",
-    )?;
-    let mut spans = Vec::new();
-    let mut previous_end = 0;
-    let mut subtotal = 0;
-    for row in stmt.query_map([invoice_line], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-    })? {
-        let (start, quantity) = row?;
-        let end = start.checked_add(quantity).ok_or_else(mismatch)?;
-        if start < previous_end || quantity <= 0 || end > delivered {
-            return Err(mismatch());
-        }
-        spans.push(start..end);
-        previous_end = end;
-        subtotal += quantity;
-    }
-    if subtotal != billed || spans.is_empty() {
-        return Err(mismatch());
-    }
-    Ok(DeliveryCostShare { delivered, spans })
 }
 
 pub(crate) fn stock_sales(
@@ -150,7 +97,7 @@ pub(crate) fn stock_sales(
             .unwrap_or(original_date);
         let share = row
             .get::<_, Option<i64>>(15)?
-            .map(|delivered| delivery_share(conn, line_id, delivered, quantity))
+            .map(|delivered| invoice_quantity_share(conn, line_id, delivered, quantity))
             .transpose()?;
         let events: [Option<(i64, NaiveDate, String, i128)>; 2] = [
             Some((row.get(1)?, original_date, row.get(3)?, 1)),

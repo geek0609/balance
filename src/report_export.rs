@@ -1226,6 +1226,66 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_receipt_reconciliation_csv(
+        &self,
+        company: i64,
+        as_of: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let context = [self.report_company_name(company)?, optional_date(as_of)?];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "as_of"]),
+            &strings(&[
+                "row_type",
+                "receipt_id",
+                "receipt_date",
+                "reference",
+                "supplier",
+                "item",
+                "location",
+                "batch",
+                "unit",
+                "received_quantity",
+                "invoiced_quantity",
+                "unbilled_quantity",
+                "receipt_acquisition_cost",
+                "cost_for_invoiced_quantity",
+                "invoice_net",
+                "price_variance",
+            ]),
+        )?;
+        let mut empty = vec![String::new(); 16];
+        empty[0] = "context".into();
+        contextual_row(&mut csv, &context, &empty)?;
+        for line in self.receipt_reconciliation(company, as_of)? {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "receipt_line".into(),
+                    line.note_id.to_string(),
+                    text_cell(&line.note_date.to_string()),
+                    text_cell(&line.reference),
+                    text_cell(&line.supplier),
+                    text_cell(&line.item),
+                    text_cell(&line.location),
+                    text_cell(line.batch.as_deref().unwrap_or_default()),
+                    text_cell(&line.unit),
+                    format_quantity(i128::from(line.received_quantity)),
+                    format_quantity(i128::from(line.invoiced_quantity)),
+                    format_quantity(i128::from(line.unbilled_quantity())),
+                    line.receipt_cost.map(money).unwrap_or_default(),
+                    line.invoiced_receipt_cost.map(money).unwrap_or_default(),
+                    money(line.invoice_net),
+                    line.variance().map(money).unwrap_or_default(),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
     /// Export direct or rolled-up quantities for a selected location.
     pub fn export_stock_location_csv(
         &self,

@@ -358,6 +358,70 @@ fn allocate_spans(
     Ok(spans)
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InvoiceQuantityShare {
+    quantity: i64,
+    spans: Vec<Range<i64>>,
+}
+
+impl InvoiceQuantityShare {
+    pub(crate) fn quantity(&self) -> i64 {
+        self.quantity
+    }
+
+    /// Allocate a non-negative cost across the quantities billed.
+    pub(crate) fn apportion(&self, total: i128) -> i128 {
+        let quantity = i128::from(self.quantity);
+        let boundary = |position: i64| {
+            let position = i128::from(position);
+            let scaled_remainder = (total % quantity) * position;
+            let remainder = scaled_remainder % quantity;
+            // Differences of rounded endpoints conserve the full cost.
+            (total / quantity) * position
+                + scaled_remainder / quantity
+                + i128::from(remainder >= quantity - remainder)
+        };
+        self.spans
+            .iter()
+            .map(|span| boundary(span.end) - boundary(span.start))
+            .sum()
+    }
+}
+
+pub(crate) fn invoice_quantity_share(
+    conn: &Connection,
+    invoice_line: i64,
+    note_quantity: i64,
+    invoice_quantity: i64,
+) -> Result<InvoiceQuantityShare> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT start_quantity, quantity FROM stock_note_invoice_spans
+         WHERE invoice_line_id = ?1 ORDER BY start_quantity",
+    )?;
+    let mut spans = Vec::new();
+    let mut previous_end = 0;
+    let mut subtotal = 0;
+    for row in stmt.query_map([invoice_line], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })? {
+        let (start, quantity) = row?;
+        let end = start.checked_add(quantity).ok_or_else(invalid_spans)?;
+        if start < previous_end || quantity <= 0 || end > note_quantity {
+            return Err(invalid_spans());
+        }
+        spans.push(start..end);
+        previous_end = end;
+        subtotal += quantity;
+    }
+    if subtotal != invoice_quantity || spans.is_empty() {
+        return Err(invalid_spans());
+    }
+    Ok(InvoiceQuantityShare {
+        quantity: note_quantity,
+        spans,
+    })
+}
+
 fn invalid_spans() -> Error {
     Error::Validation("Stock note invoice quantities do not reconcile".into())
 }

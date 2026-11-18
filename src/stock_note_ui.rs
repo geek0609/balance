@@ -1,5 +1,6 @@
 use super::{
-    pick_account, pick_batch, pick_location, pick_stock, App, InvoiceLineForm, InvoiceSource, Page,
+    money, pick_account, pick_batch, pick_location, pick_stock, App, InvoiceLineForm,
+    InvoiceSource, Page,
 };
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind};
 use balance::orders::OrderDetail;
@@ -82,6 +83,7 @@ pub(super) struct StockNoteScreen {
     reverse_date: String,
     reverse_reason: String,
     document_path: String,
+    reconcile_as_of: String,
 }
 
 impl StockNoteScreen {
@@ -127,6 +129,12 @@ impl App {
         if let Err(error) = self.stock_note_form(ui, company) {
             self.failure(error);
         }
+        ui.separator();
+        ui.collapsing("Receipt cost reconciliation", |ui| {
+            if let Err(error) = self.receipt_reconciliation_view(ui, company) {
+                ui.label(error.to_string());
+            }
+        });
         ui.separator();
         if let Err(error) = self.stock_note_register(ui, company) {
             self.failure(error);
@@ -247,6 +255,87 @@ impl App {
             self.stock_note_screen.select(Some(id));
             self.message = format!("Stock note {id} posted");
         }
+        Ok(())
+    }
+
+    fn receipt_reconciliation_view(&mut self, ui: &mut egui::Ui, company: i64) -> Result<()> {
+        ui.horizontal(|ui| {
+            ui.label("As of (optional)");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.stock_note_screen.reconcile_as_of)
+                    .hint_text("YYYY-MM-DD"),
+            );
+        });
+        ui.small("Variance compares net invoice prices with the current recorded receipt cost for the billed quantity. Amounts exclude tax and charges.");
+        self.report_export_path_field(ui);
+        let date = self.stock_note_screen.reconcile_as_of.trim();
+        let as_of = (!date.is_empty()).then_some(date);
+        let rows = self.store.receipt_reconciliation(company, as_of)?;
+        if ui.button("Export receipt reconciliation as CSV").clicked() {
+            self.store.export_receipt_reconciliation_csv(
+                company,
+                as_of,
+                self.report_export_path.trim(),
+            )?;
+            self.message = "Receipt reconciliation exported".into();
+        }
+        if rows.is_empty() {
+            ui.label("No receipt lines for the selected date.");
+            return Ok(());
+        }
+        egui::Grid::new("receipt-reconciliation")
+            .striped(true)
+            .show(ui, |ui| {
+                for label in [
+                    "Receipt",
+                    "Supplier",
+                    "Item",
+                    "Received",
+                    "Invoiced",
+                    "Unbilled",
+                    "Receipt cost",
+                    "Billed cost",
+                    "Invoice net",
+                    "Variance",
+                ] {
+                    ui.strong(label);
+                }
+                ui.end_row();
+                for row in rows {
+                    if ui
+                        .link(format!("{} · {}", row.note_date, row.reference))
+                        .clicked()
+                    {
+                        self.open_stock_note(row.note_id);
+                    }
+                    ui.label(&row.supplier);
+                    let item = format!("{} · {}", row.item, row.location);
+                    ui.label(match &row.batch {
+                        Some(batch) => format!("{item} · {batch}"),
+                        None => item,
+                    });
+                    for quantity in [
+                        row.received_quantity,
+                        row.invoiced_quantity,
+                        row.unbilled_quantity(),
+                    ] {
+                        ui.label(format!(
+                            "{} {}",
+                            format_quantity(i128::from(quantity)),
+                            row.unit
+                        ));
+                    }
+                    for cost in [
+                        row.receipt_cost,
+                        row.invoiced_receipt_cost,
+                        Some(row.invoice_net),
+                        row.variance(),
+                    ] {
+                        ui.label(cost.map(money).unwrap_or_else(|| "—".into()));
+                    }
+                    ui.end_row();
+                }
+            });
         Ok(())
     }
 

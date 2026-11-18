@@ -30,6 +30,7 @@ pub mod payroll_payments;
 pub mod periods;
 pub mod pricing;
 pub mod quotations;
+pub mod receipt_reconciliation;
 pub mod recurring;
 pub mod reorder;
 pub mod report_export;
