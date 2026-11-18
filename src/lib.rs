@@ -42,6 +42,7 @@ pub mod report_export;
 pub mod reversals;
 pub mod stock_counts;
 pub mod stock_notes;
+pub mod stock_reservations;
 pub mod stock_returns;
 pub mod stock_sales;
 pub mod tax_profiles;
@@ -49,7 +50,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 65;
+const SCHEMA_VERSION: i64 = 66;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -417,6 +418,8 @@ impl Store {
             "orders",
             "order_lines",
             "order_line_closures",
+            "stock_reservations",
+            "stock_reservation_releases",
             "invoice_order_links",
             "stock_counts",
             "stock_count_lines",
@@ -496,6 +499,9 @@ impl Store {
         store
             .conn
             .prepare("SELECT quantity, closed_on, reopened_on FROM order_line_closures LIMIT 0")?;
+        store
+            .conn
+            .prepare("SELECT company_id, order_id, item_id, remaining FROM stock_reservation_balances LIMIT 0")?;
         Ok(())
     }
     fn from_connection(mut conn: Connection) -> Result<Self> {
@@ -880,6 +886,10 @@ impl Store {
         if version < 65 {
             orders::migrate_line_closures(&tx)?;
             tx.pragma_update(None, "user_version", 65)?;
+        }
+        if version < 66 {
+            stock_reservations::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 66)?;
         }
         tx.commit()?;
         Ok(Self { conn })

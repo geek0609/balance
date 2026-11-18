@@ -922,6 +922,48 @@ pub(crate) fn insert_invoice_on_connection(
     crate::tax_profiles::write_calculation(conn, invoice_id, draft.tax_calculation)?;
     Ok((invoice_id, voucher_id))
 }
+
+fn invoice_stock_allocations(
+    conn: &Connection,
+    invoice: i64,
+) -> Result<Vec<(i64, i64, Option<i64>, i64)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT l.item_id, a.location_id, a.batch_id, a.quantity
+         FROM physical_invoice_lines l JOIN invoice_line_allocations a ON a.line_id = l.id
+         WHERE l.invoice_id = ?1",
+    )?;
+    let rows = stmt.query_map([invoice], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn insert_direct_invoice(
+    conn: &Connection,
+    company: i64,
+    draft: &InvoiceDraft,
+    order: Option<i64>,
+) -> Result<(i64, i64)> {
+    let ids = insert_invoice_on_connection(conn, company, draft)?;
+    if draft.kind == InvoiceKind::Sale {
+        let allocations = invoice_stock_allocations(conn, ids.0)?;
+        let mut buckets = HashSet::new();
+        let reference = format!("Invoice {} (#{})", draft.reference.trim(), ids.0);
+        for (item, location, batch, quantity) in allocations {
+            if let Some(order) = order {
+                crate::stock_reservations::consume_reservations(
+                    conn, order, item, location, batch, quantity, &reference,
+                )?;
+            }
+            buckets.insert((item, location, batch));
+        }
+        for (item, location, batch) in buckets {
+            crate::stock_reservations::check_stock_coverage(conn, company, item, location, batch)?;
+        }
+    }
+    Ok(ids)
+}
+
 pub(crate) fn ledger_category(
     conn: &Connection,
     company_id: i64,
@@ -1284,15 +1326,7 @@ pub(crate) fn stock_bucket_quantity(
     stock_bucket_quantity_in_scope(conn, company, item, batch, location, false, end)
 }
 
-fn stock_bucket_quantity_in_scope(
-    conn: &Connection,
-    company: i64,
-    item: i64,
-    batch: Option<i64>,
-    location: Option<i64>,
-    include_descendants: bool,
-    end: Option<chrono::NaiveDate>,
-) -> Result<i128> {
+fn stock_bucket_movements(conn: &Connection) -> rusqlite::Result<rusqlite::CachedStatement<'_>> {
     let sql = format!(
         "{STOCK_LOCATION_BRANCH}
          SELECT date, quantity FROM stock_adjustments
@@ -1313,7 +1347,19 @@ fn stock_bucket_quantity_in_scope(
          WHERE company_id = ?1 AND item_id = ?4 AND batch_id IS ?5
            AND (?2 IS NULL OR to_location_id IN (SELECT id FROM branch))"
     );
-    let mut stmt = conn.prepare(&sql)?;
+    conn.prepare_cached(&sql)
+}
+
+fn stock_bucket_quantity_in_scope(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    batch: Option<i64>,
+    location: Option<i64>,
+    include_descendants: bool,
+    end: Option<chrono::NaiveDate>,
+) -> Result<i128> {
+    let mut stmt = stock_bucket_movements(conn)?;
     let mut total = 0_i128;
     let rows = stmt.query_map(
         params![company, location, include_descendants, item, batch],
@@ -1327,6 +1373,62 @@ fn stock_bucket_quantity_in_scope(
         }
     }
     Ok(total)
+}
+
+/// Lowest closing balance from today through the last recorded stock movement.
+pub(crate) fn stock_available_to_reserve(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    location: i64,
+    batch: Option<i64>,
+) -> Result<i128> {
+    let today: String = conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))?;
+    let today = parse_date(&today)?;
+    let mut stmt = stock_bucket_movements(conn)?;
+    let mut on_hand = 0_i128;
+    let mut future = BTreeMap::<_, i128>::new();
+    let rows = stmt.query_map(params![company, location, false, item, batch], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (date, quantity) = row?;
+        let date = parse_date(&date)?;
+        if date <= today {
+            on_hand += i128::from(quantity);
+        } else {
+            *future.entry(date).or_default() += i128::from(quantity);
+        }
+    }
+    let mut available = on_hand;
+    for quantity in future.values() {
+        on_hand += quantity;
+        available = available.min(on_hand);
+    }
+    Ok(available)
+}
+
+/// Record an adjustment inside the caller's transaction.
+pub(crate) fn record_stock_adjustment(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    location: i64,
+    batch: Option<i64>,
+    date: &str,
+    quantity: i64,
+    reason: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id, batch_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![company, item, date, quantity, reason, location, batch],
+    )?;
+    let id = conn.last_insert_rowid();
+    if quantity < 0 {
+        crate::stock_reservations::check_stock_coverage(conn, company, item, location, batch)?;
+    }
+    Ok(id)
 }
 
 impl Store {
@@ -1495,8 +1597,15 @@ impl Store {
         }
         check_quantity_precision(&self.conn, company_id, item_id, quantity)?;
         check_stock_batch(&self.conn, company_id, item_id, batch_id)?;
-        self.conn.execute("INSERT INTO stock_transfers(company_id, item_id, from_location_id, to_location_id, date, quantity, reason, batch_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![company_id, item_id, from, to, date, quantity, reason, batch_id])?;
-        Ok(self.conn.last_insert_rowid())
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        tx.execute("INSERT INTO stock_transfers(company_id, item_id, from_location_id, to_location_id, date, quantity, reason, batch_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![company_id, item_id, from, to, date, quantity, reason, batch_id])?;
+        let id = tx.last_insert_rowid();
+        crate::stock_reservations::check_stock_coverage(&tx, company_id, item_id, from, batch_id)?;
+        tx.commit()?;
+        Ok(id)
     }
     pub fn stock_transfers(&self, company_id: i64) -> Result<Vec<StockTransfer>> {
         let mut stmt = self.conn.prepare("SELECT t.date, i.name, i.unit, f.name, d.name, t.quantity, t.reason, b.name FROM stock_transfers t JOIN stock_items i ON i.id = t.item_id AND i.company_id = t.company_id JOIN stock_locations f ON f.id = t.from_location_id AND f.company_id = t.company_id JOIN stock_locations d ON d.id = t.to_location_id AND d.company_id = t.company_id LEFT JOIN stock_batches b ON b.id = t.batch_id WHERE t.company_id = ?1 ORDER BY t.date DESC, t.id DESC")?;
@@ -1783,8 +1892,22 @@ impl Store {
                 "Stock location not found in the selected company".into(),
             ));
         }
-        self.conn.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id, batch_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![company_id, item_id, date, quantity, reason, location_id, batch_id])?;
-        Ok(self.conn.last_insert_rowid())
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let id = record_stock_adjustment(
+            &tx,
+            company_id,
+            item_id,
+            location_id,
+            batch_id,
+            &date,
+            quantity,
+            reason,
+        )?;
+        tx.commit()?;
+        Ok(id)
     }
     pub fn stock_location_balances(
         &self,
@@ -2099,7 +2222,7 @@ impl Store {
     /// Atomically creates the invoice, stock movements and balanced voucher.
     pub fn create_invoice(&mut self, company_id: i64, draft: &InvoiceDraft) -> Result<i64> {
         let tx = self.conn.transaction()?;
-        let (invoice_id, _) = insert_invoice_on_connection(&tx, company_id, draft)?;
+        let (invoice_id, _) = insert_direct_invoice(&tx, company_id, draft, None)?;
         tx.commit()?;
         Ok(invoice_id)
     }
@@ -2250,6 +2373,10 @@ impl Store {
         crate::costs::ensure_unallocated(&tx, voucher_id)?;
         crate::banking::ensure_no_bank_clearance(&tx, company_id, voucher_id)?;
         let prepared = prepare_invoice(&tx, company_id, draft, Some(invoice_id))?;
+        let mut affected_buckets: HashSet<_> = invoice_stock_allocations(&tx, invoice_id)?
+            .into_iter()
+            .map(|(item, location, batch, _)| (item, location, batch))
+            .collect();
         let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
         if saved != 1 {
             return Err(Error::Validation("Associated voucher not found".into()));
@@ -2299,6 +2426,16 @@ impl Store {
             [invoice_id],
         )?;
         crate::tax_profiles::write_calculation(&tx, invoice_id, draft.tax_calculation)?;
+        affected_buckets.extend(
+            invoice_stock_allocations(&tx, invoice_id)?
+                .into_iter()
+                .map(|(item, location, batch, _)| (item, location, batch)),
+        );
+        for (item, location, batch) in affected_buckets {
+            crate::stock_reservations::check_stock_coverage(
+                &tx, company_id, item, location, batch,
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }

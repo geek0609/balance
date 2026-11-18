@@ -1194,12 +1194,14 @@ impl Store {
                 "open_purchases",
                 "after_sales",
                 "projected",
+                "reserved",
+                "unreserved",
             ]),
         )?;
         contextual_row(
             &mut csv,
             &context,
-            &strings(&["context", "", "", "", "", "", "", "", ""]),
+            &strings(&["context", "", "", "", "", "", "", "", "", "", ""]),
         )?;
         for availability in self.order_availability(company)? {
             contextual_row(
@@ -1215,6 +1217,8 @@ impl Store {
                     format_quantity(availability.open_purchases),
                     format_quantity(availability.after_sales()),
                     format_quantity(availability.projected()),
+                    format_quantity(availability.reserved),
+                    format_quantity(availability.unreserved()),
                 ],
             )?;
         }

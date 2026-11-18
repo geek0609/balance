@@ -392,6 +392,9 @@ impl Store {
             "UPDATE stock_returns SET reversed_on = ?1, reversal_reason = ?2 WHERE id = ?3",
             params![date.to_string(), reason, id],
         )?;
+        if let Some(order) = source.order_id {
+            crate::stock_reservations::check_order_coverage(&tx, order)?;
+        }
         tx.commit()?;
         Ok(())
     }

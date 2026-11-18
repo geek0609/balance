@@ -4,7 +4,7 @@ use crate::advances::{insert_party_advance, AdvanceDraft, AdvanceSourceBill};
 use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
-    discounted_line_amount, find_stock_batch, insert_invoice_on_connection,
+    discounted_line_amount, find_stock_batch, insert_direct_invoice,
     insert_settlement_on_connection, invoice_total, parse_quantity, InvoiceAdjustment,
     InvoiceAllocation, InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine,
     SettlementAllocation,
@@ -3717,11 +3717,20 @@ impl Store {
                         .opening_date
                         .as_deref()
                         .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
-                    tx.execute("INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id, batch_id) VALUES (?1, ?2, ?3, ?4, 'Imported opening quantity', ?5, ?6)", params![plan.company_id, item_id, date, opening.quantity, location, batch])?;
+                    let adjustment = crate::inventory::record_stock_adjustment(
+                        &tx,
+                        plan.company_id,
+                        item_id,
+                        location,
+                        batch,
+                        date,
+                        opening.quantity,
+                        "Imported opening quantity",
+                    )?;
                     if let Some(cost) = opening.cost {
                         crate::actual_cost::insert_receipt_cost(
                             &tx,
-                            tx.last_insert_rowid(),
+                            adjustment,
                             cost,
                             "Imported stock opening cost",
                         )?;
@@ -3952,7 +3961,7 @@ impl Store {
                     })
                     .collect::<Result<Vec<_>>>()?,
             };
-            let (_, voucher_id) = insert_invoice_on_connection(&tx, plan.company_id, &draft)?;
+            let (_, voucher_id) = insert_direct_invoice(&tx, plan.company_id, &draft, None)?;
             save_metadata(
                 &tx,
                 plan.company_id,

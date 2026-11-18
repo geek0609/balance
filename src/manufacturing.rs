@@ -229,12 +229,16 @@ fn insert_movement(
     bucket: StockBucket,
     reason: &str,
 ) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id, batch_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![company, item, date, quantity, reason, bucket.location_id, bucket.batch_id],
+    let adjustment = crate::inventory::record_stock_adjustment(
+        conn,
+        company,
+        item,
+        bucket.location_id,
+        bucket.batch_id,
+        date,
+        quantity,
+        reason,
     )?;
-    let adjustment = conn.last_insert_rowid();
     conn.execute(
         "INSERT INTO production_movements(run_id, adjustment_id) VALUES (?1, ?2)",
         params![run, adjustment],

@@ -1,12 +1,12 @@
 //! Sales and purchase orders fulfilled by linked invoices.
 use crate::inventory::{
-    check_quantity_precision, insert_invoice_on_connection, ledger_category, line_amount,
-    InvoiceDraft, InvoiceKind, StockItem,
+    check_quantity_precision, insert_direct_invoice, ledger_category, line_amount,
+    InvoiceAllocation, InvoiceDraft, InvoiceKind, StockItem,
 };
 use crate::{parse_date, required, Category, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -156,9 +156,14 @@ pub struct OrderAvailability {
     pub on_hand: i128,
     pub open_sales: i128,
     pub open_purchases: i128,
+    pub reserved: i128,
 }
 
 impl OrderAvailability {
+    pub fn unreserved(&self) -> i128 {
+        self.on_hand - self.reserved
+    }
+
     pub fn after_sales(&self) -> i128 {
         self.on_hand - self.open_sales
     }
@@ -200,7 +205,31 @@ pub struct OrderDetail {
     pub lines: Vec<OrderLineProgress>,
     pub invoices: Vec<OrderInvoice>,
     pub line_closures: Vec<OrderLineClosure>,
+    pub reservations: Vec<crate::stock_reservations::StockReservation>,
     pub total: i128,
+}
+
+impl OrderDetail {
+    pub fn reserved_allocations(&self, item: i64) -> Vec<InvoiceAllocation> {
+        let mut quantities = BTreeMap::<_, i64>::new();
+        for hold in self
+            .reservations
+            .iter()
+            .filter(|hold| hold.item_id == item && hold.remaining > 0)
+        {
+            *quantities
+                .entry((hold.location_id, hold.batch_id))
+                .or_default() += hold.remaining;
+        }
+        quantities
+            .into_iter()
+            .map(|((location_id, batch_id), quantity)| InvoiceAllocation {
+                location_id,
+                batch_id,
+                quantity,
+            })
+            .collect()
+    }
 }
 
 fn remaining_quantity(ordered: i64, fulfilled: i64, preclosed: i64) -> Result<i64> {
@@ -487,6 +516,7 @@ impl Store {
     pub fn order_availability(&self, company: i64) -> Result<Vec<OrderAvailability>> {
         let snapshot = self.conn.unchecked_transaction()?;
         let balances = self.stock_balances(company, None)?;
+        let reserved = crate::stock_reservations::reserved_by_item(&snapshot, company)?;
         let mut commitments = HashMap::<i64, (i128, i128)>::new();
         {
             let mut stmt = snapshot.prepare(
@@ -522,6 +552,7 @@ impl Store {
                     .copied()
                     .unwrap_or_default();
                 OrderAvailability {
+                    reserved: reserved.get(&balance.item.id).copied().unwrap_or_default(),
                     item: balance.item,
                     on_hand: balance.quantity,
                     open_sales,
@@ -666,12 +697,14 @@ impl Store {
         for row in &lines {
             total += i128::from(line_amount(row.line.quantity, row.line.unit_price)?);
         }
+        let reservations = crate::stock_reservations::order_reservations(&tx, company, id)?;
         tx.commit()?;
         Ok(OrderDetail {
             summary,
             lines,
             invoices,
             line_closures,
+            reservations,
             total,
         })
     }
@@ -706,6 +739,7 @@ impl Store {
             params![order, item, quantity, date.to_string(), reason],
         )?;
         let closure = tx.last_insert_rowid();
+        crate::stock_reservations::check_order_coverage(&tx, order)?;
         tx.commit()?;
         Ok(closure)
     }
@@ -788,11 +822,12 @@ impl Store {
             FulfilmentChange::NewDocument,
             draft.lines.iter().map(|line| (line.item_id, line.quantity)),
         )?;
-        let (invoice, _) = insert_invoice_on_connection(&tx, company, draft)?;
+        let (invoice, _) = insert_direct_invoice(&tx, company, draft, Some(id))?;
         tx.execute(
             "INSERT INTO invoice_order_links(invoice_id, order_id) VALUES (?1, ?2)",
             params![invoice, id],
         )?;
+        crate::stock_reservations::check_order_coverage(&tx, id)?;
         tx.commit()?;
         Ok(invoice)
     }
@@ -840,7 +875,10 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP VIEW order_line_availability;
+                "DROP VIEW stock_reservation_balances;
+                 DROP TABLE stock_reservation_releases;
+                 DROP TABLE stock_reservations;
+                 DROP VIEW order_line_availability;
                  DROP TABLE order_line_closures;
                  PRAGMA user_version = 64;",
             )

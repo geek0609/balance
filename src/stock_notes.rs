@@ -580,13 +580,16 @@ pub(crate) fn insert_movement(
     direction: i64,
     reason: &str,
 ) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id, batch_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![company, line.item_id, date.to_string(), direction * line.quantity, reason,
-            line.location_id, line.batch_id],
-    )?;
-    Ok(conn.last_insert_rowid())
+    crate::inventory::record_stock_adjustment(
+        conn,
+        company,
+        line.item_id,
+        line.location_id,
+        line.batch_id,
+        &date.to_string(),
+        direction * line.quantity,
+        reason,
+    )
 }
 
 pub(crate) fn stock_direction(kind: InvoiceKind) -> i64 {
@@ -680,6 +683,17 @@ impl Store {
         let note = tx.last_insert_rowid();
         let reason = format!("{} {} (#{note})", note_label(draft.kind), reference);
         for line in &draft.lines {
+            if let Some(order) = draft.order_id.filter(|_| draft.kind == InvoiceKind::Sale) {
+                crate::stock_reservations::consume_reservations(
+                    &tx,
+                    order,
+                    line.item_id,
+                    line.location_id,
+                    line.batch_id,
+                    line.quantity,
+                    &reason,
+                )?;
+            }
             let movement = insert_movement(
                 &tx,
                 company,
@@ -701,6 +715,9 @@ impl Store {
                     &reason,
                 )?;
             }
+        }
+        if let Some(order) = draft.order_id {
+            crate::stock_reservations::check_order_coverage(&tx, order)?;
         }
         tx.commit()?;
         Ok(note)

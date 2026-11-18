@@ -538,7 +538,7 @@ impl Store {
         )?;
         let voucher = tx.last_insert_rowid();
         crate::reversals::write_counter_postings(&tx, company, original, voucher, &postings)?;
-        crate::invoice_returns::reverse_movements(
+        let orders = crate::invoice_returns::reverse_movements(
             &tx,
             company,
             note,
@@ -550,6 +550,9 @@ impl Store {
              WHERE company_id = ?3 AND id = ?4",
             params![voucher, reason, company, note],
         )?;
+        for order in orders {
+            crate::stock_reservations::check_order_coverage(&tx, order)?;
+        }
         tx.commit()?;
         Ok(voucher)
     }

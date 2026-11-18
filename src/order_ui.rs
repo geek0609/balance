@@ -1,7 +1,11 @@
-use super::{money, pick_account, pick_stock, App, InvoiceLineForm, InvoiceSource};
+use super::{
+    money, pick_account, pick_batch, pick_location, pick_stock, App, InvoiceAllocationForm,
+    InvoiceLineForm, InvoiceSource,
+};
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind};
 use balance::orders::{OrderDetail, OrderDraft, OrderLine, OrderStatus};
 use balance::stock_notes::note_label;
+use balance::stock_reservations::StockReservationDraft;
 use balance::{format_amount, parse_amount, Category, Error, Result};
 use eframe::egui;
 
@@ -96,6 +100,22 @@ struct LineReopenForm {
 }
 
 #[derive(Default)]
+struct StockReservationForm {
+    item: Option<i64>,
+    location: Option<i64>,
+    batch: Option<i64>,
+    quantity: String,
+    reason: String,
+}
+
+#[derive(Default)]
+struct StockReleaseForm {
+    id: Option<i64>,
+    quantity: String,
+    reason: String,
+}
+
+#[derive(Default)]
 pub(super) struct OrderScreen {
     form: CreateOrderForm,
     kind: Option<InvoiceKind>,
@@ -105,6 +125,8 @@ pub(super) struct OrderScreen {
     close_reason: String,
     line_closure: LineClosureForm,
     line_reopen: LineReopenForm,
+    reservation: StockReservationForm,
+    stock_release: StockReleaseForm,
     document_path: String,
     schedule_kind: Option<InvoiceKind>,
     schedule_through: String,
@@ -117,6 +139,8 @@ impl OrderScreen {
         self.close_reason.clear();
         self.line_closure = LineClosureForm::default();
         self.line_reopen = LineReopenForm::default();
+        self.reservation = StockReservationForm::default();
+        self.stock_release = StockReleaseForm::default();
     }
 }
 
@@ -337,6 +361,8 @@ impl App {
                     "Item",
                     "Unit",
                     "On hand",
+                    "Reserved",
+                    "Unreserved",
                     "Open sales",
                     "Open purchases",
                     "After sales",
@@ -350,6 +376,8 @@ impl App {
                     ui.label(&row.item.unit);
                     for quantity in [
                         row.on_hand,
+                        row.reserved,
+                        row.unreserved(),
                         row.open_sales,
                         row.open_purchases,
                         row.after_sales(),
@@ -726,6 +754,17 @@ impl App {
                 .id_salt(order.id)
                 .show(ui, |ui| self.order_line_closures(ui, company, detail));
         }
+        if (order.kind == InvoiceKind::Sale && order.status.has_pending())
+            || !detail.reservations.is_empty()
+        {
+            egui::CollapsingHeader::new("Stock reservations")
+                .id_salt(("order-stock-reservations", order.id))
+                .show(ui, |ui| {
+                    if let Err(error) = self.order_stock_reservations(ui, company, detail) {
+                        self.failure(error);
+                    }
+                });
+        }
         match self.store.stock_notes(company, Some(order.id)) {
             Ok(notes) => {
                 for note in notes {
@@ -788,6 +827,183 @@ impl App {
                 }
             });
         }
+    }
+
+    fn order_stock_reservations(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        detail: &OrderDetail,
+    ) -> Result<()> {
+        let order = &detail.summary;
+        if order.status.has_pending() {
+            let form = &mut self.order_screen.reservation;
+            let locations = self.store.stock_locations(company)?;
+            ui.horizontal_wrapped(|ui| -> Result<()> {
+                let available = detail.lines.iter().filter_map(|line| {
+                    let reserved: i64 = detail
+                        .reservations
+                        .iter()
+                        .filter(|hold| hold.item_id == line.line.item_id)
+                        .map(|hold| hold.remaining)
+                        .sum();
+                    let remaining = line.unfulfilled() - reserved;
+                    (remaining > 0).then_some((line, remaining))
+                });
+                egui::ComboBox::from_id_salt(("reserve-order-item", order.id))
+                    .selected_text(
+                        available
+                            .clone()
+                            .find(|(line, _)| Some(line.line.item_id) == form.item)
+                            .map(|(line, _)| line.item.as_str())
+                            .unwrap_or("Select item"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (line, quantity) in available {
+                            let label = format!(
+                                "{} · {} {} unreserved",
+                                line.item,
+                                format_quantity(quantity.into()),
+                                line.unit
+                            );
+                            if ui
+                                .selectable_value(&mut form.item, Some(line.line.item_id), label)
+                                .clicked()
+                            {
+                                form.batch = None;
+                                form.quantity = format_quantity(quantity.into());
+                            }
+                        }
+                    });
+                pick_location(
+                    ui,
+                    ("reserve-location", order.id),
+                    "Location",
+                    &locations,
+                    &mut form.location,
+                    false,
+                );
+                if let Some(item) = form.item {
+                    pick_batch(
+                        ui,
+                        ("reserve-batch", order.id),
+                        &self.store.stock_batches(company, item)?,
+                        &mut form.batch,
+                    );
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.quantity)
+                        .hint_text("Quantity")
+                        .desired_width(90.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.reason).hint_text("Reason for reserving"),
+                );
+                let save = ui.add_enabled(
+                    form.item.is_some() && form.location.is_some(),
+                    egui::Button::new("Reserve stock"),
+                );
+                if let (true, Some(item_id), Some(location_id)) =
+                    (save.clicked(), form.item, form.location)
+                {
+                    self.store.reserve_order_stock(
+                        company,
+                        order.id,
+                        &StockReservationDraft {
+                            item_id,
+                            location_id,
+                            batch_id: form.batch,
+                            quantity: parse_quantity(&form.quantity)?,
+                            reason: form.reason.clone(),
+                        },
+                    )?;
+                    *form = StockReservationForm::default();
+                    self.message = "Stock reserved for this order".into();
+                }
+                Ok(())
+            })
+            .inner?;
+        }
+        for hold in &detail.reservations {
+            egui::CollapsingHeader::new(format!(
+                "{} · {} · {} · {} {} reserved",
+                hold.item,
+                hold.location,
+                hold.batch.as_deref().unwrap_or("Unbatched"),
+                format_quantity(hold.remaining.into()),
+                hold.unit,
+            ))
+            .id_salt(("stock-reservation", hold.id))
+            .show(ui, |ui| -> Result<()> {
+                ui.label(format!(
+                    "{} UTC · {} {} · {}",
+                    hold.reserved_at,
+                    format_quantity(hold.quantity.into()),
+                    hold.unit,
+                    hold.reason
+                ));
+                for event in self
+                    .store
+                    .stock_reservation_history(company, order.id, hold.id)?
+                {
+                    ui.label(format!(
+                        "{} UTC · {} {} {} · {}",
+                        event.released_at,
+                        if event.fulfilled {
+                            "Fulfilled"
+                        } else {
+                            "Released"
+                        },
+                        format_quantity(event.quantity.into()),
+                        hold.unit,
+                        event.reason
+                    ));
+                }
+                let form = &mut self.order_screen.stock_release;
+                if hold.remaining > 0
+                    && form.id != Some(hold.id)
+                    && ui.button("Release stock").clicked()
+                {
+                    *form = StockReleaseForm {
+                        id: Some(hold.id),
+                        quantity: format_quantity(hold.remaining.into()),
+                        reason: String::new(),
+                    };
+                }
+                if hold.remaining > 0 && form.id == Some(hold.id) {
+                    ui.horizontal_wrapped(|ui| -> Result<()> {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.quantity)
+                                .hint_text("Quantity")
+                                .desired_width(90.0),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.reason)
+                                .hint_text("Reason for releasing"),
+                        );
+                        if ui.button("Confirm release").clicked() {
+                            self.store.release_order_stock(
+                                company,
+                                order.id,
+                                hold.id,
+                                parse_quantity(&form.quantity)?,
+                                &form.reason,
+                            )?;
+                            *form = StockReleaseForm::default();
+                            self.message = "Reserved stock released".into();
+                        } else if ui.button("Cancel").clicked() {
+                            *form = StockReleaseForm::default();
+                        }
+                        Ok(())
+                    })
+                    .inner?;
+                }
+                Ok(())
+            })
+            .body_returned
+            .transpose()?;
+        }
+        Ok(())
     }
 
     fn order_line_closures(&mut self, ui: &mut egui::Ui, company: i64, detail: &OrderDetail) {
@@ -913,6 +1129,22 @@ impl App {
                 form.item = Some(line.line.item_id);
                 form.quantity = format_quantity(line.unfulfilled().into());
                 form.price = format_amount(line.line.unit_price);
+                let allocations = detail.reserved_allocations(line.line.item_id);
+                if let Some(first) = allocations.first() {
+                    form.location = Some(first.location_id);
+                    form.batch = first.batch_id;
+                    let quantity: i128 = allocations.iter().map(|a| i128::from(a.quantity)).sum();
+                    form.quantity = format_quantity(quantity);
+                    form.extra_allocations = allocations
+                        .iter()
+                        .skip(1)
+                        .map(|a| InvoiceAllocationForm {
+                            location: Some(a.location_id),
+                            batch: a.batch_id,
+                            quantity: format_quantity(a.quantity.into()),
+                        })
+                        .collect();
+                }
                 form
             })
             .collect();

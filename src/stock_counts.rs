@@ -250,12 +250,16 @@ impl Store {
             let adjustment = if variance == 0 {
                 None
             } else {
-                tx.execute(
-                    "INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id, batch_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![company, row.item_id, date, variance, reason, plan.location_id, row.batch_id],
-                )?;
-                Some(tx.last_insert_rowid())
+                Some(crate::inventory::record_stock_adjustment(
+                    &tx,
+                    company,
+                    row.item_id,
+                    plan.location_id,
+                    row.batch_id,
+                    &date,
+                    variance,
+                    &reason,
+                )?)
             };
             tx.execute(
                 "INSERT INTO stock_count_lines(stock_count_id, item_id, batch_id, book_quantity, counted_quantity, adjustment_id)

@@ -378,7 +378,7 @@ pub(crate) fn reverse_movements(
     note: i64,
     date: NaiveDate,
     reason: &str,
-) -> Result<()> {
+) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
         "SELECT ret.id, ret.kind, ret.item_id, ret.location_id, ret.batch_id, ret.quantity,
                 COALESCE(n.order_id, link.order_id), i.party_ledger_id
@@ -406,7 +406,7 @@ pub(crate) fn reverse_movements(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let Some((_, kind, _, _, party)) = rows.first() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let kind = InvoiceKind::parse(kind)?;
     let mut quantities = BTreeMap::<_, Vec<_>>::new();
@@ -418,6 +418,7 @@ pub(crate) fn reverse_movements(
                 .push((stock.item_id, stock.quantity));
         }
     }
+    let mut orders = Vec::with_capacity(quantities.len());
     for (order, items) in quantities {
         crate::orders::check_fulfilment(
             conn,
@@ -429,6 +430,7 @@ pub(crate) fn reverse_movements(
             crate::orders::FulfilmentChange::ReverseReturn,
             items,
         )?;
+        orders.push(order);
     }
     for (id, _, stock, _, _) in rows {
         if kind == InvoiceKind::Sale {
@@ -447,7 +449,7 @@ pub(crate) fn reverse_movements(
             params![adjustment, id],
         )?;
     }
-    Ok(())
+    Ok(orders)
 }
 
 #[cfg(test)]

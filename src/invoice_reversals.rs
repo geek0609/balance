@@ -192,14 +192,19 @@ impl Store {
                 let location: i64 = row.get(2)?;
                 let batch: Option<i64> = row.get(3)?;
                 let quantity: i64 = row.get(4)?;
-                tx.execute(
-                    "INSERT INTO stock_adjustments(company_id, item_id, date, quantity, reason, location_id, batch_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![company, item, date, direction * quantity, note_reason, location, batch],
+                let adjustment = crate::inventory::record_stock_adjustment(
+                    &tx,
+                    company,
+                    item,
+                    location,
+                    batch,
+                    &date,
+                    direction * quantity,
+                    &note_reason,
                 )?;
                 tx.execute(
                     "INSERT INTO invoice_reversal_stock(invoice_id, allocation_id, adjustment_id) VALUES (?1, ?2, ?3)",
-                    params![invoice, allocation, tx.last_insert_rowid()],
+                    params![invoice, allocation, adjustment],
                 )?;
             }
         }

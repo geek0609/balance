@@ -125,11 +125,28 @@ impl App {
                 .lines
                 .iter()
                 .filter(|line| line.unfulfilled() > 0)
-                .map(|line| NoteLineForm {
-                    item: Some(line.line.item_id),
-                    quantity: format_quantity(i128::from(line.unfulfilled())),
-                    price: format_amount(line.line.unit_price),
-                    ..NoteLineForm::default()
+                .flat_map(|line| {
+                    let item = Some(line.line.item_id);
+                    let price = format_amount(line.line.unit_price);
+                    let allocations = detail.reserved_allocations(line.line.item_id);
+                    if allocations.is_empty() {
+                        return vec![NoteLineForm {
+                            item,
+                            price,
+                            quantity: format_quantity(line.unfulfilled().into()),
+                            ..NoteLineForm::default()
+                        }];
+                    }
+                    allocations
+                        .into_iter()
+                        .map(|a| NoteLineForm {
+                            item,
+                            price: price.clone(),
+                            location: Some(a.location_id),
+                            batch: a.batch_id,
+                            quantity: format_quantity(a.quantity.into()),
+                        })
+                        .collect()
                 })
                 .collect(),
             ..NoteForm::default()
