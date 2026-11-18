@@ -88,6 +88,97 @@ impl Store {
             .ok_or_else(|| Error::Validation("Company not found".into()))
     }
 
+    pub fn export_budget_csv(
+        &self,
+        company: i64,
+        version: i64,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.budget_report(company, version)?;
+        let context = [
+            self.report_company_name(company)?,
+            text_cell(&report.version.name),
+            report.version.id.to_string(),
+            report.version.start_date.clone(),
+            report.version.end_date.clone(),
+            text_cell(&report.version.scope_label()),
+        ];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&[
+                "company",
+                "budget",
+                "version",
+                "period_start",
+                "period_end",
+                "scope",
+            ]),
+            &strings(&[
+                "row_type",
+                "ledger_id",
+                "category",
+                "ledger",
+                "planned",
+                "actual",
+                "favourable_variance",
+            ]),
+        )?;
+        for entry in report.rows {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "ledger".into(),
+                    entry.ledger_id.to_string(),
+                    entry.category.as_str().into(),
+                    text_cell(&entry.ledger),
+                    entry
+                        .planned
+                        .map(|value| money(value.into()))
+                        .unwrap_or_default(),
+                    money(entry.actual),
+                    money(entry.favourable_variance()),
+                ],
+            )?;
+        }
+        for (category, planned, actual, variance) in [
+            (
+                "Income",
+                report.planned.income,
+                report.actual.income,
+                report.actual.income - report.planned.income,
+            ),
+            (
+                "Expense",
+                report.planned.expenses,
+                report.actual.expenses,
+                report.planned.expenses - report.actual.expenses,
+            ),
+            (
+                "Net",
+                report.planned.net(),
+                report.actual.net(),
+                report.actual.net() - report.planned.net(),
+            ),
+        ] {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "total".into(),
+                    String::new(),
+                    category.into(),
+                    String::new(),
+                    money(planned),
+                    money(actual),
+                    money(variance),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
     pub fn export_cost_report_csv(
         &self,
         company: i64,

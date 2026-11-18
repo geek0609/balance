@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod actual_cost;
 pub mod advances;
 pub mod banking;
+pub mod budgets;
 pub mod company;
 pub mod contacts;
 pub mod costs;
@@ -32,7 +33,7 @@ pub mod stock_sales;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 44;
+const SCHEMA_VERSION: i64 = 45;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -416,6 +417,9 @@ impl Store {
             "material_components",
             "production_runs",
             "production_movements",
+            "financial_budgets",
+            "budget_versions",
+            "budget_targets",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -729,6 +733,10 @@ impl Store {
         if version < 44 {
             manufacturing::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 44)?;
+        }
+        if version < 45 {
+            budgets::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 45)?;
         }
         tx.commit()?;
         Ok(Self { conn })

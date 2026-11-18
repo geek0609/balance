@@ -17,6 +17,7 @@ use eframe::egui::{self, Color32, RichText};
 
 mod actual_cost_ui;
 mod advance_ui;
+mod budget_ui;
 mod cost_ui;
 mod manufacturing_ui;
 mod order_ui;
@@ -24,6 +25,7 @@ mod stock_count_ui;
 mod valuation_ui;
 use actual_cost_ui::ActualCostScreen;
 use advance_ui::AdvanceScreen;
+use budget_ui::BudgetScreen;
 use cost_ui::CostScreen;
 use manufacturing_ui::ManufacturingScreen;
 use order_ui::OrderScreen;
@@ -51,6 +53,7 @@ enum Page {
     Bank,
     Reports,
     CostCentres,
+    Budgets,
 }
 struct App {
     store: Store,
@@ -203,6 +206,7 @@ struct App {
     actual_cost_screen: ActualCostScreen,
     advance_screen: AdvanceScreen,
     manufacturing_screen: ManufacturingScreen,
+    budget_screen: BudgetScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -446,6 +450,7 @@ impl App {
             actual_cost_screen: ActualCostScreen::default(),
             advance_screen: AdvanceScreen::default(),
             manufacturing_screen: ManufacturingScreen::default(),
+            budget_screen: BudgetScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -565,6 +570,7 @@ impl App {
         self.actual_cost_screen = ActualCostScreen::default();
         self.advance_screen = AdvanceScreen::default();
         self.manufacturing_screen = ManufacturingScreen::default();
+        self.budget_screen = BudgetScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -5239,6 +5245,7 @@ impl eframe::App for App {
                 ("Back up", Page::Backup),
                 ("Reports", Page::Reports),
                 ("Cost centres", Page::CostCentres),
+                ("Budgets", Page::Budgets),
             ] {
                 if ui.selectable_label(self.page == page, label).clicked() {
                     self.page = page;
@@ -5284,6 +5291,7 @@ impl eframe::App for App {
                     Page::Backup => {}
                     Page::Reports => self.reports_page(ui, company),
                     Page::CostCentres => self.cost_page(ui, company),
+                    Page::Budgets => self.budgets_page(ui, company),
                 }
             });
         });
