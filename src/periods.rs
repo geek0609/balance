@@ -62,6 +62,44 @@ pub(crate) fn protect_dated_table(conn: &Connection, table: &str) -> Result<()> 
     Ok(())
 }
 
+/// Early voucher entry stored dates as entered. Give those rows the same date
+/// representation as new vouchers so the cutoff compares calendar dates.
+pub(crate) fn normalize_voucher_dates(conn: &Connection) -> Result<()> {
+    let mut changes = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, date FROM vouchers
+             WHERE date NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, old_date) = row?;
+            let date = parse_date(&old_date)?.format("%Y-%m-%d").to_string();
+            if date != old_date {
+                changes.push((id, date));
+            }
+        }
+    }
+    if changes.is_empty() {
+        return Ok(());
+    }
+    // The migration changes formatting only, including in locked periods.
+    conn.execute_batch(
+        "DROP TRIGGER period_lock_vouchers_INSERT;
+         DROP TRIGGER period_lock_vouchers_UPDATE;
+         DROP TRIGGER period_lock_vouchers_DELETE;",
+    )?;
+    for (id, date) in changes {
+        conn.execute(
+            "UPDATE vouchers SET date = ?1 WHERE id = ?2",
+            params![date, id],
+        )?;
+    }
+    protect_dated_table(conn, "vouchers")
+}
+
 pub(crate) fn cutoff(conn: &Connection, company: i64) -> Result<Option<NaiveDate>> {
     let cutoff: Option<Option<String>> = conn
         .query_row(

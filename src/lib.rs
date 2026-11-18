@@ -26,7 +26,7 @@ pub mod reversals;
 pub mod stock_counts;
 pub mod terms;
 
-const SCHEMA_VERSION: i64 = 36;
+const SCHEMA_VERSION: i64 = 37;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -678,6 +678,10 @@ impl Store {
         if version < 36 {
             invoice_reversals::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 36)?;
+        }
+        if version < 37 {
+            periods::normalize_voucher_dates(&tx)?;
+            tx.pragma_update(None, "user_version", 37)?;
         }
         tx.commit()?;
         Ok(Self { conn })
