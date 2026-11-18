@@ -19,6 +19,7 @@ pub mod inventory;
 pub mod invoice_register;
 pub mod invoice_reversals;
 pub mod ledgers;
+pub mod manufacturing;
 pub mod opening;
 pub mod orders;
 pub mod periods;
@@ -31,7 +32,7 @@ pub mod stock_sales;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 43;
+const SCHEMA_VERSION: i64 = 44;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -410,6 +411,11 @@ impl Store {
             "stock_receipt_costs",
             "party_advances",
             "advance_allocations",
+            "bills_of_materials",
+            "material_revisions",
+            "material_components",
+            "production_runs",
+            "production_movements",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -719,6 +725,10 @@ impl Store {
         if version < 43 {
             advances::migrate_source_bill(&tx)?;
             tx.pragma_update(None, "user_version", 43)?;
+        }
+        if version < 44 {
+            manufacturing::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 44)?;
         }
         tx.commit()?;
         Ok(Self { conn })

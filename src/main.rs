@@ -18,12 +18,14 @@ use eframe::egui::{self, Color32, RichText};
 mod actual_cost_ui;
 mod advance_ui;
 mod cost_ui;
+mod manufacturing_ui;
 mod order_ui;
 mod stock_count_ui;
 mod valuation_ui;
 use actual_cost_ui::ActualCostScreen;
 use advance_ui::AdvanceScreen;
 use cost_ui::CostScreen;
+use manufacturing_ui::ManufacturingScreen;
 use order_ui::OrderScreen;
 use stock_count_ui::StockCountScreen;
 use valuation_ui::ValuationScreen;
@@ -38,6 +40,7 @@ enum Page {
     Stock,
     StockCounts,
     Valuation,
+    Manufacturing,
     Invoice,
     InvoiceRegister,
     Orders,
@@ -199,6 +202,7 @@ struct App {
     valuation_screen: ValuationScreen,
     actual_cost_screen: ActualCostScreen,
     advance_screen: AdvanceScreen,
+    manufacturing_screen: ManufacturingScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -441,6 +445,7 @@ impl App {
             valuation_screen: ValuationScreen::default(),
             actual_cost_screen: ActualCostScreen::default(),
             advance_screen: AdvanceScreen::default(),
+            manufacturing_screen: ManufacturingScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -559,6 +564,7 @@ impl App {
         self.valuation_screen = ValuationScreen::default();
         self.actual_cost_screen = ActualCostScreen::default();
         self.advance_screen = AdvanceScreen::default();
+        self.manufacturing_screen = ManufacturingScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -5226,6 +5232,7 @@ impl eframe::App for App {
                 ("Stock", Page::Stock),
                 ("Stock counts", Page::StockCounts),
                 ("Stock valuation", Page::Valuation),
+                ("Manufacturing", Page::Manufacturing),
                 ("Invoices", Page::Invoice),
                 ("Orders", Page::Orders),
                 ("Import XML", Page::Import),
@@ -5270,6 +5277,7 @@ impl eframe::App for App {
                     Page::Stock => self.stock_page(ui, company),
                     Page::StockCounts => self.stock_counts_page(ui, company),
                     Page::Valuation => self.valuation_page(ui, company),
+                    Page::Manufacturing => self.manufacturing_page(ui, company),
                     Page::Invoice => self.invoice_page(ui, company),
                     Page::Orders => self.orders_page(ui, company),
                     Page::Import => self.import_page(ui, company),
