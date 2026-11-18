@@ -2,8 +2,8 @@ use super::{
     money, pick_account, pick_batch, pick_location, pick_stock, App, InvoiceAllocationForm,
     InvoiceLineForm, InvoiceSource,
 };
-use balance::inventory::{format_quantity, parse_quantity, InvoiceKind};
-use balance::orders::{OrderDetail, OrderDraft, OrderLine, OrderStatus};
+use balance::inventory::{format_quantity, parse_quantity, InvoiceKind, StockItem};
+use balance::orders::{OrderAmendmentDraft, OrderDetail, OrderDraft, OrderLine, OrderStatus};
 use balance::stock_notes::note_label;
 use balance::stock_reservations::StockReservationDraft;
 use balance::{format_amount, parse_amount, Category, Error, Result};
@@ -14,6 +14,46 @@ struct LineForm {
     item: Option<i64>,
     quantity: String,
     price: String,
+}
+
+impl LineForm {
+    fn draft(&self) -> Result<OrderLine> {
+        Ok(OrderLine {
+            item_id: self
+                .item
+                .ok_or_else(|| Error::Validation("Select an item for every line".into()))?,
+            quantity: parse_quantity(&self.quantity)?,
+            unit_price: parse_amount(&self.price)?,
+        })
+    }
+}
+
+fn order_line_fields(ui: &mut egui::Ui, lines: &mut Vec<LineForm>, items: &[StockItem]) {
+    let mut remove = None;
+    for (index, line) in lines.iter_mut().enumerate() {
+        ui.horizontal_wrapped(|ui| {
+            pick_stock(ui, ("order-item", index), "Item", items, &mut line.item);
+            ui.add(
+                egui::TextEdit::singleline(&mut line.quantity)
+                    .hint_text("Total quantity")
+                    .desired_width(100.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut line.price)
+                    .hint_text("Unit price")
+                    .desired_width(80.0),
+            );
+            if ui.button("Remove").clicked() {
+                remove = Some(index);
+            }
+        });
+    }
+    if let Some(index) = remove {
+        lines.remove(index);
+    }
+    if ui.button("Add item").clicked() {
+        lines.push(LineForm::default());
+    }
 }
 
 struct CreateOrderForm {
@@ -52,16 +92,8 @@ impl CreateOrderForm {
         let lines = self
             .lines
             .iter()
-            .map(|line| {
-                Ok(OrderLine {
-                    item_id: line
-                        .item
-                        .ok_or_else(|| Error::Validation("Select an item for every line".into()))?,
-                    quantity: parse_quantity(&line.quantity)?,
-                    unit_price: parse_amount(&line.price)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .map(LineForm::draft)
+            .collect::<Result<_>>()?;
         Ok(OrderDraft {
             kind: self.kind,
             party_ledger_id,
@@ -70,6 +102,53 @@ impl CreateOrderForm {
             expected_on: (!self.expected_on.trim().is_empty()).then(|| self.expected_on.clone()),
             notes: self.notes.clone(),
             lines,
+        })
+    }
+}
+
+struct OrderAmendmentForm {
+    order: i64,
+    base_revision: Option<i64>,
+    reference: String,
+    expected_on: String,
+    notes: String,
+    lines: Vec<LineForm>,
+    reason: String,
+}
+
+impl OrderAmendmentForm {
+    fn new(detail: &OrderDetail) -> Self {
+        Self {
+            order: detail.summary.id,
+            base_revision: detail.summary.revision,
+            reference: detail.summary.reference.clone(),
+            expected_on: detail.summary.expected_on.clone().unwrap_or_default(),
+            notes: detail.summary.notes.clone(),
+            lines: detail
+                .lines
+                .iter()
+                .map(|row| LineForm {
+                    item: Some(row.line.item_id),
+                    quantity: format_quantity(row.line.quantity.into()),
+                    price: format_amount(row.line.unit_price),
+                })
+                .collect(),
+            reason: String::new(),
+        }
+    }
+
+    fn draft(&self) -> Result<OrderAmendmentDraft> {
+        Ok(OrderAmendmentDraft {
+            base_revision: self.base_revision,
+            reference: self.reference.clone(),
+            expected_on: (!self.expected_on.trim().is_empty()).then(|| self.expected_on.clone()),
+            notes: self.notes.clone(),
+            lines: self
+                .lines
+                .iter()
+                .map(LineForm::draft)
+                .collect::<Result<_>>()?,
+            reason: self.reason.clone(),
         })
     }
 }
@@ -122,6 +201,7 @@ pub(super) struct OrderScreen {
     status: Option<OrderStatus>,
     search: String,
     selected: Option<i64>,
+    amendment: Option<OrderAmendmentForm>,
     close_reason: String,
     line_closure: LineClosureForm,
     line_reopen: LineReopenForm,
@@ -134,6 +214,10 @@ pub(super) struct OrderScreen {
 }
 
 impl OrderScreen {
+    pub(super) fn amending_order(&self) -> bool {
+        self.amendment.is_some()
+    }
+
     pub(super) fn select(&mut self, order: i64) {
         self.selected = Some(order);
         self.close_reason.clear();
@@ -146,6 +230,12 @@ impl OrderScreen {
 
 impl App {
     pub(super) fn orders_page(&mut self, ui: &mut egui::Ui, company: i64) {
+        if self.order_screen.amending_order() {
+            if let Err(error) = self.order_amendment_form(ui, company) {
+                self.failure(error);
+            }
+            return;
+        }
         crate::theme::section(ui, "Sales and purchase orders");
         egui::CollapsingHeader::new("Create order or quotation")
             .show(ui, |ui| self.create_order_form(ui, company));
@@ -440,31 +530,7 @@ impl App {
                 ui.end_row();
             }
         });
-        let mut remove = None;
-        for (index, line) in form.lines.iter_mut().enumerate() {
-            ui.horizontal_wrapped(|ui| {
-                pick_stock(ui, ("order-item", index), "Item", &items, &mut line.item);
-                ui.add(
-                    egui::TextEdit::singleline(&mut line.quantity)
-                        .hint_text("Quantity")
-                        .desired_width(80.0),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut line.price)
-                        .hint_text("Unit price")
-                        .desired_width(80.0),
-                );
-                if ui.button("Remove").clicked() {
-                    remove = Some(index);
-                }
-            });
-        }
-        if let Some(index) = remove {
-            form.lines.remove(index);
-        }
-        if ui.button("Add item").clicked() {
-            form.lines.push(LineForm::default());
-        }
+        order_line_fields(ui, &mut form.lines, &items);
         let quotation = form.quotation;
         if ui
             .button(if quotation {
@@ -676,6 +742,9 @@ impl App {
             self.order_screen.selected = None;
             self.order_screen.close_reason.clear();
         }
+        if order.closed_at.is_none() && ui.button("Amend order").clicked() {
+            self.order_screen.amendment = Some(OrderAmendmentForm::new(detail));
+        }
         ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.order_screen.document_path)
@@ -748,6 +817,15 @@ impl App {
         }
         if let (Some(at), Some(reason)) = (&order.closed_at, &order.close_reason) {
             ui.label(format!("Closed {at} UTC | {reason}"));
+        }
+        if order.revision.is_some() {
+            egui::CollapsingHeader::new("Amendment history")
+                .id_salt(("order-amendment-history", order.id))
+                .show(ui, |ui| {
+                    if let Err(error) = self.order_amendment_history(ui, company, order.id) {
+                        self.failure(error);
+                    }
+                });
         }
         if order.status.has_pending() || !detail.line_closures.is_empty() {
             egui::CollapsingHeader::new("Line closures")
@@ -827,6 +905,89 @@ impl App {
                 }
             });
         }
+    }
+
+    fn order_amendment_form(&mut self, ui: &mut egui::Ui, company: i64) -> Result<()> {
+        let Some(form) = &mut self.order_screen.amendment else {
+            return Ok(());
+        };
+        crate::theme::section(ui, "Amend order");
+        egui::Grid::new("order-amendment-fields").show(ui, |ui| {
+            for (label, value) in [
+                ("Reference", &mut form.reference),
+                ("Expected date (optional)", &mut form.expected_on),
+                ("Notes", &mut form.notes),
+                ("Reason for amendment", &mut form.reason),
+            ] {
+                ui.label(label);
+                ui.text_edit_singleline(value);
+                ui.end_row();
+            }
+        });
+        let items = self.store.stock_items(company)?;
+        order_line_fields(ui, &mut form.lines, &items);
+        let (save, cancel) = ui
+            .horizontal(|ui| {
+                (
+                    ui.button("Save amendment").clicked(),
+                    ui.button("Cancel").clicked(),
+                )
+            })
+            .inner;
+        if save {
+            let order = form.order;
+            self.store.amend_order(company, order, &form.draft()?)?;
+            self.order_screen.amendment = None;
+            self.order_screen.select(order);
+            self.message = "Order amendment saved".into();
+        } else if cancel {
+            self.order_screen.amendment = None;
+        }
+        Ok(())
+    }
+
+    fn order_amendment_history(&self, ui: &mut egui::Ui, company: i64, order: i64) -> Result<()> {
+        for revision in self.store.order_revisions(company, order)? {
+            egui::CollapsingHeader::new(format!(
+                "{} UTC · {}",
+                revision.amended_at, revision.reason
+            ))
+            .id_salt(("order-amendment", revision.id))
+            .show(ui, |ui| -> Result<()> {
+                ui.label(format!("Previous reference {}", revision.reference));
+                if let Some(expected) = &revision.expected_on {
+                    ui.label(format!("Previously expected {expected}"));
+                }
+                if !revision.notes.is_empty() {
+                    ui.label(&revision.notes);
+                }
+                let lines = self
+                    .store
+                    .order_revision_lines(company, order, revision.id)?;
+                egui::Grid::new(("order-amendment-lines", revision.id))
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Item");
+                        ui.strong("Previous quantity");
+                        ui.strong("Previous unit price");
+                        ui.end_row();
+                        for line in lines {
+                            ui.label(&line.item);
+                            ui.label(format!(
+                                "{} {}",
+                                format_quantity(line.values.quantity.into()),
+                                line.unit
+                            ));
+                            ui.label(format_amount(line.values.unit_price));
+                            ui.end_row();
+                        }
+                    });
+                Ok(())
+            })
+            .body_returned
+            .transpose()?;
+        }
+        Ok(())
     }
 
     fn order_stock_reservations(

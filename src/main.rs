@@ -695,6 +695,7 @@ impl App {
             || self.editing_ledger.is_some()
             || self.invoice_draft_in_use()
             || self.invoice_refund.is_some()
+            || self.order_screen.amending_order()
             || self.stock_count_screen.preview_pending()
             || self.cost_screen.has_pending_changes()
             || self.currency_screen.has_preview()

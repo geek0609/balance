@@ -71,7 +71,32 @@ pub(crate) fn migrate_line_closures(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+pub(crate) fn migrate_amendments(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE order_revisions(
+            id INTEGER PRIMARY KEY,
+            order_id INTEGER NOT NULL REFERENCES orders(id),
+            reference TEXT NOT NULL,
+            expected_on TEXT,
+            notes TEXT NOT NULL,
+            amended_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            reason TEXT NOT NULL
+        );
+        CREATE INDEX order_revisions_order ON order_revisions(order_id, id);
+        CREATE TABLE order_revision_lines(
+            revision_id INTEGER NOT NULL REFERENCES order_revisions(id),
+            item_id INTEGER NOT NULL REFERENCES stock_items(id),
+            item TEXT NOT NULL,
+            unit TEXT NOT NULL,
+            quantity INTEGER NOT NULL CHECK(quantity > 0),
+            unit_price INTEGER NOT NULL CHECK(unit_price >= 0),
+            PRIMARY KEY(revision_id, item_id)
+        );",
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderLine {
     pub item_id: i64,
     pub quantity: i64,
@@ -87,6 +112,33 @@ pub struct OrderDraft {
     pub expected_on: Option<String>,
     pub notes: String,
     pub lines: Vec<OrderLine>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderAmendmentDraft {
+    pub base_revision: Option<i64>,
+    pub reference: String,
+    pub expected_on: Option<String>,
+    pub notes: String,
+    pub lines: Vec<OrderLine>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderRevision {
+    pub id: i64,
+    pub reference: String,
+    pub expected_on: Option<String>,
+    pub notes: String,
+    pub amended_at: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderRevisionLine {
+    pub values: OrderLine,
+    pub item: String,
+    pub unit: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +178,7 @@ pub struct OrderSummary {
     pub closed_at: Option<String>,
     pub close_reason: Option<String>,
     pub status: OrderStatus,
+    pub revision: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -247,7 +300,8 @@ const ORDER_SUMMARIES: &str =
             EXISTS(SELECT 1 FROM order_line_availability p WHERE p.order_id = o.id AND p.quantity - p.fulfilled > p.preclosed),
             EXISTS(SELECT 1 FROM order_line_progress p WHERE p.order_id = o.id AND p.fulfilled > 0),
             EXISTS(SELECT 1 FROM order_lines ol JOIN order_line_closures c ON c.order_line_id = ol.id
-                   WHERE ol.order_id = o.id AND c.reopened_on IS NULL)
+                   WHERE ol.order_id = o.id AND c.reopened_on IS NULL),
+            (SELECT MAX(r.id) FROM order_revisions r WHERE r.order_id = o.id)
      FROM orders o JOIN ledgers l ON l.id = o.party_ledger_id AND l.company_id = o.company_id
      WHERE o.company_id = ?1";
 
@@ -280,6 +334,7 @@ fn read_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrderSummary> {
         closed_at,
         close_reason: row.get(9)?,
         status,
+        revision: row.get(13)?,
     })
 }
 
@@ -341,21 +396,38 @@ pub(crate) fn linked_orders(conn: &Connection, invoice: i64) -> Result<Vec<i64>>
     Ok(rows)
 }
 
+fn expected_order_date(date: NaiveDate, expected: Option<&str>) -> Result<Option<NaiveDate>> {
+    let expected = expected.map(parse_date).transpose()?;
+    if expected.is_some_and(|expected| expected < date) {
+        return Err(Error::Validation(
+            "Expected date cannot precede the order date".into(),
+        ));
+    }
+    Ok(expected)
+}
+
+fn validate_order_lines(conn: &Connection, company: i64, lines: &[OrderLine]) -> Result<()> {
+    if lines.is_empty() {
+        return Err(Error::Validation("Enter at least one stock item".into()));
+    }
+    let mut items = HashSet::new();
+    for line in lines {
+        if !items.insert(line.item_id) {
+            return Err(Error::Validation("Enter each item once per order".into()));
+        }
+        line_amount(line.quantity, line.unit_price)?;
+        check_quantity_precision(conn, company, line.item_id, line.quantity)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_order_draft(
     conn: &Connection,
     company: i64,
     draft: &OrderDraft,
 ) -> Result<(NaiveDate, Option<NaiveDate>)> {
     let date = parse_date(&draft.date)?;
-    let expected = draft.expected_on.as_deref().map(parse_date).transpose()?;
-    if expected.is_some_and(|expected| expected < date) {
-        return Err(Error::Validation(
-            "Expected date cannot precede the order date".into(),
-        ));
-    }
-    if draft.lines.is_empty() {
-        return Err(Error::Validation("Enter at least one stock item".into()));
-    }
+    let expected = expected_order_date(date, draft.expected_on.as_deref())?;
     if !matches!(
         ledger_category(conn, company, draft.party_ledger_id)?,
         Category::Asset | Category::Liability
@@ -364,14 +436,7 @@ pub(crate) fn validate_order_draft(
             "The party ledger must be an asset or liability".into(),
         ));
     }
-    let mut items = HashSet::new();
-    for line in &draft.lines {
-        if !items.insert(line.item_id) {
-            return Err(Error::Validation("Enter each item once per order".into()));
-        }
-        line_amount(line.quantity, line.unit_price)?;
-        check_quantity_precision(conn, company, line.item_id, line.quantity)?;
-    }
+    validate_order_lines(conn, company, &draft.lines)?;
     Ok((date, expected))
 }
 
@@ -399,6 +464,24 @@ pub(crate) fn insert_order(conn: &Connection, company: i64, draft: &OrderDraft) 
             )?;
     }
     Ok(order)
+}
+
+fn remove_unused_line(conn: &Connection, order: i64, item: i64) -> Result<bool> {
+    let removed = conn.execute(
+        "DELETE FROM order_lines AS ol WHERE ol.order_id = ?1 AND ol.item_id = ?2
+           AND NOT EXISTS(SELECT 1 FROM order_line_closures c WHERE c.order_line_id = ol.id)
+           AND NOT EXISTS(SELECT 1 FROM stock_reservations r WHERE r.order_line_id = ol.id)
+           AND NOT EXISTS(
+               SELECT 1 FROM stock_notes n JOIN stock_note_lines nl ON nl.note_id = n.id
+               WHERE n.order_id = ol.order_id AND nl.item_id = ol.item_id
+           )
+           AND NOT EXISTS(
+               SELECT 1 FROM invoice_order_links i JOIN invoice_lines il ON il.invoice_id = i.invoice_id
+               WHERE i.order_id = ol.order_id AND il.item_id = ol.item_id
+           )",
+        params![order, item],
+    )?;
+    Ok(removed == 1)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -649,6 +732,158 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Amend the current agreement while preserving prior terms and the linked stock and invoices.
+    pub fn amend_order(
+        &mut self,
+        company: i64,
+        id: i64,
+        draft: &OrderAmendmentDraft,
+    ) -> Result<i64> {
+        let reference = required(&draft.reference, "Order reference")?;
+        let reason = required(&draft.reason, "Amendment reason")?;
+        let reference_key = reference.to_lowercase();
+        let notes = draft.notes.trim();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = order_summary(&tx, company, id)?;
+        if current.closed_at.is_some() {
+            return Err(Error::Validation("The entire order is closed".into()));
+        }
+        if current.revision != draft.base_revision {
+            return Err(Error::Validation(
+                "The order was amended since this draft was opened. Open the latest order to continue."
+                    .into(),
+            ));
+        }
+        let expected_on =
+            expected_order_date(parse_date(&current.date)?, draft.expected_on.as_deref())?
+                .map(|date| date.to_string());
+        validate_order_lines(&tx, company, &draft.lines)?;
+        let previous = order_lines(&tx, id)?;
+        let updated: HashMap<_, _> = draft
+            .lines
+            .iter()
+            .map(|line| (line.item_id, line))
+            .collect();
+        if reference == current.reference
+            && expected_on == current.expected_on
+            && notes == current.notes
+            && previous.len() == updated.len()
+            && previous
+                .iter()
+                .all(|line| updated.get(&line.line.item_id).copied() == Some(&line.line))
+        {
+            return Err(Error::Validation("Change at least one order field".into()));
+        }
+        let duplicate: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM orders
+             WHERE company_id = ?1 AND kind = ?2 AND party_ledger_id = ?3 AND reference_key = ?4 AND id != ?5)",
+            params![company, current.kind.as_str(), current.party_ledger_id, reference_key, id],
+            |r| r.get(0),
+        )?;
+        if duplicate {
+            return Err(Error::Validation(
+                "An order with this type, party and reference already exists".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO order_revisions(order_id, reference, expected_on, notes, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                current.reference,
+                current.expected_on,
+                current.notes,
+                reason
+            ],
+        )?;
+        let revision = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO order_revision_lines(revision_id, item_id, item, unit, quantity, unit_price)
+             SELECT ?1, ol.item_id, s.name, s.unit, ol.quantity, ol.unit_price
+             FROM order_lines ol JOIN stock_items s ON s.id = ol.item_id
+             WHERE ol.order_id = ?2 ORDER BY ol.id",
+            params![revision, id],
+        )?;
+        for old in &previous {
+            if let Some(line) = updated.get(&old.line.item_id) {
+                if remaining_quantity(line.quantity, old.fulfilled, old.preclosed).is_err() {
+                    return Err(Error::Validation(format!(
+                        "Quantity for {} must cover fulfilled and pre-closed units",
+                        old.item
+                    )));
+                }
+            } else if !remove_unused_line(&tx, id, old.line.item_id)? {
+                return Err(Error::Validation(format!(
+                    "{} has fulfilment, closure, or reservation history. Keep it on the order and amend its quantity.",
+                    old.item
+                )));
+            }
+        }
+        tx.execute(
+            "UPDATE orders SET reference = ?1, reference_key = ?2, expected_on = ?3, notes = ?4
+             WHERE id = ?5",
+            params![reference, reference_key, expected_on, notes, id],
+        )?;
+        for line in &draft.lines {
+            tx.execute(
+                "INSERT INTO order_lines(order_id, item_id, quantity, unit_price) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(order_id, item_id) DO UPDATE
+                    SET quantity = excluded.quantity, unit_price = excluded.unit_price",
+                params![id, line.item_id, line.quantity, line.unit_price],
+            )?;
+        }
+        crate::stock_reservations::check_order_coverage(&tx, id)?;
+        tx.commit()?;
+        Ok(revision)
+    }
+
+    pub fn order_revisions(&self, company: i64, order: i64) -> Result<Vec<OrderRevision>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT r.id, r.reference, r.expected_on, r.notes, r.amended_at, r.reason
+             FROM order_revisions r JOIN orders o ON o.id = r.order_id
+             WHERE o.company_id = ?1 AND o.id = ?2 ORDER BY r.id DESC",
+        )?;
+        let rows = stmt.query_map(params![company, order], |r| {
+            Ok(OrderRevision {
+                id: r.get(0)?,
+                reference: r.get(1)?,
+                expected_on: r.get(2)?,
+                notes: r.get(3)?,
+                amended_at: r.get(4)?,
+                reason: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn order_revision_lines(
+        &self,
+        company: i64,
+        order: i64,
+        revision: i64,
+    ) -> Result<Vec<OrderRevisionLine>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT l.item_id, l.item, l.unit, l.quantity, l.unit_price
+             FROM order_revision_lines l JOIN order_revisions r ON r.id = l.revision_id
+             JOIN orders o ON o.id = r.order_id
+             WHERE o.company_id = ?1 AND o.id = ?2 AND r.id = ?3 ORDER BY l.rowid",
+        )?;
+        let rows = stmt.query_map(params![company, order, revision], |r| {
+            Ok(OrderRevisionLine {
+                values: OrderLine {
+                    item_id: r.get(0)?,
+                    quantity: r.get(3)?,
+                    unit_price: r.get(4)?,
+                },
+                item: r.get(1)?,
+                unit: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn order_detail(&self, company: i64, id: i64) -> Result<OrderDetail> {
         let tx = self.conn.unchecked_transaction()?;
         let summary = order_summary(&tx, company, id)?;
@@ -836,6 +1071,203 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stock_notes::{StockNoteDraft, StockNoteLineDraft};
+    use crate::stock_reservations::StockReservationDraft;
+
+    #[test]
+    fn amendments_keep_history_and_respect_fulfilment_and_reservations() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let other_company = store.create_company("Other").unwrap();
+        let party = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        let item = store.create_stock_item(company, "Part", "Each").unwrap();
+        let remove = store.create_stock_item(company, "Packing", "Each").unwrap();
+        let add = store.create_stock_item(company, "Insert", "Each").unwrap();
+        let location = store.stock_locations(company).unwrap()[0].id;
+        let date = "2026-01-01";
+        store
+            .adjust_stock_batch(company, item, location, None, date, 10_000, "Opening")
+            .unwrap();
+        store
+            .adjust_stock_batch(company, add, location, None, date, 1000, "Opening")
+            .unwrap();
+        let initial = OrderDraft {
+            kind: InvoiceKind::Sale,
+            party_ledger_id: party,
+            reference: "SO-01".into(),
+            date: date.into(),
+            expected_on: Some("2026-02-01".into()),
+            notes: "Initial terms".into(),
+            lines: vec![
+                OrderLine {
+                    item_id: item,
+                    quantity: 10_000,
+                    unit_price: 2500,
+                },
+                OrderLine {
+                    item_id: remove,
+                    quantity: 1000,
+                    unit_price: 200,
+                },
+            ],
+        };
+        let order = store.create_order(company, &initial).unwrap();
+        let mut other_order = initial.clone();
+        other_order.reference = "SO-02".into();
+        store.create_order(company, &other_order).unwrap();
+        let mut delivery = StockNoteDraft {
+            kind: InvoiceKind::Sale,
+            date: date.into(),
+            reference: "DEL-01".into(),
+            party_ledger_id: party,
+            order_id: Some(order),
+            narration: String::new(),
+            lines: vec![StockNoteLineDraft {
+                item_id: item,
+                location_id: location,
+                batch_id: None,
+                quantity: 2000,
+                unit_price: 2500,
+            }],
+        };
+        let note = store.post_stock_note(company, &delivery).unwrap();
+        store
+            .preclose_order_line(company, order, item, date, 1000, "No longer needed")
+            .unwrap();
+        let reservation = store
+            .reserve_order_stock(
+                company,
+                order,
+                &StockReservationDraft {
+                    item_id: item,
+                    location_id: location,
+                    batch_id: None,
+                    quantity: 4000,
+                    reason: "Set aside".into(),
+                },
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE order_revision_lines;
+             DROP TABLE order_revisions;
+             PRAGMA user_version = 66;",
+            )
+            .unwrap();
+        let mut store = Store::from_connection(store.conn).unwrap();
+        assert!(store.order_revisions(company, order).unwrap().is_empty());
+        let mut amendment = OrderAmendmentDraft {
+            base_revision: None,
+            reference: initial.reference.clone(),
+            expected_on: initial.expected_on.clone(),
+            notes: initial.notes.clone(),
+            lines: initial.lines.clone(),
+            reason: "Change terms after shipment".into(),
+        };
+        assert!(store.amend_order(company, order, &amendment).is_err());
+        amendment.reference = "so-02".into();
+        assert!(store.amend_order(company, order, &amendment).is_err());
+        amendment.reference = "SO-01A".into();
+        assert!(store.amend_order(other_company, order, &amendment).is_err());
+        amendment.lines[0].quantity = 2000;
+        assert!(store.amend_order(company, order, &amendment).is_err());
+        amendment.lines[0].quantity = 6000;
+        assert!(store.amend_order(company, order, &amendment).is_err());
+        assert_eq!(
+            store
+                .order_detail(company, order)
+                .unwrap()
+                .summary
+                .reference,
+            "SO-01"
+        );
+        assert!(store.order_revisions(company, order).unwrap().is_empty());
+
+        amendment.expected_on = Some("2026-03-01".into());
+        amendment.notes = "New delivery date".into();
+        amendment.lines[0].quantity = 7000;
+        amendment.lines[0].unit_price = 2700;
+        amendment.lines[1] = OrderLine {
+            item_id: add,
+            quantity: 3000,
+            unit_price: 100,
+        };
+        let revision = store.amend_order(company, order, &amendment).unwrap();
+        let saved = store.order_detail(company, order).unwrap();
+        assert_eq!(saved.summary.revision, Some(revision));
+        assert_eq!(saved.summary.reference, "SO-01A");
+        assert_eq!(saved.lines[0].unfulfilled(), 4000);
+        assert_eq!(saved.lines[1].line.item_id, add);
+        assert_eq!(saved.reservations[0].id, reservation);
+        assert_eq!(saved.reservations[0].remaining, 4000);
+        assert_eq!(
+            store.stock_note_lines(company, note).unwrap()[0]
+                .values
+                .unit_price,
+            2500
+        );
+        let report = store
+            .pending_order_schedule(company, Some(InvoiceKind::Sale), Some("2026-03-01"))
+            .unwrap();
+        let amended_line = report
+            .iter()
+            .find(|row| row.order_id == order && row.item_id == item)
+            .unwrap();
+        assert_eq!(
+            (amended_line.reference.as_str(), amended_line.remaining),
+            ("SO-01A", 4000)
+        );
+        let history = store.order_revisions(company, order).unwrap();
+        assert_eq!(history[0].reference, initial.reference);
+        assert_eq!(history[0].expected_on, initial.expected_on);
+        assert_eq!(history[0].notes, initial.notes);
+        assert_eq!(history[0].reason, amendment.reason);
+        assert!(store
+            .order_revision_lines(other_company, order, revision)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .order_revision_lines(company, order, revision)
+                .unwrap()
+                .iter()
+                .map(|row| row.values.clone())
+                .collect::<Vec<_>>(),
+            initial.lines
+        );
+
+        amendment.notes = "Add instructions".into();
+        assert!(
+            store.amend_order(company, order, &amendment).is_err(),
+            "stale draft"
+        );
+        amendment.base_revision = Some(revision);
+        delivery.reference = "DEL-02".into();
+        delivery.lines[0].item_id = add;
+        delivery.lines[0].quantity = 1000;
+        let second_note = store.post_stock_note(company, &delivery).unwrap();
+        store
+            .reverse_stock_note(company, second_note, date, "Goods returned")
+            .unwrap();
+        let mut remove_used = amendment.clone();
+        remove_used.lines.pop();
+        assert!(store.amend_order(company, order, &remove_used).is_err());
+        let second_revision = store.amend_order(company, order, &amendment).unwrap();
+        let history = store.order_revisions(company, order).unwrap();
+        assert_eq!(
+            history.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![second_revision, revision]
+        );
+        store
+            .close_order(company, order, "Cancelled balance")
+            .unwrap();
+        amendment.base_revision = Some(second_revision);
+        amendment.notes = "Change closed order".into();
+        assert!(store.amend_order(company, order, &amendment).is_err());
+    }
 
     #[test]
     fn line_closures_adjust_commitments_and_keep_history_per_order() {
@@ -875,7 +1307,9 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP VIEW stock_reservation_balances;
+                "DROP TABLE order_revision_lines;
+                 DROP TABLE order_revisions;
+                 DROP VIEW stock_reservation_balances;
                  DROP TABLE stock_reservation_releases;
                  DROP TABLE stock_reservations;
                  DROP VIEW order_line_availability;
