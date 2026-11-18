@@ -173,6 +173,7 @@ struct App {
     batch_manufactured: String,
     batch_expiry: String,
     stock_balance_location: Option<i64>,
+    stock_balance_descendants: bool,
     adjustment_location: Option<i64>,
     adjustment_batch: Option<i64>,
     transfer_item: Option<i64>,
@@ -434,6 +435,7 @@ impl App {
             batch_manufactured: String::new(),
             batch_expiry: String::new(),
             stock_balance_location: None,
+            stock_balance_descendants: false,
             adjustment_location: None,
             adjustment_batch: None,
             transfer_item: None,
@@ -578,6 +580,7 @@ impl App {
         self.stock_group_parent = None;
         self.stock_location_parent = None;
         self.stock_balance_location = None;
+        self.stock_balance_descendants = false;
         self.reorder_selection = None;
         self.reorder_editing = None;
         self.reorder_level.clear();
@@ -2847,9 +2850,35 @@ impl App {
                 Err(e) => self.message = e.to_string(),
             }
         }
-        ui.small("The CSV includes all locations and the current reorder settings, regardless of the selected location.");
+        ui.small("The company-wide CSV includes current reorder settings.");
         let balances = match self.stock_balance_location {
-            Some(location) => self.store.stock_location_balances(company, location, end),
+            Some(location) => {
+                ui.checkbox(
+                    &mut self.stock_balance_descendants,
+                    "Include child locations in quantity totals",
+                );
+                if ui
+                    .button("Export selected location totals as CSV")
+                    .clicked()
+                {
+                    match self.store.export_stock_location_csv(
+                        company,
+                        location,
+                        self.stock_balance_descendants,
+                        end,
+                        self.report_export_path.trim(),
+                    ) {
+                        Ok(()) => self.message = "Location stock report exported".into(),
+                        Err(error) => self.message = error.to_string(),
+                    }
+                }
+                self.store.location_stock_quantities(
+                    company,
+                    location,
+                    self.stock_balance_descendants,
+                    end,
+                )
+            }
             None => self.store.stock_balances(company, end),
         };
         match balances {

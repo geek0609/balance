@@ -1692,81 +1692,82 @@ impl Store {
         location_id: i64,
         as_of: Option<&str>,
     ) -> Result<Vec<StockBalance>> {
-        if !self
-            .stock_locations(company_id)?
-            .iter()
-            .any(|location| location.id == location_id)
-        {
+        self.location_stock_quantities(company_id, location_id, false, as_of)
+    }
+
+    /// Return direct quantities at a location or the sum across its branch.
+    pub fn location_stock_quantities(
+        &self,
+        company_id: i64,
+        location_id: i64,
+        include_descendants: bool,
+        as_of: Option<&str>,
+    ) -> Result<Vec<StockBalance>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM stock_locations WHERE id = ?1 AND company_id = ?2)",
+            params![location_id, company_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
             return Err(Error::Validation(
                 "Stock location not found in the selected company".into(),
             ));
         }
+
         let end = as_of.map(parse_date).transpose()?;
         let mut sums = HashMap::<i64, i128>::new();
-        let mut adjustments = self.conn.prepare("SELECT item_id, date, quantity FROM stock_adjustments WHERE company_id = ?1 AND location_id = ?2")?;
-        for row in adjustments.query_map(params![company_id, location_id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })? {
-            let (item, date, quantity) = row?;
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE branch(id) AS (
+                SELECT id FROM stock_locations WHERE company_id = ?1 AND id = ?2
+                UNION
+                SELECT l.id FROM stock_locations l JOIN branch b ON b.id = l.parent_id
+                WHERE l.company_id = ?1 AND ?3
+             )
+             SELECT a.item_id, a.date, a.quantity
+             FROM stock_adjustments a
+             WHERE a.company_id = ?1 AND a.location_id IN (SELECT id FROM branch)
+             UNION ALL
+             SELECT l.item_id, v.date, CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END
+             FROM invoice_line_allocations a
+             JOIN invoice_lines l ON l.id = a.line_id
+             JOIN invoices i ON i.id = l.invoice_id
+             JOIN vouchers v ON v.id = i.voucher_id
+             WHERE i.company_id = ?1 AND a.location_id IN (SELECT id FROM branch)
+             UNION ALL
+             SELECT item_id, date, -quantity FROM stock_transfers
+             WHERE company_id = ?1 AND from_location_id IN (SELECT id FROM branch)
+             UNION ALL
+             SELECT item_id, date, quantity FROM stock_transfers
+             WHERE company_id = ?1 AND to_location_id IN (SELECT id FROM branch)",
+        )?;
+        let movements = stmt.query_map(
+            params![company_id, location_id, include_descendants],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        for movement in movements {
+            let (item, date, quantity) = movement?;
             let date = parse_date(&date)?;
             if end.is_none_or(|limit| date <= limit) {
                 *sums.entry(item).or_default() += i128::from(quantity);
             }
         }
-        let mut invoices = self.conn.prepare("SELECT l.item_id, v.date, i.kind, a.quantity FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND a.location_id = ?2")?;
-        for row in invoices.query_map(params![company_id, location_id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-            ))
-        })? {
-            let (item, date, kind, quantity) = row?;
-            let date = parse_date(&date)?;
-            if end.is_none_or(|limit| date <= limit) {
-                let sign = if InvoiceKind::parse(&kind)? == InvoiceKind::Purchase {
-                    1
-                } else {
-                    -1
-                };
-                *sums.entry(item).or_default() += sign * i128::from(quantity);
-            }
-        }
-        let mut transfers = self.conn.prepare("SELECT item_id, date, quantity, from_location_id, to_location_id FROM stock_transfers WHERE company_id = ?1 AND (from_location_id = ?2 OR to_location_id = ?2)")?;
-        for row in transfers.query_map(params![company_id, location_id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-            ))
-        })? {
-            let (item, date, quantity, from, to) = row?;
-            let date = parse_date(&date)?;
-            if end.is_none_or(|limit| date <= limit) {
-                if from == location_id {
-                    *sums.entry(item).or_default() -= i128::from(quantity);
-                }
-                if to == location_id {
-                    *sums.entry(item).or_default() += i128::from(quantity);
-                }
-            }
-        }
+
         Ok(self
             .stock_items(company_id)?
             .into_iter()
             .map(|item| StockBalance {
-                quantity: *sums.get(&item.id).unwrap_or(&0),
+                quantity: sums.get(&item.id).copied().unwrap_or_default(),
                 item,
             })
             .collect())
     }
+
     pub fn stock_balances(
         &self,
         company_id: i64,

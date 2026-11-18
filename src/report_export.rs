@@ -1122,6 +1122,57 @@ impl Store {
         save(csv, destination)
     }
 
+    /// Export direct or rolled-up quantities for a selected location.
+    pub fn export_stock_location_csv(
+        &self,
+        company: i64,
+        location_id: i64,
+        include_descendants: bool,
+        as_of: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let location = self
+            .stock_locations(company)?
+            .into_iter()
+            .find(|location| location.id == location_id)
+            .ok_or_else(|| Error::Validation("Stock location not found".into()))?;
+        let balances =
+            self.location_stock_quantities(company, location_id, include_descendants, as_of)?;
+        let scope = if include_descendants {
+            "location and descendants"
+        } else {
+            "direct location"
+        };
+        let context = [
+            self.report_company_name(company)?,
+            location.id.to_string(),
+            text_cell(&location.name),
+            scope.into(),
+            optional_date(as_of)?,
+        ];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "location_id", "location", "scope", "as_of"]),
+            &strings(&["row_type", "item_id", "item", "unit", "on_hand"]),
+        )?;
+        contextual_row(&mut csv, &context, &strings(&["context", "", "", "", ""]))?;
+        for balance in balances {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "item".into(),
+                    balance.item.id.to_string(),
+                    text_cell(&balance.item.name),
+                    text_cell(&balance.item.unit),
+                    format_quantity(balance.quantity),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
     /// Export company-wide quantities and current reorder settings.
     pub fn export_stock_csv(
         &self,
