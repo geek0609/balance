@@ -666,21 +666,25 @@ impl Store {
             "deductions",
             "net",
             "employer_contributions",
+            "paid",
+            "outstanding",
         ]);
         contextual_row(
             &mut csv,
             &strings(&["company", "date_from", "date_through", "employee_filter_id"]),
             &details,
         )?;
-        let mut totals = [0_i128; 4];
+        let mut totals = [0_i128; 6];
         for row in entries {
             for (total, value) in totals.iter_mut().zip([
-                row.gross,
-                row.deductions,
-                row.net,
-                row.employer_contributions,
+                i128::from(row.gross),
+                i128::from(row.deductions),
+                i128::from(row.net),
+                i128::from(row.employer_contributions),
+                row.paid,
+                row.outstanding,
             ]) {
-                *total += i128::from(value);
+                *total += value;
             }
             contextual_row(
                 &mut csv,
@@ -701,6 +705,8 @@ impl Store {
                     money(row.deductions.into()),
                     money(row.net.into()),
                     money(row.employer_contributions.into()),
+                    money(row.paid),
+                    money(row.outstanding),
                 ],
             )?;
         }

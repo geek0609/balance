@@ -149,6 +149,8 @@ pub struct PayrollAccrual {
     pub deductions: i64,
     pub net: i64,
     pub employer_contributions: i64,
+    pub paid: i128,
+    pub outstanding: i128,
 }
 
 #[derive(Debug, Clone)]
@@ -397,10 +399,10 @@ impl Store {
         }
         let inserted = tx.execute(
             "INSERT INTO payroll_accruals(company_id, employee_id, voucher_id, period_start, period_end,
-                reference_key, gross, deductions, net, employer_contributions)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT DO NOTHING",
+                reference_key, gross, deductions, net, employer_contributions, payable_ledger_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT DO NOTHING",
             params![company, draft.employee_id, voucher, from, to, reference.to_lowercase(),
-                supported_amount(gross)?, supported_amount(deductions)?, supported_amount(net)?, supported_amount(employer)?],
+                supported_amount(gross)?, supported_amount(deductions)?, supported_amount(net)?, supported_amount(employer)?, payable],
         )?;
         if inserted != 1 {
             return Err(Error::Validation(
@@ -447,10 +449,19 @@ impl Store {
             if start.is_some_and(|from| parsed < from) || end.is_some_and(|end| parsed > end) {
                 continue;
             }
+            let id = row.get(0)?;
+            let net = row.get::<_, i64>(13)?;
+            let paid = crate::payroll_payments::payment_state(&self.conn, company, id, end)?.paid;
+            let outstanding = i128::from(net) - paid;
+            if outstanding < 0 {
+                return Err(Error::Validation(
+                    "Payroll payments exceed the accrued amount".into(),
+                ));
+            }
             result.push((
                 parsed,
                 PayrollAccrual {
-                    id: row.get(0)?,
+                    id,
                     employee_id: row.get(1)?,
                     code: row.get(2)?,
                     employee: row.get(3)?,
@@ -463,7 +474,9 @@ impl Store {
                     narration: row.get(10)?,
                     gross: row.get(11)?,
                     deductions: row.get(12)?,
-                    net: row.get(13)?,
+                    net,
+                    paid,
+                    outstanding,
                     employer_contributions: row.get(14)?,
                 },
             ));

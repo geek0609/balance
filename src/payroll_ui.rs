@@ -3,6 +3,7 @@ use balance::payroll::{
     Employee, EmployeeDraft, PayAmount, PayHead, PayHeadDraft, PayHeadKind, PayrollAccrual,
     PayrollDraft,
 };
+use balance::payroll_payments::PayrollPaymentDraft;
 use balance::{parse_amount, Category, Error, Ledger, Result};
 use eframe::egui;
 
@@ -104,6 +105,36 @@ impl AccrualForm {
 }
 
 #[derive(Default)]
+struct PaymentForm {
+    bank: Option<i64>,
+    date: String,
+    reference: String,
+    amount: String,
+    narration: String,
+}
+impl PaymentForm {
+    fn draft(&self) -> Result<PayrollPaymentDraft> {
+        Ok(PayrollPaymentDraft {
+            bank_ledger_id: self
+                .bank
+                .ok_or_else(|| Error::Validation("Select a cash or bank ledger".into()))?,
+            date: self.date.clone(),
+            reference: self.reference.clone(),
+            amount: parse_amount(&self.amount)?,
+            narration: self.narration.clone(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct PaymentReversalForm {
+    payment: i64,
+    date: String,
+    reference: String,
+    reason: String,
+}
+
+#[derive(Default)]
 pub(super) struct PayrollScreen {
     employee: EmployeeForm,
     head: HeadForm,
@@ -114,6 +145,8 @@ pub(super) struct PayrollScreen {
     entries: Vec<PayrollAccrual>,
     selected: Option<i64>,
     register_loaded: bool,
+    payment: PaymentForm,
+    reversal: Option<PaymentReversalForm>,
 }
 
 impl App {
@@ -143,6 +176,11 @@ impl App {
         let liabilities = ledgers
             .iter()
             .filter(|ledger| ledger.category == Category::Liability)
+            .cloned()
+            .collect::<Vec<_>>();
+        let banks = ledgers
+            .iter()
+            .filter(|ledger| ledger.category == Category::Asset)
             .cloned()
             .collect::<Vec<_>>();
         let expenses = ledgers
@@ -191,7 +229,7 @@ impl App {
                 self.payroll_accrual_form(ui, company, &employees, &heads);
             });
         egui::CollapsingHeader::new("Payroll register").show(ui, |ui| {
-            self.payroll_register_view(ui, company, &employees);
+            self.payroll_register_view(ui, company, &employees, &banks);
         });
     }
 
@@ -364,7 +402,13 @@ impl App {
         }
     }
 
-    fn payroll_register_view(&mut self, ui: &mut egui::Ui, company: i64, employees: &[Employee]) {
+    fn payroll_register_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        employees: &[Employee],
+        banks: &[Ledger],
+    ) {
         self.report_export_path_field(ui);
         let form = &mut self.payroll_screen;
         let mut changed = false;
@@ -395,6 +439,8 @@ impl App {
             form.register_loaded = false;
             form.entries.clear();
             form.selected = None;
+            form.payment = PaymentForm::default();
+            form.reversal = None;
         }
         let from = optional(&form.register_from);
         let to = optional(&form.register_to);
@@ -433,56 +479,240 @@ impl App {
             ui.label("No payroll entries match.");
         }
         let mut net = 0_i128;
+        let mut paid = 0_i128;
+        let mut outstanding = 0_i128;
         for row in &form.entries {
             net += i128::from(row.net);
+            paid += row.paid;
+            outstanding += row.outstanding;
             let selected = form.selected == Some(row.id);
             if ui
                 .selectable_label(
                     selected,
                     format!(
-                        "{} | {} {} | {} | Net {}",
+                        "{} | {} {} | {} | Outstanding {}",
                         row.date,
                         row.code,
                         row.employee,
                         row.reference,
-                        money(row.net.into())
+                        money(row.outstanding)
                     ),
                 )
                 .clicked()
             {
                 form.selected = (!selected).then_some(row.id);
-            }
-            if form.selected != Some(row.id) {
-                continue;
-            }
-            ui.label(format!(
-                "Period {} to {} | Voucher {}",
-                row.period_start, row.period_end, row.voucher_id
-            ));
-            ui.label(format!(
-                "Gross {} | Deductions {} | Employer contributions {}",
-                money(row.gross.into()),
-                money(row.deductions.into()),
-                money(row.employer_contributions.into())
-            ));
-            if !row.narration.is_empty() {
-                ui.label(&row.narration);
-            }
-            match self.store.payroll_lines(company, row.id) {
-                Ok(lines) => {
-                    for line in lines {
-                        ui.label(format!(
-                            "{} | {} | {}",
-                            line.head,
-                            line.kind.label(),
-                            money(line.amount.into())
-                        ));
-                    }
-                }
-                Err(error) => self.message = error.to_string(),
+                form.payment = PaymentForm {
+                    amount: money(row.outstanding),
+                    ..PaymentForm::default()
+                };
+                form.reversal = None;
             }
         }
-        ui.label(format!("Net accrued {}", money(net)));
+        ui.label(format!(
+            "Net accrued {} | Paid {} | Outstanding {}",
+            money(net),
+            money(paid),
+            money(outstanding)
+        ));
+        let selected = form
+            .entries
+            .iter()
+            .find(|row| Some(row.id) == form.selected)
+            .cloned();
+        let cutoff = to.map(str::to_owned);
+        if let Some(row) = selected {
+            ui.separator();
+            self.payroll_detail(ui, company, &row, cutoff.as_deref(), banks);
+        }
+    }
+
+    fn payroll_detail(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        row: &PayrollAccrual,
+        end: Option<&str>,
+        banks: &[Ledger],
+    ) {
+        ui.heading(format!("{} | {}", row.employee, row.reference));
+        ui.label(format!(
+            "Period {} to {} | Voucher {}",
+            row.period_start, row.period_end, row.voucher_id
+        ));
+        ui.label(format!(
+            "Gross {} | Deductions {} | Net {} | Employer contributions {}",
+            money(row.gross.into()),
+            money(row.deductions.into()),
+            money(row.net.into()),
+            money(row.employer_contributions.into())
+        ));
+        if !row.narration.is_empty() {
+            ui.label(&row.narration);
+        }
+        match self.store.payroll_lines(company, row.id) {
+            Ok(lines) => {
+                for line in lines {
+                    ui.label(format!(
+                        "{} | {} | {}",
+                        line.head,
+                        line.kind.label(),
+                        money(line.amount.into())
+                    ));
+                }
+            }
+            Err(error) => self.failure(error),
+        }
+        ui.separator();
+        ui.strong("Salary payments");
+        match self.store.payroll_payments(company, row.id, end) {
+            Ok(payments) if payments.is_empty() => {
+                ui.label("No payments recorded through this date.");
+            }
+            Ok(payments) => {
+                for payment in payments {
+                    ui.label(format!(
+                        "{} | {} | {} | {} | Voucher {}",
+                        payment.date,
+                        payment.reference,
+                        payment.bank,
+                        money(payment.amount.into()),
+                        payment.voucher_id
+                    ));
+                    if let Some(reversal) = &payment.reversal {
+                        ui.small(format!(
+                            "Reversed {} | {} (voucher {}) | {}",
+                            reversal.date, reversal.reference, reversal.voucher_id, reversal.reason
+                        ));
+                    } else if end.is_none() {
+                        ui.push_id(payment.id, |ui| {
+                            self.payroll_reversal_form(ui, company, payment.id)
+                        });
+                    }
+                }
+            }
+            Err(error) => self.failure(error),
+        }
+        if end.is_some() {
+            ui.small(
+                "Clear the Through date and run the register again to enter a payment or reversal.",
+            );
+            return;
+        }
+        if row.outstanding <= 0 {
+            return;
+        }
+        egui::CollapsingHeader::new("Record salary payment")
+            .id_salt(row.id)
+            .show(ui, |ui| {
+                let form = &mut self.payroll_screen.payment;
+                pick_account(
+                    ui,
+                    "salary-bank-ledger",
+                    "Cash or bank",
+                    banks,
+                    &mut form.bank,
+                    false,
+                );
+                egui::Grid::new("salary-payment-fields").show(ui, |ui| {
+                    for (label, field) in [
+                        ("Date (YYYY-MM-DD)", &mut form.date),
+                        ("Reference", &mut form.reference),
+                        ("Amount", &mut form.amount),
+                        ("Narration", &mut form.narration),
+                    ] {
+                        ui.label(label);
+                        ui.text_edit_singleline(field);
+                        ui.end_row();
+                    }
+                });
+                if ui.button("Post salary payment").clicked() {
+                    match form
+                        .draft()
+                        .and_then(|draft| self.store.pay_payroll_accrual(company, row.id, &draft))
+                    {
+                        Ok(payment) => {
+                            *form = PaymentForm::default();
+                            self.reload_payroll_after_change(
+                                company,
+                                format!("Salary payment {payment} recorded"),
+                            );
+                        }
+                        Err(error) => self.failure(error),
+                    }
+                }
+            });
+    }
+
+    fn payroll_reversal_form(&mut self, ui: &mut egui::Ui, company: i64, payment: i64) {
+        if ui.button("Reverse payment").clicked() {
+            self.payroll_screen.reversal = Some(PaymentReversalForm {
+                payment,
+                ..PaymentReversalForm::default()
+            });
+        }
+        let Some(form) = &mut self.payroll_screen.reversal else {
+            return;
+        };
+        if form.payment != payment {
+            return;
+        }
+        egui::Grid::new("salary-reversal-fields").show(ui, |ui| {
+            for (label, field) in [
+                ("Date (YYYY-MM-DD)", &mut form.date),
+                ("Reference", &mut form.reference),
+                ("Reason", &mut form.reason),
+            ] {
+                ui.label(label);
+                ui.text_edit_singleline(field);
+                ui.end_row();
+            }
+        });
+        let mut post = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            post = ui.button("Post reversal").clicked();
+            cancel = ui.button("Cancel").clicked();
+        });
+        if post {
+            match self.store.reverse_payroll_payment(
+                company,
+                payment,
+                &form.date,
+                &form.reference,
+                &form.reason,
+            ) {
+                Ok(voucher) => {
+                    cancel = true;
+                    self.reload_payroll_after_change(
+                        company,
+                        format!("Salary payment reversed with voucher {voucher}"),
+                    );
+                }
+                Err(error) => self.failure(error),
+            }
+        }
+        if cancel {
+            self.payroll_screen.reversal = None;
+        }
+    }
+
+    fn reload_payroll_after_change(&mut self, company: i64, success: String) {
+        let screen = &mut self.payroll_screen;
+        match self.store.payroll_register(
+            company,
+            optional(&screen.register_from),
+            optional(&screen.register_to),
+            screen.register_employee,
+        ) {
+            Ok(entries) => {
+                screen.entries = entries;
+                self.message = success;
+            }
+            Err(error) => {
+                screen.register_loaded = false;
+                self.message = format!("{success}. Could not refresh the register: {error}");
+            }
+        }
     }
 }
 
