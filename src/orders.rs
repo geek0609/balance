@@ -4,6 +4,7 @@ use crate::inventory::{
     InvoiceDraft, InvoiceKind, StockItem,
 };
 use crate::{parse_date, required, Category, Error, Result, Store};
+use chrono::NaiveDate;
 use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 
@@ -130,6 +131,19 @@ impl OrderAvailability {
     pub fn projected(&self) -> i128 {
         self.after_sales() + self.open_purchases
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingOrderLine {
+    pub order_id: i64,
+    pub kind: InvoiceKind,
+    pub reference: String,
+    pub party: String,
+    pub expected_on: Option<NaiveDate>,
+    pub item_id: i64,
+    pub item: String,
+    pub unit: String,
+    pub remaining: i64,
 }
 impl OrderLineProgress {
     pub fn unfulfilled(&self) -> i64 {
@@ -295,6 +309,68 @@ impl Store {
                 }
             })
             .collect())
+    }
+
+    /// Current unfulfilled order lines, optionally limited by expected date.
+    pub fn pending_order_schedule(
+        &self,
+        company: i64,
+        kind: Option<InvoiceKind>,
+        expected_through: Option<&str>,
+    ) -> Result<Vec<PendingOrderLine>> {
+        let through = expected_through.map(parse_date).transpose()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT o.id, o.kind, o.reference, l.name, o.expected_on,
+                    p.item_id, s.name, s.unit, p.quantity, p.fulfilled
+             FROM orders o
+             JOIN order_line_progress p ON p.order_id = o.id
+             JOIN ledgers l ON l.id = o.party_ledger_id AND l.company_id = o.company_id
+             JOIN stock_items s ON s.id = p.item_id AND s.company_id = o.company_id
+             WHERE o.company_id = ?1 AND o.closed_at IS NULL AND p.fulfilled != p.quantity
+               AND (?2 IS NULL OR o.kind = ?2)
+             ORDER BY o.id, p.id",
+        )?;
+        let rows = stmt.query_map(params![company, kind.map(InvoiceKind::as_str)], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })?;
+        let mut schedule = Vec::new();
+        for row in rows {
+            let (order_id, kind, reference, party, date, item_id, item, unit, ordered, fulfilled) =
+                row?;
+            if !(0..=ordered).contains(&fulfilled) {
+                return Err(Error::Validation(
+                    "Order quantities are inconsistent".into(),
+                ));
+            }
+            let expected_on = date.as_deref().map(parse_date).transpose()?;
+            if through.is_some_and(|limit| expected_on.is_none_or(|date| date > limit)) {
+                continue;
+            }
+            schedule.push(PendingOrderLine {
+                order_id,
+                kind: InvoiceKind::parse(&kind)?,
+                reference,
+                party,
+                expected_on,
+                item_id,
+                item,
+                unit,
+                remaining: ordered - fulfilled,
+            });
+        }
+        schedule.sort_by_key(|line| (line.expected_on.is_none(), line.expected_on));
+        Ok(schedule)
     }
 
     pub fn create_order(&mut self, company: i64, draft: &OrderDraft) -> Result<i64> {

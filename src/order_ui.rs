@@ -73,6 +73,8 @@ pub(super) struct OrderScreen {
     search: String,
     selected: Option<i64>,
     close_reason: String,
+    schedule_kind: Option<InvoiceKind>,
+    schedule_through: String,
 }
 
 impl OrderScreen {
@@ -89,6 +91,8 @@ impl App {
             .show(ui, |ui| self.create_order_form(ui, company));
         egui::CollapsingHeader::new("Stock availability")
             .show(ui, |ui| self.order_availability_view(ui, company));
+        egui::CollapsingHeader::new("Pending order schedule")
+            .show(ui, |ui| self.pending_order_schedule_view(ui, company));
         ui.separator();
         if let Some(selected) = self.order_screen.selected {
             match self.store.order_detail(company, selected) {
@@ -174,6 +178,92 @@ impl App {
                 self.order_screen.select(order.id);
             }
         }
+    }
+
+    fn pending_order_schedule_view(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("pending-order-schedule-kind")
+                .selected_text(
+                    self.order_screen
+                        .schedule_kind
+                        .map(InvoiceKind::as_str)
+                        .unwrap_or("All types"),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.order_screen.schedule_kind, None, "All types");
+                    for kind in InvoiceKind::ALL {
+                        ui.selectable_value(
+                            &mut self.order_screen.schedule_kind,
+                            Some(kind),
+                            kind.as_str(),
+                        );
+                    }
+                });
+            ui.label("Expected through");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.order_screen.schedule_through)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
+        });
+        ui.small(
+            "Shows current unfulfilled lines. Clear the date filter to include undated orders.",
+        );
+        self.report_export_path_field(ui);
+        let kind = self.order_screen.schedule_kind;
+        let date = self.order_screen.schedule_through.trim();
+        let through = (!date.is_empty()).then_some(date);
+        let rows = match self.store.pending_order_schedule(company, kind, through) {
+            Ok(rows) => rows,
+            Err(error) => {
+                ui.label(error.to_string());
+                return;
+            }
+        };
+        if ui.button("Export schedule as CSV").clicked() {
+            match self.store.export_pending_order_schedule_csv(
+                company,
+                kind,
+                through,
+                self.report_export_path.trim(),
+            ) {
+                Ok(()) => self.message = "Pending order schedule exported".into(),
+                Err(error) => self.failure(error),
+            }
+        }
+        if rows.is_empty() {
+            ui.label("No pending lines match the filters.");
+            return;
+        }
+        egui::Grid::new("pending-order-schedule")
+            .striped(true)
+            .show(ui, |ui| {
+                for title in ["Expected", "Order", "Party", "Item", "Remaining", ""] {
+                    ui.strong(title);
+                }
+                ui.end_row();
+                for line in rows {
+                    ui.label(
+                        line.expected_on
+                            .map(|date| date.to_string())
+                            .unwrap_or_else(|| "Undated".into()),
+                    );
+                    ui.label(format!("{} {}", line.kind.as_str(), line.reference));
+                    ui.label(line.party);
+                    ui.label(line.item);
+                    ui.label(format!(
+                        "{} {}",
+                        format_quantity(i128::from(line.remaining)),
+                        line.unit
+                    ));
+                    ui.push_id((line.order_id, line.item_id), |ui| {
+                        if ui.button("View order").clicked() {
+                            self.order_screen.select(line.order_id);
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
     }
 
     fn order_availability_view(&mut self, ui: &mut egui::Ui, company: i64) {

@@ -1169,6 +1169,63 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_pending_order_schedule_csv(
+        &self,
+        company: i64,
+        kind: Option<InvoiceKind>,
+        expected_through: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let context = [
+            self.report_company_name(company)?,
+            kind.map(InvoiceKind::as_str).unwrap_or("all").into(),
+            optional_date(expected_through)?,
+        ];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "kind_filter", "expected_through"]),
+            &strings(&[
+                "row_type",
+                "order_id",
+                "kind",
+                "reference",
+                "party",
+                "expected_on",
+                "item_id",
+                "item",
+                "unit",
+                "remaining",
+            ]),
+        )?;
+        contextual_row(
+            &mut csv,
+            &context,
+            &strings(&["context", "", "", "", "", "", "", "", "", ""]),
+        )?;
+        for line in self.pending_order_schedule(company, kind, expected_through)? {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "order_line".into(),
+                    line.order_id.to_string(),
+                    line.kind.as_str().into(),
+                    text_cell(&line.reference),
+                    text_cell(&line.party),
+                    line.expected_on
+                        .map(|date| date.to_string())
+                        .unwrap_or_default(),
+                    line.item_id.to_string(),
+                    text_cell(&line.item),
+                    text_cell(&line.unit),
+                    format_quantity(i128::from(line.remaining)),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
     /// Export direct or rolled-up quantities for a selected location.
     pub fn export_stock_location_csv(
         &self,
