@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod banking;
 pub mod company;
 pub mod contacts;
+pub mod costs;
 pub mod documents;
 pub mod exchange;
 pub mod grouped_reports;
@@ -26,7 +27,7 @@ pub mod reversals;
 pub mod stock_counts;
 pub mod terms;
 
-const SCHEMA_VERSION: i64 = 37;
+const SCHEMA_VERSION: i64 = 38;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -397,6 +398,10 @@ impl Store {
             "stock_count_lines",
             "invoice_reversals",
             "invoice_reversal_stock",
+            "cost_centres",
+            "cost_allocations",
+            "cost_allocation_changes",
+            "cost_allocation_change_lines",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -683,6 +688,10 @@ impl Store {
             periods::normalize_voucher_dates(&tx)?;
             tx.pragma_update(None, "user_version", 37)?;
         }
+        if version < 38 {
+            costs::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 38)?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
@@ -944,6 +953,7 @@ impl Store {
                 "Linked postings cannot be edited from the voucher screen".into(),
             ));
         }
+        costs::ensure_unallocated(&tx, voucher_id)?;
         banking::ensure_no_bank_clearance(&tx, company_id, voucher_id)?;
         let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
         if saved != 1 {

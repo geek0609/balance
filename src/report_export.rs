@@ -87,6 +87,82 @@ impl Store {
             .ok_or_else(|| Error::Validation("Company not found".into()))
     }
 
+    pub fn export_cost_report_csv(
+        &self,
+        company: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.cost_report(company, start, end)?;
+        let context = vec![
+            self.report_company_name(company)?,
+            optional_date(start)?,
+            optional_date(end)?,
+        ];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "period_start", "period_end"]),
+            &strings(&[
+                "row_type",
+                "centre_id",
+                "parent_id",
+                "centre_path",
+                "direct_income",
+                "direct_expenses",
+                "direct_net",
+                "income_with_children",
+                "expenses_with_children",
+                "net_with_children",
+            ]),
+        )?;
+        for entry in report.rows {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "centre".into(),
+                    entry.centre.id.to_string(),
+                    entry
+                        .centre
+                        .parent_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    text_cell(&entry.path),
+                    money(entry.direct.income),
+                    money(entry.direct.expenses),
+                    money(entry.direct.net()),
+                    money(entry.including_children.income),
+                    money(entry.including_children.expenses),
+                    money(entry.including_children.net()),
+                ],
+            )?;
+        }
+        for (label, totals) in [
+            ("unallocated", report.unallocated),
+            ("company_total", report.total),
+        ] {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    label.into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    money(totals.income),
+                    money(totals.expenses),
+                    money(totals.net()),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
     pub fn export_day_book_csv(
         &self,
         company: i64,

@@ -15,8 +15,10 @@ use balance::terms::LedgerTerms;
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
 
+mod cost_ui;
 mod order_ui;
 mod stock_count_ui;
+use cost_ui::CostScreen;
 use order_ui::OrderScreen;
 use stock_count_ui::StockCountScreen;
 
@@ -37,6 +39,7 @@ enum Page {
     Outstanding,
     Bank,
     Reports,
+    CostCentres,
 }
 struct App {
     store: Store,
@@ -184,6 +187,7 @@ struct App {
     invoice_order: Option<i64>,
     order_screen: OrderScreen,
     stock_count_screen: StockCountScreen,
+    cost_screen: CostScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -422,6 +426,7 @@ impl App {
             invoice_order: None,
             order_screen: OrderScreen::default(),
             stock_count_screen: StockCountScreen::default(),
+            cost_screen: CostScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -536,6 +541,7 @@ impl App {
         self.invoice_order = None;
         self.order_screen = OrderScreen::default();
         self.stock_count_screen = StockCountScreen::default();
+        self.cost_screen = CostScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -579,6 +585,7 @@ impl App {
             || self.editing_ledger.is_some()
             || self.invoice_draft_in_use()
             || self.stock_count_screen.preview_pending()
+            || self.cost_screen.has_pending_changes()
             || self.stock_editing.is_some();
         let profile_dirty = profile_dirty || self.reorder_editing.is_some();
         if profile_dirty {
@@ -5192,6 +5199,7 @@ impl eframe::App for App {
                 ("Import XML", Page::Import),
                 ("Back up", Page::Backup),
                 ("Reports", Page::Reports),
+                ("Cost centres", Page::CostCentres),
             ] {
                 if ui.selectable_label(self.page == page, label).clicked() {
                     self.page = page;
@@ -5233,6 +5241,7 @@ impl eframe::App for App {
                     Page::Import => self.import_page(ui, company),
                     Page::Backup => {}
                     Page::Reports => self.reports_page(ui, company),
+                    Page::CostCentres => self.cost_page(ui, company),
                 }
             });
         });

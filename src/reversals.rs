@@ -58,12 +58,7 @@ impl Store {
         let reversed = counter_postings(&tx, company, original, &date)?;
         tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, VoucherKind::Journal.as_str(), reference, date, format!("Reversal of voucher {original}: {reason}")])?;
         let reversal = tx.last_insert_rowid();
-        for posting in reversed {
-            tx.execute(
-                "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-                params![reversal, posting.ledger_id, posting.amount],
-            )?;
-        }
+        write_counter_postings(&tx, company, original, reversal, &reversed)?;
         tx.execute("INSERT INTO voucher_reversals(company_id, original_voucher_id, reversal_voucher_id, reason) VALUES (?1, ?2, ?3, ?4)", params![company, original, reversal, reason])?;
         tx.commit()?;
         Ok(reversal)
@@ -103,4 +98,30 @@ pub(crate) fn counter_postings(
     check_ledgers(conn, company, &reversed)?;
     crate::opening::check_no_control_postings(conn, company, &reversed)?;
     Ok(reversed)
+}
+
+pub(crate) fn write_counter_postings(
+    conn: &Connection,
+    company: i64,
+    original: i64,
+    reversal: i64,
+    counters: &[Posting],
+) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
+    let ids = stmt
+        .query_map([original], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if ids.len() != counters.len() {
+        return Err(Error::Validation(
+            "Original postings changed during reversal".into(),
+        ));
+    }
+    for (&source_id, posting) in ids.iter().zip(counters) {
+        conn.execute(
+            "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
+            params![reversal, posting.ledger_id, posting.amount],
+        )?;
+        crate::costs::copy_reversal_allocation(conn, company, source_id, conn.last_insert_rowid())?;
+    }
+    Ok(())
 }

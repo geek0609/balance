@@ -132,12 +132,7 @@ impl Store {
             params![company, voucher_kind.as_str(), reference, date, note_reason],
         )?;
         let voucher = tx.last_insert_rowid();
-        for posting in postings {
-            tx.execute(
-                "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-                params![voucher, posting.ledger_id, posting.amount],
-            )?;
-        }
+        crate::reversals::write_counter_postings(&tx, company, original, voucher, &postings)?;
         tx.execute(
             "INSERT INTO invoice_reversals(invoice_id, company_id, reversal_voucher_id, reason) VALUES (?1, ?2, ?3, ?4)",
             params![invoice, company, voucher, reason],
