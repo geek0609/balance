@@ -9,6 +9,7 @@ use balance::stock_notes::note_label;
 use balance::stock_reservations::StockReservationDraft;
 use balance::{format_amount, parse_amount, Category, Error, Result};
 use eframe::egui;
+use std::collections::HashSet;
 
 #[derive(Default)]
 struct LineForm {
@@ -18,6 +19,10 @@ struct LineForm {
 }
 
 impl LineForm {
+    fn has_content(&self) -> bool {
+        self.item.is_some() || !self.quantity.trim().is_empty() || !self.price.trim().is_empty()
+    }
+
     fn draft(&self) -> Result<OrderLine> {
         Ok(OrderLine {
             item_id: self
@@ -86,6 +91,20 @@ impl Default for CreateOrderForm {
 }
 
 impl CreateOrderForm {
+    fn has_content(&self) -> bool {
+        self.party.is_some()
+            || [
+                &self.reference,
+                &self.date,
+                &self.expected_on,
+                &self.valid_through,
+                &self.notes,
+            ]
+            .iter()
+            .any(|field| !field.trim().is_empty())
+            || self.lines.iter().any(LineForm::has_content)
+    }
+
     fn draft(&self) -> Result<OrderDraft> {
         let party_ledger_id = self
             .party
@@ -220,6 +239,7 @@ pub(super) struct OrderScreen {
     reservation: StockReservationForm,
     stock_release: StockReleaseForm,
     allocation: StockAllocationForm,
+    replenishment_items: HashSet<i64>,
     document_path: String,
     schedule_kind: Option<InvoiceKind>,
     schedule_through: String,
@@ -250,7 +270,18 @@ impl App {
             return;
         }
         crate::theme::section(ui, "Sales and purchase orders");
+        let prepared = egui::CollapsingHeader::new("Replenishment planning")
+            .show(ui, |ui| match self.replenishment_view(ui, company) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.failure(error);
+                    false
+                }
+            })
+            .body_returned
+            .unwrap_or(false);
         egui::CollapsingHeader::new("Create order or quotation")
+            .open(prepared.then_some(true))
             .show(ui, |ui| self.create_order_form(ui, company));
         egui::CollapsingHeader::new("Quotations").show(ui, |ui| {
             if let Err(error) = self.quotation_register(ui, company) {
@@ -498,6 +529,106 @@ impl App {
                     ui.end_row();
                 }
             });
+    }
+
+    fn replenishment_view(&mut self, ui: &mut egui::Ui, company: i64) -> Result<bool> {
+        ui.small("Projected stock uses all saved dates. Suggestions use whole reorder lots.");
+        self.report_export_path_field(ui);
+        if ui.button("Export replenishment CSV").clicked() {
+            self.store
+                .export_replenishment_csv(company, self.report_export_path.trim())?;
+            self.message = "Replenishment suggestions exported".into();
+        }
+        let suggestions = self.store.replenishment_suggestions(company)?;
+        let selected = &mut self.order_screen.replenishment_items;
+        selected.retain(|item| suggestions.iter().any(|row| row.stock.item.id == *item));
+        if suggestions.is_empty() {
+            ui.label("No items have reached their projected reorder level.");
+            return Ok(false);
+        }
+        egui::Grid::new("replenishment-planning")
+            .striped(true)
+            .show(ui, |ui| {
+                for label in [
+                    "Item",
+                    "On hand",
+                    "Open sales",
+                    "Open purchases",
+                    "Projected",
+                    "Reorder level",
+                    "Suggested",
+                ] {
+                    ui.strong(label);
+                }
+                ui.end_row();
+                for row in &suggestions {
+                    let item = &row.stock.item;
+                    let mut checked = selected.contains(&item.id);
+                    if ui
+                        .checkbox(&mut checked, format!("{} ({})", item.name, item.unit))
+                        .changed()
+                    {
+                        if checked {
+                            selected.insert(item.id);
+                        } else {
+                            selected.remove(&item.id);
+                        }
+                    }
+                    for quantity in [
+                        row.stock.on_hand,
+                        row.stock.open_sales,
+                        row.stock.open_purchases,
+                        row.stock.projected(),
+                        i128::from(row.rule.level),
+                        row.suggested_quantity,
+                    ] {
+                        ui.label(format_quantity(quantity));
+                    }
+                    ui.end_row();
+                }
+            });
+        let form = &mut self.order_screen.form;
+        let can_prepare =
+            !form.quotation && (form.kind == InvoiceKind::Purchase || !form.has_content());
+        let additions: Vec<_> = suggestions
+            .iter()
+            .filter(|row| {
+                selected.contains(&row.stock.item.id)
+                    && !form
+                        .lines
+                        .iter()
+                        .any(|line| line.item == Some(row.stock.item.id))
+            })
+            .map(|row| LineForm {
+                item: Some(row.stock.item.id),
+                quantity: format_quantity(row.suggested_quantity),
+                price: String::new(),
+            })
+            .collect();
+        let prepare = ui.add_enabled(
+            can_prepare && !additions.is_empty(),
+            egui::Button::new("Add to purchase order draft"),
+        );
+        let prepare = if can_prepare {
+            prepare
+        } else {
+            prepare.on_disabled_hover_text(
+                "Save or clear the current sales order or quotation draft first.",
+            )
+        };
+        if prepare.clicked() {
+            form.kind = InvoiceKind::Purchase;
+            form.lines.retain(LineForm::has_content);
+            for line in &additions {
+                if let Some(item) = line.item {
+                    selected.remove(&item);
+                }
+            }
+            form.lines.extend(additions);
+            self.message = "Replenishment lines added to the purchase order draft".into();
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn create_order_form(&mut self, ui: &mut egui::Ui, company: i64) {

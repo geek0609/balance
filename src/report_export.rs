@@ -1174,6 +1174,58 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_replenishment_csv(
+        &self,
+        company: i64,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let context = [self.report_company_name(company)?, "all saved dates".into()];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "date_scope"]),
+            &strings(&[
+                "row_type",
+                "item_id",
+                "item",
+                "unit",
+                "on_hand",
+                "open_sales",
+                "open_purchases",
+                "projected",
+                "reorder_level",
+                "reorder_lot",
+                "suggested_quantity",
+            ]),
+        )?;
+        contextual_row(
+            &mut csv,
+            &context,
+            &strings(&["context", "", "", "", "", "", "", "", "", "", ""]),
+        )?;
+        for row in self.replenishment_suggestions(company)? {
+            let stock = row.stock;
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "suggestion".into(),
+                    stock.item.id.to_string(),
+                    text_cell(&stock.item.name),
+                    text_cell(&stock.item.unit),
+                    format_quantity(stock.on_hand),
+                    format_quantity(stock.open_sales),
+                    format_quantity(stock.open_purchases),
+                    format_quantity(stock.projected()),
+                    format_quantity(row.rule.level.into()),
+                    format_quantity(row.rule.quantity.into()),
+                    format_quantity(row.suggested_quantity),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
     pub fn export_order_availability_csv(
         &self,
         company: i64,

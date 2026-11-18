@@ -599,12 +599,21 @@ impl Store {
     /// Stock quantities and open order remainders across all saved dates.
     pub fn order_availability(&self, company: i64) -> Result<Vec<OrderAvailability>> {
         let snapshot = self.conn.unchecked_transaction()?;
+        let rows = self.order_availability_in_snapshot(company)?;
+        snapshot.commit()?;
+        Ok(rows)
+    }
+
+    pub(crate) fn order_availability_in_snapshot(
+        &self,
+        company: i64,
+    ) -> Result<Vec<OrderAvailability>> {
         let balances = self.stock_balances(company, None)?;
-        let reserved = crate::stock_reservations::reserved_by_item(&snapshot, company)?;
-        let in_transit = crate::stock_transit::in_transit_by_item(&snapshot, company)?;
+        let reserved = crate::stock_reservations::reserved_by_item(&self.conn, company)?;
+        let in_transit = crate::stock_transit::in_transit_by_item(&self.conn, company)?;
         let mut commitments = HashMap::<i64, (i128, i128)>::new();
         {
-            let mut stmt = snapshot.prepare(
+            let mut stmt = self.conn.prepare(
                 "SELECT p.item_id, o.kind, p.quantity, p.fulfilled, p.preclosed
                  FROM orders o JOIN order_line_availability p ON p.order_id = o.id
                  WHERE o.company_id = ?1 AND o.closed_at IS NULL",
@@ -628,7 +637,6 @@ impl Store {
                 }
             }
         }
-        snapshot.commit()?;
         Ok(balances
             .into_iter()
             .map(|balance| {
