@@ -1,7 +1,8 @@
-//! Printable invoice and payroll records.
+//! Printable invoice, quotation and payroll records.
 use crate::{
     format_amount,
-    inventory::{format_quantity, InvoiceDiscount},
+    inventory::{format_quantity, line_amount, InvoiceDiscount},
+    quotations::quotation,
     Error, Result, Store,
 };
 use std::{fmt::Write as _, io::Write as _, path::Path};
@@ -61,6 +62,76 @@ fn write_html(destination: &Path, html: &str) -> Result<()> {
 }
 
 impl Store {
+    pub fn export_quotation_html(
+        &self,
+        company_id: i64,
+        quote_id: i64,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let destination = html_destination(destination.as_ref())?;
+        let company = self
+            .companies()?
+            .into_iter()
+            .find(|company| company.id == company_id)
+            .ok_or_else(|| Error::Validation("Company not found".into()))?;
+        let quote = quotation(&self.conn, company_id, quote_id)?;
+        let lines = self.quotation_lines(company_id, quote_id)?;
+        let items = self.stock_items(company_id)?;
+        let title = format!("{} quotation {}", quote.kind.as_str(), quote.reference);
+        let mut html = printable_html(&title);
+        let _ = write!(
+            html,
+            "<h1>{}</h1><p><strong>{}</strong><br>Party: {}<br>Date: {}<br>Status: {}",
+            escape(&title),
+            escape(&company.name),
+            escape(&quote.party),
+            escape(&quote.date),
+            quote.status(),
+        );
+        if let Some(date) = &quote.valid_through {
+            let _ = write!(html, "<br>Valid through: {}", escape(date));
+        }
+        if let Some(date) = &quote.expected_on {
+            let _ = write!(html, "<br>Expected delivery: {}", escape(date));
+        }
+        if let Some(currency) = self.company_base_currency(company_id)? {
+            let _ = write!(html, "<br>Currency: {}", escape(&currency));
+        }
+        html.push_str("</p><table><thead><tr><th>Item</th><th class=\"num\">Quantity</th><th class=\"num\">Unit price</th><th class=\"num\">Amount</th></tr></thead><tbody>");
+        let mut subtotal = 0_i128;
+        for line in lines {
+            let item = items
+                .iter()
+                .find(|item| item.id == line.item_id)
+                .ok_or_else(|| Error::Validation("A quoted item is unavailable".into()))?;
+            let amount = line_amount(line.quantity, line.unit_price)?;
+            subtotal += i128::from(amount);
+            let _ = write!(
+                html,
+                "<tr><td>{}</td><td class=\"num\">{} {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+                escape(&item.name),
+                format_quantity(i128::from(line.quantity)),
+                escape(&item.unit),
+                format_amount(line.unit_price),
+                format_amount(amount),
+            );
+        }
+        let _ = write!(
+            html,
+            "</tbody></table><table class=\"totals\"><tr class=\"total\"><td>Quoted subtotal</td><td class=\"num\">{}</td></tr></table>",
+            money(subtotal),
+        );
+        if !quote.notes.is_empty() {
+            let _ = write!(
+                html,
+                "<p><strong>Notes</strong><br>{}</p>",
+                escape(&quote.notes)
+            );
+        }
+        html.push_str("</body></html>");
+        write_html(destination, &html)
+    }
+
     /// Export the current invoice and party details to a new, printable HTML file.
     /// No tax compliance, historical master snapshot, or payment status is implied.
     pub fn export_invoice_html(

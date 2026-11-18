@@ -115,6 +115,13 @@ fn quotation_lines(conn: &Connection, company: i64, quote: i64) -> Result<Vec<Or
     Ok(rows)
 }
 
+pub(crate) fn quotation(conn: &Connection, company: i64, id: i64) -> Result<Quotation> {
+    quotations(conn, company, Some(id))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Validation("Quotation not found in the selected company".into()))
+}
+
 impl Store {
     pub fn create_quotation(
         &mut self,
@@ -203,7 +210,7 @@ impl Store {
     pub fn convert_quotation(
         &mut self,
         company: i64,
-        quotation: i64,
+        quote_id: i64,
         order_reference: &str,
         order_date: &str,
         expected_on: Option<&str>,
@@ -212,11 +219,10 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let quote = quotations(&tx, company, Some(quotation))?
-            .into_iter()
-            .next()
-            .filter(|quote| quote.closed_at.is_none() && quote.order_id.is_none())
-            .ok_or_else(|| Error::Validation("Select an open quotation".into()))?;
+        let quote = quotation(&tx, company, quote_id)?;
+        if quote.closed_at.is_some() || quote.order_id.is_some() {
+            return Err(Error::Validation("Select an open quotation".into()));
+        }
         if date < parse_date(&quote.date)? {
             return Err(Error::Validation(
                 "The order date must be on or after the quotation date".into(),
@@ -236,13 +242,13 @@ impl Store {
             date: date.to_string(),
             expected_on: expected_on.map(str::to_owned),
             notes: quote.notes,
-            lines: quotation_lines(&tx, company, quotation)?,
+            lines: quotation_lines(&tx, company, quote_id)?,
         };
         let order = insert_order(&tx, company, &draft)?;
         tx.execute(
             "UPDATE quotations SET order_id = ?1, converted_at = CURRENT_TIMESTAMP
              WHERE company_id = ?2 AND id = ?3",
-            params![order, company, quotation],
+            params![order, company, quote_id],
         )?;
         tx.commit()?;
         Ok(order)

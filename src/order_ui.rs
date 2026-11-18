@@ -76,6 +76,7 @@ struct QuotationForm {
     order_date: String,
     expected_on: String,
     close_reason: String,
+    document_path: String,
 }
 
 #[derive(Default)]
@@ -537,6 +538,18 @@ impl App {
                     ui.end_row();
                 }
             });
+        ui.horizontal(|ui| {
+            ui.label("Document path");
+            ui.add(
+                egui::TextEdit::singleline(&mut form.document_path)
+                    .hint_text("Absolute path to a new .html file"),
+            );
+        });
+        if ui.button("Export quotation for printing").clicked() {
+            self.store
+                .export_quotation_html(company, quote.id, form.document_path.trim())?;
+            self.message = "Quotation document exported".into();
+        }
         if let Some(order) = quote.order_id {
             if let Some(converted) = &quote.converted_at {
                 ui.label(format!("Converted {converted} UTC"));
