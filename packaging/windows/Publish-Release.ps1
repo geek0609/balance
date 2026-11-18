@@ -51,6 +51,17 @@ function Get-Release {
     gh api "repos/$repo/releases?per_page=100" --paginate --jq $filter | ConvertFrom-Json
 }
 
+function Wait-Release([scriptblock]$Ready) {
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        $candidate = Get-Release
+        if ($candidate -and (& $Ready $candidate)) {
+            return $candidate
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw "GitHub has not confirmed the release state. Retry with the same build directory."
+}
+
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 Push-Location -LiteralPath $root
 try {
@@ -84,7 +95,7 @@ try {
         $create = @($tag, '--repo', $repo, '--draft', '--target', $metadata.commit, '--title', "Balance $($metadata.version)", '--notes-file', $NotesFile)
         if ($prerelease) { $create += '--prerelease' }
         gh release create @create
-        $release = Get-Release
+        $release = Wait-Release { param($candidate) $candidate.draft }
     }
     if (-not $release -or $release.prerelease -ne $prerelease) {
         throw 'GitHub returned an unexpected release.'
@@ -102,7 +113,10 @@ try {
         $asset = $release.assets | Where-Object name -ceq $filename
         if (-not $asset -and $release.draft) {
             gh release upload $tag $file --repo $repo
-            $release = Get-Release
+            $release = Wait-Release {
+                param($candidate)
+                $candidate.assets | Where-Object { $_.name -ceq $filename -and $_.state -ceq 'uploaded' -and $_.digest }
+            }
             $asset = $release.assets | Where-Object name -ceq $filename
         }
         $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -114,10 +128,7 @@ try {
     if ($release.draft) {
         gh release edit $tag --repo $repo --draft=false
     }
-    $release = Get-Release
-    if (-not $release.published_at -or $release.draft) {
-        throw 'The release must be public before updating the feed.'
-    }
+    $release = Wait-Release { param($candidate) $candidate.published_at -and -not $candidate.draft }
     $publishedRefs = @(git ls-remote $remote "refs/tags/$tag" "refs/tags/$tag^{}")
     if (-not $publishedRefs -or ($publishedRefs[-1] -split '\s+')[0] -cne $metadata.commit) {
         throw 'The public release tag points to a different source revision.'
