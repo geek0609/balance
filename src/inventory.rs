@@ -46,6 +46,7 @@ pub struct StockGroup {
 pub struct StockLocation {
     pub id: i64,
     pub name: String,
+    pub parent_id: Option<i64>,
 }
 #[derive(Debug, Clone)]
 pub struct StockBatch {
@@ -1307,33 +1308,54 @@ impl Store {
         stock_bucket_quantity(&self.conn, company, item, Some(batch), location, end)
     }
     pub fn stock_locations(&self, company_id: i64) -> Result<Vec<StockLocation>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, name FROM stock_locations WHERE company_id = ?1 ORDER BY name")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, parent_id FROM stock_locations WHERE company_id = ?1 ORDER BY name",
+        )?;
         let rows = stmt
             .query_map([company_id], |r| {
                 Ok(StockLocation {
                     id: r.get(0)?,
                     name: r.get(1)?,
+                    parent_id: r.get(2)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
     pub fn create_stock_location(&self, company_id: i64, name: &str) -> Result<i64> {
+        self.create_stock_location_under(company_id, name, None)
+    }
+
+    pub fn create_stock_location_under(
+        &self,
+        company_id: i64,
+        name: &str,
+        parent_id: Option<i64>,
+    ) -> Result<i64> {
         let name = required(name, "Stock location name")?;
-        if self
-            .stock_locations(company_id)?
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let locations = self.stock_locations(company_id)?;
+        if locations
             .iter()
             .any(|l| l.name.trim().to_lowercase() == name.to_lowercase())
         {
             return Err(Error::Validation("Stock location already exists".into()));
         }
-        self.conn.execute(
-            "INSERT INTO stock_locations(company_id, name) VALUES (?1, ?2)",
-            params![company_id, name],
+        if parent_id.is_some_and(|id| !locations.iter().any(|location| location.id == id)) {
+            return Err(Error::Validation(
+                "The parent location must belong to the selected company".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO stock_locations(company_id, name, parent_id) VALUES (?1, ?2, ?3)",
+            params![company_id, name, parent_id],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
     }
     pub fn transfer_stock(
         &self,

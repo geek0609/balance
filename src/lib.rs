@@ -39,7 +39,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 52;
+const SCHEMA_VERSION: i64 = 53;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -790,6 +790,12 @@ impl Store {
         if version < 52 {
             cash_flow::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 52)?;
+        }
+        if version < 53 {
+            tx.execute_batch(
+                "ALTER TABLE stock_locations ADD COLUMN parent_id INTEGER REFERENCES stock_locations(id)",
+            )?;
+            tx.pragma_update(None, "user_version", 53)?;
         }
         tx.commit()?;
         Ok(Self { conn })

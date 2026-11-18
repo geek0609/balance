@@ -164,6 +164,7 @@ struct App {
     stock_group_name: String,
     stock_group_parent: Option<i64>,
     stock_location_name: String,
+    stock_location_parent: Option<i64>,
     batch_item: Option<i64>,
     batch_name: String,
     batch_manufactured: String,
@@ -423,6 +424,7 @@ impl App {
             stock_group_name: String::new(),
             stock_group_parent: None,
             stock_location_name: String::new(),
+            stock_location_parent: None,
             batch_item: None,
             batch_name: String::new(),
             batch_manufactured: String::new(),
@@ -569,6 +571,7 @@ impl App {
         self.stock_edit_group = None;
         self.stock_edit_description.clear();
         self.stock_group_parent = None;
+        self.stock_location_parent = None;
         self.stock_balance_location = None;
         self.reorder_selection = None;
         self.reorder_editing = None;
@@ -2122,11 +2125,30 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Name");
             ui.text_edit_singleline(&mut self.stock_location_name);
+            ui.label("Parent");
+            let parent = locations
+                .iter()
+                .find(|location| Some(location.id) == self.stock_location_parent)
+                .map(|location| location.name.as_str())
+                .unwrap_or("Top level");
+            egui::ComboBox::from_id_salt("stock-location-parent")
+                .selected_text(parent)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.stock_location_parent, None, "Top level");
+                    for location in &locations {
+                        ui.selectable_value(
+                            &mut self.stock_location_parent,
+                            Some(location.id),
+                            &location.name,
+                        );
+                    }
+                });
             if ui.button("Create location").clicked() {
-                match self
-                    .store
-                    .create_stock_location(company, &self.stock_location_name)
-                {
+                match self.store.create_stock_location_under(
+                    company,
+                    &self.stock_location_name,
+                    self.stock_location_parent,
+                ) {
                     Ok(id) => {
                         self.stock_location_name.clear();
                         self.transfer_to = Some(id);
@@ -2134,6 +2156,19 @@ impl App {
                     }
                     Err(e) => self.failure(e),
                 }
+            }
+        });
+        ui.collapsing("Location list", |ui| {
+            for location in &locations {
+                let parent = locations
+                    .iter()
+                    .find(|parent| Some(parent.id) == location.parent_id);
+                ui.horizontal(|ui| {
+                    ui.label(&location.name);
+                    if let Some(parent) = parent {
+                        ui.small(format!("in {}", parent.name));
+                    }
+                });
             }
         });
         ui.separator();
@@ -4200,7 +4235,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, flat stock locations, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. Invoices require one matching new bill reference and one accounting allocation per item; additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, nested locations, mixed bill allocations, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. Invoices require one matching new bill reference and one accounting allocation per item; additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed bill allocations, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Bank clearance");

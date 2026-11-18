@@ -54,6 +54,7 @@ struct StockGroupImport {
 #[derive(Debug, Clone)]
 struct StockLocationImport {
     name: String,
+    parent: Option<String>,
     metadata: SourceMetadata,
 }
 #[derive(Debug, Clone)]
@@ -2250,6 +2251,7 @@ impl Store {
             }
         }
         let mut input_locations = HashSet::new();
+        let mut pending_locations = Vec::new();
         for node in doc.descendants().filter(|n| {
             n.is_element()
                 && local_name(*n).eq_ignore_ascii_case("GODOWN")
@@ -2274,14 +2276,13 @@ impl Store {
                 plan.issues.push(format!("{label}: duplicate name"));
                 continue;
             }
-            let parent = direct_text(node, "PARENT").unwrap_or_default();
-            if normalized(&name) == "primary"
-                || (!parent.is_empty() && normalized(&parent) != "primary")
-            {
-                plan.issues.push(format!(
-                    "{label}: nested or root location records are not supported"
-                ));
+            if normalized(&name) == "primary" {
+                plan.issues
+                    .push(format!("{label}: the root location is implicit"));
+                continue;
             }
+            let parent = direct_text(node, "PARENT")
+                .filter(|name| !name.is_empty() && normalized(name) != "primary");
             let metadata = source_metadata(node, &label, &mut plan.issues);
             register_metadata(
                 "stocklocation",
@@ -2290,14 +2291,55 @@ impl Store {
                 &mut seen_metadata,
                 &mut plan.issues,
             );
-            if let Some(id) = known_locations.get(&normalized(&name)).copied().flatten() {
+            if let Some(existing) = existing_locations
+                .iter()
+                .find(|location| normalized(&location.name) == normalized(&name))
+            {
+                let actual_parent = existing
+                    .parent_id
+                    .and_then(|id| existing_locations.iter().find(|location| location.id == id))
+                    .map(|location| normalized(&location.name));
+                if actual_parent != parent.as_deref().map(normalized) {
+                    plan.issues
+                        .push(format!("{label}: existing parent differs"));
+                }
                 if !metadata.is_empty() {
-                    plan.existing_location_metadata.push((id, metadata));
+                    plan.existing_location_metadata
+                        .push((existing.id, metadata));
                 }
             } else {
-                known_locations.insert(normalized(&name), None);
-                plan.locations.push(StockLocationImport { name, metadata });
+                pending_locations.push(StockLocationImport {
+                    name,
+                    parent,
+                    metadata,
+                });
             }
+        }
+        while !pending_locations.is_empty() {
+            let mut unresolved = Vec::new();
+            let prior_count = plan.locations.len();
+            for location in pending_locations {
+                if location
+                    .parent
+                    .as_deref()
+                    .is_some_and(|parent| !known_locations.contains_key(&normalized(parent)))
+                {
+                    unresolved.push(location);
+                } else {
+                    known_locations.insert(normalized(&location.name), None);
+                    plan.locations.push(location);
+                }
+            }
+            if plan.locations.len() == prior_count {
+                for location in unresolved {
+                    plan.issues.push(format!(
+                        "Stock location {}: parent is missing or cyclic",
+                        location.name
+                    ));
+                }
+                break;
+            }
+            pending_locations = unresolved;
         }
         let mut known_items = HashSet::<String>::new();
         for item in self.stock_items(company_id)? {
@@ -3164,9 +3206,20 @@ impl Store {
                     location.name
                 )));
             }
+            let parent_id = match location.parent.as_deref() {
+                Some(parent) => Some(
+                    find_stock_location(&tx, plan.company_id, parent)?.ok_or_else(|| {
+                        Error::Validation(format!(
+                            "Stock location {}: parent {parent} is unavailable",
+                            location.name
+                        ))
+                    })?,
+                ),
+                None => None,
+            };
             tx.execute(
-                "INSERT INTO stock_locations(company_id, name) VALUES (?1, ?2)",
-                params![plan.company_id, location.name],
+                "INSERT INTO stock_locations(company_id, name, parent_id) VALUES (?1, ?2, ?3)",
+                params![plan.company_id, location.name, parent_id],
             )?;
             save_metadata(
                 &tx,
