@@ -26,6 +26,7 @@ mod currency_ui;
 mod manufacturing_ui;
 mod order_ui;
 mod payroll_ui;
+mod recurring_ui;
 mod stock_count_ui;
 mod tax_ui;
 mod valuation_ui;
@@ -38,6 +39,7 @@ use currency_ui::CurrencyScreen;
 use manufacturing_ui::ManufacturingScreen;
 use order_ui::OrderScreen;
 use payroll_ui::PayrollScreen;
+use recurring_ui::RecurringJournalScreen;
 use stock_count_ui::StockCountScreen;
 use tax_ui::{TaxProfileScreen, TaxRegisterScreen};
 use valuation_ui::ValuationScreen;
@@ -68,6 +70,7 @@ enum Page {
     Payroll,
     Currencies,
     CashFlow,
+    Recurring,
 }
 struct App {
     store: Store,
@@ -227,6 +230,7 @@ struct App {
     advance_screen: AdvanceScreen,
     manufacturing_screen: ManufacturingScreen,
     budget_screen: BudgetScreen,
+    recurring_journals: RecurringJournalScreen,
     tax_register_screen: TaxRegisterScreen,
     tax_profile_screen: TaxProfileScreen,
     payroll_screen: PayrollScreen,
@@ -487,6 +491,7 @@ impl App {
             advance_screen: AdvanceScreen::default(),
             manufacturing_screen: ManufacturingScreen::default(),
             budget_screen: BudgetScreen::default(),
+            recurring_journals: RecurringJournalScreen::default(),
             tax_register_screen: TaxRegisterScreen::default(),
             tax_profile_screen: TaxProfileScreen::default(),
             payroll_screen: PayrollScreen::default(),
@@ -613,6 +618,7 @@ impl App {
         self.advance_screen = AdvanceScreen::default();
         self.manufacturing_screen = ManufacturingScreen::default();
         self.budget_screen = BudgetScreen::default();
+        self.recurring_journals = RecurringJournalScreen::default();
         self.tax_register_screen = TaxRegisterScreen::default();
         self.tax_profile_screen = TaxProfileScreen::default();
         self.payroll_screen = PayrollScreen::default();
@@ -1525,7 +1531,16 @@ impl App {
             self.clear_voucher();
             self.message.clear();
         }
-        if submit {
+        let save_schedule = if self.editing_voucher.is_none()
+            && self.voucher_kind == VoucherKind::Journal
+        {
+            ui.button("Save as monthly schedule")
+                    .on_hover_text("The date becomes the first occurrence and the reference becomes the schedule name.")
+                    .clicked()
+        } else {
+            false
+        };
+        if submit || save_schedule {
             let result = (|| -> balance::Result<i64> {
                 let mut postings = Vec::with_capacity(self.lines.len());
                 for line in &self.lines {
@@ -1543,7 +1558,15 @@ impl App {
                         amount: if line.debit { amount } else { -amount },
                     });
                 }
-                if let Some(id) = self.editing_voucher {
+                if save_schedule {
+                    self.store.create_monthly_journal(
+                        company,
+                        &self.voucher_reference,
+                        &self.date,
+                        &self.narration,
+                        &postings,
+                    )
+                } else if let Some(id) = self.editing_voucher {
                     self.store.update_voucher_with_reference(
                         company,
                         id,
@@ -1566,6 +1589,11 @@ impl App {
                 }
             })();
             match result {
+                Ok(id) if save_schedule => {
+                    self.clear_voucher();
+                    self.open_recurring_journal(id);
+                    self.message = "Monthly schedule saved".into();
+                }
                 Ok(id) => {
                     self.message = format!("Voucher {id} saved");
                     self.clear_voucher();
@@ -1637,6 +1665,10 @@ impl App {
                         .store
                         .is_foreign_voucher(company, voucher.id)
                         .unwrap_or(true);
+                    let recurring = self
+                        .store
+                        .is_monthly_journal_voucher(company, voucher.id)
+                        .unwrap_or(true);
                     ui.horizontal(|ui| {
                         ui.label(format!(
                             "{}  #{}  {}",
@@ -1647,7 +1679,10 @@ impl App {
                             ui.label(format!("Ref: {}", voucher.reference));
                         }
                         if ui
-                            .add_enabled(!protected && !foreign, egui::Button::new("Edit"))
+                            .add_enabled(
+                                !protected && !foreign && !recurring,
+                                egui::Button::new("Edit"),
+                            )
                             .clicked()
                         {
                             self.editing_voucher = Some(voucher.id);
@@ -1679,6 +1714,8 @@ impl App {
                         }
                         if foreign {
                             ui.small("Foreign amounts are in Currencies.");
+                        } else if recurring {
+                            ui.small("Monthly journal. Use a reversal to correct it.");
                         } else if protected {
                             ui.small("Linked or reversed postings cannot be edited here.");
                         }
@@ -5421,6 +5458,7 @@ impl eframe::App for App {
                 ("Companies", Page::Company),
                 ("Ledgers", Page::Ledger),
                 ("Voucher", Page::Voucher),
+                ("Monthly journals", Page::Recurring),
                 ("Currencies", Page::Currencies),
                 ("Ledger activity", Page::Register),
                 ("Day book", Page::DayBook),
@@ -5471,6 +5509,7 @@ impl eframe::App for App {
                     Page::Company => {}
                     Page::Ledger => self.ledger_page(ui, company),
                     Page::Voucher => self.voucher_page(ui, company),
+                    Page::Recurring => self.show_recurring_journals(ui, company),
                     Page::Currencies => self.currency_page(ui, company),
                     Page::Register => self.register_page(ui, company),
                     Page::DayBook => self.day_book_page(ui, company),

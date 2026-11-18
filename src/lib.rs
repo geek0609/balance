@@ -29,6 +29,7 @@ pub mod payroll;
 pub mod payroll_payments;
 pub mod periods;
 pub mod pricing;
+pub mod recurring;
 pub mod reorder;
 pub mod report_export;
 pub mod reversals;
@@ -39,7 +40,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 53;
+const SCHEMA_VERSION: i64 = 54;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -445,6 +446,9 @@ impl Store {
             "foreign_posting_amounts",
             "cash_flow_ledger_rules",
             "cash_flow_voucher_rules",
+            "recurring_journals",
+            "recurring_journal_lines",
+            "recurring_journal_occurrences",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -797,6 +801,10 @@ impl Store {
             )?;
             tx.pragma_update(None, "user_version", 53)?;
         }
+        if version < 54 {
+            recurring::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 54)?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
@@ -955,25 +963,7 @@ impl Store {
     ) -> Result<i64> {
         let date = validate_voucher(date, postings)?;
         let tx = self.conn.transaction()?;
-        check_ledgers(&tx, company_id, postings)?;
-        opening::check_no_control_postings(&tx, company_id, postings)?;
-        tx.execute(
-            "INSERT INTO vouchers(company_id, date, narration, kind, reference) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                company_id,
-                date.format("%Y-%m-%d").to_string(),
-                narration.trim(),
-                kind.as_str(),
-                reference.trim()
-            ],
-        )?;
-        let id = tx.last_insert_rowid();
-        for p in postings {
-            tx.execute(
-                "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-                params![id, p.ledger_id, p.amount],
-            )?;
-        }
+        let id = insert_voucher(&tx, company_id, kind, reference, date, narration, postings)?;
         tx.commit()?;
         Ok(id)
     }
@@ -1053,7 +1043,7 @@ impl Store {
             params![voucher_id, company_id],
             |r| r.get(0),
         )?;
-        if invoice_backed {
+        if invoice_backed || recurring::contains_voucher(&tx, company_id, voucher_id)? {
             return Err(Error::Validation(
                 "Linked postings cannot be edited from the voucher screen".into(),
             ));
@@ -1446,6 +1436,30 @@ fn validate_voucher(date: &str, postings: &[Posting]) -> Result<NaiveDate> {
         return Err(Error::Validation("Debits and credits must balance".into()));
     }
     Ok(date)
+}
+fn insert_voucher(
+    conn: &Connection,
+    company_id: i64,
+    kind: VoucherKind,
+    reference: &str,
+    date: NaiveDate,
+    narration: &str,
+    postings: &[Posting],
+) -> Result<i64> {
+    check_ledgers(conn, company_id, postings)?;
+    opening::check_no_control_postings(conn, company_id, postings)?;
+    conn.execute(
+        "INSERT INTO vouchers(company_id, date, narration, kind, reference) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![company_id, date.format("%Y-%m-%d").to_string(), narration.trim(), kind.as_str(), reference.trim()],
+    )?;
+    let id = conn.last_insert_rowid();
+    for posting in postings {
+        conn.execute(
+            "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
+            params![id, posting.ledger_id, posting.amount],
+        )?;
+    }
+    Ok(id)
 }
 fn check_ledgers(conn: &Connection, company_id: i64, postings: &[Posting]) -> Result<()> {
     for p in postings {
