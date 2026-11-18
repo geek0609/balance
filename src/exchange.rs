@@ -3192,7 +3192,11 @@ impl Store {
                 let mut latest_reversal = crate::advances::invoice_allocation_state(
                     &self.conn, company_id, invoice.id, None,
                 )?
-                .latest_release;
+                .latest_release
+                .max(
+                    crate::invoice_credits::state(&self.conn, company_id, invoice.id, None)?
+                        .latest_reversal,
+                );
                 let mut settlement_references = HashSet::new();
                 for settlement in self.invoice_settlements(company_id, invoice.id)? {
                     settlement_references.insert(normalized(&settlement.reference));
@@ -4087,7 +4091,9 @@ impl Store {
                 }
                 let advances =
                     crate::advances::invoice_allocation_state(&tx, plan.company_id, id, None)?;
-                let mut outstanding = invoice_total(&tx, id, tax)? - advances.applied;
+                let credits = crate::invoice_credits::state(&tx, plan.company_id, id, None)?;
+                let mut outstanding =
+                    invoice_total(&tx, id, tax)? - advances.applied - credits.applied;
                 let mut paid = tx.prepare("SELECT s.amount FROM invoice_settlements s WHERE s.company_id = ?1 AND s.invoice_id = ?2 AND NOT EXISTS(SELECT 1 FROM settlement_reversals r WHERE r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id)")?;
                 for amount in
                     paid.query_map(params![plan.company_id, id], |r| r.get::<_, i64>(0))?

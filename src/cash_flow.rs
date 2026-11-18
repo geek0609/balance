@@ -304,6 +304,7 @@ impl Store {
                  UNION ALL SELECT clearing_voucher_id, original_voucher_id FROM opening_balance_clears WHERE company_id = ?1
                  UNION ALL SELECT r.reversal_voucher_id, i.voucher_id FROM invoice_reversals r
                               JOIN invoices i ON i.id = r.invoice_id WHERE r.company_id = ?1
+                 UNION ALL SELECT reversal_voucher_id, voucher_id FROM invoice_credit_notes WHERE company_id = ?1 AND reversal_voucher_id IS NOT NULL
                  UNION ALL SELECT reversal_voucher_id, voucher_id FROM party_advances WHERE company_id = ?1 AND reversal_voucher_id IS NOT NULL
                  UNION ALL SELECT reversal_voucher_id, voucher_id FROM payroll_accruals WHERE company_id = ?1 AND reversal_voucher_id IS NOT NULL
                  UNION ALL SELECT reversal_voucher_id, voucher_id FROM payroll_payments WHERE company_id = ?1 AND reversal_voucher_id IS NOT NULL",

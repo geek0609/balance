@@ -212,9 +212,11 @@ pub struct InvoiceSummary {
     pub tax_calculation: Option<TaxCalculationDetail>,
     pub settled: i128,
     pub advance_applied: i128,
+    pub credited: i128,
     pub outstanding: i128,
     pub has_settlement_history: bool,
     pub has_advance_history: bool,
+    pub has_credit_history: bool,
     pub order_id: Option<i64>,
     pub stock_note_id: Option<i64>,
     pub opening_bill: Option<crate::opening_bills::OpeningBill>,
@@ -279,6 +281,7 @@ pub struct OutstandingInvoice {
     pub total: i128,
     pub settled: i128,
     pub advance_applied: i128,
+    pub credited: i128,
     pub outstanding: i128,
     /// Days since the invoice date, not days past a payment due date.
     pub age_days: i64,
@@ -1185,12 +1188,15 @@ pub(crate) fn insert_settlement_on_connection(
             allocation.invoice_id,
             None,
         )?;
+        let credits = crate::invoice_credits::state(conn, company_id, allocation.invoice_id, None)?;
         if advances
             .latest_release
+            .max(credits.latest_reversal)
             .is_some_and(|date| parsed_date < date)
         {
             return Err(Error::Validation(
-                "Settlement date cannot precede an advance release on the invoice".into(),
+                "Settlement date cannot precede an advance release or note reversal on the invoice"
+                    .into(),
             ));
         }
         let mut paid = 0_i128;
@@ -1220,7 +1226,9 @@ pub(crate) fn insert_settlement_on_connection(
             }
         }
         drop(previous);
-        if i128::from(allocation.amount) > total_on_invoice - paid - advances.applied {
+        if i128::from(allocation.amount)
+            > total_on_invoice - paid - advances.applied - credits.applied
+        {
             return Err(Error::Validation(
                 "An allocation exceeds its invoice's outstanding amount".into(),
             ));
@@ -2231,6 +2239,11 @@ impl Store {
                 "An invoice with advance allocation history cannot yet be edited".into(),
             ));
         }
+        if crate::invoice_credits::state(&tx, company_id, invoice_id, None)?.has_history {
+            return Err(Error::Validation(
+                "An invoice with credit or debit note history cannot be edited".into(),
+            ));
+        }
         crate::costs::ensure_unallocated(&tx, voucher_id)?;
         crate::banking::ensure_no_bank_clearance(&tx, company_id, voucher_id)?;
         let prepared = prepare_invoice(&tx, company_id, draft, Some(invoice_id))?;
@@ -2287,6 +2300,9 @@ impl Store {
         Ok(())
     }
     pub fn is_invoice_voucher(&self, company_id: i64, voucher_id: i64) -> Result<bool> {
+        if crate::invoice_credits::is_linked_voucher(&self.conn, company_id, voucher_id)? {
+            return Ok(true);
+        }
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM party_advances WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_accruals WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_payments WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM opening_balances WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?1 AND (original_voucher_id = ?2 OR clearing_voucher_id = ?2))",
             params![company_id, voucher_id],
@@ -2464,10 +2480,11 @@ impl Store {
             let reversal = crate::invoice_reversals::for_invoice(&self.conn, company_id, id)?;
             let advances =
                 crate::advances::invoice_allocation_state(&self.conn, company_id, id, None)?;
+            let credits = crate::invoice_credits::state(&self.conn, company_id, id, None)?;
             let outstanding = if reversal.is_some() {
                 0
             } else {
-                total - settled - advances.applied
+                total - settled - advances.applied - credits.applied
             };
             result.push(InvoiceSummary {
                 id,
@@ -2489,6 +2506,8 @@ impl Store {
                 has_settlement_history,
                 has_advance_history: advances.has_history,
                 advance_applied: advances.applied,
+                credited: credits.applied,
+                has_credit_history: credits.has_history,
                 order_id: crate::orders::linked_order(&self.conn, id)?,
                 stock_note_id: crate::stock_notes::linked_note(&self.conn, id)?,
                 opening_bill,
@@ -2726,10 +2745,13 @@ impl Store {
                 Some(end),
             )?
             .applied;
-            let outstanding = invoice.total - settled - advance_applied;
+            let credited =
+                crate::invoice_credits::state(&self.conn, company_id, invoice.id, Some(end))?
+                    .applied;
+            let outstanding = invoice.total - settled - advance_applied - credited;
             if outstanding < 0 {
                 return Err(Error::Validation(
-                    "Invoice settlements exceed its total".into(),
+                    "Allocations and notes exceed the invoice total".into(),
                 ));
             }
             if outstanding == 0 {
@@ -2758,6 +2780,7 @@ impl Store {
                 total: invoice.total,
                 settled,
                 advance_applied,
+                credited,
                 outstanding,
                 age_days: age,
                 overdue_days,

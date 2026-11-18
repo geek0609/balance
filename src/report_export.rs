@@ -598,11 +598,7 @@ impl Store {
                 &mut csv,
                 &context,
                 &[
-                    if row.reversal {
-                        "reversal".into()
-                    } else {
-                        "invoice".into()
-                    },
+                    row.document_type().to_ascii_lowercase().replace(' ', "_"),
                     row.date.to_string(),
                     row.voucher_id.to_string(),
                     row.invoice_id.to_string(),
@@ -982,6 +978,7 @@ impl Store {
             "outstanding",
             "age_days",
             "overdue_days",
+            "credited",
         ]);
         contextual_row(&mut csv, &strings(&["company", "as_of"]), &details)?;
         let mut context_fields = vec![String::new(); details.len()];
@@ -1013,6 +1010,7 @@ impl Store {
                         .overdue_days
                         .map(|d| d.to_string())
                         .unwrap_or_default(),
+                    money(entry.credited),
                 ],
             )?;
         }
@@ -1058,6 +1056,7 @@ impl Store {
             "settled_all_dates",
             "advance_applied_all_dates",
             "outstanding_all_dates",
+            "credited_all_dates",
         ]);
         let mut csv = writer();
         contextual_row(
@@ -1121,6 +1120,7 @@ impl Store {
                     money(invoice.settled),
                     money(invoice.advance_applied),
                     money(invoice.outstanding),
+                    money(invoice.credited),
                 ],
             )?;
         }

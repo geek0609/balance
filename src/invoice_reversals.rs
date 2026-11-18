@@ -97,6 +97,20 @@ impl Store {
                 "This invoice has already been reversed".into(),
             ));
         }
+        let credits = crate::invoice_credits::state(&tx, company, invoice, None)?;
+        if credits.applied > 0 {
+            return Err(Error::Validation(
+                "Reverse the active credit or debit notes before reversing this invoice".into(),
+            ));
+        }
+        if credits
+            .latest_reversal
+            .is_some_and(|reversed| date < reversed)
+        {
+            return Err(Error::Validation(
+                "Invoice reversal date cannot precede an invoice note reversal".into(),
+            ));
+        }
         {
             let mut stmt = tx.prepare(
                 "SELECT v.date FROM invoice_settlements s

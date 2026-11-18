@@ -23,6 +23,7 @@ mod budget_ui;
 mod cash_flow_ui;
 mod cost_ui;
 mod currency_ui;
+mod invoice_credit_ui;
 mod manufacturing_ui;
 mod opening_bill_ui;
 mod order_ui;
@@ -265,6 +266,7 @@ struct App {
     reversal_reference: String,
     reversal_reason: String,
     invoice_reversal: Option<InvoiceReversalForm>,
+    invoice_credit: Option<invoice_credit_ui::NoteForm>,
     message: String,
 }
 struct InvoiceReversalForm {
@@ -531,6 +533,7 @@ impl App {
             reversal_reference: String::new(),
             reversal_reason: String::new(),
             invoice_reversal: None,
+            invoice_credit: None,
             message: String::new(),
         }
     }
@@ -666,6 +669,7 @@ impl App {
         self.reversal_reference.clear();
         self.reversal_reason.clear();
         self.invoice_reversal = None;
+        self.invoice_credit = None;
     }
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
@@ -3937,7 +3941,7 @@ impl App {
                 ui.small("Editing or copying an invoice replaces the current invoice form. A copy retains prices, tax and allocations for review; enter a new date and reference before saving.");
                 for invoice in invoices {
                     ui.strong(format!(
-                        "{}  {}  {}  {}  Total {}  Cash {}  Advances {}  Outstanding {}",
+                        "{}  {}  {}  {}  Total {}  Cash {}  Advances {}  Notes {}  Outstanding {}",
                         invoice.date,
                         invoice.document_type(),
                         invoice.reference,
@@ -3945,6 +3949,7 @@ impl App {
                         money(invoice.total),
                         money(invoice.settled),
                         money(invoice.advance_applied),
+                        money(invoice.credited),
                         money(invoice.outstanding)
                     ));
                     if let Some(bill) = &invoice.opening_bill {
@@ -3966,6 +3971,7 @@ impl App {
                         .add_enabled(
                             !invoice.has_settlement_history
                                 && !invoice.has_advance_history
+                                && !invoice.has_credit_history
                                 && invoice.reversal.is_none()
                                 && invoice.order_id.is_none()
                                 && invoice.stock_note_id.is_none()
@@ -3999,6 +4005,7 @@ impl App {
                         }
                     }
                     self.invoice_reversal_form(ui, company, &invoice);
+                    self.invoice_credit_panel(ui, company, &invoice);
                     if let Some(note) = invoice.stock_note_id {
                         if ui.link(format!("View stock note {note}")).clicked() {
                             self.open_stock_note(note);
@@ -4228,6 +4235,7 @@ impl App {
         };
         let can_reverse = invoice.settled == 0
             && invoice.advance_applied == 0
+            && invoice.credited == 0
             && self.editing_invoice != Some(invoice.id);
         if self.invoice_reversal.is_none()
             && ui
@@ -4236,7 +4244,7 @@ impl App {
                     egui::Button::new(format!("Reverse with a {note}")),
                 )
                 .on_disabled_hover_text(
-                    "Finish editing, reverse active settlements and release applied advances before reversing the invoice.",
+                    "Finish editing, reverse active settlements and notes, and release applied advances before reversing the invoice.",
                 )
                 .clicked()
         {
@@ -5040,6 +5048,7 @@ impl App {
                             "Reversed on",
                             "Cash settled",
                             "Advances",
+                            "Notes",
                             "Outstanding",
                         ] {
                             ui.strong(label);
@@ -5066,6 +5075,7 @@ impl App {
                             );
                             ui.label(money(invoice.settled));
                             ui.label(money(invoice.advance_applied));
+                            ui.label(money(invoice.credited));
                             ui.label(money(invoice.outstanding));
                             ui.end_row();
                         }
@@ -5129,6 +5139,7 @@ impl App {
                         "Total",
                         "Cash settled",
                         "Advances",
+                        "Notes",
                         "Outstanding",
                         "Age (days)",
                         "Overdue (days)",
@@ -5173,6 +5184,7 @@ impl App {
                         ui.label(money(row.total));
                         ui.label(money(row.settled));
                         ui.label(money(row.advance_applied));
+                        ui.label(money(row.credited));
                         ui.label(money(row.outstanding));
                         ui.label(row.age_days.to_string());
                         ui.label(

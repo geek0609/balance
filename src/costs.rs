@@ -320,6 +320,9 @@ impl Store {
                 SELECT 1 FROM invoice_reversals r JOIN invoices i ON i.id = r.invoice_id
                 WHERE r.company_id = ?1 AND ?2 IN (i.voucher_id, r.reversal_voucher_id)
                 UNION ALL
+                SELECT 1 FROM invoice_credit_notes n WHERE n.company_id = ?1
+                    AND n.reversal_voucher_id IS NOT NULL AND ?2 IN (n.voucher_id, n.reversal_voucher_id)
+                UNION ALL
                 SELECT 1 FROM payroll_accruals a WHERE a.company_id = ?1
                     AND a.reversal_voucher_id IS NOT NULL AND ?2 IN (a.voucher_id, a.reversal_voucher_id)
             )",

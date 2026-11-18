@@ -158,6 +158,19 @@ pub struct InvoiceTaxEntry {
     pub ledger: String,
     pub amount: i128,
     pub reversal: bool,
+    pub credit_note: bool,
+}
+
+impl InvoiceTaxEntry {
+    pub fn document_type(&self) -> &'static str {
+        match (self.credit_note, self.reversal, self.kind) {
+            (true, true, _) => "Note reversal",
+            (true, false, InvoiceKind::Sale) => "Credit note",
+            (true, false, InvoiceKind::Purchase) => "Debit note",
+            (false, true, _) => "Reversal",
+            (false, false, _) => "Invoice",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -177,7 +190,7 @@ pub struct InvoiceTaxRegister {
 }
 
 impl Store {
-    /// Report recorded invoice tax, with full reversals on the note date.
+    /// Report recorded invoice tax and subsequent adjustments by their voucher dates.
     pub fn invoice_tax_register(
         &self,
         company: i64,
@@ -204,21 +217,27 @@ impl Store {
             }
         }
         let mut stmt = self.conn.prepare(
-            "WITH tax(invoice_id, ledger_id, amount) AS (
-                SELECT id, tax_ledger_id, tax_amount FROM invoices
+            "WITH tax(invoice_id, ledger_id, amount, note_id) AS (
+                SELECT id, tax_ledger_id, tax_amount, NULL FROM invoices
                 WHERE company_id = ?1 AND tax_amount > 0
                 UNION ALL
-                SELECT t.invoice_id, t.ledger_id, t.amount FROM invoice_additional_taxes t
+                SELECT t.invoice_id, t.ledger_id, t.amount, NULL FROM invoice_additional_taxes t
                 JOIN invoices i ON i.id = t.invoice_id WHERE i.company_id = ?1
+                UNION ALL
+                SELECT n.invoice_id, l.ledger_id, l.reduction, n.id FROM invoice_credit_notes n
+                JOIN invoice_credit_lines l ON l.note_id = n.id AND l.is_tax = 1
+                WHERE n.company_id = ?1
              )
              SELECT i.id, i.kind, v.id, v.date, v.reference, p.name, l.id, l.name, tax.amount,
-                    rv.id, rv.date, rv.reference
+                    rv.id, rv.date, rv.reference, n.id IS NOT NULL
              FROM tax JOIN invoices i ON i.id = tax.invoice_id AND i.company_id = ?1
-             JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = i.company_id
+             LEFT JOIN invoice_credit_notes n ON n.id = tax.note_id
+             JOIN vouchers v ON v.id = COALESCE(n.voucher_id, i.voucher_id) AND v.company_id = i.company_id
              JOIN ledgers p ON p.id = i.party_ledger_id AND p.company_id = i.company_id
              JOIN ledgers l ON l.id = tax.ledger_id AND l.company_id = i.company_id
              LEFT JOIN invoice_reversals r ON r.invoice_id = i.id AND r.company_id = i.company_id
-             LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
+             LEFT JOIN vouchers rv ON rv.company_id = i.company_id AND rv.id =
+                CASE WHEN n.id IS NULL THEN r.reversal_voucher_id ELSE n.reversal_voucher_id END
              WHERE (?2 IS NULL OR i.kind = ?2) AND (?3 IS NULL OR l.id = ?3)",
         )?;
         let mut rows = stmt.query(params![company, kind.map(InvoiceKind::as_str), ledger_id])?;
@@ -229,6 +248,7 @@ impl Store {
         while let Some(row) = rows.next()? {
             let kind = InvoiceKind::parse(&row.get::<_, String>(1)?)?;
             let amount = i128::from(row.get::<_, i64>(8)?);
+            let credit_note: bool = row.get(12)?;
             let ledger_id = row.get(6)?;
             let ledger: String = row.get(7)?;
             let events: [Option<(i64, NaiveDate, String, bool)>; 2] = [
@@ -254,7 +274,11 @@ impl Store {
                 {
                     continue;
                 }
-                let amount = if reversal { -amount } else { amount };
+                let amount = if reversal ^ credit_note {
+                    -amount
+                } else {
+                    amount
+                };
                 let ledger_total = ledgers.entry(ledger_id).or_insert_with(|| TaxLedgerTotals {
                     ledger_id,
                     ledger: ledger.clone(),
@@ -281,6 +305,7 @@ impl Store {
                     ledger: ledger.clone(),
                     amount,
                     reversal,
+                    credit_note,
                 });
             }
         }

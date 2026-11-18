@@ -151,7 +151,7 @@ impl App {
                         for row in &report.entries {
                             ui.label(row.date.to_string());
                             ui.label(row.kind.as_str());
-                            ui.label(if row.reversal { "Reversal" } else { "Invoice" });
+                            ui.label(row.document_type());
                             ui.label(&row.reference);
                             ui.label(&row.party);
                             ui.label(&row.ledger);

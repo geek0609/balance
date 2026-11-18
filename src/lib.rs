@@ -19,6 +19,7 @@ pub mod documents;
 pub mod exchange;
 pub mod grouped_reports;
 pub mod inventory;
+pub mod invoice_credits;
 pub mod invoice_register;
 pub mod invoice_reversals;
 pub mod ledgers;
@@ -44,7 +45,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 58;
+const SCHEMA_VERSION: i64 = 59;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -461,6 +462,8 @@ impl Store {
             "stock_note_invoice_lines",
             "stock_note_invoice_spans",
             "opening_bills",
+            "invoice_credit_notes",
+            "invoice_credit_lines",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -833,6 +836,10 @@ impl Store {
             opening_bills::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 58)?;
         }
+        if version < 59 {
+            invoice_credits::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 59)?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
@@ -1071,7 +1078,10 @@ impl Store {
             params![voucher_id, company_id],
             |r| r.get(0),
         )?;
-        if invoice_backed || recurring::contains_voucher(&tx, company_id, voucher_id)? {
+        if invoice_backed
+            || invoice_credits::is_linked_voucher(&tx, company_id, voucher_id)?
+            || recurring::contains_voucher(&tx, company_id, voucher_id)?
+        {
             return Err(Error::Validation(
                 "Linked postings cannot be edited from the voucher screen".into(),
             ));

@@ -49,7 +49,7 @@ impl Store {
             ));
         }
         let linked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM party_advances WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_accruals WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_payments WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM opening_balances WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?1 AND (original_voucher_id = ?2 OR reversal_voucher_id = ?2) UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?1 AND (original_voucher_id = ?2 OR clearing_voucher_id = ?2))", params![company, original], |r| r.get(0))?;
-        if linked {
+        if linked || crate::invoice_credits::is_linked_voucher(&tx, company, original)? {
             return Err(Error::Validation(
                 "Linked or already reversed vouchers cannot be reversed here".into(),
             ));

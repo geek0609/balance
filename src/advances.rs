@@ -461,14 +461,15 @@ impl Store {
         let advance_state =
             allocation_state(&tx, company, AllocationTarget::Advance(advance), None)?;
         let invoice_state = invoice_allocation_state(&tx, company, invoice, None)?;
+        let credits = crate::invoice_credits::state(&tx, company, invoice, None)?;
         if advance_state
             .latest_release
             .max(invoice_state.latest_release)
+            .max(credits.latest_reversal)
             .is_some_and(|released| date < released)
         {
             return Err(Error::Validation(
-                "Allocation date cannot precede an existing release on this invoice or advance"
-                    .into(),
+                "Allocation date cannot precede an advance release or note reversal".into(),
             ));
         }
         if i128::from(amount) > i128::from(advance_amount) - advance_state.applied {
@@ -497,7 +498,9 @@ impl Store {
                 }
             }
         }
-        if i128::from(amount) > invoice_total(&tx, invoice, tax)? - paid - invoice_state.applied {
+        if i128::from(amount)
+            > invoice_total(&tx, invoice, tax)? - paid - invoice_state.applied - credits.applied
+        {
             return Err(Error::Validation(
                 "Allocation exceeds the outstanding invoice amount".into(),
             ));
