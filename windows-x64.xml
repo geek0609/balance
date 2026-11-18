@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Balance for Windows x64</title>
+    <link>https://github.com/geek0609/balance/releases</link>
+    <description>Updates for installed Windows copies of Balance</description>
+    <item>
+      <title>Balance 0.1.0-alpha.2</title>
+      <pubDate>Wed, 18 Nov 2026 10:27:19 GMT</pubDate>
+      <sparkle:version>2</sparkle:version>
+      <sparkle:shortVersionString>0.1.0-alpha.2</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>10.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/geek0609/balance/releases/download/v0.1.0-alpha.2/balance-0.1.0-alpha.2-windows-x64-setup.exe" length="6358051" type="application/octet-stream"
+        sparkle:os="windows-x64" sparkle:edSignature="xX1G7PhwqkhN/bpdYV9Ox551QJNWHBD3GK0kGqs0pGPJ5H0s37bmDCiW6arfXYFFH4tkfpc4b5t6NtqmeBa5BA=="
+        sparkle:installerArguments="/SILENT /SP- /NORESTART" />
+    </item>
+  </channel>
+</rss>
