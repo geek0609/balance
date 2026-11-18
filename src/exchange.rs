@@ -17,7 +17,7 @@ use chrono::NaiveDate;
 use roxmltree::{Document, Node, ParsingOptions};
 use rusqlite::{params, Connection, OptionalExtension};
 use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 
 const MAX_BYTES: usize = 50 * 1024 * 1024;
@@ -2240,6 +2240,10 @@ impl Store {
             pending_stock_groups = unresolved;
         }
         let existing_locations = self.stock_locations(company_id)?;
+        let locations_by_id: HashMap<_, _> = existing_locations
+            .iter()
+            .map(|location| (location.id, location))
+            .collect();
         let mut known_locations = HashMap::<String, Option<i64>>::new();
         for location in &existing_locations {
             if known_locations
@@ -2255,9 +2259,12 @@ impl Store {
         for node in doc.descendants().filter(|n| {
             n.is_element()
                 && local_name(*n).eq_ignore_ascii_case("GODOWN")
-                && !n
-                    .ancestors()
-                    .any(|a| a.is_element() && local_name(a).eq_ignore_ascii_case("VOUCHER"))
+                && !n.ancestors().any(|a| {
+                    a.is_element()
+                        && ["VOUCHER", "STOCKITEM"]
+                            .iter()
+                            .any(|tag| local_name(a).eq_ignore_ascii_case(tag))
+                })
         }) {
             let Some(name) = object_name(node) else {
                 plan.issues
@@ -2291,13 +2298,15 @@ impl Store {
                 &mut seen_metadata,
                 &mut plan.issues,
             );
-            if let Some(existing) = existing_locations
-                .iter()
-                .find(|location| normalized(&location.name) == normalized(&name))
+            if let Some(existing) = known_locations
+                .get(&normalized(&name))
+                .copied()
+                .flatten()
+                .and_then(|id| locations_by_id.get(&id))
             {
                 let actual_parent = existing
                     .parent_id
-                    .and_then(|id| existing_locations.iter().find(|location| location.id == id))
+                    .and_then(|id| locations_by_id.get(&id))
                     .map(|location| normalized(&location.name));
                 if actual_parent != parent.as_deref().map(normalized) {
                     plan.issues
@@ -2315,31 +2324,29 @@ impl Store {
                 });
             }
         }
-        while !pending_locations.is_empty() {
-            let mut unresolved = Vec::new();
-            let prior_count = plan.locations.len();
-            for location in pending_locations {
-                if location
-                    .parent
-                    .as_deref()
-                    .is_some_and(|parent| !known_locations.contains_key(&normalized(parent)))
-                {
-                    unresolved.push(location);
-                } else {
-                    known_locations.insert(normalized(&location.name), None);
-                    plan.locations.push(location);
+        let mut ready = VecDeque::new();
+        let mut waiting = BTreeMap::<String, Vec<StockLocationImport>>::new();
+        for location in pending_locations {
+            match location.parent.as_deref().map(normalized) {
+                Some(parent) if !known_locations.contains_key(&parent) => {
+                    waiting.entry(parent).or_default().push(location);
                 }
+                _ => ready.push_back(location),
             }
-            if plan.locations.len() == prior_count {
-                for location in unresolved {
-                    plan.issues.push(format!(
-                        "Stock location {}: parent is missing or cyclic",
-                        location.name
-                    ));
-                }
-                break;
+        }
+        while let Some(location) = ready.pop_front() {
+            let name = normalized(&location.name);
+            if let Some(children) = waiting.remove(&name) {
+                ready.extend(children);
             }
-            pending_locations = unresolved;
+            known_locations.insert(name, None);
+            plan.locations.push(location);
+        }
+        for location in waiting.into_values().flatten() {
+            plan.issues.push(format!(
+                "Stock location {}: parent is missing or cyclic",
+                location.name
+            ));
         }
         let mut known_items = HashSet::<String>::new();
         for item in self.stock_items(company_id)? {
