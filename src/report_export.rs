@@ -634,6 +634,85 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_payroll_register_csv(
+        &self,
+        company: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        employee: Option<i64>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let entries = self.payroll_register(company, start, end, employee)?;
+        let context = [
+            self.report_company_name(company)?,
+            optional_date(start)?,
+            optional_date(end)?,
+            employee.map(|id| id.to_string()).unwrap_or_default(),
+        ];
+        let mut csv = writer();
+        let details = strings(&[
+            "row_type",
+            "accrual_id",
+            "voucher_id",
+            "date",
+            "employee_id",
+            "employee_code",
+            "employee",
+            "department",
+            "period_start",
+            "period_end",
+            "reference",
+            "gross",
+            "deductions",
+            "net",
+            "employer_contributions",
+        ]);
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "date_from", "date_through", "employee_filter_id"]),
+            &details,
+        )?;
+        let mut totals = [0_i128; 4];
+        for row in entries {
+            for (total, value) in totals.iter_mut().zip([
+                row.gross,
+                row.deductions,
+                row.net,
+                row.employer_contributions,
+            ]) {
+                *total += i128::from(value);
+            }
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "accrual".into(),
+                    row.id.to_string(),
+                    row.voucher_id.to_string(),
+                    row.date,
+                    row.employee_id.to_string(),
+                    text_cell(&row.code),
+                    text_cell(&row.employee),
+                    text_cell(&row.department),
+                    row.period_start,
+                    row.period_end,
+                    text_cell(&row.reference),
+                    money(row.gross.into()),
+                    money(row.deductions.into()),
+                    money(row.net.into()),
+                    money(row.employer_contributions.into()),
+                ],
+            )?;
+        }
+        let mut summary = vec![String::new(); details.len()];
+        summary[0] = "total".into();
+        for (index, total) in totals.into_iter().enumerate() {
+            summary[11 + index] = money(total);
+        }
+        contextual_row(&mut csv, &context, &summary)?;
+        save(csv, destination)
+    }
+
     pub fn export_day_book_csv(
         &self,
         company: i64,

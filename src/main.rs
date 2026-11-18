@@ -23,6 +23,7 @@ mod budget_ui;
 mod cost_ui;
 mod manufacturing_ui;
 mod order_ui;
+mod payroll_ui;
 mod stock_count_ui;
 mod tax_ui;
 mod valuation_ui;
@@ -32,6 +33,7 @@ use budget_ui::BudgetScreen;
 use cost_ui::CostScreen;
 use manufacturing_ui::ManufacturingScreen;
 use order_ui::OrderScreen;
+use payroll_ui::PayrollScreen;
 use stock_count_ui::StockCountScreen;
 use tax_ui::{TaxProfileScreen, TaxRegisterScreen};
 use valuation_ui::ValuationScreen;
@@ -59,6 +61,7 @@ enum Page {
     CostCentres,
     Budgets,
     TaxRegister,
+    Payroll,
 }
 struct App {
     store: Store,
@@ -219,6 +222,7 @@ struct App {
     budget_screen: BudgetScreen,
     tax_register_screen: TaxRegisterScreen,
     tax_profile_screen: TaxProfileScreen,
+    payroll_screen: PayrollScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -475,6 +479,7 @@ impl App {
             budget_screen: BudgetScreen::default(),
             tax_register_screen: TaxRegisterScreen::default(),
             tax_profile_screen: TaxProfileScreen::default(),
+            payroll_screen: PayrollScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -597,6 +602,7 @@ impl App {
         self.budget_screen = BudgetScreen::default();
         self.tax_register_screen = TaxRegisterScreen::default();
         self.tax_profile_screen = TaxProfileScreen::default();
+        self.payroll_screen = PayrollScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -5374,6 +5380,7 @@ impl eframe::App for App {
                 ("Reports", Page::Reports),
                 ("Cost centres", Page::CostCentres),
                 ("Budgets", Page::Budgets),
+                ("Payroll", Page::Payroll),
             ] {
                 if ui.selectable_label(self.page == page, label).clicked() {
                     self.page = page;
@@ -5421,6 +5428,7 @@ impl eframe::App for App {
                     Page::Reports => self.reports_page(ui, company),
                     Page::CostCentres => self.cost_page(ui, company),
                     Page::Budgets => self.budgets_page(ui, company),
+                    Page::Payroll => self.payroll_page(ui, company),
                 }
             });
         });
