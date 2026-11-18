@@ -22,9 +22,10 @@ pub mod pricing;
 pub mod reorder;
 pub mod report_export;
 pub mod reversals;
+pub mod stock_counts;
 pub mod terms;
 
-const SCHEMA_VERSION: i64 = 34;
+const SCHEMA_VERSION: i64 = 35;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -391,6 +392,8 @@ impl Store {
             "orders",
             "order_lines",
             "invoice_order_links",
+            "stock_counts",
+            "stock_count_lines",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -664,6 +667,10 @@ impl Store {
         if version < 34 {
             orders::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 34)?;
+        }
+        if version < 35 {
+            stock_counts::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 35)?;
         }
         tx.commit()?;
         Ok(Self { conn })

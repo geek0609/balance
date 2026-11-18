@@ -25,34 +25,39 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX period_lock_events_company ON period_lock_events(company_id, id);",
     )?;
     for table in ["vouchers", "stock_adjustments", "stock_transfers"] {
-        for (action, rows) in [
-            ("INSERT", &["NEW"][..]),
-            ("UPDATE", &["OLD", "NEW"][..]),
-            ("DELETE", &["OLD"][..]),
-        ] {
-            // Transaction dates are canonical ISO strings. Chrono prefixes years
-            // above 9999 with a plus sign, so those follow every valid cutoff.
-            let conditions = rows
-                .iter()
-                .map(|row| {
-                    format!(
-                        "({row}.date NOT GLOB '+*' AND {row}.date <= (
-                            SELECT locked_through FROM period_lock_events
-                            WHERE company_id = {row}.company_id ORDER BY id DESC LIMIT 1
-                        ))"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            conn.execute_batch(&format!(
-                "CREATE TRIGGER period_lock_{table}_{action}
-                 BEFORE {action} ON {table}
-                 WHEN {conditions}
-                 BEGIN
-                     SELECT RAISE(ABORT, '{LOCKED_PERIOD_MESSAGE}');
-                 END;"
-            ))?;
-        }
+        protect_dated_table(conn, table)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn protect_dated_table(conn: &Connection, table: &str) -> Result<()> {
+    for (action, rows) in [
+        ("INSERT", &["NEW"][..]),
+        ("UPDATE", &["OLD", "NEW"][..]),
+        ("DELETE", &["OLD"][..]),
+    ] {
+        // Transaction dates are canonical ISO strings. Chrono prefixes years
+        // above 9999 with a plus sign, so those follow every valid cutoff.
+        let conditions = rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "({row}.date NOT GLOB '+*' AND {row}.date <= (
+                        SELECT locked_through FROM period_lock_events
+                        WHERE company_id = {row}.company_id ORDER BY id DESC LIMIT 1
+                    ))"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER period_lock_{table}_{action}
+             BEFORE {action} ON {table}
+             WHEN {conditions}
+             BEGIN
+                 SELECT RAISE(ABORT, '{LOCKED_PERIOD_MESSAGE}');
+             END;"
+        ))?;
     }
     Ok(())
 }

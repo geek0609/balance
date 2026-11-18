@@ -1181,6 +1181,33 @@ pub(crate) fn insert_settlement_on_connection(
     Ok((voucher_id, ids))
 }
 
+// None for the batch means the unbatched bucket. None for location includes all locations.
+pub(crate) fn stock_bucket_quantity(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    batch: Option<i64>,
+    location: Option<i64>,
+    end: Option<chrono::NaiveDate>,
+) -> Result<i128> {
+    let sql = "SELECT date, quantity FROM stock_adjustments WHERE company_id = ?1 AND item_id = ?2 AND batch_id IS ?3 AND (?4 IS NULL OR location_id = ?4)
+        UNION ALL SELECT v.date, CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND a.batch_id IS ?3 AND (?4 IS NULL OR a.location_id = ?4)
+        UNION ALL SELECT date, -quantity FROM stock_transfers WHERE company_id = ?1 AND item_id = ?2 AND batch_id IS ?3 AND (?4 IS NULL OR from_location_id = ?4)
+        UNION ALL SELECT date, quantity FROM stock_transfers WHERE company_id = ?1 AND item_id = ?2 AND batch_id IS ?3 AND (?4 IS NULL OR to_location_id = ?4)";
+    let mut stmt = conn.prepare(sql)?;
+    let mut total = 0_i128;
+    for row in stmt.query_map(params![company, item, batch, location], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })? {
+        let (date, quantity) = row?;
+        let date = parse_date(&date)?;
+        if end.is_none_or(|limit| date <= limit) {
+            total += i128::from(quantity);
+        }
+    }
+    Ok(total)
+}
+
 impl Store {
     pub fn stock_batches(&self, company: i64, item: i64) -> Result<Vec<StockBatch>> {
         let exists: bool = self.conn.query_row(
@@ -1246,22 +1273,7 @@ impl Store {
             }
         }
         let end = as_of.map(parse_date).transpose()?;
-        let sql = "SELECT date, quantity FROM stock_adjustments WHERE company_id = ?1 AND item_id = ?2 AND batch_id = ?3 AND (?4 IS NULL OR location_id = ?4)
-            UNION ALL SELECT v.date, CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND a.batch_id = ?3 AND (?4 IS NULL OR a.location_id = ?4)
-            UNION ALL SELECT date, -quantity FROM stock_transfers WHERE company_id = ?1 AND item_id = ?2 AND batch_id = ?3 AND (?4 IS NULL OR from_location_id = ?4)
-            UNION ALL SELECT date, quantity FROM stock_transfers WHERE company_id = ?1 AND item_id = ?2 AND batch_id = ?3 AND (?4 IS NULL OR to_location_id = ?4)";
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut total = 0_i128;
-        for row in stmt.query_map(params![company, item, batch, location], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })? {
-            let (date, quantity) = row?;
-            let date = parse_date(&date)?;
-            if end.is_none_or(|limit| date <= limit) {
-                total += i128::from(quantity);
-            }
-        }
-        Ok(total)
+        stock_bucket_quantity(&self.conn, company, item, Some(batch), location, end)
     }
     pub fn stock_locations(&self, company_id: i64) -> Result<Vec<StockLocation>> {
         let mut stmt = self

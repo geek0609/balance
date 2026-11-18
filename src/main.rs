@@ -16,7 +16,9 @@ use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, Vou
 use eframe::egui::{self, Color32, RichText};
 
 mod order_ui;
+mod stock_count_ui;
 use order_ui::OrderScreen;
+use stock_count_ui::StockCountScreen;
 
 #[derive(PartialEq)]
 enum Page {
@@ -26,6 +28,7 @@ enum Page {
     Register,
     Import,
     Stock,
+    StockCounts,
     Invoice,
     InvoiceRegister,
     Orders,
@@ -180,6 +183,7 @@ struct App {
     copying_invoice: bool,
     invoice_order: Option<i64>,
     order_screen: OrderScreen,
+    stock_count_screen: StockCountScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -410,6 +414,7 @@ impl App {
             copying_invoice: false,
             invoice_order: None,
             order_screen: OrderScreen::default(),
+            stock_count_screen: StockCountScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -522,6 +527,7 @@ impl App {
         self.copying_invoice = false;
         self.invoice_order = None;
         self.order_screen = OrderScreen::default();
+        self.stock_count_screen = StockCountScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -563,6 +569,7 @@ impl App {
                     || self.terms_limit != self.terms_original_limit))
             || self.editing_ledger.is_some()
             || self.invoice_draft_in_use()
+            || self.stock_count_screen.preview_pending()
             || self.stock_editing.is_some();
         let profile_dirty = profile_dirty || self.reorder_editing.is_some();
         if profile_dirty {
@@ -687,7 +694,9 @@ impl App {
         } else {
             ui.label("All periods are open.");
         }
-        ui.small("The lock applies to vouchers and stock movements, including imports.");
+        ui.small(
+            "The lock applies to vouchers, stock counts and stock movements, including imports.",
+        );
         egui::Grid::new("period-lock").show(ui, |ui| {
             ui.label("Lock through (YYYY-MM-DD)");
             ui.text_edit_singleline(&mut self.period_lock_date);
@@ -5069,6 +5078,7 @@ impl eframe::App for App {
                 ("Invoice register", Page::InvoiceRegister),
                 ("Bank clearance", Page::Bank),
                 ("Stock", Page::Stock),
+                ("Stock counts", Page::StockCounts),
                 ("Invoices", Page::Invoice),
                 ("Orders", Page::Orders),
                 ("Import XML", Page::Import),
@@ -5109,6 +5119,7 @@ impl eframe::App for App {
                     Page::InvoiceRegister => self.invoice_register_page(ui, company),
                     Page::Bank => self.bank_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),
+                    Page::StockCounts => self.stock_counts_page(ui, company),
                     Page::Invoice => self.invoice_page(ui, company),
                     Page::Orders => self.orders_page(ui, company),
                     Page::Import => self.import_page(ui, company),
