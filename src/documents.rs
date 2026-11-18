@@ -1,11 +1,12 @@
-//! Printable invoice, quotation, stock note and payroll records.
+//! Printable invoice, adjustment note, quotation, stock note and payroll records.
 use crate::{
     format_amount,
-    inventory::{format_quantity, line_amount, InvoiceDiscount},
+    inventory::{format_quantity, line_amount, InvoiceDiscount, InvoiceKind},
     quotations::quotation,
     stock_notes::{get_note, note_label},
     Error, Result, Store,
 };
+use rusqlite::{params, OptionalExtension};
 use std::{fmt::Write as _, io::Write as _, path::Path};
 
 fn escape(value: &str) -> String {
@@ -63,6 +64,87 @@ fn write_html(destination: &Path, html: &str) -> Result<()> {
 }
 
 impl Store {
+    pub fn export_invoice_credit_html(
+        &self,
+        company: i64,
+        note: i64,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let destination = html_destination(destination.as_ref())?;
+        let tx = self.conn.unchecked_transaction()?;
+        let (business, party, kind, invoice, invoice_date, voucher, date, reference, amount, reason, reversed_on, reversal_reference, reversal_reason) = tx.query_row(
+            "SELECT c.name, p.name, i.kind, iv.reference, iv.date, nv.id, nv.date, nv.reference,
+                    n.amount, n.reason, rv.date, rv.reference, n.reversal_reason
+             FROM invoice_credit_notes n
+             JOIN companies c ON c.id = n.company_id
+             JOIN invoices i ON i.id = n.invoice_id AND i.company_id = n.company_id
+             JOIN ledgers p ON p.id = i.party_ledger_id AND p.company_id = n.company_id
+             JOIN vouchers iv ON iv.id = i.voucher_id AND iv.company_id = n.company_id
+             JOIN vouchers nv ON nv.id = n.voucher_id AND nv.company_id = n.company_id
+             LEFT JOIN vouchers rv ON rv.id = n.reversal_voucher_id AND rv.company_id = n.company_id
+             WHERE n.company_id = ?1 AND n.id = ?2",
+            params![company, note],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?, r.get::<_, String>(7)?, r.get::<_, i64>(8)?,
+                r.get::<_, String>(9)?, r.get::<_, Option<String>>(10)?,
+                r.get::<_, Option<String>>(11)?, r.get::<_, Option<String>>(12)?,
+            )),
+        ).optional()?.ok_or_else(|| Error::Validation("Invoice note not found in the selected company".into()))?;
+        let label = match InvoiceKind::parse(&kind)? {
+            InvoiceKind::Sale => "Credit note",
+            InvoiceKind::Purchase => "Debit note",
+        };
+        let title = format!("{label} {reference}");
+        let mut html = printable_html(&title);
+        let _ = write!(
+            html,
+            "<h1>{}</h1><p><strong>{}</strong><br>Party: {}<br>Date: {}<br>Invoice: {} ({})<br>Voucher: {voucher}</p><p>{}</p>",
+            escape(&title), escape(&business), escape(&party), escape(&date),
+            escape(&invoice), escape(&invoice_date), escape(&reason),
+        );
+        if let Some(date) = reversed_on {
+            let _ = write!(
+                html,
+                "<p><strong>Reversed {}</strong><br>Reference: {}<br>{}</p>",
+                escape(&date),
+                escape(reversal_reference.as_deref().unwrap_or_default()),
+                escape(reversal_reason.as_deref().unwrap_or_default())
+            );
+        }
+        html.push_str("<table><thead><tr><th>Ledger</th><th>Component</th><th class=\"num\">Reduction</th></tr></thead><tbody>");
+        {
+            let mut stmt = tx.prepare(
+                "SELECT l.name, d.is_tax, d.reduction FROM invoice_credit_lines d
+                 JOIN ledgers l ON l.id = d.ledger_id AND l.company_id = ?1
+                 WHERE d.note_id = ?2 ORDER BY d.is_tax, l.name, l.id",
+            )?;
+            let mut rows = stmt.query(params![company, note])?;
+            while let Some(row) = rows.next()? {
+                let ledger: String = row.get(0)?;
+                let tax: bool = row.get(1)?;
+                let reduction: i64 = row.get(2)?;
+                let component = if tax {
+                    "Tax"
+                } else if reduction < 0 {
+                    "Deduction"
+                } else {
+                    "Trade"
+                };
+                let _ = write!(
+                    html,
+                    "<tr><td>{}</td><td>{component}</td><td class=\"num\">{}</td></tr>",
+                    escape(&ledger),
+                    format_amount(reduction)
+                );
+            }
+        }
+        tx.commit()?;
+        let _ = write!(html, "</tbody><tfoot><tr class=\"total\"><td colspan=\"2\">Net invoice reduction</td><td class=\"num\">{}</td></tr></tfoot></table><p class=\"note\">Financial adjustment record</p></body></html>", format_amount(amount));
+        write_html(destination, &html)
+    }
+
     pub fn export_stock_note_html(
         &self,
         company_id: i64,

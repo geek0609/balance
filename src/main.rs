@@ -3930,14 +3930,14 @@ impl App {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("New invoice HTML file");
+                    ui.label("New document HTML file");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.invoice_document_path)
                             .hint_text("Absolute path ending in .html")
                             .desired_width(350.0),
                     );
                 });
-                ui.small("Export a saved invoice for review or printing in a browser. Existing files are not overwritten; company and party details are current. This basic layout is not a statutory tax document.");
+                ui.small("Export a saved invoice or note for printing in a browser. Use a new file path. The document uses current company and party details.");
                 ui.small("Editing or copying an invoice replaces the current invoice form. A copy retains prices, tax and allocations for review; enter a new date and reference before saving.");
                 for invoice in invoices {
                     ui.strong(format!(
