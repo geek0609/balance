@@ -32,7 +32,7 @@ impl Default for CashFlowScreen {
 
 impl App {
     pub(super) fn cash_flow_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Cash flow");
+        crate::theme::section(ui, "Cash flow");
         let ledgers = match self.store.ledgers(company) {
             Ok(ledgers) => ledgers,
             Err(error) => {

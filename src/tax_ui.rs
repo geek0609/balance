@@ -16,7 +16,7 @@ pub(super) struct TaxRegisterScreen {
 
 impl App {
     pub(super) fn tax_register_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Invoice tax register");
+        crate::theme::section(ui, "Invoice tax register");
         ui.small("Recorded invoice tax and full reversals. Dates apply separately to invoices and notes.");
         egui::CollapsingHeader::new("Tax calculation profiles").show(ui, |ui| {
             self.tax_profile_settings(ui, company);

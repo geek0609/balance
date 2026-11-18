@@ -19,7 +19,7 @@ pub(super) struct ValuationScreen {
 
 impl App {
     pub(super) fn valuation_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Stock valuation");
+        crate::theme::section(ui, "Stock valuation");
         ui.small("Valuation reports do not change ledger balances.");
         egui::CollapsingHeader::new("Standard costs")
             .default_open(true)

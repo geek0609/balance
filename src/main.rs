@@ -15,7 +15,7 @@ use balance::tax_profiles::TaxCalculation;
 use balance::taxes::InvoiceTaxLine;
 use balance::terms::LedgerTerms;
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui;
 
 mod actual_cost_ui;
 mod advance_ui;
@@ -29,9 +29,11 @@ mod opening_bill_ui;
 mod order_ui;
 mod payroll_ui;
 mod recurring_ui;
+mod shell;
 mod stock_count_ui;
 mod stock_note_ui;
 mod tax_ui;
+mod theme;
 #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
 mod updates;
 mod valuation_ui;
@@ -50,8 +52,9 @@ use stock_note_ui::StockNoteScreen;
 use tax_ui::{TaxProfileScreen, TaxRegisterScreen};
 use valuation_ui::ValuationScreen;
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Page {
+    Home,
     Company,
     Ledger,
     Voucher,
@@ -87,6 +90,7 @@ enum InvoiceSource {
 
 struct App {
     store: Store,
+    shell: shell::Shell,
     opening_bill: opening_bill_ui::OpeningBillForm,
     #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
     updates: updates::Updates,
@@ -354,11 +358,12 @@ impl App {
     fn new(store: Store, database_path: std::path::PathBuf) -> Self {
         Self {
             store,
+            shell: shell::Shell::default(),
             opening_bill: opening_bill_ui::OpeningBillForm::default(),
             #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
             updates: updates::Updates::default(),
             database_path,
-            page: Page::Company,
+            page: Page::Home,
             company: None,
             company_name: String::new(),
             company_profile_selection: None,
@@ -539,6 +544,7 @@ impl App {
     }
     fn failure(&mut self, e: impl std::fmt::Display) {
         self.message = e.to_string();
+        self.shell.last_failure = self.message.clone();
     }
     fn clear_voucher(&mut self) {
         self.lines = vec![VoucherLine::new(true), VoucherLine::new(false)];
@@ -671,8 +677,23 @@ impl App {
         self.invoice_reversal = None;
         self.invoice_credit = None;
     }
+    /// Whether a form holds edits that would be lost by switching company.
+    fn has_unsaved_edits(&self) -> bool {
+        (self.profile_ledger.is_some() && self.ledger_profile != self.profile_original)
+            || self.company_profile != self.company_profile_original
+            || (self.terms_ledger.is_some()
+                && (self.terms_days != self.terms_original_days
+                    || self.terms_limit != self.terms_original_limit))
+            || self.editing_ledger.is_some()
+            || self.invoice_draft_in_use()
+            || self.stock_count_screen.preview_pending()
+            || self.cost_screen.has_pending_changes()
+            || self.currency_screen.has_preview()
+            || self.stock_editing.is_some()
+            || self.reorder_editing.is_some()
+    }
     fn company_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Companies");
+        crate::theme::section(ui, "Companies");
         ui.label("Create or select a company to work with.");
         if self.company != self.company_profile_selection {
             if let Some(company) = self.company {
@@ -689,19 +710,7 @@ impl App {
                 }
             }
         }
-        let profile_dirty = (self.profile_ledger.is_some()
-            && self.ledger_profile != self.profile_original)
-            || self.company_profile != self.company_profile_original
-            || (self.terms_ledger.is_some()
-                && (self.terms_days != self.terms_original_days
-                    || self.terms_limit != self.terms_original_limit))
-            || self.editing_ledger.is_some()
-            || self.invoice_draft_in_use()
-            || self.stock_count_screen.preview_pending()
-            || self.cost_screen.has_pending_changes()
-            || self.currency_screen.has_preview()
-            || self.stock_editing.is_some();
-        let profile_dirty = profile_dirty || self.reorder_editing.is_some();
+        let profile_dirty = self.has_unsaved_edits();
         if profile_dirty {
             ui.label("Save or discard the current edits before changing company.");
         }
@@ -746,7 +755,7 @@ impl App {
         }
         if let Some(company) = self.company {
             ui.separator();
-            ui.heading("Company details");
+            crate::theme::section(ui, "Company details");
             ui.small("Financial year and books start dates are for reference.");
             egui::Grid::new("company-profile")
                 .num_columns(2)
@@ -802,7 +811,7 @@ impl App {
                     Ok(rows) => for row in rows {
                         ui.label(format!("{} UTC — {}, {}, {}, {} | {} | {} | Tax ID: {} | Registration: {} | Financial year: {} | Books: {}", row.changed_at, row.profile.address, row.profile.region, row.profile.postal_code, row.profile.country, row.profile.email, row.profile.phone, row.profile.tax_id, row.profile.registration_type, row.profile.financial_year_start, row.profile.books_start));
                     },
-                    Err(e) => { ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string()); }
+                    Err(e) => { ui.colored_label(crate::theme::DANGER, e.to_string()); }
                 }
             });
             self.period_lock_form(ui, company);
@@ -811,7 +820,7 @@ impl App {
 
     fn period_lock_form(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.separator();
-        ui.heading("Period lock");
+        crate::theme::section(ui, "Period lock");
         let cutoff = match self.store.period_lock(company) {
             Ok(cutoff) => cutoff,
             Err(error) => {
@@ -893,7 +902,7 @@ impl App {
     }
 
     fn ledger_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Ledgers");
+        crate::theme::section(ui, "Ledgers");
         let groups = match self.store.account_groups(company) {
             Ok(v) => v,
             Err(e) => {
@@ -979,7 +988,7 @@ impl App {
                                 }
                             }
                             Err(e) => {
-                                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                                ui.colored_label(crate::theme::DANGER, e.to_string());
                             }
                         }
                     });
@@ -988,7 +997,7 @@ impl App {
         if let Some(id) = self.editing_ledger {
             if let Some(ledger) = ledgers.iter().find(|ledger| ledger.id == id) {
                 ui.separator();
-                ui.heading(format!("Edit ledger: {}", ledger.name));
+                crate::theme::section(ui, format!("Edit ledger: {}", ledger.name));
                 ui.small("The group must retain the same accounting category; existing reports use the current ledger name and group.");
                 ui.horizontal(|ui| {
                     ui.label("Name");
@@ -1034,7 +1043,7 @@ impl App {
             }
         }
         ui.separator();
-        ui.heading("Opening balances");
+        crate::theme::section(ui, "Opening balances");
         ui.label("Each opening balance is offset against the opening difference account. Reconcile the difference as other opening balances are entered.");
         let previous_opening_ledger = self.opening_ledger;
         pick_account(
@@ -1157,7 +1166,7 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                            ui.colored_label(crate::theme::DANGER, e.to_string());
                         }
                     }
                 });
@@ -1165,7 +1174,7 @@ impl App {
         ui.separator();
         self.opening_bill_panel(ui, company, &ledgers);
         ui.separator();
-        ui.heading("Ledger details");
+        crate::theme::section(ui, "Ledger details");
         let dirty = self.profile_ledger.is_some() && self.ledger_profile != self.profile_original;
         pick_account(
             ui,
@@ -1284,13 +1293,13 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                            ui.colored_label(crate::theme::DANGER, e.to_string());
                         }
                     }
                 });
         }
         ui.separator();
-        ui.heading("Party payment terms");
+        crate::theme::section(ui, "Party payment terms");
         ui.small("Defaults are optional. Credit limits are informational and do not prevent invoicing or payments.");
         let party_ledgers: Vec<_> = ledgers
             .iter()
@@ -1413,13 +1422,13 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                            ui.colored_label(crate::theme::DANGER, e.to_string());
                         }
                     }
                 });
         }
         ui.separator();
-        ui.heading("Account groups");
+        crate::theme::section(ui, "Account groups");
         ui.horizontal(|ui| {
             ui.label("New group");
             ui.text_edit_singleline(&mut self.group_name);
@@ -1475,10 +1484,13 @@ impl App {
         }
     }
     fn voucher_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading(match self.editing_voucher {
-            Some(id) => format!("Edit voucher {id}"),
-            None => "Journal voucher".into(),
-        });
+        crate::theme::section(
+            ui,
+            match self.editing_voucher {
+                Some(id) => format!("Edit voucher {id}"),
+                None => format!("{} voucher", self.voucher_kind.as_str()),
+            },
+        );
         ui.label(
             "Enter at least two lines. Debits and credits must balance. Press Ctrl+Enter to save.",
         );
@@ -1557,7 +1569,8 @@ impl App {
                 "Post voucher"
             })
             .clicked()
-            || ui.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Enter));
+            || (!self.shell.go_to_is_open()
+                && ui.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Enter)));
         if self.editing_voucher.is_some() && ui.button("Cancel edit").clicked() {
             self.clear_voucher();
             self.message.clear();
@@ -1633,7 +1646,7 @@ impl App {
             }
         }
         ui.separator();
-        ui.heading("Voucher history");
+        crate::theme::section(ui, "Voucher history");
         if let Some(target) = self.voucher_reversal_target {
             ui.label(format!(
                 "Reverse ordinary voucher #{target} with a separate journal entry"
@@ -1806,7 +1819,7 @@ impl App {
                                     }
                                 }
                                 Err(e) => {
-                                    ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                                    ui.colored_label(crate::theme::DANGER, e.to_string());
                                 }
                             }
                         });
@@ -1816,7 +1829,7 @@ impl App {
         }
     }
     fn reports_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Financial reports");
+        crate::theme::section(ui, "Financial reports");
         self.report_export_path_field(ui);
         ui.label("Dates are inclusive. Leave a field blank for an open boundary; an empty end date includes future-dated entries.");
         ui.horizontal(|ui| {
@@ -1846,11 +1859,11 @@ impl App {
         let report = match self.store.financial_report(company, from, to) {
             Ok(v) => v,
             Err(e) => {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                ui.colored_label(crate::theme::DANGER, e.to_string());
                 return;
             }
         };
-        ui.heading("Trial balance");
+        crate::theme::section(ui, "Trial balance");
         ui.label("As of the end date; debit balances are positive, credits negative.");
         if ui.button("Export trial balance as CSV").clicked() {
             match self
@@ -1893,11 +1906,11 @@ impl App {
         ));
         if debit != credit {
             ui.colored_label(
-                Color32::from_rgb(155, 55, 35),
+                crate::theme::DANGER,
                 "Trial balance is out of balance; review the underlying records.",
             );
         }
-        ui.heading("Trial balance by account group");
+        crate::theme::section(ui, "Trial balance by account group");
         ui.small("Each group total includes its descendants. Do not add parent and child rows together. Balances are grouped by each ledger's current group.");
         if ui.button("Export grouped trial balance as CSV").clicked() {
             match self.store.export_group_trial_balance_csv(
@@ -1956,18 +1969,18 @@ impl App {
                 }
             }
             Err(e) => {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                ui.colored_label(crate::theme::DANGER, e.to_string());
             }
         }
         ui.separator();
-        ui.heading("Profit and loss");
+        crate::theme::section(ui, "Profit and loss");
         ui.label(format!(
             "Income: {}    Expenses: {}    Net profit: {}",
             money(report.income),
             money(report.expenses),
             money(report.profit)
         ));
-        ui.heading("Balance sheet");
+        crate::theme::section(ui, "Balance sheet");
         ui.label(format!(
             "Assets: {}    Liabilities: {}    Equity including profit: {}",
             money(report.assets),
@@ -1977,7 +1990,7 @@ impl App {
         ui.small("The balance sheet includes cumulative profit through the end date and recorded opening balances. Automatic tax and statutory adjustments are not implemented.");
     }
     fn register_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Ledger activity");
+        crate::theme::section(ui, "Ledger activity");
         self.report_export_path_field(ui);
         let ledgers = match self.store.ledgers(company) {
             Ok(v) => v,
@@ -2029,7 +2042,7 @@ impl App {
         let register = match self.store.ledger_register(company, ledger, from, to) {
             Ok(v) => v,
             Err(e) => {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                ui.colored_label(crate::theme::DANGER, e.to_string());
                 return;
             }
         };
@@ -2125,7 +2138,7 @@ impl App {
                 .find(|g| g.parent_id.is_none() && g.name == "Primary")
                 .map(|g| g.id);
         }
-        ui.heading("Units and stock groups");
+        crate::theme::section(ui, "Units and stock groups");
         ui.horizontal(|ui| {
             ui.label("Unit symbol");
             ui.text_edit_singleline(&mut self.unit_symbol);
@@ -2189,7 +2202,7 @@ impl App {
             }
         });
         ui.separator();
-        ui.heading("Stock locations");
+        crate::theme::section(ui, "Stock locations");
         ui.horizontal(|ui| {
             ui.label("Name");
             ui.text_edit_singleline(&mut self.stock_location_name);
@@ -2240,7 +2253,7 @@ impl App {
             }
         });
         ui.separator();
-        ui.heading("Stock items");
+        crate::theme::section(ui, "Stock items");
         ui.horizontal(|ui| {
             ui.label("Name");
             ui.text_edit_singleline(&mut self.stock_name);
@@ -2313,7 +2326,7 @@ impl App {
             }
         };
         ui.separator();
-        ui.heading("Stock price lists");
+        crate::theme::section(ui, "Stock price lists");
         ui.small("Prices are per base unit. A later entry for the same item and effective date replaces the earlier value for lookup; both remain in history. Invoice prices are saved independently.");
         ui.horizontal(|ui| {
             ui.label("New price list");
@@ -2391,13 +2404,13 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                            ui.colored_label(crate::theme::DANGER, e.to_string());
                         }
                     }
                 });
         }
         ui.separator();
-        ui.heading("Reorder settings");
+        crate::theme::section(ui, "Reorder settings");
         ui.small("Warnings compare company-wide on-hand quantities with current rules; they do not include future orders or create purchase orders.");
         pick_stock(
             ui,
@@ -2490,13 +2503,13 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                            ui.colored_label(crate::theme::DANGER, e.to_string());
                         }
                     }
                 });
         }
         ui.separator();
-        ui.heading("Stock batches");
+        crate::theme::section(ui, "Stock batches");
         pick_stock(ui, "batch-item", "Item", &items, &mut self.batch_item);
         ui.horizontal(|ui| {
             ui.label("Batch name");
@@ -2563,7 +2576,7 @@ impl App {
                                 );
                                 if expired {
                                     ui.colored_label(
-                                        Color32::from_rgb(155, 55, 35),
+                                        crate::theme::DANGER,
                                         format!("{text} — expired as of selected date"),
                                     );
                                 } else {
@@ -2571,7 +2584,7 @@ impl App {
                                 }
                             }
                             Err(e) => {
-                                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                                ui.colored_label(crate::theme::DANGER, e.to_string());
                             }
                         }
                     }
@@ -2580,7 +2593,7 @@ impl App {
             }
         }
         ui.separator();
-        ui.heading("Edit stock item");
+        crate::theme::section(ui, "Edit stock item");
         if self.stock_editing.is_none() {
             pick_stock(
                 ui,
@@ -2677,7 +2690,7 @@ impl App {
             }
         }
         ui.separator();
-        ui.heading("Quantity adjustment");
+        crate::theme::section(ui, "Quantity adjustment");
         ui.label("Adjustments change quantities only; create any accounting entry separately.");
         let previous_adjustment_item = self.adjustment_item;
         pick_stock(
@@ -2759,7 +2772,7 @@ impl App {
             }
         }
         ui.separator();
-        ui.heading("Transfer stock");
+        crate::theme::section(ui, "Transfer stock");
         ui.label("Transfers change location quantities only and do not create accounting entries. Negative location balances are allowed.");
         let previous_transfer_item = self.transfer_item;
         pick_stock(ui, "transfer-item", "Item", &items, &mut self.transfer_item);
@@ -2843,12 +2856,12 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                    ui.colored_label(crate::theme::DANGER, e.to_string());
                 }
             }
         });
         ui.separator();
-        ui.heading("Stock quantities");
+        crate::theme::section(ui, "Stock quantities");
         self.report_export_path_field(ui);
         ui.small(
             "An empty as-of date includes all saved movements, including future-dated entries.",
@@ -2922,11 +2935,11 @@ impl App {
                 }
             }
             Err(e) => {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                ui.colored_label(crate::theme::DANGER, e.to_string());
             }
         }
         ui.small("Quantities may be negative. See Stock valuation for standard cost, weighted average and FIFO reports.");
-        ui.heading("Low stock across all locations");
+        crate::theme::section(ui, "Low stock across all locations");
         ui.small("Uses the as-of date above and current reorder settings, regardless of the location filter. Suggested quantities are fixed and do not account for pending orders.");
         match self.store.low_stock(company, end) {
             Ok(rows) if rows.is_empty() => {
@@ -2946,11 +2959,11 @@ impl App {
                 }
             }
             Err(e) => {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                ui.colored_label(crate::theme::DANGER, e.to_string());
             }
         }
         ui.separator();
-        ui.heading("Stock activity");
+        crate::theme::section(ui, "Stock activity");
         ui.small("Stock activity uses the location scope above. It shows transfers into or out of that scope.");
         pick_stock(
             ui,
@@ -3020,7 +3033,7 @@ impl App {
                     ));
                 }
                 Err(e) => {
-                    ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                    ui.colored_label(crate::theme::DANGER, e.to_string());
                 }
             }
         }
@@ -3148,12 +3161,15 @@ impl App {
             .collect();
     }
     fn invoice_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading(match self.editing_invoice {
-            Some(id) => format!("Edit invoice {id}"),
-            None if self.invoice_source.is_some() => "Invoice linked stock".into(),
-            None if self.copying_invoice => "New invoice from copy".into(),
-            None => "Sales and purchase invoices".into(),
-        });
+        crate::theme::section(
+            ui,
+            match self.editing_invoice {
+                Some(id) => format!("Edit invoice {id}"),
+                None if self.invoice_source.is_some() => "Invoice linked stock".into(),
+                None if self.copying_invoice => "New invoice from copy".into(),
+                None => "Sales and purchase invoices".into(),
+            },
+        );
         let from_note = matches!(self.invoice_source, Some(InvoiceSource::StockNote(_)));
         match self.invoice_source {
             Some(InvoiceSource::Order(order)) => {
@@ -3325,7 +3341,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                        ui.colored_label(crate::theme::DANGER, e.to_string());
                     }
                 }
             }
@@ -3531,7 +3547,7 @@ impl App {
         if !from_note && ui.button("Add item line").clicked() {
             self.invoice_lines.push(InvoiceLineForm::new());
         }
-        ui.heading("Services, charges and deductions");
+        crate::theme::section(ui, "Services, charges and deductions");
         ui.small("Enter each amount and description manually. For an invoice without stock items, include a positive line in an income account for a sale, or an expense or asset account for a purchase. These lines do not calculate or classify tax.");
         let mut remove_adjustment = None;
         for (index, adjustment) in self.invoice_adjustments.iter_mut().enumerate() {
@@ -3746,10 +3762,10 @@ impl App {
             }
         }
         ui.separator();
-        ui.heading("Invoices");
+        crate::theme::section(ui, "Invoices");
         ui.small("Invoice balances include all saved settlements and reversals. Use Outstanding for a specific date.");
         if let Some(voucher) = self.reversal_target {
-            ui.heading(format!("Reverse settlement voucher {voucher}"));
+            crate::theme::section(ui, format!("Reverse settlement voucher {voucher}"));
             ui.label("This reverses the entire receipt or payment, including all invoices allocated to it.");
             ui.horizontal(|ui| {
                 ui.label("Date");
@@ -3785,7 +3801,7 @@ impl App {
         }
         match self.store.invoices(company) {
             Ok(invoices) => {
-                ui.heading("Record a receipt or payment");
+                crate::theme::section(ui, "Record a receipt or payment");
                 ui.small("Allocate one receipt or payment to one or more outstanding invoices of the same party and type.");
                 let selected = invoices
                     .iter()
@@ -4109,7 +4125,7 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                            ui.colored_label(crate::theme::DANGER, e.to_string());
                         }
                     }
                     ui.small(format!("Accounting voucher #{}", invoice.voucher_id));
@@ -4199,7 +4215,7 @@ impl App {
                                     }
                                 }
                                 Err(e) => {
-                                    ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                                    ui.colored_label(crate::theme::DANGER, e.to_string());
                                 }
                             }
                         });
@@ -4308,7 +4324,7 @@ impl App {
     }
 
     fn import_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Import accounting XML");
+        crate::theme::section(ui, "Import accounting XML");
         ui.label("Preview a file before importing. Only supported, complete records can be imported; no changes are made if any issue is found.");
         ui.horizontal(|ui| {
             ui.label("File path");
@@ -4384,7 +4400,7 @@ impl App {
                 ui.label("Preview found no issues. Review the limitations below before importing.");
             } else {
                 ui.colored_label(
-                    Color32::from_rgb(155, 55, 35),
+                    crate::theme::DANGER,
                     format!("{} issue(s) prevent import:", plan.issues().len()),
                 );
                 for issue in plan.issues().iter().take(100) {
@@ -4414,7 +4430,7 @@ impl App {
         ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. Invoices require one matching new bill reference and one accounting allocation per item; additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed bill allocations, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Bank clearance");
+        crate::theme::section(ui, "Bank clearance");
         ui.label("Manually record clearance dates for postings in a cash or bank asset ledger. Compare these with your bank statement; a cleared balance is calculated from marked book entries, not imported from the bank.");
         let ledgers = match self.store.ledgers(company) {
             Ok(values) => values
@@ -4458,7 +4474,7 @@ impl App {
         let report = match self.store.bank_report(company, ledger, &self.bank_as_of) {
             Ok(report) => report,
             Err(e) => {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                ui.colored_label(crate::theme::DANGER, e.to_string());
                 return;
             }
         };
@@ -4482,7 +4498,7 @@ impl App {
             Ok(None) => ui.label(
                 "No statement balance is available for this date; set an opening balance first.",
             ),
-            Err(e) => ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string()),
+            Err(e) => ui.colored_label(crate::theme::DANGER, e.to_string()),
         };
         ui.small("The statement balance uses only imported entries and the entered opening; verify coverage against the bank. It is not independently verified.");
         ui.small("Balances are debit minus credit. Past reports use the current clearance dates; revisions do not reconstruct past states.");
@@ -4598,7 +4614,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                        ui.colored_label(crate::theme::DANGER, e.to_string());
                     }
                 }
             });
@@ -4612,7 +4628,7 @@ impl App {
         book_entries: &[BankEntry],
     ) {
         ui.separator();
-        ui.heading("Statement entries");
+        crate::theme::section(ui, "Statement entries");
         ui.label("Set the balance immediately before the start date; imported entries on that date are included. Positive is a debit balance, negative a credit balance.");
         let opening = match self.store.statement_opening(company, ledger) {
             Ok(opening) => opening,
@@ -4706,7 +4722,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                    ui.colored_label(crate::theme::DANGER, e.to_string());
                 }
             }
         });
@@ -4755,7 +4771,7 @@ impl App {
         if let Some(plan) = &self.bank_csv_preview {
             ui.label(format!("Preview: {} entries", plan.row_count()));
             for issue in plan.issues().iter().take(100) {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), issue);
+                ui.colored_label(crate::theme::DANGER, issue);
             }
             if plan.issues().len() > 100 {
                 ui.label("Additional issues are not shown.");
@@ -4796,7 +4812,7 @@ impl App {
         {
             Ok(entries) => entries,
             Err(e) => {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                ui.colored_label(crate::theme::DANGER, e.to_string());
                 return;
             }
         };
@@ -4943,13 +4959,13 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                        ui.colored_label(crate::theme::DANGER, e.to_string());
                     }
                 }
             });
     }
     fn invoice_register_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Sales and purchase register");
+        crate::theme::section(ui, "Sales and purchase register");
         self.report_export_path_field(ui);
         ui.small("The date filter applies to original invoices. The report shows original totals and all recorded reversals, including future dates. Use Outstanding for balances on a specific date.");
         let ledgers = match self.store.ledgers(company) {
@@ -5088,12 +5104,12 @@ impl App {
                 ));
             }
             Err(e) => {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                ui.colored_label(crate::theme::DANGER, e.to_string());
             }
         }
     }
     fn outstanding_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Outstanding invoices");
+        crate::theme::section(ui, "Outstanding invoices");
         self.report_export_path_field(ui);
         ui.label("Age is measured from the invoice date; overdue days are measured from the optional due date. Credit notes and unallocated payments are not included. Past reports use the invoice's current details and due date.");
         ui.horizontal(|ui| {
@@ -5200,7 +5216,7 @@ impl App {
                     money(receivable),
                     money(payable)
                 ));
-                ui.heading("Outstanding by party");
+                crate::theme::section(ui, "Outstanding by party");
                 ui.small("Receivables and payables are not netted. Overdue totals exclude invoices with no due date. Credit limits are current and informational.");
                 if ui.button("Export party outstanding as CSV").clicked() {
                     match self.store.export_party_outstanding_csv(
@@ -5255,10 +5271,10 @@ impl App {
                             });
                     }
                     Err(e) => {
-                        ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                        ui.colored_label(crate::theme::DANGER, e.to_string());
                     }
                 };
-                ui.heading("Age from invoice date");
+                crate::theme::section(ui, "Age from invoice date");
                 egui::Grid::new("outstanding-age")
                     .striped(true)
                     .show(ui, |ui| {
@@ -5278,7 +5294,7 @@ impl App {
                         }
                         ui.end_row();
                     });
-                ui.heading("Age from due date");
+                crate::theme::section(ui, "Age from due date");
                 ui.small("Current includes invoices due today or later; invoices without a due date are shown separately.");
                 egui::Grid::new("outstanding-due-age")
                     .striped(true)
@@ -5308,12 +5324,12 @@ impl App {
                     });
             }
             Err(e) => {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                ui.colored_label(crate::theme::DANGER, e.to_string());
             }
         }
     }
     fn day_book_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Day book");
+        crate::theme::section(ui, "Day book");
         self.report_export_path_field(ui);
         ui.horizontal(|ui| {
             ui.label("From");
@@ -5396,7 +5412,7 @@ impl App {
                 });
             }
             Err(e) => {
-                ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
+                ui.colored_label(crate::theme::DANGER, e.to_string());
             }
         }
     }
@@ -5412,7 +5428,7 @@ impl App {
         ui.small("Exports include the current report filters and never overwrite existing files. Day-book, invoice-register, outstanding, stock and trial-balance files include a context row; ledger files include opening and closing rows. Potential spreadsheet formulas in text are prefixed with an apostrophe.");
     }
     fn backup_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Back up data");
+        crate::theme::section(ui, "Back up data");
         ui.label("Create a snapshot of all companies, ledgers, vouchers, invoices, stock records and saved revisions in this database.");
         ui.label("Choose a new file path. Existing files are not overwritten.");
         ui.horizontal(|ui| {
@@ -5432,7 +5448,7 @@ impl App {
         }
         ui.small("If backup creation fails, an incomplete file may remain at the selected path.");
         ui.separator();
-        ui.heading("Restore to a new file");
+        crate::theme::section(ui, "Restore to a new file");
         ui.label("Choose an existing backup and a new destination. The current database stays open and is not replaced. The new copy is checked and upgraded before use.");
         ui.horizontal(|ui| {
             ui.label("Backup file");
@@ -5588,104 +5604,7 @@ fn money(value: i128) -> String {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("Balance").color(Color32::from_rgb(30, 75, 115)));
-                ui.label("Early accounting prototype");
-                #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
-                self.updates.show(ui);
-            });
-            if let Some(company) = self.company {
-                if let Ok(Some(code)) = self.store.company_base_currency(company) {
-                    ui.small(format!("Base currency: {code}"));
-                }
-            }
-            ui.small(format!("Database: {}", self.database_path.display()));
-        });
-        egui::SidePanel::left("navigation").show(ctx, |ui| {
-            ui.heading("Gateway");
-            for (label, page) in [
-                ("Companies", Page::Company),
-                ("Ledgers", Page::Ledger),
-                ("Voucher", Page::Voucher),
-                ("Monthly journals", Page::Recurring),
-                ("Currencies", Page::Currencies),
-                ("Ledger activity", Page::Register),
-                ("Day book", Page::DayBook),
-                ("Outstanding", Page::Outstanding),
-                ("Advances", Page::Advances),
-                ("Invoice register", Page::InvoiceRegister),
-                ("Tax register", Page::TaxRegister),
-                ("Bank clearance", Page::Bank),
-                ("Cash flow", Page::CashFlow),
-                ("Stock", Page::Stock),
-                ("Stock counts", Page::StockCounts),
-                ("Delivery and receipt notes", Page::StockNotes),
-                ("Stock valuation", Page::Valuation),
-                ("Manufacturing", Page::Manufacturing),
-                ("Invoices", Page::Invoice),
-                ("Orders", Page::Orders),
-                ("Import XML", Page::Import),
-                ("Back up", Page::Backup),
-                ("Reports", Page::Reports),
-                ("Cost centres", Page::CostCentres),
-                ("Budgets", Page::Budgets),
-                ("Payroll", Page::Payroll),
-            ] {
-                if ui.selectable_label(self.page == page, label).clicked() {
-                    self.page = page;
-                    self.message.clear();
-                }
-            }
-        });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if !self.message.is_empty() {
-                    ui.colored_label(Color32::from_rgb(155, 55, 35), &self.message);
-                    ui.separator();
-                }
-                if self.page == Page::Company {
-                    self.company_page(ui);
-                    return;
-                }
-                if self.page == Page::Backup {
-                    self.backup_page(ui);
-                    return;
-                }
-                let Some(company) = self.company else {
-                    ui.label("Select a company first.");
-                    return;
-                };
-                match self.page {
-                    Page::Company => {}
-                    Page::Ledger => self.ledger_page(ui, company),
-                    Page::Voucher => self.voucher_page(ui, company),
-                    Page::Recurring => self.show_recurring_journals(ui, company),
-                    Page::Currencies => self.currency_page(ui, company),
-                    Page::Register => self.register_page(ui, company),
-                    Page::DayBook => self.day_book_page(ui, company),
-                    Page::Outstanding => self.outstanding_page(ui, company),
-                    Page::Advances => self.advances_page(ui, company),
-                    Page::InvoiceRegister => self.invoice_register_page(ui, company),
-                    Page::TaxRegister => self.tax_register_page(ui, company),
-                    Page::Bank => self.bank_page(ui, company),
-                    Page::CashFlow => self.cash_flow_page(ui, company),
-                    Page::Stock => self.stock_page(ui, company),
-                    Page::StockCounts => self.stock_counts_page(ui, company),
-                    Page::StockNotes => self.stock_notes_page(ui, company),
-                    Page::Valuation => self.valuation_page(ui, company),
-                    Page::Manufacturing => self.manufacturing_page(ui, company),
-                    Page::Invoice => self.invoice_page(ui, company),
-                    Page::Orders => self.orders_page(ui, company),
-                    Page::Import => self.import_page(ui, company),
-                    Page::Backup => {}
-                    Page::Reports => self.reports_page(ui, company),
-                    Page::CostCentres => self.cost_page(ui, company),
-                    Page::Budgets => self.budgets_page(ui, company),
-                    Page::Payroll => self.payroll_page(ui, company),
-                }
-            });
-        });
+        self.shell_update(ctx);
     }
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -5711,10 +5630,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Store::open(&database_path)?
     };
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Balance")
+            .with_inner_size([1360.0, 860.0])
+            .with_min_inner_size([1024.0, 640.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "Balance",
-        eframe::NativeOptions::default(),
-        Box::new(move |_| Ok(Box::new(App::new(store, database_path)))),
+        options,
+        Box::new(move |cc| {
+            theme::install(&cc.egui_ctx);
+            Ok(Box::new(App::new(store, database_path)))
+        }),
     )?;
     Ok(())
 }

@@ -75,7 +75,7 @@ pub(super) struct BudgetScreen {
 
 impl App {
     pub(super) fn budgets_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Budgets");
+        crate::theme::section(ui, "Budgets");
         egui::CollapsingHeader::new("Set a budget")
             .default_open(true)
             .show(ui, |ui| {
@@ -246,7 +246,7 @@ impl App {
         let Some(report) = self.budget_screen.report.as_ref() else {
             return;
         };
-        ui.heading(version_label(&report.version));
+        crate::theme::section(ui, version_label(&report.version));
         ui.label(format!(
             "{} UTC | {}",
             report.version.recorded_at, report.version.reason

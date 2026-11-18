@@ -68,7 +68,7 @@ impl CostScreen {
 
 impl App {
     pub(super) fn cost_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Cost centres");
+        crate::theme::section(ui, "Cost centres");
         let centres = match self.store.cost_centres(company) {
             Ok(centres) => centres,
             Err(error) => {

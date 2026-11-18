@@ -25,7 +25,7 @@ impl RecurringJournalScreen {
         store: &mut Store,
         company: i64,
     ) -> Result<Option<String>> {
-        ui.heading("Monthly journals");
+        crate::theme::section(ui, "Monthly journals");
         let journals = store.monthly_journals(company)?;
         if journals.is_empty() {
             ui.label("Save a journal as a monthly schedule from the Voucher page.");
@@ -136,7 +136,7 @@ impl RecurringJournalScreen {
         }
 
         ui.separator();
-        ui.heading("Occurrence history");
+        crate::theme::section(ui, "Occurrence history");
         let history = store.monthly_journal_history(company, journal.id)?;
         if history.is_empty() {
             ui.label("No occurrences recorded.");

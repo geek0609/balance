@@ -10,6 +10,9 @@ fn main() {
         let manifest = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("packaging/windows/balance.manifest");
         println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", manifest.display());
+        println!(
+            "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+            manifest.display()
+        );
     }
 }

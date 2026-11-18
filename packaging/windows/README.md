@@ -2,7 +2,7 @@
 
 The Windows x64 installer bundles Balance, the WinSparkle runtime and third-party notices. It installs under the current user and uses a registered Start menu shortcut. The database remains in Balance's local application-data directory across upgrades and uninstall.
 
-Installed builds are configured for the public Windows update feed on the repository's [updates branch](https://github.com/geek0609/balance/tree/updates). The installer enables automatic checks for a new user and preserves the user's choice on upgrade. WinSparkle verifies the Ed25519 signature of the installer before running it. A user approves the update and reopens Balance after setup completes.
+Installed builds check the public Windows update feed on the repository's [updates branch](https://github.com/geek0609/balance/tree/updates) hourly while Balance runs. The installer enables automatic checks for a new user and preserves the user's choice on upgrade. After the user approves an update, WinSparkle verifies the installer's Ed25519 signature before running it. Setup reopens Balance when installation completes.
 
 ## Automatic releases
 

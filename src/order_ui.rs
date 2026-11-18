@@ -103,7 +103,7 @@ impl OrderScreen {
 
 impl App {
     pub(super) fn orders_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Sales and purchase orders");
+        crate::theme::section(ui, "Sales and purchase orders");
         egui::CollapsingHeader::new("Create order or quotation")
             .show(ui, |ui| self.create_order_form(ui, company));
         egui::CollapsingHeader::new("Quotations").show(ui, |ui| {
@@ -123,7 +123,7 @@ impl App {
             }
             ui.separator();
         }
-        ui.heading("Order register");
+        crate::theme::section(ui, "Order register");
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("order-kind-filter")
                 .selected_text(
@@ -609,12 +609,15 @@ impl App {
 
     fn order_detail_view(&mut self, ui: &mut egui::Ui, company: i64, detail: &OrderDetail) {
         let order = &detail.summary;
-        ui.heading(format!(
-            "{} order {} | {}",
-            order.kind.as_str(),
-            order.reference,
-            order.status.label()
-        ));
+        crate::theme::section(
+            ui,
+            format!(
+                "{} order {} | {}",
+                order.kind.as_str(),
+                order.reference,
+                order.status.label()
+            ),
+        );
         match self.store.order_quotation(company, order.id) {
             Ok(Some(reference)) => {
                 ui.label(format!("Quotation {reference}"));

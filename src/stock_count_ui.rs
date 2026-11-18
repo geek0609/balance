@@ -72,7 +72,7 @@ impl StockCountScreen {
 
 impl App {
     pub(super) fn stock_counts_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Physical stock counts");
+        crate::theme::section(ui, "Physical stock counts");
         if self.stock_count_screen.preview_pending() {
             self.stock_count_preview(ui, company);
         } else {
@@ -184,12 +184,15 @@ impl App {
         let Some(preview) = self.stock_count_screen.preview.as_ref() else {
             return;
         };
-        ui.heading(format!(
-            "{} | {} | {}",
-            preview.reference(),
-            preview.location(),
-            preview.date()
-        ));
+        crate::theme::section(
+            ui,
+            format!(
+                "{} | {} | {}",
+                preview.reference(),
+                preview.location(),
+                preview.date()
+            ),
+        );
         ui.small("Book quantities include all movements already saved through the count date. Posting records the count and adjusts quantities by the difference.");
         count_table(ui, "count-preview", preview.lines(), false);
         let mut edit = false;
@@ -215,7 +218,7 @@ impl App {
     }
 
     fn stock_count_history(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Count history");
+        crate::theme::section(ui, "Count history");
         ui.add(
             egui::TextEdit::singleline(&mut self.stock_count_screen.search)
                 .hint_text("Reference or location"),

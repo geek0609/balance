@@ -125,7 +125,7 @@ impl App {
     }
 
     pub(super) fn stock_notes_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Delivery and receipt notes");
+        crate::theme::section(ui, "Delivery and receipt notes");
         if let Err(error) = self.stock_note_form(ui, company) {
             self.failure(error);
         }
@@ -154,7 +154,7 @@ impl App {
             .into_iter()
             .filter(|ledger| matches!(ledger.category, Category::Asset | Category::Liability))
             .collect::<Vec<_>>();
-        ui.heading("New stock note");
+        crate::theme::section(ui, "New stock note");
         let form = &mut self.stock_note_screen.form;
         if let Some(order) = form.order {
             ui.horizontal(|ui| {
@@ -340,7 +340,7 @@ impl App {
     }
 
     fn stock_note_register(&mut self, ui: &mut egui::Ui, company: i64) -> Result<()> {
-        ui.heading("Stock note register");
+        crate::theme::section(ui, "Stock note register");
         let notes = self.store.stock_notes(company, None)?;
         if notes.is_empty() {
             ui.label("No delivery or receipt notes posted.");

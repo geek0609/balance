@@ -104,7 +104,7 @@ impl CurrencyScreen {
 
 impl App {
     pub(super) fn currency_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Currencies");
+        crate::theme::section(ui, "Currencies");
         let base = match self.store.company_base_currency(company) {
             Ok(base) => base,
             Err(error) => {

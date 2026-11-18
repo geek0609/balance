@@ -123,7 +123,7 @@ pub(super) struct ManufacturingScreen {
 
 impl App {
     pub(super) fn manufacturing_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Manufacturing");
+        crate::theme::section(ui, "Manufacturing");
         let items = match self.store.stock_items(company) {
             Ok(items) => items,
             Err(error) => {

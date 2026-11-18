@@ -88,14 +88,14 @@ impl AdvanceScreen {
 
 impl App {
     pub(super) fn advances_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Customer and supplier advances");
+        crate::theme::section(ui, "Customer and supplier advances");
         egui::CollapsingHeader::new("Record advance")
             .default_open(true)
             .show(ui, |ui| {
                 self.advance_entry_form(ui, company);
             });
         ui.separator();
-        ui.heading("Advance register");
+        crate::theme::section(ui, "Advance register");
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("advance-kind-filter")
                 .selected_text(

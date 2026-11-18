@@ -156,7 +156,7 @@ pub(super) struct PayrollScreen {
 
 impl App {
     pub(super) fn payroll_page(&mut self, ui: &mut egui::Ui, company: i64) {
-        ui.heading("Payroll");
+        crate::theme::section(ui, "Payroll");
         let employees = match self.store.employees(company) {
             Ok(employees) => employees,
             Err(error) => {
@@ -545,7 +545,7 @@ impl App {
         end: Option<&str>,
         banks: &[Ledger],
     ) {
-        ui.heading(format!("{} | {}", row.employee, row.reference));
+        crate::theme::section(ui, format!("{} | {}", row.employee, row.reference));
         ui.label(format!(
             "Period {} to {} | Voucher {}",
             row.period_start, row.period_end, row.voucher_id
