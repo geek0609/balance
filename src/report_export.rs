@@ -617,29 +617,25 @@ impl Store {
         let entries = self.outstanding_invoices(company, &date)?;
         let context = vec![self.report_company_name(company)?, date];
         let mut csv = writer();
-        contextual_row(
-            &mut csv,
-            &strings(&["company", "as_of"]),
-            &strings(&[
-                "row_type",
-                "invoice_id",
-                "type",
-                "party",
-                "date",
-                "due_date",
-                "reference",
-                "total",
-                "settled",
-                "outstanding",
-                "age_days",
-                "overdue_days",
-            ]),
-        )?;
-        contextual_row(
-            &mut csv,
-            &context,
-            &strings(&["context", "", "", "", "", "", "", "", "", "", "", ""]),
-        )?;
+        let details = strings(&[
+            "row_type",
+            "invoice_id",
+            "type",
+            "party",
+            "date",
+            "due_date",
+            "reference",
+            "total",
+            "settled",
+            "advance_applied",
+            "outstanding",
+            "age_days",
+            "overdue_days",
+        ]);
+        contextual_row(&mut csv, &strings(&["company", "as_of"]), &details)?;
+        let mut context_fields = vec![String::new(); details.len()];
+        context_fields[0] = "context".into();
+        contextual_row(&mut csv, &context, &context_fields)?;
         for entry in entries {
             contextual_row(
                 &mut csv,
@@ -654,6 +650,7 @@ impl Store {
                     text_cell(&entry.reference),
                     money(entry.total),
                     money(entry.settled),
+                    money(entry.advance_applied),
                     money(entry.outstanding),
                     entry.age_days.to_string(),
                     entry
@@ -703,6 +700,7 @@ impl Store {
             "reversal_date",
             "reversal_reference",
             "settled_all_dates",
+            "advance_applied_all_dates",
             "outstanding_all_dates",
         ]);
         let mut csv = writer();
@@ -765,6 +763,7 @@ impl Store {
                         .map(|r| text_cell(&r.reference))
                         .unwrap_or_default(),
                     money(invoice.settled),
+                    money(invoice.advance_applied),
                     money(invoice.outstanding),
                 ],
             )?;

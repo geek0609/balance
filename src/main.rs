@@ -3619,13 +3619,14 @@ impl App {
                 ui.small("Editing or copying an invoice replaces the current invoice form. A copy retains prices, tax and allocations for review; enter a new date and reference before saving.");
                 for invoice in invoices {
                     ui.strong(format!(
-                        "{}  {}  {}  {}  Total {}  Paid {}  Outstanding {}",
+                        "{}  {}  {}  {}  Total {}  Cash {}  Advances {}  Outstanding {}",
                         invoice.date,
                         invoice.kind.as_str(),
                         invoice.reference,
                         invoice.party,
                         money(invoice.total),
                         money(invoice.settled),
+                        money(invoice.advance_applied),
                         money(invoice.outstanding)
                     ));
                     if ui.button("Export printable invoice").clicked() {
@@ -3641,6 +3642,7 @@ impl App {
                     if ui
                         .add_enabled(
                             !invoice.has_settlement_history
+                                && !invoice.has_advance_history
                                 && invoice.reversal.is_none()
                                 && invoice.order_id.is_none()
                                 && !self.invoice_draft_in_use(),
@@ -3679,8 +3681,8 @@ impl App {
                             self.message.clear();
                         }
                     }
-                    if invoice.has_settlement_history {
-                        ui.small("Invoices with settlement history cannot yet be edited, even after a reversal.");
+                    if invoice.has_settlement_history || invoice.has_advance_history {
+                        ui.small("Invoice details are fixed once a settlement or advance has been applied.");
                     }
                     if let Some(due_date) = &invoice.due_date {
                         ui.small(format!("Due: {due_date}"));
@@ -3864,7 +3866,9 @@ impl App {
             InvoiceKind::Sale => "credit note",
             InvoiceKind::Purchase => "debit note",
         };
-        let can_reverse = invoice.settled == 0 && self.editing_invoice != Some(invoice.id);
+        let can_reverse = invoice.settled == 0
+            && invoice.advance_applied == 0
+            && self.editing_invoice != Some(invoice.id);
         if self.invoice_reversal.is_none()
             && ui
                 .add_enabled(
@@ -3872,7 +3876,7 @@ impl App {
                     egui::Button::new(format!("Reverse with a {note}")),
                 )
                 .on_disabled_hover_text(
-                    "Finish editing or reverse active settlements before reversing the invoice.",
+                    "Finish editing, reverse active settlements and release applied advances before reversing the invoice.",
                 )
                 .clicked()
         {
@@ -4660,7 +4664,8 @@ impl App {
                             "Due",
                             "Original total",
                             "Reversed on",
-                            "Settled",
+                            "Cash settled",
+                            "Advances",
                             "Outstanding",
                         ] {
                             ui.strong(label);
@@ -4686,6 +4691,7 @@ impl App {
                                     .unwrap_or("—"),
                             );
                             ui.label(money(invoice.settled));
+                            ui.label(money(invoice.advance_applied));
                             ui.label(money(invoice.outstanding));
                             ui.end_row();
                         }
@@ -4747,7 +4753,8 @@ impl App {
                         "Due date",
                         "Reference",
                         "Total",
-                        "Settled",
+                        "Cash settled",
+                        "Advances",
                         "Outstanding",
                         "Age (days)",
                         "Overdue (days)",
@@ -4786,6 +4793,7 @@ impl App {
                         ui.label(row.reference);
                         ui.label(money(row.total));
                         ui.label(money(row.settled));
+                        ui.label(money(row.advance_applied));
                         ui.label(money(row.outstanding));
                         ui.label(row.age_days.to_string());
                         ui.label(

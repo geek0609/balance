@@ -120,6 +120,20 @@ impl Store {
                 }
             }
         }
+        let advances = crate::advances::invoice_allocation_state(&tx, company, invoice, None)?;
+        if advances.applied > 0 {
+            return Err(Error::Validation(
+                "Release active advances before reversing this invoice".into(),
+            ));
+        }
+        if advances
+            .latest_release
+            .is_some_and(|released| date < released)
+        {
+            return Err(Error::Validation(
+                "Note date cannot precede an advance release".into(),
+            ));
+        }
         let (voucher_kind, direction) = match InvoiceKind::parse(&kind)? {
             InvoiceKind::Sale => (VoucherKind::CreditNote, 1),
             InvoiceKind::Purchase => (VoucherKind::DebitNote, -1),

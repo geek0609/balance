@@ -31,7 +31,7 @@ pub mod stock_sales;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 41;
+const SCHEMA_VERSION: i64 = 42;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -409,6 +409,7 @@ impl Store {
             "standard_stock_costs",
             "stock_receipt_costs",
             "party_advances",
+            "advance_allocations",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -710,6 +711,10 @@ impl Store {
         if version < 41 {
             advances::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 41)?;
+        }
+        if version < 42 {
+            advances::migrate_allocations(&tx)?;
+            tx.pragma_update(None, "user_version", 42)?;
         }
         tx.commit()?;
         Ok(Self { conn })

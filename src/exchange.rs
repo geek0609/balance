@@ -4,8 +4,9 @@ use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
     discounted_line_amount, find_stock_batch, insert_invoice_on_connection,
-    insert_settlement_on_connection, parse_quantity, InvoiceAdjustment, InvoiceAllocation,
-    InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine, SettlementAllocation,
+    insert_settlement_on_connection, invoice_total, parse_quantity, InvoiceAdjustment,
+    InvoiceAllocation, InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine,
+    SettlementAllocation,
 };
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
@@ -2693,7 +2694,10 @@ impl Store {
                 ),
             >::new();
             for invoice in self.invoices(company_id)? {
-                let mut latest_reversal = None;
+                let mut latest_reversal = crate::advances::invoice_allocation_state(
+                    &self.conn, company_id, invoice.id, None,
+                )?
+                .latest_release;
                 let mut settlement_references = HashSet::new();
                 for settlement in self.invoice_settlements(company_id, invoice.id)? {
                     settlement_references.insert(normalized(&settlement.reference));
@@ -2823,7 +2827,7 @@ impl Store {
                                     || reversal.is_some_and(|value| date < value)
                                 {
                                     plan.issues.push(format!(
-                                        "{label}: settlement precedes the invoice or a reversal"
+                                        "{label}: settlement precedes the invoice, a reversal or an advance release"
                                     ));
                                 }
                                 if i128::from(allocation.amount) > *outstanding {
@@ -3452,12 +3456,9 @@ impl Store {
                         allocation.reference
                     )));
                 }
-                let mut outstanding = i128::from(tax);
-                let mut amounts = tx.prepare("SELECT amount FROM invoice_lines WHERE invoice_id = ?1 UNION ALL SELECT amount FROM invoice_adjustments WHERE invoice_id = ?1")?;
-                for amount in amounts.query_map([id], |r| r.get::<_, i64>(0))? {
-                    outstanding += i128::from(amount?);
-                }
-                drop(amounts);
+                let advances =
+                    crate::advances::invoice_allocation_state(&tx, plan.company_id, id, None)?;
+                let mut outstanding = invoice_total(&tx, id, tax)? - advances.applied;
                 let mut paid = tx.prepare("SELECT s.amount FROM invoice_settlements s WHERE s.company_id = ?1 AND s.invoice_id = ?2 AND NOT EXISTS(SELECT 1 FROM settlement_reversals r WHERE r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id)")?;
                 for amount in
                     paid.query_map(params![plan.company_id, id], |r| r.get::<_, i64>(0))?

@@ -183,8 +183,10 @@ pub struct InvoiceSummary {
     pub total: i128,
     pub tax_amount: i64,
     pub settled: i128,
+    pub advance_applied: i128,
     pub outstanding: i128,
     pub has_settlement_history: bool,
+    pub has_advance_history: bool,
     pub order_id: Option<i64>,
     pub reversal: Option<crate::invoice_reversals::InvoiceReversal>,
     pub lines: Vec<InvoiceDetailLine>,
@@ -234,6 +236,7 @@ pub struct OutstandingInvoice {
     pub party_ledger_id: i64,
     pub total: i128,
     pub settled: i128,
+    pub advance_applied: i128,
     pub outstanding: i128,
     /// Days since the invoice date, not days past a payment due date.
     pub age_days: i64,
@@ -1055,6 +1058,18 @@ pub(crate) fn create_stock_item_on_connection(
     conn.execute("INSERT INTO stock_items(company_id, name, unit, unit_id, group_id, description) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![company_id, name, unit, unit_id, group_id, description.trim()])?;
     Ok(conn.last_insert_rowid())
 }
+pub(crate) fn invoice_total(conn: &Connection, invoice: i64, tax: i64) -> Result<i128> {
+    let mut stmt = conn.prepare(
+        "SELECT amount FROM invoice_lines WHERE invoice_id = ?1
+         UNION ALL SELECT amount FROM invoice_adjustments WHERE invoice_id = ?1",
+    )?;
+    let mut total = i128::from(tax);
+    for row in stmt.query_map([invoice], |row| row.get::<_, i64>(0))? {
+        total += i128::from(row?);
+    }
+    Ok(total)
+}
+
 pub(crate) fn insert_settlement_on_connection(
     conn: &Connection,
     company_id: i64,
@@ -1108,18 +1123,21 @@ pub(crate) fn insert_settlement_on_connection(
             ));
         }
         common = Some((kind, party));
-        let mut invoice_total = i128::from(tax);
-        let mut amounts = conn.prepare("SELECT amount FROM invoice_lines WHERE invoice_id = ?1")?;
-        for value in amounts.query_map([allocation.invoice_id], |r| r.get::<_, i64>(0))? {
-            invoice_total += i128::from(value?);
+        let total_on_invoice = invoice_total(conn, allocation.invoice_id, tax)?;
+        let advances = crate::advances::invoice_allocation_state(
+            conn,
+            company_id,
+            allocation.invoice_id,
+            None,
+        )?;
+        if advances
+            .latest_release
+            .is_some_and(|date| parsed_date < date)
+        {
+            return Err(Error::Validation(
+                "Settlement date cannot precede an advance release on the invoice".into(),
+            ));
         }
-        drop(amounts);
-        let mut adjustments =
-            conn.prepare("SELECT amount FROM invoice_adjustments WHERE invoice_id = ?1")?;
-        for value in adjustments.query_map([allocation.invoice_id], |r| r.get::<_, i64>(0))? {
-            invoice_total += i128::from(value?);
-        }
-        drop(adjustments);
         let mut paid = 0_i128;
         let mut previous = conn.prepare("SELECT s.amount, v.reference, rv.date FROM invoice_settlements s JOIN vouchers v ON v.id = s.voucher_id LEFT JOIN settlement_reversals r ON r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id WHERE s.invoice_id = ?1 AND s.company_id = ?2")?;
         for row in previous.query_map(params![allocation.invoice_id, company_id], |r| {
@@ -1147,7 +1165,7 @@ pub(crate) fn insert_settlement_on_connection(
             }
         }
         drop(previous);
-        if i128::from(allocation.amount) > invoice_total - paid {
+        if i128::from(allocation.amount) > total_on_invoice - paid - advances.applied {
             return Err(Error::Validation(
                 "An allocation exceeds its invoice's outstanding amount".into(),
             ));
@@ -2064,6 +2082,12 @@ impl Store {
                 "An invoice linked to an order cannot yet be edited".into(),
             ));
         }
+        if crate::advances::invoice_allocation_state(&tx, company_id, invoice_id, None)?.has_history
+        {
+            return Err(Error::Validation(
+                "An invoice with advance allocation history cannot yet be edited".into(),
+            ));
+        }
         crate::costs::ensure_unallocated(&tx, voucher_id)?;
         crate::banking::ensure_no_bank_clearance(&tx, company_id, voucher_id)?;
         let prepared = prepare_invoice(&tx, company_id, draft, Some(invoice_id))?;
@@ -2263,10 +2287,12 @@ impl Store {
             }
             let has_settlement_history: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM invoice_settlements WHERE invoice_id = ?1 AND company_id = ?2)", params![id, company_id], |r| r.get(0))?;
             let reversal = crate::invoice_reversals::for_invoice(&self.conn, company_id, id)?;
+            let advances =
+                crate::advances::invoice_allocation_state(&self.conn, company_id, id, None)?;
             let outstanding = if reversal.is_some() {
                 0
             } else {
-                total - settled
+                total - settled - advances.applied
             };
             result.push(InvoiceSummary {
                 id,
@@ -2284,6 +2310,8 @@ impl Store {
                 outstanding,
                 reversal,
                 has_settlement_history,
+                has_advance_history: advances.has_history,
+                advance_applied: advances.applied,
                 order_id: crate::orders::linked_order(&self.conn, id)?,
                 lines,
                 adjustments,
@@ -2512,7 +2540,14 @@ impl Store {
                     settled += i128::from(settlement.amount);
                 }
             }
-            let outstanding = invoice.total - settled;
+            let advance_applied = crate::advances::invoice_allocation_state(
+                &self.conn,
+                company_id,
+                invoice.id,
+                Some(end),
+            )?
+            .applied;
+            let outstanding = invoice.total - settled - advance_applied;
             if outstanding < 0 {
                 return Err(Error::Validation(
                     "Invoice settlements exceed its total".into(),
@@ -2537,6 +2572,7 @@ impl Store {
                 party_ledger_id: invoice.party_ledger_id,
                 total: invoice.total,
                 settled,
+                advance_applied,
                 outstanding,
                 age_days: (end - date).num_days(),
                 overdue_days,
