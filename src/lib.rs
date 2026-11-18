@@ -40,6 +40,7 @@ pub mod recurring;
 pub mod reorder;
 pub mod report_export;
 pub mod reversals;
+pub mod stock_allocation;
 pub mod stock_counts;
 pub mod stock_notes;
 pub mod stock_policy;

@@ -286,7 +286,7 @@ impl OrderDetail {
     }
 }
 
-fn remaining_quantity(ordered: i64, fulfilled: i64, preclosed: i64) -> Result<i64> {
+pub(crate) fn remaining_quantity(ordered: i64, fulfilled: i64, preclosed: i64) -> Result<i64> {
     if !(0..=ordered).contains(&fulfilled) || !(0..=ordered - fulfilled).contains(&preclosed) {
         return Err(Error::Validation(
             "Order quantities are inconsistent".into(),

@@ -4,6 +4,7 @@ use super::{
 };
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind, StockItem};
 use balance::orders::{OrderAmendmentDraft, OrderDetail, OrderDraft, OrderLine, OrderStatus};
+use balance::stock_allocation::{StockAllocationDraft, StockAllocationPlan};
 use balance::stock_notes::note_label;
 use balance::stock_reservations::StockReservationDraft;
 use balance::{format_amount, parse_amount, Category, Error, Result};
@@ -195,6 +196,17 @@ struct StockReleaseForm {
 }
 
 #[derive(Default)]
+struct StockAllocationForm {
+    item: Option<i64>,
+    location: Option<i64>,
+    batch: Option<i64>,
+    maximum: String,
+    expected_through: String,
+    reason: String,
+    plan: Option<StockAllocationPlan>,
+}
+
+#[derive(Default)]
 pub(super) struct OrderScreen {
     form: CreateOrderForm,
     kind: Option<InvoiceKind>,
@@ -207,6 +219,7 @@ pub(super) struct OrderScreen {
     line_reopen: LineReopenForm,
     reservation: StockReservationForm,
     stock_release: StockReleaseForm,
+    allocation: StockAllocationForm,
     document_path: String,
     schedule_kind: Option<InvoiceKind>,
     schedule_through: String,
@@ -248,6 +261,11 @@ impl App {
             .show(ui, |ui| self.order_availability_view(ui, company));
         egui::CollapsingHeader::new("Pending order schedule")
             .show(ui, |ui| self.pending_order_schedule_view(ui, company));
+        egui::CollapsingHeader::new("Allocate stock to sales orders").show(ui, |ui| {
+            if let Err(error) = self.stock_allocation_view(ui, company) {
+                self.failure(error);
+            }
+        });
         ui.separator();
         if let Some(selected) = self.order_screen.selected {
             match self.store.order_detail(company, selected) {
@@ -988,6 +1006,142 @@ impl App {
             })
             .body_returned
             .transpose()?;
+        }
+        Ok(())
+    }
+
+    fn stock_allocation_view(&mut self, ui: &mut egui::Ui, company: i64) -> Result<()> {
+        let form = &mut self.order_screen.allocation;
+        let items = self.store.stock_items(company)?;
+        let locations = self.store.stock_locations(company)?;
+        ui.horizontal_wrapped(|ui| -> Result<()> {
+            let previous = (form.item, form.location, form.batch);
+            pick_stock(ui, "allocate-stock-item", "Item", &items, &mut form.item);
+            if previous.0 != form.item {
+                form.batch = None;
+            }
+            pick_location(
+                ui,
+                "allocate-stock-location",
+                "Location",
+                &locations,
+                &mut form.location,
+                false,
+            );
+            if let Some(item) = form.item {
+                let batches = self.store.stock_batches(company, item)?;
+                pick_batch(ui, "allocate-stock-batch", &batches, &mut form.batch);
+            }
+            if previous != (form.item, form.location, form.batch) {
+                form.plan = None;
+            }
+            Ok(())
+        })
+        .inner?;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Maximum quantity (optional)");
+            let maximum_changed = ui
+                .add(egui::TextEdit::singleline(&mut form.maximum).desired_width(95.0))
+                .changed();
+            ui.label("Expected through (optional)");
+            let date_changed = ui
+                .add(
+                    egui::TextEdit::singleline(&mut form.expected_through)
+                        .hint_text("YYYY-MM-DD")
+                        .desired_width(115.0),
+                )
+                .changed();
+            if maximum_changed || date_changed {
+                form.plan = None;
+            }
+        });
+        let preview = ui.add_enabled(
+            form.item.is_some() && form.location.is_some(),
+            egui::Button::new("Preview allocation"),
+        );
+        if let (true, Some(item_id), Some(location_id)) =
+            (preview.clicked(), form.item, form.location)
+        {
+            form.plan = None;
+            let maximum = (!form.maximum.trim().is_empty())
+                .then(|| parse_quantity(&form.maximum))
+                .transpose()?;
+            form.plan = Some(
+                self.store.preview_stock_allocation(
+                    company,
+                    &StockAllocationDraft {
+                        item_id,
+                        location_id,
+                        batch_id: form.batch,
+                        maximum,
+                        expected_through: (!form.expected_through.trim().is_empty())
+                            .then(|| form.expected_through.clone()),
+                    },
+                )?,
+            );
+        }
+        let Some(plan) = &form.plan else {
+            return Ok(());
+        };
+        let unit = items
+            .iter()
+            .find(|item| Some(item.id) == form.item)
+            .map(|item| item.unit.as_str())
+            .unwrap_or("");
+        ui.label(format!(
+            "{} {unit} available to reserve",
+            format_quantity(plan.available())
+        ));
+        if plan.allocations().is_empty() {
+            ui.label("No stock can be allocated with this selection.");
+            return Ok(());
+        }
+        egui::Grid::new("stock-allocation-preview")
+            .striped(true)
+            .show(ui, |ui| {
+                for label in [
+                    "Sales order",
+                    "Party",
+                    "Order date",
+                    "Expected",
+                    "Unreserved",
+                    "To reserve",
+                ] {
+                    ui.strong(label);
+                }
+                ui.end_row();
+                for row in plan.allocations() {
+                    ui.label(&row.reference);
+                    ui.label(&row.party);
+                    ui.label(row.order_date.to_string());
+                    ui.label(
+                        row.expected_on
+                            .map(|date| date.to_string())
+                            .unwrap_or_else(|| "—".into()),
+                    );
+                    ui.label(format_quantity(row.unreserved.into()));
+                    ui.label(format_quantity(row.quantity.into()));
+                    ui.end_row();
+                }
+            });
+        let apply = ui
+            .horizontal_wrapped(|ui| {
+                ui.label("Reservation reason");
+                ui.text_edit_singleline(&mut form.reason);
+                ui.add_enabled(
+                    !form.reason.trim().is_empty(),
+                    egui::Button::new("Apply reservations"),
+                )
+                .clicked()
+            })
+            .inner;
+        if apply {
+            let count = self
+                .store
+                .apply_stock_allocation(company, plan, &form.reason)?;
+            form.plan = None;
+            form.reason.clear();
+            self.message = format!("Stock reserved on {count} order lines");
         }
         Ok(())
     }

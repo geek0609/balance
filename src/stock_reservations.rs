@@ -117,13 +117,13 @@ pub(crate) fn reserved_by_item(conn: &Connection, company: i64) -> Result<HashMa
     Ok(quantities)
 }
 
-pub(crate) fn check_stock_coverage(
+pub(crate) fn reserved_in_bucket(
     conn: &Connection,
     company: i64,
     item: i64,
     location: i64,
     batch: Option<i64>,
-) -> Result<()> {
+) -> Result<i128> {
     let mut stmt = conn.prepare_cached(
         "SELECT remaining FROM stock_reservation_balances
          WHERE company_id = ?1 AND item_id = ?2 AND location_id = ?3 AND batch_id IS ?4
@@ -135,6 +135,17 @@ pub(crate) fn check_stock_coverage(
     })? {
         reserved += i128::from(row?);
     }
+    Ok(reserved)
+}
+
+pub(crate) fn check_stock_coverage(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    location: i64,
+    batch: Option<i64>,
+) -> Result<()> {
+    let reserved = reserved_in_bucket(conn, company, item, location, batch)?;
     if reserved > 0 && stock_available_to_reserve(conn, company, item, location, batch)? < reserved
     {
         return Err(Error::Validation(
@@ -213,26 +224,22 @@ pub(crate) fn consume_reservations(
     Ok(())
 }
 
-impl Store {
-    pub fn reserve_order_stock(
-        &mut self,
-        company: i64,
-        order: i64,
-        draft: &StockReservationDraft,
-    ) -> Result<i64> {
-        let reason = required(&draft.reason, "Reservation reason")?;
-        if draft.quantity <= 0 {
-            return Err(Error::Validation(
-                "Reservation quantity must be positive".into(),
-            ));
-        }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_quantity_precision(&tx, company, draft.item_id, draft.quantity)?;
-        check_stock_location(&tx, company, draft.location_id)?;
-        check_stock_batch(&tx, company, draft.item_id, draft.batch_id)?;
-        let inserted = tx.execute(
+pub(crate) fn insert_reservation(
+    conn: &Connection,
+    company: i64,
+    order: i64,
+    draft: &StockReservationDraft,
+) -> Result<i64> {
+    let reason = required(&draft.reason, "Reservation reason")?;
+    if draft.quantity <= 0 {
+        return Err(Error::Validation(
+            "Reservation quantity must be positive".into(),
+        ));
+    }
+    check_quantity_precision(conn, company, draft.item_id, draft.quantity)?;
+    check_stock_location(conn, company, draft.location_id)?;
+    check_stock_batch(conn, company, draft.item_id, draft.batch_id)?;
+    let inserted = conn.execute(
             "INSERT INTO stock_reservations(order_line_id, location_id, batch_id, quantity, reason)
              SELECT p.id, ?4, ?5, ?6, ?7 FROM order_line_availability p
              JOIN orders o ON o.id = p.order_id
@@ -243,12 +250,25 @@ impl Store {
                ), 0) >= ?6",
             params![company, order, draft.item_id, draft.location_id, draft.batch_id, draft.quantity, reason],
         )?;
-        if inserted != 1 {
-            return Err(Error::Validation(
-                "Select a sales order line with enough unreserved pending quantity".into(),
-            ));
-        }
-        let reservation = tx.last_insert_rowid();
+    if inserted != 1 {
+        return Err(Error::Validation(
+            "Select a sales order line with enough unreserved pending quantity".into(),
+        ));
+    }
+    Ok(conn.last_insert_rowid())
+}
+
+impl Store {
+    pub fn reserve_order_stock(
+        &mut self,
+        company: i64,
+        order: i64,
+        draft: &StockReservationDraft,
+    ) -> Result<i64> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reservation = insert_reservation(&tx, company, order, draft)?;
         check_stock_coverage(
             &tx,
             company,
