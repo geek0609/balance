@@ -40,6 +40,8 @@ struct App {
     company_profile_selection: Option<i64>,
     company_profile: CompanyProfile,
     company_profile_original: CompanyProfile,
+    period_lock_date: String,
+    period_lock_reason: String,
     ledger_name: String,
     category: Category,
     ledger_group: Option<i64>,
@@ -266,6 +268,8 @@ impl App {
             company_profile_selection: None,
             company_profile: CompanyProfile::default(),
             company_profile_original: CompanyProfile::default(),
+            period_lock_date: String::new(),
+            period_lock_reason: String::new(),
             ledger_name: String::new(),
             category: Category::Asset,
             ledger_group: None,
@@ -426,6 +430,8 @@ impl App {
         self.company_profile_selection = None;
         self.company_profile = CompanyProfile::default();
         self.company_profile_original = CompanyProfile::default();
+        self.period_lock_date.clear();
+        self.period_lock_reason.clear();
         self.clear_voucher();
         self.voucher_reversal_target = None;
         self.voucher_reversal_date.clear();
@@ -595,9 +601,7 @@ impl App {
         if let Some(company) = self.company {
             ui.separator();
             ui.heading("Company details");
-            ui.small(
-                "Accounting dates are informational and do not restrict entries or close periods.",
-            );
+            ui.small("Financial year and books start dates are for reference.");
             egui::Grid::new("company-profile")
                 .num_columns(2)
                 .show(ui, |ui| {
@@ -655,8 +659,91 @@ impl App {
                     Err(e) => { ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string()); }
                 }
             });
+            self.period_lock_form(ui, company);
         }
     }
+
+    fn period_lock_form(&mut self, ui: &mut egui::Ui, company: i64) {
+        ui.separator();
+        ui.heading("Period lock");
+        let cutoff = match self.store.period_lock(company) {
+            Ok(cutoff) => cutoff,
+            Err(error) => {
+                self.failure(error);
+                return;
+            }
+        };
+        if let Some(date) = cutoff {
+            ui.label(format!("Transactions locked through {date}"));
+        } else {
+            ui.label("All periods are open.");
+        }
+        ui.small("The lock applies to vouchers and stock movements, including imports.");
+        egui::Grid::new("period-lock").show(ui, |ui| {
+            ui.label("Lock through (YYYY-MM-DD)");
+            ui.text_edit_singleline(&mut self.period_lock_date);
+            ui.end_row();
+            ui.label("Reason");
+            ui.text_edit_singleline(&mut self.period_lock_reason);
+            ui.end_row();
+        });
+        let mut change = None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.period_lock_date.trim().is_empty()
+                        && !self.period_lock_reason.trim().is_empty(),
+                    egui::Button::new("Set cutoff"),
+                )
+                .clicked()
+            {
+                change = Some(Some(self.period_lock_date.as_str()));
+            }
+            if ui
+                .add_enabled(
+                    cutoff.is_some() && !self.period_lock_reason.trim().is_empty(),
+                    egui::Button::new("Reopen all periods"),
+                )
+                .clicked()
+            {
+                change = Some(None);
+            }
+        });
+        if let Some(date) = change {
+            match self
+                .store
+                .set_period_lock(company, date, &self.period_lock_reason)
+            {
+                Ok(()) => {
+                    self.period_lock_date.clear();
+                    self.period_lock_reason.clear();
+                    self.message = "Period lock updated".into();
+                }
+                Err(error) => self.failure(error),
+            }
+        }
+        egui::CollapsingHeader::new("Period lock history").show(ui, |ui| {
+            match self.store.period_lock_history(company) {
+                Ok(events) if events.is_empty() => {
+                    ui.label("No changes recorded.");
+                }
+                Ok(events) => {
+                    for event in events {
+                        let state = match event.locked_through {
+                            Some(date) => format!("Locked through {date}"),
+                            None => "All periods reopened".into(),
+                        };
+                        ui.label(format!(
+                            "{} UTC | {state} | {}",
+                            event.changed_at, event.reason
+                        ));
+                    }
+                }
+                Err(error) => self.failure(error),
+            }
+        });
+    }
+
     fn ledger_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Ledgers");
         let groups = match self.store.account_groups(company) {

@@ -190,6 +190,32 @@ pub struct ImportPlan {
     issues: Vec<String>,
 }
 impl ImportPlan {
+    fn check_period_lock(&self, conn: &Connection) -> Result<()> {
+        let Some(cutoff) = crate::periods::cutoff(conn, self.company_id)? else {
+            return Ok(());
+        };
+        let openings = self.accounts.iter().any(|row| row.opening.is_some())
+            || self
+                .items
+                .iter()
+                .any(|item| item.openings.iter().any(|row| row.quantity != 0));
+        let dates = self
+            .transactions
+            .iter()
+            .map(|row| row.date.as_str())
+            .chain(self.invoices.iter().map(|row| row.date.as_str()))
+            .chain(self.settlements.iter().map(|row| row.date.as_str()))
+            .chain(self.opening_date.as_deref().filter(|_| openings));
+        for date in dates {
+            if parse_date(date)? <= cutoff {
+                return Err(Error::Validation(format!(
+                    "Import includes a transaction dated {date}. The company is locked through {cutoff}."
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn group_count(&self) -> usize {
         self.groups.len()
     }
@@ -2847,6 +2873,11 @@ impl Store {
         {
             plan.issues.push("No supported records were found".into());
         }
+        match plan.check_period_lock(&self.conn) {
+            Ok(()) => {}
+            Err(Error::Validation(message)) => plan.issues.push(message),
+            Err(error) => return Err(error),
+        }
         Ok(plan)
     }
     /// Apply the exact preview atomically. No records are written on any error.
@@ -2857,6 +2888,7 @@ impl Store {
             ));
         }
         let tx = self.conn.transaction()?;
+        plan.check_period_lock(&tx)?;
         for (id, metadata) in &plan.existing_location_metadata {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM stock_locations WHERE id = ?1 AND company_id = ?2)",

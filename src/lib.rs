@@ -16,18 +16,33 @@ pub mod inventory;
 pub mod invoice_register;
 pub mod ledgers;
 pub mod opening;
+pub mod periods;
 pub mod pricing;
 pub mod reorder;
 pub mod report_export;
 pub mod reversals;
 pub mod terms;
 
+const SCHEMA_VERSION: i64 = 33;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("{0}")]
     Validation(String),
     #[error("database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[source] rusqlite::Error),
+}
+impl From<rusqlite::Error> for Error {
+    fn from(error: rusqlite::Error) -> Self {
+        if let rusqlite::Error::SqliteFailure(code, Some(message)) = &error {
+            if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+                && message == periods::LOCKED_PERIOD_MESSAGE
+            {
+                return Self::Validation(message.clone());
+            }
+        }
+        Self::Database(error)
+    }
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -257,7 +272,7 @@ fn check_database_integrity(conn: &Connection) -> Result<()> {
 }
 fn check_database_signature(conn: &Connection) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if !(1..=32).contains(&version) {
+    if !(1..=SCHEMA_VERSION).contains(&version) {
         return Err(Error::Validation(
             "Database has an unsupported version".into(),
         ));
@@ -371,6 +386,7 @@ impl Store {
             "ledger_term_revisions",
             "stock_reorder_rules",
             "stock_reorder_revisions",
+            "period_lock_events",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -388,7 +404,7 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 32 {
+        if version > SCHEMA_VERSION {
             return Err(Error::Validation(
                 "This database was created by a newer version of the application".into(),
             ));
@@ -633,6 +649,10 @@ impl Store {
                 CREATE TABLE stock_reorder_revisions(id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), reorder_level INTEGER NOT NULL, reorder_quantity INTEGER NOT NULL, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
                 CREATE INDEX stock_reorder_revisions_item ON stock_reorder_revisions(company_id, item_id, id);
                 PRAGMA user_version = 32;")?;
+        }
+        if version < 33 {
+            periods::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 33)?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -1500,7 +1520,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, SCHEMA_VERSION);
     }
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
