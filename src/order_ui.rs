@@ -1,6 +1,6 @@
 use super::{
-    money, pick_account, pick_batch, pick_location, pick_stock, App, InvoiceAllocationForm,
-    InvoiceLineForm, InvoiceSource,
+    money, pick_account, pick_batch, pick_location, pick_price_list, pick_stock, App,
+    InvoiceAllocationForm, InvoiceLineForm, InvoiceSource,
 };
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind, StockItem};
 use balance::orders::{OrderAmendmentDraft, OrderDetail, OrderDraft, OrderLine, OrderStatus};
@@ -69,6 +69,7 @@ struct CreateOrderForm {
     expected_on: String,
     valid_through: String,
     party: Option<i64>,
+    price_list: Option<i64>,
     reference: String,
     notes: String,
     lines: Vec<LineForm>,
@@ -83,6 +84,7 @@ impl Default for CreateOrderForm {
             expected_on: String::new(),
             valid_through: String::new(),
             party: None,
+            price_list: None,
             reference: String::new(),
             notes: String::new(),
             lines: vec![LineForm::default()],
@@ -91,6 +93,34 @@ impl Default for CreateOrderForm {
 }
 
 impl CreateOrderForm {
+    fn fill_prices(&mut self, store: &balance::Store, company: i64) -> Result<usize> {
+        let list = self
+            .price_list
+            .ok_or_else(|| Error::Validation("Select a price list".into()))?;
+        let mut prices = Vec::new();
+        for (index, line) in self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.price.trim().is_empty())
+        {
+            let item = line.item.ok_or_else(|| {
+                Error::Validation(format!("Select an item on line {}", index + 1))
+            })?;
+            let price = store
+                .stock_price(company, list, item, &self.date)?
+                .ok_or_else(|| {
+                    Error::Validation(format!("No applicable price for item line {}", index + 1))
+                })?;
+            prices.push((index, price));
+        }
+        let count = prices.len();
+        for (index, price) in prices {
+            self.lines[index].price = format_amount(price);
+        }
+        Ok(count)
+    }
+
     fn has_content(&self) -> bool {
         self.party.is_some()
             || [
@@ -649,6 +679,13 @@ impl App {
                 return;
             }
         };
+        let lists = match self.store.price_lists(company) {
+            Ok(lists) => lists,
+            Err(error) => {
+                self.failure(error);
+                return;
+            }
+        };
         let form = &mut self.order_screen.form;
         ui.checkbox(&mut form.quotation, "Save as quotation");
         egui::ComboBox::from_id_salt("order-kind")
@@ -681,6 +718,25 @@ impl App {
                 ui.end_row();
             }
         });
+        if !lists.is_empty() {
+            let fill = ui
+                .horizontal(|ui| {
+                    pick_price_list(ui, "order-price-list", &lists, &mut form.price_list);
+                    ui.add_enabled(
+                        form.price_list.is_some(),
+                        egui::Button::new("Fill blank item prices"),
+                    )
+                    .clicked()
+                })
+                .inner;
+            if fill {
+                match form.fill_prices(&self.store, company) {
+                    Ok(0) => self.message = "There are no blank item prices to fill".into(),
+                    Ok(_) => self.message = "Blank prices filled using the draft date".into(),
+                    Err(error) => self.message = error.to_string(),
+                }
+            }
+        }
         order_line_fields(ui, &mut form.lines, &items);
         let quotation = form.quotation;
         if ui
