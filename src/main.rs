@@ -11,6 +11,7 @@ use balance::inventory::{
 };
 use balance::pricing::PriceList;
 use balance::reorder::ReorderRule;
+use balance::tax_profiles::TaxCalculation;
 use balance::taxes::InvoiceTaxLine;
 use balance::terms::LedgerTerms;
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
@@ -32,7 +33,7 @@ use cost_ui::CostScreen;
 use manufacturing_ui::ManufacturingScreen;
 use order_ui::OrderScreen;
 use stock_count_ui::StockCountScreen;
-use tax_ui::TaxRegisterScreen;
+use tax_ui::{TaxProfileScreen, TaxRegisterScreen};
 use valuation_ui::ValuationScreen;
 
 #[derive(PartialEq)]
@@ -199,6 +200,10 @@ struct App {
     invoice_tax_ledger: Option<i64>,
     invoice_tax_amount: String,
     invoice_additional_taxes: Vec<InvoiceTaxForm>,
+    invoice_tax_calculation: Option<TaxCalculation>,
+    invoice_tax_calculation_date: String,
+    invoice_tax_profile: Option<i64>,
+    invoice_taxable_base: String,
     invoice_lines: Vec<InvoiceLineForm>,
     invoice_adjustments: Vec<InvoiceAdjustmentForm>,
     editing_invoice: Option<i64>,
@@ -213,6 +218,7 @@ struct App {
     manufacturing_screen: ManufacturingScreen,
     budget_screen: BudgetScreen,
     tax_register_screen: TaxRegisterScreen,
+    tax_profile_screen: TaxProfileScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -450,6 +456,10 @@ impl App {
             invoice_tax_ledger: None,
             invoice_tax_amount: String::new(),
             invoice_additional_taxes: Vec::new(),
+            invoice_tax_calculation: None,
+            invoice_tax_calculation_date: String::new(),
+            invoice_tax_profile: None,
+            invoice_taxable_base: String::new(),
             invoice_lines: vec![InvoiceLineForm::new()],
             invoice_adjustments: Vec::new(),
             editing_invoice: None,
@@ -464,6 +474,7 @@ impl App {
             manufacturing_screen: ManufacturingScreen::default(),
             budget_screen: BudgetScreen::default(),
             tax_register_screen: TaxRegisterScreen::default(),
+            tax_profile_screen: TaxProfileScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -585,12 +596,14 @@ impl App {
         self.manufacturing_screen = ManufacturingScreen::default();
         self.budget_screen = BudgetScreen::default();
         self.tax_register_screen = TaxRegisterScreen::default();
+        self.tax_profile_screen = TaxProfileScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
         self.invoice_credit_days.clear();
         self.invoice_tax_amount.clear();
         self.invoice_additional_taxes.clear();
+        self.clear_invoice_tax_context();
         self.settlement_invoice = None;
         self.settlement_bank = None;
         self.settlement_reference.clear();
@@ -2890,6 +2903,14 @@ impl App {
         } else {
             format_amount(draft.tax_amount)
         };
+        self.clear_invoice_tax_context();
+        if let Some(tax) = draft.tax_calculation.filter(|_| edit.is_some()) {
+            self.invoice_tax_calculation = Some(tax);
+            self.invoice_tax_calculation_date = self.invoice_date.clone();
+            if !tax.whole_invoice {
+                self.invoice_taxable_base = format_amount(tax.taxable_amount);
+            }
+        }
         self.invoice_additional_taxes = draft
             .additional_taxes
             .into_iter()
@@ -3118,47 +3139,50 @@ impl App {
             &mut self.invoice_trade,
             false,
         );
-        pick_account(
-            ui,
-            "invoice-tax",
-            "Tax ledger (optional)",
-            &ledgers,
-            &mut self.invoice_tax_ledger,
-            true,
-        );
-        ui.horizontal(|ui| {
-            ui.label("Tax amount");
-            ui.add(egui::TextEdit::singleline(&mut self.invoice_tax_amount).hint_text("0.00"));
-        });
-        let mut remove_tax = None;
-        for (index, tax) in self.invoice_additional_taxes.iter_mut().enumerate() {
-            ui.horizontal_wrapped(|ui| {
-                pick_account(
-                    ui,
-                    ("invoice-additional-tax", index),
-                    "Tax ledger",
-                    &ledgers,
-                    &mut tax.ledger,
-                    false,
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut tax.amount)
-                        .hint_text("Tax amount")
-                        .desired_width(100.0),
-                );
-                if ui.button("Remove tax").clicked() {
-                    remove_tax = Some(index);
-                }
+        self.invoice_tax_profile_form(ui, company);
+        ui.add_enabled_ui(self.invoice_tax_calculation.is_none(), |ui| {
+            pick_account(
+                ui,
+                "invoice-tax",
+                "Tax ledger (optional)",
+                &ledgers,
+                &mut self.invoice_tax_ledger,
+                true,
+            );
+            ui.horizontal(|ui| {
+                ui.label("Tax amount");
+                ui.add(egui::TextEdit::singleline(&mut self.invoice_tax_amount).hint_text("0.00"));
             });
-        }
-        if let Some(index) = remove_tax {
-            self.invoice_additional_taxes.remove(index);
-        }
-        if ui.button("Add tax component").clicked() {
-            self.invoice_additional_taxes
-                .push(InvoiceTaxForm::default());
-        }
-        ui.small("Tax is entered manually; statutory rules and filing are not implemented. Percentage discounts apply to the gross line amount after it is rounded to two decimal places.");
+            let mut remove_tax = None;
+            for (index, tax) in self.invoice_additional_taxes.iter_mut().enumerate() {
+                ui.horizontal_wrapped(|ui| {
+                    pick_account(
+                        ui,
+                        ("invoice-additional-tax", index),
+                        "Tax ledger",
+                        &ledgers,
+                        &mut tax.ledger,
+                        false,
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut tax.amount)
+                            .hint_text("Tax amount")
+                            .desired_width(100.0),
+                    );
+                    if ui.button("Remove tax").clicked() {
+                        remove_tax = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = remove_tax {
+                self.invoice_additional_taxes.remove(index);
+            }
+            if ui.button("Add tax component").clicked() {
+                self.invoice_additional_taxes
+                    .push(InvoiceTaxForm::default());
+            }
+        });
+        ui.small("Review the tax amounts before saving. Percentage discounts apply to the rounded gross line amount.");
         let mut remove = None;
         for (index, line) in self.invoice_lines.iter_mut().enumerate() {
             ui.horizontal(|ui| {
@@ -3374,6 +3398,7 @@ impl App {
             self.invoice_adjustments.clear();
             self.invoice_tax_amount.clear();
             self.invoice_additional_taxes.clear();
+            self.clear_invoice_tax_context();
             self.invoice_tax_ledger = None;
         }
         if ui.button("Save invoice").clicked() {
@@ -3442,6 +3467,14 @@ impl App {
                         description: line.description.clone(),
                     });
                 }
+                if self.invoice_tax_calculation.is_some()
+                    && self.invoice_tax_calculation_date != self.invoice_date.trim()
+                {
+                    return Err(balance::Error::Validation(
+                        "The invoice date changed. Recalculate taxes or keep manual amounts."
+                            .into(),
+                    ));
+                }
                 let draft = InvoiceDraft {
                     kind: self.invoice_kind,
                     date: self.invoice_date.clone(),
@@ -3472,6 +3505,7 @@ impl App {
                     tax_ledger_id: self.invoice_tax_ledger,
                     tax_amount,
                     additional_taxes,
+                    tax_calculation: self.invoice_tax_calculation,
                     lines,
                     adjustments,
                 };
@@ -3495,6 +3529,7 @@ impl App {
                     self.invoice_adjustments.clear();
                     self.invoice_tax_amount.clear();
                     self.invoice_additional_taxes.clear();
+                    self.clear_invoice_tax_context();
                     self.invoice_tax_ledger = None;
                     self.editing_invoice = None;
                     self.copying_invoice = false;
@@ -3791,6 +3826,14 @@ impl App {
                             ));
                         }
                     }
+                    if let Some(calculated) = &invoice.tax_calculation {
+                        ui.small(format!(
+                            "Tax profile {} v{} | Taxable amount {}",
+                            calculated.profile,
+                            calculated.calculation.version_id,
+                            format_amount(calculated.calculation.taxable_amount)
+                        ));
+                    }
                     for tax in &invoice.taxes {
                         ui.label(format!(
                             "  Tax in {} | {}",
@@ -3861,6 +3904,16 @@ impl App {
                                             revision.party
                                         ));
                                         ui.label(format!("Trade ledger: {}", revision.trade));
+                                        if let Some(calculated) = &revision.tax_calculation {
+                                            ui.small(format!(
+                                                "Tax profile {} v{} | Taxable amount {}",
+                                                calculated.profile,
+                                                calculated.calculation.version_id,
+                                                format_amount(
+                                                    calculated.calculation.taxable_amount
+                                                )
+                                            ));
+                                        }
                                         for tax in &revision.taxes {
                                             ui.label(format!(
                                                 "Tax in {} | {}",

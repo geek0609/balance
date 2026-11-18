@@ -30,11 +30,12 @@ pub mod report_export;
 pub mod reversals;
 pub mod stock_counts;
 pub mod stock_sales;
+pub mod tax_profiles;
 pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 46;
+const SCHEMA_VERSION: i64 = 47;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -423,6 +424,11 @@ impl Store {
             "budget_targets",
             "invoice_additional_taxes",
             "invoice_revision_additional_taxes",
+            "tax_profiles",
+            "tax_profile_versions",
+            "tax_profile_rates",
+            "invoice_tax_calculations",
+            "invoice_revision_tax_calculations",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -744,6 +750,10 @@ impl Store {
         if version < 46 {
             taxes::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 46)?;
+        }
+        if version < 47 {
+            tax_profiles::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 47)?;
         }
         tx.commit()?;
         Ok(Self { conn })

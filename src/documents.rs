@@ -166,6 +166,16 @@ impl Store {
             "<tr class=\"total\"><td>Total</td><td class=\"num\">{}</td></tr></tbody></table>",
             money(invoice.total)
         );
+        if let Some(calculated) = &invoice.tax_calculation {
+            let _ = write!(
+                html,
+                "<p>Taxable amount {} · Tax profile {}, version {} (effective {})</p>",
+                format_amount(calculated.calculation.taxable_amount),
+                escape(&calculated.profile),
+                calculated.calculation.version_id,
+                escape(&calculated.effective_on)
+            );
+        }
         if !draft.narration.is_empty() {
             let _ = write!(
                 html,

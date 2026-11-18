@@ -25,7 +25,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceTaxLine {
     pub ledger_id: i64,
     pub amount: i64,

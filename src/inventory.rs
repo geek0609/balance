@@ -1,5 +1,6 @@
 //! Stock quantities and basic sales/purchase invoices.
 //! Quantities use thousandths; prices and accounting amounts use hundredths.
+use crate::tax_profiles::{TaxCalculation, TaxCalculationDetail};
 use crate::taxes::{InvoiceTaxDetail, InvoiceTaxLine};
 use crate::{
     check_ledgers, parse_date, required, validate_voucher, Category, Error, Posting, Result, Store,
@@ -168,6 +169,7 @@ pub struct InvoiceDraft {
     pub tax_ledger_id: Option<i64>,
     pub tax_amount: i64,
     pub additional_taxes: Vec<InvoiceTaxLine>,
+    pub tax_calculation: Option<TaxCalculation>,
     pub lines: Vec<InvoiceLine>,
     pub adjustments: Vec<InvoiceAdjustment>,
 }
@@ -185,6 +187,7 @@ pub struct InvoiceSummary {
     pub total: i128,
     pub tax_amount: i64,
     pub taxes: Vec<InvoiceTaxDetail>,
+    pub tax_calculation: Option<TaxCalculationDetail>,
     pub settled: i128,
     pub advance_applied: i128,
     pub outstanding: i128,
@@ -226,6 +229,7 @@ pub struct InvoiceRevision {
     pub tax_ledger: Option<String>,
     pub tax_amount: i64,
     pub taxes: Vec<InvoiceTaxDetail>,
+    pub tax_calculation: Option<TaxCalculationDetail>,
     pub lines: Vec<InvoiceDetailLine>,
     pub adjustments: Vec<InvoiceAdjustmentDetail>,
 }
@@ -546,6 +550,17 @@ fn prepare_invoice(
             "A non-stock invoice needs a positive service / charge line in a compatible sales or purchase account".into(),
         ));
     }
+    if let Some(context) = draft.tax_calculation {
+        crate::tax_profiles::validate_invoice_calculation(
+            conn,
+            company_id,
+            draft.kind,
+            invoice_date,
+            total - i128::from(total_tax),
+            context,
+            &taxes,
+        )?;
+    }
     if total <= 0 {
         return Err(Error::Validation(
             "Invoice amount must be greater than zero".into(),
@@ -850,6 +865,7 @@ pub(crate) fn insert_invoice_on_connection(
     )?;
     write_invoice_adjustments(conn, invoice_id, &draft.adjustments)?;
     crate::taxes::write_additional(conn, invoice_id, &draft.additional_taxes)?;
+    crate::tax_profiles::write_calculation(conn, invoice_id, draft.tax_calculation)?;
     Ok((invoice_id, voucher_id))
 }
 pub(crate) fn ledger_category(
@@ -2033,6 +2049,10 @@ impl Store {
             tax_ledger_id,
             tax_amount,
             additional_taxes: crate::taxes::additional_lines(&self.conn, invoice_id)?,
+            tax_calculation: crate::tax_profiles::calculation_detail(
+                &self.conn, invoice_id, false,
+            )?
+            .map(|row| row.calculation),
             lines,
             adjustments,
         })
@@ -2090,6 +2110,11 @@ impl Store {
         tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![voucher_revision, voucher_id])?;
         tx.execute("INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days) SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days FROM invoices WHERE id = ?2 AND company_id = ?3", params![voucher_revision, invoice_id, company_id])?;
         let revision_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO invoice_revision_tax_calculations(revision_id, version_id, taxable_amount, whole_invoice)
+             SELECT ?1, version_id, taxable_amount, whole_invoice FROM invoice_tax_calculations WHERE invoice_id = ?2",
+            params![revision_id, invoice_id],
+        )?;
         tx.execute("INSERT INTO invoice_revision_additional_taxes(revision_id, ledger_id, amount)
                     SELECT ?1, ledger_id, amount FROM invoice_additional_taxes WHERE invoice_id = ?2 ORDER BY id",
                    params![revision_id, invoice_id])?;
@@ -2121,6 +2146,11 @@ impl Store {
             [invoice_id],
         )?;
         crate::taxes::write_additional(&tx, invoice_id, &draft.additional_taxes)?;
+        tx.execute(
+            "DELETE FROM invoice_tax_calculations WHERE invoice_id = ?1",
+            [invoice_id],
+        )?;
+        crate::tax_profiles::write_calculation(&tx, invoice_id, draft.tax_calculation)?;
         tx.commit()?;
         Ok(())
     }
@@ -2212,6 +2242,7 @@ impl Store {
                 tax_ledger,
                 tax_amount: total_tax,
                 taxes,
+                tax_calculation: crate::tax_profiles::calculation_detail(&self.conn, id, true)?,
                 lines,
                 adjustments: read_invoice_adjustments(&self.conn, id, true)?,
             });
@@ -2315,6 +2346,7 @@ impl Store {
                 total,
                 tax_amount: tax,
                 taxes,
+                tax_calculation: crate::tax_profiles::calculation_detail(&self.conn, id, false)?,
                 settled,
                 outstanding,
                 reversal,

@@ -363,6 +363,7 @@ impl App {
         self.invoice_credit_days.clear();
         self.invoice_tax_amount.clear();
         self.invoice_additional_taxes.clear();
+        self.clear_invoice_tax_context();
         self.invoice_tax_ledger = None;
         self.invoice_adjustments.clear();
         self.invoice_lines = detail
