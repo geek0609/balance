@@ -8,6 +8,8 @@ Balance is an open-source accounting and business-management application written
 
 Download the Windows x64 ZIP from [Releases](https://github.com/geek0609/balance/releases), extract it and open `balance.exe`. To build from source on Windows, install a Rust toolchain and run `cargo run`.
 
+The feature list below describes the source on `main`. Each release page describes the packaged build.
+
 Balance stores a SQLite database in the user's local application-data directory. Create a company, create ledgers in account groups, and enter balanced vouchers. The application is licensed under [Apache-2.0](LICENSE).
 
 To open an existing database at a different absolute path, run `cargo run -- --database "C:\path\to\balance.db"`. The selected path is shown in the application header. The optional path must already exist; the default database is used when the option is omitted.
