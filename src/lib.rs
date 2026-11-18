@@ -16,6 +16,7 @@ pub mod inventory;
 pub mod invoice_register;
 pub mod ledgers;
 pub mod opening;
+pub mod orders;
 pub mod periods;
 pub mod pricing;
 pub mod reorder;
@@ -23,7 +24,7 @@ pub mod report_export;
 pub mod reversals;
 pub mod terms;
 
-const SCHEMA_VERSION: i64 = 33;
+const SCHEMA_VERSION: i64 = 34;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -387,6 +388,9 @@ impl Store {
             "stock_reorder_rules",
             "stock_reorder_revisions",
             "period_lock_events",
+            "orders",
+            "order_lines",
+            "invoice_order_links",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -399,6 +403,9 @@ impl Store {
                 )));
             }
         }
+        store
+            .conn
+            .prepare("SELECT id, fulfilled FROM order_line_progress LIMIT 0")?;
         Ok(())
     }
     fn from_connection(mut conn: Connection) -> Result<Self> {
@@ -653,6 +660,10 @@ impl Store {
         if version < 33 {
             periods::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 33)?;
+        }
+        if version < 34 {
+            orders::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 34)?;
         }
         tx.commit()?;
         Ok(Self { conn })

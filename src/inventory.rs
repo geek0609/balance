@@ -102,7 +102,7 @@ impl InvoiceKind {
             Self::Purchase => VoucherKind::Purchase,
         }
     }
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "Sale" => Ok(Self::Sale),
             "Purchase" => Ok(Self::Purchase),
@@ -185,6 +185,7 @@ pub struct InvoiceSummary {
     pub settled: i128,
     pub outstanding: i128,
     pub has_settlement_history: bool,
+    pub order_id: Option<i64>,
     pub lines: Vec<InvoiceDetailLine>,
     pub adjustments: Vec<InvoiceAdjustmentDetail>,
 }
@@ -858,7 +859,11 @@ pub(crate) fn insert_invoice_on_connection(
     write_invoice_adjustments(conn, invoice_id, &draft.adjustments)?;
     Ok((invoice_id, voucher_id))
 }
-fn ledger_category(conn: &Connection, company_id: i64, ledger_id: i64) -> Result<Category> {
+pub(crate) fn ledger_category(
+    conn: &Connection,
+    company_id: i64,
+    ledger_id: i64,
+) -> Result<Category> {
     let value: String = conn
         .query_row(
             "SELECT category FROM ledgers WHERE id = ?1 AND company_id = ?2",
@@ -2030,6 +2035,11 @@ impl Store {
                 "An invoice with receipts or payments cannot yet be edited".into(),
             ));
         }
+        if crate::orders::linked_order(&tx, invoice_id)?.is_some() {
+            return Err(Error::Validation(
+                "An invoice linked to an order cannot yet be edited".into(),
+            ));
+        }
         crate::banking::ensure_no_bank_clearance(&tx, company_id, voucher_id)?;
         let prepared = prepare_invoice(&tx, company_id, draft, Some(invoice_id))?;
         let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
@@ -2242,6 +2252,7 @@ impl Store {
                 settled,
                 outstanding: total - settled,
                 has_settlement_history,
+                order_id: crate::orders::linked_order(&self.conn, id)?,
                 lines,
                 adjustments,
             });

@@ -15,6 +15,9 @@ use balance::terms::LedgerTerms;
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
 
+mod order_ui;
+use order_ui::OrderScreen;
+
 #[derive(PartialEq)]
 enum Page {
     Company,
@@ -25,6 +28,7 @@ enum Page {
     Stock,
     Invoice,
     InvoiceRegister,
+    Orders,
     Backup,
     DayBook,
     Outstanding,
@@ -174,6 +178,8 @@ struct App {
     invoice_adjustments: Vec<InvoiceAdjustmentForm>,
     editing_invoice: Option<i64>,
     copying_invoice: bool,
+    invoice_order: Option<i64>,
+    order_screen: OrderScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -402,6 +408,8 @@ impl App {
             invoice_adjustments: Vec::new(),
             editing_invoice: None,
             copying_invoice: false,
+            invoice_order: None,
+            order_screen: OrderScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -512,6 +520,8 @@ impl App {
         self.invoice_adjustments.clear();
         self.editing_invoice = None;
         self.copying_invoice = false;
+        self.invoice_order = None;
+        self.order_screen = OrderScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -552,8 +562,7 @@ impl App {
                 && (self.terms_days != self.terms_original_days
                     || self.terms_limit != self.terms_original_limit))
             || self.editing_ledger.is_some()
-            || self.editing_invoice.is_some()
-            || self.copying_invoice
+            || self.invoice_draft_in_use()
             || self.stock_editing.is_some();
         let profile_dirty = profile_dirty || self.reorder_editing.is_some();
         if profile_dirty {
@@ -2777,7 +2786,12 @@ impl App {
             }
         }
     }
+    fn invoice_draft_in_use(&self) -> bool {
+        self.editing_invoice.is_some() || self.copying_invoice || self.invoice_order.is_some()
+    }
+
     fn load_invoice_form(&mut self, draft: InvoiceDraft, edit: Option<i64>) {
+        self.invoice_order = None;
         self.editing_invoice = edit;
         self.copying_invoice = edit.is_none();
         self.invoice_kind = draft.kind;
@@ -2855,10 +2869,14 @@ impl App {
     fn invoice_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading(match self.editing_invoice {
             Some(id) => format!("Edit invoice {id}"),
+            None if self.invoice_order.is_some() => "New invoice for an order".into(),
             None if self.copying_invoice => "New invoice from copy".into(),
             None => "Sales and purchase invoices".into(),
         });
         ui.label("Save an invoice to create its accounting voucher and any stock movements together. For services, remove all item lines and add a positive service / charge line. Item prices are per unit; each line rounds to two decimal places.");
+        if let Some(order) = self.invoice_order {
+            ui.label(format!("Order {order}. Adjust the quantities for this invoice and check the prices before saving."));
+        }
         let items = match self.store.stock_items(company) {
             Ok(v) => v,
             Err(e) => {
@@ -3238,11 +3256,10 @@ impl App {
             ui.label("Narration");
             ui.text_edit_singleline(&mut self.invoice_narration);
         });
-        if (self.editing_invoice.is_some() || self.copying_invoice)
-            && ui.button("Cancel invoice draft").clicked()
-        {
+        if self.invoice_draft_in_use() && ui.button("Cancel invoice draft").clicked() {
             self.editing_invoice = None;
             self.copying_invoice = false;
+            self.invoice_order = None;
             self.invoice_date.clear();
             self.invoice_party = None;
             self.invoice_trade = None;
@@ -3342,6 +3359,8 @@ impl App {
                 if let Some(id) = self.editing_invoice {
                     self.store.update_invoice(company, id, &draft)?;
                     Ok(id)
+                } else if let Some(order) = self.invoice_order {
+                    self.store.invoice_order(company, order, &draft)
                 } else {
                     self.store.create_invoice(company, &draft)
                 }
@@ -3359,6 +3378,7 @@ impl App {
                     self.invoice_tax_ledger = None;
                     self.editing_invoice = None;
                     self.copying_invoice = false;
+                    self.invoice_order = None;
                 }
                 Err(e) => self.failure(e),
             }
@@ -3581,8 +3601,8 @@ impl App {
                     if ui
                         .add_enabled(
                             !invoice.has_settlement_history
-                                && self.editing_invoice.is_none()
-                                && !self.copying_invoice,
+                                && invoice.order_id.is_none()
+                                && !self.invoice_draft_in_use(),
                             egui::Button::new("Edit invoice"),
                         )
                         .clicked()
@@ -3597,7 +3617,7 @@ impl App {
                     }
                     if ui
                         .add_enabled(
-                            self.editing_invoice.is_none() && !self.copying_invoice,
+                            !self.invoice_draft_in_use(),
                             egui::Button::new("Prepare copy (replace draft)"),
                         )
                         .clicked()
@@ -3608,6 +3628,13 @@ impl App {
                                 self.message = "Copy prepared; review details and enter a new date and reference".into();
                             }
                             Err(e) => self.failure(e),
+                        }
+                    }
+                    if let Some(order) = invoice.order_id {
+                        if ui.link(format!("View linked order {order}")).clicked() {
+                            self.order_screen.select(order);
+                            self.page = Page::Orders;
+                            self.message.clear();
                         }
                     }
                     if invoice.has_settlement_history {
@@ -5043,6 +5070,7 @@ impl eframe::App for App {
                 ("Bank clearance", Page::Bank),
                 ("Stock", Page::Stock),
                 ("Invoices", Page::Invoice),
+                ("Orders", Page::Orders),
                 ("Import XML", Page::Import),
                 ("Back up", Page::Backup),
                 ("Reports", Page::Reports),
@@ -5082,6 +5110,7 @@ impl eframe::App for App {
                     Page::Bank => self.bank_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),
                     Page::Invoice => self.invoice_page(ui, company),
+                    Page::Orders => self.orders_page(ui, company),
                     Page::Import => self.import_page(ui, company),
                     Page::Backup => {}
                     Page::Reports => self.reports_page(ui, company),
