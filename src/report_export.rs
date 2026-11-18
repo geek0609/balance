@@ -550,6 +550,90 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_invoice_tax_register_csv(
+        &self,
+        company: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        kind: Option<InvoiceKind>,
+        ledger: Option<i64>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.invoice_tax_register(company, start, end, kind, ledger)?;
+        let context = [
+            self.report_company_name(company)?,
+            optional_date(start)?,
+            optional_date(end)?,
+            kind.map(InvoiceKind::as_str).unwrap_or("All").into(),
+            ledger.map(|id| id.to_string()).unwrap_or_default(),
+        ];
+        let mut csv = writer();
+        let columns = strings(&[
+            "row_type",
+            "date",
+            "voucher_id",
+            "invoice_id",
+            "invoice_type",
+            "reference",
+            "party",
+            "ledger_id",
+            "tax_ledger",
+            "amount",
+            "sales_tax",
+            "purchase_tax",
+        ]);
+        contextual_row(
+            &mut csv,
+            &strings(&[
+                "company",
+                "period_start",
+                "period_end",
+                "invoice_type_filter",
+                "ledger_filter_id",
+            ]),
+            &columns,
+        )?;
+        for row in report.entries {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    if row.reversal {
+                        "reversal".into()
+                    } else {
+                        "invoice".into()
+                    },
+                    row.date.to_string(),
+                    row.voucher_id.to_string(),
+                    row.invoice_id.to_string(),
+                    row.kind.as_str().into(),
+                    text_cell(&row.reference),
+                    text_cell(&row.party),
+                    row.ledger_id.to_string(),
+                    text_cell(&row.ledger),
+                    money(row.amount),
+                    String::new(),
+                    String::new(),
+                ],
+            )?;
+        }
+        for row in report.ledgers {
+            let mut totals = vec![String::new(); columns.len()];
+            totals[0] = "tax_ledger_total".into();
+            totals[7] = row.ledger_id.to_string();
+            totals[8] = text_cell(&row.ledger);
+            totals[10] = money(row.sales);
+            totals[11] = money(row.purchases);
+            contextual_row(&mut csv, &context, &totals)?;
+        }
+        let mut totals = vec![String::new(); columns.len()];
+        totals[0] = "total".into();
+        totals[10] = money(report.sales);
+        totals[11] = money(report.purchases);
+        contextual_row(&mut csv, &context, &totals)?;
+        save(csv, destination)
+    }
+
     pub fn export_day_book_csv(
         &self,
         company: i64,

@@ -23,6 +23,7 @@ mod cost_ui;
 mod manufacturing_ui;
 mod order_ui;
 mod stock_count_ui;
+mod tax_ui;
 mod valuation_ui;
 use actual_cost_ui::ActualCostScreen;
 use advance_ui::AdvanceScreen;
@@ -31,6 +32,7 @@ use cost_ui::CostScreen;
 use manufacturing_ui::ManufacturingScreen;
 use order_ui::OrderScreen;
 use stock_count_ui::StockCountScreen;
+use tax_ui::TaxRegisterScreen;
 use valuation_ui::ValuationScreen;
 
 #[derive(PartialEq)]
@@ -55,6 +57,7 @@ enum Page {
     Reports,
     CostCentres,
     Budgets,
+    TaxRegister,
 }
 struct App {
     store: Store,
@@ -209,6 +212,7 @@ struct App {
     advance_screen: AdvanceScreen,
     manufacturing_screen: ManufacturingScreen,
     budget_screen: BudgetScreen,
+    tax_register_screen: TaxRegisterScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -459,6 +463,7 @@ impl App {
             advance_screen: AdvanceScreen::default(),
             manufacturing_screen: ManufacturingScreen::default(),
             budget_screen: BudgetScreen::default(),
+            tax_register_screen: TaxRegisterScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -579,6 +584,7 @@ impl App {
         self.advance_screen = AdvanceScreen::default();
         self.manufacturing_screen = ManufacturingScreen::default();
         self.budget_screen = BudgetScreen::default();
+        self.tax_register_screen = TaxRegisterScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -5302,6 +5308,7 @@ impl eframe::App for App {
                 ("Outstanding", Page::Outstanding),
                 ("Advances", Page::Advances),
                 ("Invoice register", Page::InvoiceRegister),
+                ("Tax register", Page::TaxRegister),
                 ("Bank clearance", Page::Bank),
                 ("Stock", Page::Stock),
                 ("Stock counts", Page::StockCounts),
@@ -5348,6 +5355,7 @@ impl eframe::App for App {
                     Page::Outstanding => self.outstanding_page(ui, company),
                     Page::Advances => self.advances_page(ui, company),
                     Page::InvoiceRegister => self.invoice_register_page(ui, company),
+                    Page::TaxRegister => self.tax_register_page(ui, company),
                     Page::Bank => self.bank_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),
                     Page::StockCounts => self.stock_counts_page(ui, company),
