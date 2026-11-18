@@ -4,7 +4,7 @@ use crate::stock_sales::{stock_sales, SaleCostOrigin, StockSale};
 use crate::{parse_date, required, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -122,6 +122,233 @@ pub struct ActualSalesCostReport {
 pub type AverageCostRow = ActualCostRow;
 pub type AverageCostValuation = ActualCostValuation;
 
+pub const DEFAULT_AGEING_CUTOFFS: [u32; 3] = [30, 60, 90];
+
+#[derive(Debug, Clone)]
+pub struct StockAgeingReport {
+    pub date: NaiveDate,
+    pub cutoffs: [u32; 3],
+    pub rows: Vec<StockAgeingRow>,
+}
+
+impl StockAgeingReport {
+    pub fn band_labels(&self) -> [String; 4] {
+        let [a, b, c] = self.cutoffs.map(u64::from);
+        [
+            format!("0–{a} days"),
+            format!("{}–{b} days", a + 1),
+            format!("{}–{c} days", b + 1),
+            format!("{}+ days", c + 1),
+        ]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StockAgeingRow {
+    pub item: StockItem,
+    pub quantity: i128,
+    pub breakdown: Option<StockAgeingBreakdown>,
+    pub issue: Option<ActualCostIssue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StockAgeingBreakdown {
+    pub bands: [AgeingAmount; 4],
+    pub receipts: Vec<StockAgeingReceipt>,
+    pub fifo_value: Option<i128>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgeingAmount {
+    pub quantity: i128,
+    pub fifo_value: Option<i128>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StockAgeingReceipt {
+    pub received_on: NaiveDate,
+    pub age_days: i64,
+    pub amount: AgeingAmount,
+}
+
+#[cfg(test)]
+mod ageing_tests {
+    use super::*;
+    use crate::stock_notes::{StockNoteDraft, StockNoteLineDraft};
+    use crate::stock_returns::StockReturnLineDraft;
+    use crate::Category;
+
+    #[test]
+    fn ageing_reconciles_fifo_quantities_and_values_at_the_requested_date() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let party = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        let item = store.create_stock_item(company, "Part", "Each").unwrap();
+        let location = store.stock_locations(company).unwrap()[0].id;
+        let opening = store
+            .adjust_stock_batch(company, item, location, None, "2026-01-01", 5000, "Opening")
+            .unwrap();
+        store
+            .set_stock_receipt_cost(company, opening, 5000, "Opening value")
+            .unwrap();
+        let second = store
+            .adjust_stock_batch(company, item, location, None, "2026-01-31", 4000, "Receipt")
+            .unwrap();
+        let broken = store
+            .create_stock_item(company, "Out of sequence", "Each")
+            .unwrap();
+        store
+            .adjust_stock_batch(
+                company,
+                broken,
+                location,
+                None,
+                "2026-01-02",
+                -1000,
+                "Before receipt",
+            )
+            .unwrap();
+        store
+            .adjust_stock_batch(
+                company,
+                broken,
+                location,
+                None,
+                "2026-02-01",
+                2000,
+                "Receipt",
+            )
+            .unwrap();
+        let note = store
+            .post_stock_note(
+                company,
+                &StockNoteDraft {
+                    kind: InvoiceKind::Sale,
+                    date: "2026-02-01".into(),
+                    reference: "DEL-01".into(),
+                    party_ledger_id: party,
+                    order_id: None,
+                    narration: String::new(),
+                    lines: vec![StockNoteLineDraft {
+                        item_id: item,
+                        location_id: location,
+                        batch_id: None,
+                        quantity: 6000,
+                        unit_price: 2500,
+                    }],
+                },
+            )
+            .unwrap();
+        let note_line = store.stock_note_lines(company, note).unwrap()[0].id;
+        store
+            .post_stock_return(
+                company,
+                note,
+                "2026-02-20",
+                "RET-01",
+                "Returned to inventory",
+                &[StockReturnLineDraft {
+                    note_line,
+                    quantity: 2000,
+                }],
+            )
+            .unwrap();
+        assert!(store
+            .stock_ageing(company, "2026-02-21", [30, 20, 90])
+            .is_err());
+        let report = store
+            .stock_ageing(company, "2026-01-31", [0, 10, 30])
+            .unwrap();
+        let row = report.rows.iter().find(|row| row.item.id == item).unwrap();
+        assert_eq!(
+            row.breakdown
+                .as_ref()
+                .unwrap()
+                .bands
+                .map(|band| band.quantity),
+            [4000, 0, 5000, 0]
+        );
+
+        let cutoffs = [10, 20, 30];
+        let report = store.stock_ageing(company, "2026-02-15", cutoffs).unwrap();
+        let row = report.rows.iter().find(|row| row.item.id == item).unwrap();
+        let ageing = row.breakdown.as_ref().unwrap();
+        assert_eq!(row.quantity, 3000);
+        assert_eq!(ageing.bands.map(|band| band.quantity), [0, 3000, 0, 0]);
+        assert_eq!((ageing.receipts[0].age_days, ageing.fifo_value), (15, None));
+        assert!(
+            matches!(row.issue, Some(ActualCostIssue::MissingReceiptCost { receipt_id, .. }) if receipt_id == second)
+        );
+        let negative = report
+            .rows
+            .iter()
+            .find(|row| row.item.id == broken)
+            .unwrap();
+        assert_eq!(negative.quantity, 1000);
+        assert!(negative.breakdown.is_none());
+        assert!(matches!(
+            negative.issue,
+            Some(ActualCostIssue::InsufficientStock { .. })
+        ));
+
+        store
+            .set_stock_receipt_cost(company, second, 8000, "Acquisition value")
+            .unwrap();
+        let end = "2026-02-21";
+        let report = store.stock_ageing(company, end, cutoffs).unwrap();
+        let row = report.rows.iter().find(|row| row.item.id == item).unwrap();
+        let ageing = row.breakdown.as_ref().unwrap();
+        assert_eq!(row.quantity, 5000);
+        assert_eq!(ageing.bands.map(|band| band.quantity), [2000, 0, 3000, 0]);
+        assert_eq!(
+            (
+                ageing.receipts[1].received_on.to_string().as_str(),
+                ageing.receipts[1].age_days
+            ),
+            ("2026-02-20", 1)
+        );
+        assert_eq!(ageing.fifo_value, Some(8333));
+        let fifo = store
+            .stock_valuation_at_actual_cost(company, end, ActualCostMethod::Fifo)
+            .unwrap();
+        assert_eq!(fifo.known_value, ageing.fifo_value.unwrap());
+        assert_eq!(
+            ageing
+                .bands
+                .iter()
+                .map(|band| band.fifo_value.unwrap())
+                .sum::<i128>(),
+            fifo.known_value
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("balance-ageing-test-{}.csv", std::process::id()));
+        store
+            .export_stock_ageing_csv(company, end, cutoffs, &path)
+            .unwrap();
+        let data = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let mut csv = csv::Reader::from_reader(data.as_bytes());
+        let headers = csv.headers().unwrap().clone();
+        let record_type = headers
+            .iter()
+            .position(|column| column == "row_type")
+            .unwrap();
+        let rows = csv
+            .records()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| &row[record_type] == "receipt")
+                .count(),
+            2
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IssueOrigin {
     Sale(SaleCostOrigin),
@@ -213,8 +440,14 @@ impl Layer {
 struct Pool {
     available: Layer,
     // Weighted average has a single combined layer, represented by None.
-    fifo_layers: Option<VecDeque<Layer>>,
+    fifo_layers: Option<VecDeque<(NaiveDate, Layer)>>,
     issue_layers: HashMap<IssueOrigin, Vec<Layer>>,
+}
+
+#[derive(Clone, Copy)]
+enum Calculation {
+    Valuation(ActualCostMethod),
+    AgeingQuantities,
 }
 
 fn amount_too_large() -> Error {
@@ -222,7 +455,7 @@ fn amount_too_large() -> Error {
 }
 
 impl Pool {
-    fn receive(&mut self, layer: Layer) -> Result<()> {
+    fn receive(&mut self, date: NaiveDate, layer: Layer) -> Result<()> {
         self.available.quantity = self
             .available
             .quantity
@@ -234,7 +467,7 @@ impl Pool {
             .checked_add(layer.value)
             .ok_or_else(amount_too_large)?;
         if let Some(layers) = &mut self.fifo_layers {
-            layers.push_back(layer);
+            layers.push_back((date, layer));
         }
         Ok(())
     }
@@ -246,7 +479,7 @@ impl Pool {
         let mut unfilled = quantity;
         let mut portions = Vec::new();
         while unfilled > 0 {
-            let layer = layers.front_mut().ok_or_else(|| {
+            let (_, layer) = layers.front_mut().ok_or_else(|| {
                 Error::Validation("FIFO layers do not cover the available units".into())
             })?;
             let take = unfilled.min(layer.quantity);
@@ -265,44 +498,61 @@ impl Pool {
 
 fn calculate(
     events: &mut [Event],
-    method: ActualCostMethod,
+    calculation: Calculation,
     mut reported_sale_costs: Option<&mut HashMap<SaleCostOrigin, i128>>,
 ) -> Result<std::result::Result<Pool, ActualCostIssue>> {
     events.sort_by_key(Event::order);
+    let track_cost = matches!(calculation, Calculation::Valuation(_));
     let mut pool = Pool {
-        fifo_layers: (method == ActualCostMethod::Fifo).then(VecDeque::new),
+        fifo_layers: (!matches!(
+            calculation,
+            Calculation::Valuation(ActualCostMethod::WeightedAverage)
+        ))
+        .then(VecDeque::new),
         ..Pool::default()
     };
     for event in events {
         match &event.movement {
-            Movement::Receipt(Some(value)) | Movement::Purchase(value) => {
-                pool.receive(Layer {
-                    quantity: event.quantity,
-                    value: i128::from(*value),
-                })?;
-            }
-            Movement::Receipt(None) => {
-                return Ok(Err(ActualCostIssue::MissingReceiptCost {
-                    date: event.date,
-                    receipt_id: event.source_id,
-                }));
+            Movement::Receipt(_) | Movement::Purchase(_) => {
+                let value = match (&event.movement, track_cost) {
+                    (_, false) => 0,
+                    (Movement::Receipt(Some(value)) | Movement::Purchase(value), true) => {
+                        i128::from(*value)
+                    }
+                    _ => {
+                        return Ok(Err(ActualCostIssue::MissingReceiptCost {
+                            date: event.date,
+                            receipt_id: event.source_id,
+                        }))
+                    }
+                };
+                pool.receive(
+                    event.date,
+                    Layer {
+                        quantity: event.quantity,
+                        value,
+                    },
+                )?;
             }
             Movement::IssueReversal(origin) => {
                 let restored = pool.issue_layers.remove(origin).ok_or_else(|| {
                     Error::Validation("Original stock issue cost is missing for a reversal".into())
                 })?;
                 for layer in restored {
-                    pool.receive(layer)?;
+                    pool.receive(event.date, layer)?;
                 }
             }
             Movement::SaleReturn { origin, share, .. } => {
                 let issued = pool.issue_layers.get(origin).ok_or_else(|| {
                     Error::Validation("Original delivery cost is missing for a return".into())
                 })?;
-                pool.receive(Layer {
-                    quantity: event.quantity,
-                    value: share.apportion(issued.iter().map(|layer| layer.value).sum()),
-                })?;
+                pool.receive(
+                    event.date,
+                    Layer {
+                        quantity: event.quantity,
+                        value: share.apportion(issued.iter().map(|layer| layer.value).sum()),
+                    },
+                )?;
             }
             issue => {
                 if event.quantity > pool.available.quantity {
@@ -356,6 +606,51 @@ fn calculate(
         }
     }
     Ok(Ok(pool))
+}
+
+fn ageing_breakdown(
+    pool: Pool,
+    as_of: NaiveDate,
+    cutoffs: [u32; 3],
+    valued: bool,
+) -> StockAgeingBreakdown {
+    let mut by_date = BTreeMap::<_, Layer>::new();
+    if let Some(layers) = pool.fifo_layers {
+        for (date, layer) in layers {
+            let total = by_date.entry(date).or_default();
+            total.quantity += layer.quantity;
+            total.value += layer.value;
+        }
+    }
+    let mut bands = [AgeingAmount {
+        quantity: 0,
+        fifo_value: valued.then_some(0),
+    }; 4];
+    let mut receipts = Vec::with_capacity(by_date.len());
+    for (received_on, layer) in by_date {
+        let age_days = (as_of - received_on).num_days();
+        let band = cutoffs
+            .iter()
+            .position(|&limit| age_days <= i64::from(limit))
+            .unwrap_or(3);
+        bands[band].quantity += layer.quantity;
+        if let Some(value) = &mut bands[band].fifo_value {
+            *value += layer.value;
+        }
+        receipts.push(StockAgeingReceipt {
+            received_on,
+            age_days,
+            amount: AgeingAmount {
+                quantity: layer.quantity,
+                fifo_value: valued.then_some(layer.value),
+            },
+        });
+    }
+    StockAgeingBreakdown {
+        bands,
+        receipts,
+        fifo_value: valued.then_some(pool.available.value),
+    }
 }
 
 fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64, Vec<Event>>> {
@@ -735,7 +1030,7 @@ impl Store {
         for balance in balances {
             let (value, issue) = match calculate(
                 &mut events.remove(&balance.item.id).unwrap_or_default(),
-                method,
+                Calculation::Valuation(method),
                 None,
             )? {
                 Ok(pool) => {
@@ -765,6 +1060,67 @@ impl Store {
         }
         tx.commit()?;
         Ok(report)
+    }
+
+    /// Age the remaining company-wide FIFO layers by their latest receipt dates.
+    pub fn stock_ageing(
+        &self,
+        company: i64,
+        as_of: &str,
+        cutoffs: [u32; 3],
+    ) -> Result<StockAgeingReport> {
+        let date = parse_date(as_of)?;
+        if !(cutoffs[0] < cutoffs[1] && cutoffs[1] < cutoffs[2]) {
+            return Err(Error::Validation(
+                "Enter three increasing age cutoffs in days".into(),
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut movements = events(&tx, company, date)?;
+        let balances = self.stock_balances(company, Some(as_of))?;
+        let mut rows = Vec::new();
+        for balance in balances {
+            let mut item_events = movements.remove(&balance.item.id).unwrap_or_default();
+            let (pool, issue, valued) = match calculate(
+                &mut item_events,
+                Calculation::Valuation(ActualCostMethod::Fifo),
+                None,
+            )? {
+                Ok(pool) => (Some(pool), None, true),
+                Err(cost_issue @ ActualCostIssue::MissingReceiptCost { .. }) => {
+                    match calculate(&mut item_events, Calculation::AgeingQuantities, None)? {
+                        Ok(pool) => (Some(pool), Some(cost_issue), false),
+                        Err(quantity_issue) => (None, Some(quantity_issue), false),
+                    }
+                }
+                Err(issue) => (None, Some(issue), false),
+            };
+            let breakdown = if let Some(pool) = pool {
+                if pool.available.quantity != balance.quantity {
+                    return Err(Error::Validation(format!(
+                        "Stock movements do not reconcile for {}",
+                        balance.item.name,
+                    )));
+                }
+                Some(ageing_breakdown(pool, date, cutoffs, valued))
+            } else {
+                None
+            };
+            if balance.quantity != 0 || issue.is_some() {
+                rows.push(StockAgeingRow {
+                    item: balance.item,
+                    quantity: balance.quantity,
+                    breakdown,
+                    issue,
+                });
+            }
+        }
+        tx.commit()?;
+        Ok(StockAgeingReport {
+            date,
+            cutoffs,
+            rows,
+        })
     }
 
     /// Cost item sales and reversals with the same valuation rules as the stock report.
@@ -808,7 +1164,7 @@ impl Store {
         for item in items {
             if let Err(issue) = calculate(
                 &mut events.remove(&item).unwrap_or_default(),
-                method,
+                Calculation::Valuation(method),
                 Some(&mut costs),
             )? {
                 issues.insert(item, issue);

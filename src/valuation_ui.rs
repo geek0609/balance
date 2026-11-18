@@ -1,7 +1,8 @@
 use super::{money, pick_stock, App};
+use balance::actual_cost::{StockAgeingReport, DEFAULT_AGEING_CUTOFFS};
 use balance::inventory::format_quantity;
 use balance::valuation::{SalesCostReport, StockValuation};
-use balance::{format_amount, parse_amount, Error};
+use balance::{format_amount, parse_amount, Error, Result};
 use eframe::egui;
 
 #[derive(Default)]
@@ -12,9 +13,40 @@ pub(super) struct ValuationScreen {
     reason: String,
     stock_date: String,
     stock: Option<StockValuation>,
+    ageing: StockAgeingScreen,
     sales_from: String,
     sales_to: String,
     sales: Option<SalesCostReport>,
+}
+
+struct StockAgeingScreen {
+    date: String,
+    cutoffs: [String; 3],
+    report: Option<StockAgeingReport>,
+    selected: Option<i64>,
+}
+
+impl Default for StockAgeingScreen {
+    fn default() -> Self {
+        Self {
+            date: String::new(),
+            cutoffs: DEFAULT_AGEING_CUTOFFS.map(|days| days.to_string()),
+            report: None,
+            selected: None,
+        }
+    }
+}
+
+impl StockAgeingScreen {
+    fn cutoffs(&self) -> Result<[u32; 3]> {
+        let parse_days = |value: &str| {
+            value.trim().parse::<u32>().map_err(|_| {
+                Error::Validation("Enter three increasing age cutoffs in whole days".into())
+            })
+        };
+        let [first, second, third] = &self.cutoffs;
+        Ok([parse_days(first)?, parse_days(second)?, parse_days(third)?])
+    }
 }
 
 impl App {
@@ -34,12 +66,149 @@ impl App {
         egui::CollapsingHeader::new("Stock value at standard cost").show(ui, |ui| {
             self.standard_stock_view(ui, company);
         });
+        egui::CollapsingHeader::new("Stock ageing").show(ui, |ui| {
+            if let Err(error) = self.stock_ageing_view(ui, company) {
+                self.failure(error);
+            }
+        });
         egui::CollapsingHeader::new("Item sales and actual margin").show(ui, |ui| {
             self.actual_sales_view(ui, company);
         });
         egui::CollapsingHeader::new("Item sales and standard margin").show(ui, |ui| {
             self.standard_sales_view(ui, company);
         });
+    }
+
+    fn stock_ageing_view(&mut self, ui: &mut egui::Ui, company: i64) -> Result<()> {
+        let form = &mut self.valuation_screen.ageing;
+        let (run, export) = ui
+            .horizontal_wrapped(|ui| {
+                ui.label("As of");
+                let mut changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut form.date)
+                            .hint_text("YYYY-MM-DD")
+                            .desired_width(110.0),
+                    )
+                    .changed();
+                ui.label("Age cutoffs (days)");
+                for cutoff in &mut form.cutoffs {
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(cutoff).desired_width(50.0))
+                        .changed();
+                }
+                if changed {
+                    form.report = None;
+                    form.selected = None;
+                }
+                (
+                    ui.button("Run stock ageing").clicked(),
+                    ui.button("Export ageing CSV").clicked(),
+                )
+            })
+            .inner;
+        ui.small("Age uses the latest receipt date of each remaining FIFO quantity across all locations.");
+        if run {
+            form.report = Some(self.store.stock_ageing(
+                company,
+                form.date.trim(),
+                form.cutoffs()?,
+            )?);
+            form.selected = None;
+            self.message.clear();
+        }
+        if export {
+            self.store.export_stock_ageing_csv(
+                company,
+                form.date.trim(),
+                form.cutoffs()?,
+                self.report_export_path.trim(),
+            )?;
+            self.message = "Stock ageing exported".into();
+        }
+        let Some(report) = &form.report else {
+            return Ok(());
+        };
+        if report.rows.is_empty() {
+            ui.label("No stock to age on this date.");
+            return Ok(());
+        }
+        egui::Grid::new("stock-ageing-summary")
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Item");
+                ui.strong("Unit");
+                ui.strong("On hand");
+                for label in report.band_labels() {
+                    ui.strong(label);
+                }
+                ui.strong("FIFO value");
+                ui.strong("Report issue");
+                ui.end_row();
+                for row in &report.rows {
+                    if ui
+                        .selectable_label(form.selected == Some(row.item.id), &row.item.name)
+                        .clicked()
+                    {
+                        form.selected = Some(row.item.id);
+                    }
+                    ui.label(&row.item.unit);
+                    ui.label(format_quantity(row.quantity));
+                    if let Some(breakdown) = &row.breakdown {
+                        for band in &breakdown.bands {
+                            ui.label(format_quantity(band.quantity));
+                        }
+                        ui.label(
+                            breakdown
+                                .fifo_value
+                                .map(money)
+                                .unwrap_or_else(|| "—".into()),
+                        );
+                    } else {
+                        for _ in 0..5 {
+                            ui.label("—");
+                        }
+                    }
+                    ui.label(
+                        row.issue
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    );
+                    ui.end_row();
+                }
+            });
+        if let Some(row) = report
+            .rows
+            .iter()
+            .find(|row| Some(row.item.id) == form.selected)
+        {
+            if let Some(breakdown) = &row.breakdown {
+                crate::theme::section(ui, format!("Remaining receipts for {}", row.item.name));
+                egui::Grid::new(("stock-ageing-receipts", row.item.id))
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for label in ["Receipt date", "Age (days)", "Quantity", "FIFO value"] {
+                            ui.strong(label);
+                        }
+                        ui.end_row();
+                        for layer in &breakdown.receipts {
+                            ui.label(layer.received_on.to_string());
+                            ui.label(layer.age_days.to_string());
+                            ui.label(format_quantity(layer.amount.quantity));
+                            ui.label(
+                                layer
+                                    .amount
+                                    .fifo_value
+                                    .map(money)
+                                    .unwrap_or_else(|| "—".into()),
+                            );
+                            ui.end_row();
+                        }
+                    });
+            }
+        }
+        Ok(())
     }
 
     fn cost_rate_form(&mut self, ui: &mut egui::Ui, company: i64) {

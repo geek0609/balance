@@ -1346,6 +1346,107 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_stock_ageing_csv(
+        &self,
+        company: i64,
+        as_of: &str,
+        cutoffs: [u32; 3],
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.stock_ageing(company, as_of, cutoffs)?;
+        let context = [
+            self.report_company_name(company)?,
+            report.date.to_string(),
+            cutoffs[0].to_string(),
+            cutoffs[1].to_string(),
+            cutoffs[2].to_string(),
+        ];
+        let columns = [
+            "row_type",
+            "item_id",
+            "item",
+            "unit",
+            "quantity",
+            "fifo_value",
+            "receipt_date",
+            "age_days",
+            "band_1_quantity",
+            "band_2_quantity",
+            "band_3_quantity",
+            "band_4_quantity",
+            "band_1_value",
+            "band_2_value",
+            "band_3_value",
+            "band_4_value",
+            "issue",
+        ];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&[
+                "company",
+                "as_of",
+                "through_days_1",
+                "through_days_2",
+                "through_days_3",
+            ]),
+            &strings(&columns),
+        )?;
+        let mut metadata = vec![String::new(); columns.len()];
+        metadata[0] = "context".into();
+        contextual_row(&mut csv, &context, &metadata)?;
+        for row in report.rows {
+            let row_fields = |kind: &str, quantity: i128, value: Option<i128>| {
+                vec![
+                    kind.into(),
+                    row.item.id.to_string(),
+                    text_cell(&row.item.name),
+                    text_cell(&row.item.unit),
+                    format_quantity(quantity),
+                    value.map(money).unwrap_or_default(),
+                ]
+            };
+            let mut line = row_fields(
+                "item",
+                row.quantity,
+                row.breakdown.as_ref().and_then(|aged| aged.fifo_value),
+            );
+            line.extend([String::new(), String::new()]);
+            if let Some(breakdown) = &row.breakdown {
+                line.extend(breakdown.bands.map(|band| format_quantity(band.quantity)));
+                line.extend(
+                    breakdown
+                        .bands
+                        .map(|band| band.fifo_value.map(money).unwrap_or_default()),
+                );
+            }
+            line.resize(columns.len() - 1, String::new());
+            line.push(
+                row.issue
+                    .as_ref()
+                    .map(|issue| text_cell(&issue.to_string()))
+                    .unwrap_or_default(),
+            );
+            contextual_row(&mut csv, &context, &line)?;
+            if let Some(breakdown) = row.breakdown {
+                for receipt in breakdown.receipts {
+                    let mut line = row_fields(
+                        "receipt",
+                        receipt.amount.quantity,
+                        receipt.amount.fifo_value,
+                    );
+                    line.extend([
+                        receipt.received_on.to_string(),
+                        receipt.age_days.to_string(),
+                    ]);
+                    line.resize(columns.len(), String::new());
+                    contextual_row(&mut csv, &context, &line)?;
+                }
+            }
+        }
+        save(csv, destination)
+    }
+
     pub fn export_stock_dispatches_csv(
         &self,
         company: i64,
