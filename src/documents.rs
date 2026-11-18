@@ -98,6 +98,14 @@ impl Store {
         if let Some(days) = invoice.credit_days {
             let _ = write!(html, "<br>Credit period: {days} days");
         }
+        if let Some(reversal) = &invoice.reversal {
+            let _ = write!(
+                html,
+                "<br><strong>Reversed on {} by note {}</strong>",
+                escape(&reversal.date),
+                escape(&reversal.reference)
+            );
+        }
         html.push_str("</p><p><strong>Party</strong><br>");
         let _ = write!(html, "{}", escape(&invoice.party));
         for value in [

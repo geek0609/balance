@@ -299,10 +299,14 @@ impl App {
         if !detail.invoices.is_empty() {
             ui.strong("Linked invoices");
             for invoice in &detail.invoices {
-                ui.label(format!(
+                let mut label = format!(
                     "{} | {} (invoice {})",
                     invoice.date, invoice.reference, invoice.id
-                ));
+                );
+                if let Some(date) = &invoice.reversal_date {
+                    label.push_str(&format!(" | Reversed {date}"));
+                }
+                ui.label(label);
             }
         }
         if let (Some(at), Some(reason)) = (&order.closed_at, &order.close_reason) {

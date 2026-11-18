@@ -195,7 +195,14 @@ struct App {
     reversal_date: String,
     reversal_reference: String,
     reversal_reason: String,
+    invoice_reversal: Option<InvoiceReversalForm>,
     message: String,
+}
+struct InvoiceReversalForm {
+    invoice_id: i64,
+    date: String,
+    reference: String,
+    reason: String,
 }
 struct SettlementLineForm {
     invoice: Option<i64>,
@@ -426,6 +433,7 @@ impl App {
             reversal_date: String::new(),
             reversal_reference: String::new(),
             reversal_reason: String::new(),
+            invoice_reversal: None,
             message: String::new(),
         }
     }
@@ -542,6 +550,7 @@ impl App {
         self.reversal_date.clear();
         self.reversal_reference.clear();
         self.reversal_reason.clear();
+        self.invoice_reversal = None;
     }
     fn company_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Companies");
@@ -3394,7 +3403,7 @@ impl App {
         }
         ui.separator();
         ui.heading("Invoices");
-        ui.small("Invoice totals include all recorded settlements and reversals, including future-dated entries. Use Outstanding for a specific as-of date.");
+        ui.small("Invoice balances include all saved settlements and reversals. Use Outstanding for a specific date.");
         if let Some(voucher) = self.reversal_target {
             ui.heading(format!("Reverse settlement voucher {voucher}"));
             ui.label("This reverses the entire receipt or payment, including all invoices allocated to it.");
@@ -3610,6 +3619,7 @@ impl App {
                     if ui
                         .add_enabled(
                             !invoice.has_settlement_history
+                                && invoice.reversal.is_none()
                                 && invoice.order_id.is_none()
                                 && !self.invoice_draft_in_use(),
                             egui::Button::new("Edit invoice"),
@@ -3639,6 +3649,7 @@ impl App {
                             Err(e) => self.failure(e),
                         }
                     }
+                    self.invoice_reversal_form(ui, company, &invoice);
                     if let Some(order) = invoice.order_id {
                         if ui.link(format!("View linked order {order}")).clicked() {
                             self.order_screen.select(order);
@@ -3807,6 +3818,95 @@ impl App {
             Err(e) => self.failure(e),
         }
     }
+    fn invoice_reversal_form(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        invoice: &balance::inventory::InvoiceSummary,
+    ) {
+        if let Some(reversal) = &invoice.reversal {
+            if self
+                .invoice_reversal
+                .as_ref()
+                .is_some_and(|form| form.invoice_id == invoice.id)
+            {
+                self.invoice_reversal = None;
+            }
+            ui.label(format!(
+                "Reversed {} | {} (voucher {}) | {}",
+                reversal.date, reversal.reference, reversal.voucher_id, reversal.reason
+            ));
+            return;
+        }
+        let note = match invoice.kind {
+            InvoiceKind::Sale => "credit note",
+            InvoiceKind::Purchase => "debit note",
+        };
+        let can_reverse = invoice.settled == 0 && self.editing_invoice != Some(invoice.id);
+        if self.invoice_reversal.is_none()
+            && ui
+                .add_enabled(
+                    can_reverse,
+                    egui::Button::new(format!("Reverse with a {note}")),
+                )
+                .on_disabled_hover_text(
+                    "Finish editing or reverse active settlements before reversing the invoice.",
+                )
+                .clicked()
+        {
+            self.invoice_reversal = Some(InvoiceReversalForm {
+                invoice_id: invoice.id,
+                date: String::new(),
+                reference: String::new(),
+                reason: String::new(),
+            });
+        }
+        let Some(form) = &mut self.invoice_reversal else {
+            return;
+        };
+        if form.invoice_id != invoice.id {
+            return;
+        }
+        ui.small("This reverses the whole invoice and its stock quantities. The original invoice remains in the history.");
+        egui::Grid::new(("reverse-invoice", invoice.id)).show(ui, |ui| {
+            for (label, value) in [
+                ("Note date (YYYY-MM-DD)", &mut form.date),
+                ("Note reference", &mut form.reference),
+                ("Reason", &mut form.reason),
+            ] {
+                ui.label(label);
+                ui.text_edit_singleline(value);
+                ui.end_row();
+            }
+        });
+        let mut dismiss = false;
+        let mut post = false;
+        ui.horizontal(|ui| {
+            post = ui
+                .add_enabled(can_reverse, egui::Button::new(format!("Post {note}")))
+                .clicked();
+            dismiss = ui.button("Cancel").clicked();
+        });
+        if post {
+            match self.store.reverse_invoice(
+                company,
+                invoice.id,
+                &form.date,
+                &form.reference,
+                &form.reason,
+            ) {
+                Ok(voucher) => {
+                    self.message = format!("Invoice reversed with voucher {voucher}");
+                    dismiss = true;
+                }
+                Err(error) => self.failure(error),
+            }
+        }
+        if dismiss {
+            self.invoice_reversal = None;
+        }
+    }
+
     fn import_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Import accounting XML");
         ui.label("Preview a file before importing. Only supported, complete records can be imported; no changes are made if any issue is found.");
@@ -4443,7 +4543,7 @@ impl App {
     fn invoice_register_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Sales and purchase register");
         self.report_export_path_field(ui);
-        ui.small("Invoice dates are inclusive. Settled and outstanding amounts include all saved settlements and reversals, including future-dated entries; use Outstanding for an as-of view.");
+        ui.small("The date filter applies to original invoices. The report shows original totals and all recorded reversals, including future dates. Use Outstanding for balances on a specific date.");
         let ledgers = match self.store.ledgers(company) {
             Ok(value) => value,
             Err(e) => {
@@ -4536,7 +4636,8 @@ impl App {
                             "Party",
                             "Reference",
                             "Due",
-                            "Total",
+                            "Original total",
+                            "Reversed on",
                             "Settled",
                             "Outstanding",
                         ] {
@@ -4555,13 +4656,20 @@ impl App {
                             ui.label(&invoice.reference);
                             ui.label(invoice.due_date.as_deref().unwrap_or("—"));
                             ui.label(money(invoice.total));
+                            ui.label(
+                                invoice
+                                    .reversal
+                                    .as_ref()
+                                    .map(|r| r.date.as_str())
+                                    .unwrap_or("—"),
+                            );
                             ui.label(money(invoice.settled));
                             ui.label(money(invoice.outstanding));
                             ui.end_row();
                         }
                     });
                 ui.label(format!(
-                    "{} invoices · Sales {} · Purchases {}",
+                    "{} invoices · Original sales {} · Original purchases {}",
                     rows.len(),
                     money(sales),
                     money(purchases)

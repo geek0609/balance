@@ -186,6 +186,7 @@ pub struct InvoiceSummary {
     pub outstanding: i128,
     pub has_settlement_history: bool,
     pub order_id: Option<i64>,
+    pub reversal: Option<crate::invoice_reversals::InvoiceReversal>,
     pub lines: Vec<InvoiceDetailLine>,
     pub adjustments: Vec<InvoiceAdjustmentDetail>,
 }
@@ -1088,6 +1089,12 @@ pub(crate) fn insert_settlement_on_connection(
         if parsed_date < parse_date(&invoice_date)? {
             return Err(Error::Validation(
                 "Settlement date must not precede any invoice date".into(),
+            ));
+        }
+        if crate::invoice_reversals::for_invoice(conn, company_id, allocation.invoice_id)?.is_some()
+        {
+            return Err(Error::Validation(
+                "A reversed invoice cannot accept settlements".into(),
             ));
         }
         if bank_ledger_id == party {
@@ -2041,6 +2048,11 @@ impl Store {
                 }
                 other => Error::Database(other),
             })?;
+        if crate::invoice_reversals::for_invoice(&tx, company_id, invoice_id)?.is_some() {
+            return Err(Error::Validation(
+                "A reversed invoice cannot be edited".into(),
+            ));
+        }
         let settled: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND invoice_id = ?2)", params![company_id, invoice_id], |r| r.get(0))?;
         if settled {
             return Err(Error::Validation(
@@ -2090,7 +2102,7 @@ impl Store {
     }
     pub fn is_invoice_voucher(&self, company_id: i64, voucher_id: i64) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?1 AND (original_voucher_id = ?2 OR clearing_voucher_id = ?2))",
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?1 AND (original_voucher_id = ?2 OR clearing_voucher_id = ?2))",
             params![company_id, voucher_id],
             |r| r.get(0),
         )?)
@@ -2249,6 +2261,12 @@ impl Store {
                 settled += i128::from(amount?);
             }
             let has_settlement_history: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM invoice_settlements WHERE invoice_id = ?1 AND company_id = ?2)", params![id, company_id], |r| r.get(0))?;
+            let reversal = crate::invoice_reversals::for_invoice(&self.conn, company_id, id)?;
+            let outstanding = if reversal.is_some() {
+                0
+            } else {
+                total - settled
+            };
             result.push(InvoiceSummary {
                 id,
                 voucher_id,
@@ -2262,7 +2280,8 @@ impl Store {
                 total,
                 tax_amount: tax,
                 settled,
-                outstanding: total - settled,
+                outstanding,
+                reversal,
                 has_settlement_history,
                 order_id: crate::orders::linked_order(&self.conn, id)?,
                 lines,
@@ -2473,6 +2492,11 @@ impl Store {
             let date = parse_date(&invoice.date)?;
             if date > end {
                 continue;
+            }
+            if let Some(reversal) = &invoice.reversal {
+                if parse_date(&reversal.date)? <= end {
+                    continue;
+                }
             }
             let mut settled = 0_i128;
             for settlement in self.invoice_settlements(company_id, invoice.id)? {

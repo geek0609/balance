@@ -3,7 +3,7 @@ use crate::{
     check_ledgers, parse_date, required, validate_voucher, Error, Posting, Result, Store,
     VoucherKind,
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 
 #[derive(Debug, Clone)]
 pub struct VoucherReversal {
@@ -48,38 +48,14 @@ impl Store {
                 "Reversal date must not precede the original voucher".into(),
             ));
         }
-        let linked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?1 AND (original_voucher_id = ?2 OR reversal_voucher_id = ?2) UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?1 AND (original_voucher_id = ?2 OR clearing_voucher_id = ?2))", params![company, original], |r| r.get(0))?;
+        let linked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?1 AND (original_voucher_id = ?2 OR reversal_voucher_id = ?2) UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?1 AND (original_voucher_id = ?2 OR clearing_voucher_id = ?2))", params![company, original], |r| r.get(0))?;
         if linked {
             return Err(Error::Validation(
                 "Linked or already reversed vouchers cannot be reversed here".into(),
             ));
         }
-        let mut stmt =
-            tx.prepare("SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
-        let postings = stmt
-            .query_map([original], |r| {
-                Ok(Posting {
-                    ledger_id: r.get(0)?,
-                    amount: r.get(1)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-        let reversed = postings
-            .into_iter()
-            .map(|p| {
-                Ok(Posting {
-                    ledger_id: p.ledger_id,
-                    amount: p.amount.checked_neg().ok_or_else(|| {
-                        Error::Validation("Posting amount cannot be reversed".into())
-                    })?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
         let date = date.format("%Y-%m-%d").to_string();
-        validate_voucher(&date, &reversed)?;
-        check_ledgers(&tx, company, &reversed)?;
-        crate::opening::check_no_control_postings(&tx, company, &reversed)?;
+        let reversed = counter_postings(&tx, company, original, &date)?;
         tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, VoucherKind::Journal.as_str(), reference, date, format!("Reversal of voucher {original}: {reason}")])?;
         let reversal = tx.last_insert_rowid();
         for posting in reversed {
@@ -92,4 +68,39 @@ impl Store {
         tx.commit()?;
         Ok(reversal)
     }
+}
+
+pub(crate) fn counter_postings(
+    conn: &Connection,
+    company: i64,
+    original: i64,
+    date: &str,
+) -> Result<Vec<Posting>> {
+    let mut stmt =
+        conn.prepare("SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
+    let postings = stmt
+        .query_map([original], |r| {
+            Ok(Posting {
+                ledger_id: r.get(0)?,
+                amount: r.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let reversed = postings
+        .into_iter()
+        .map(|p| {
+            Ok(Posting {
+                ledger_id: p.ledger_id,
+                amount: p
+                    .amount
+                    .checked_neg()
+                    .ok_or_else(|| Error::Validation("Posting amount cannot be reversed".into()))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_voucher(date, &reversed)?;
+    check_ledgers(conn, company, &reversed)?;
+    crate::opening::check_no_control_postings(conn, company, &reversed)?;
+    Ok(reversed)
 }

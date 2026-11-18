@@ -313,6 +313,26 @@ impl Store {
             party.map(|value| value.to_string()).unwrap_or_default(),
             text_cell(search.trim()),
         ];
+        let details = strings(&[
+            "row_type",
+            "invoice_id",
+            "voucher_id",
+            "date",
+            "type",
+            "party_id",
+            "party",
+            "reference",
+            "due_date",
+            "stock_net",
+            "manual_tax",
+            "service_and_adjustments",
+            "total",
+            "reversal_voucher_id",
+            "reversal_date",
+            "reversal_reference",
+            "settled_all_dates",
+            "outstanding_all_dates",
+        ]);
         let mut csv = writer();
         contextual_row(
             &mut csv,
@@ -324,31 +344,11 @@ impl Store {
                 "party_filter_id",
                 "search",
             ]),
-            &strings(&[
-                "row_type",
-                "invoice_id",
-                "voucher_id",
-                "date",
-                "type",
-                "party_id",
-                "party",
-                "reference",
-                "due_date",
-                "stock_net",
-                "manual_tax",
-                "service_and_adjustments",
-                "total",
-                "settled_all_dates",
-                "outstanding_all_dates",
-            ]),
+            &details,
         )?;
-        contextual_row(
-            &mut csv,
-            &context,
-            &strings(&[
-                "context", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
-            ]),
-        )?;
+        let mut context_fields = vec![String::new(); details.len()];
+        context_fields[0] = "context".into();
+        contextual_row(&mut csv, &context, &context_fields)?;
         for invoice in invoices {
             let stock: i128 = invoice
                 .lines
@@ -377,6 +377,21 @@ impl Store {
                     money(i128::from(invoice.tax_amount)),
                     money(adjustments),
                     money(invoice.total),
+                    invoice
+                        .reversal
+                        .as_ref()
+                        .map(|r| r.voucher_id.to_string())
+                        .unwrap_or_default(),
+                    invoice
+                        .reversal
+                        .as_ref()
+                        .map(|r| r.date.clone())
+                        .unwrap_or_default(),
+                    invoice
+                        .reversal
+                        .as_ref()
+                        .map(|r| text_cell(&r.reference))
+                        .unwrap_or_default(),
                     money(invoice.settled),
                     money(invoice.outstanding),
                 ],

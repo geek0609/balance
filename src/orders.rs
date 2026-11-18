@@ -124,6 +124,7 @@ pub struct OrderInvoice {
     pub id: i64,
     pub date: String,
     pub reference: String,
+    pub reversal_date: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,7 +139,8 @@ const ORDER_SUMMARIES: &str =
     "SELECT o.id, o.kind, o.party_ledger_id, l.name, o.reference, o.date,
             o.expected_on, o.notes, o.closed_at, o.close_reason,
             EXISTS(SELECT 1 FROM order_line_progress p WHERE p.order_id = o.id AND p.fulfilled < p.quantity),
-            EXISTS(SELECT 1 FROM invoice_order_links link WHERE link.order_id = o.id)
+            EXISTS(SELECT 1 FROM invoice_order_links link WHERE link.order_id = o.id
+                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id))
      FROM orders o JOIN ledgers l ON l.id = o.party_ledger_id AND l.company_id = o.company_id
      WHERE o.company_id = ?1";
 
@@ -294,9 +296,11 @@ impl Store {
         let lines = order_lines(&tx, id)?;
         let invoices = {
             let mut stmt = tx.prepare(
-                "SELECT i.id, v.date, v.reference FROM invoice_order_links link
+                "SELECT i.id, v.date, v.reference, rv.date FROM invoice_order_links link
                  JOIN invoices i ON i.id = link.invoice_id AND i.company_id = ?1
                  JOIN vouchers v ON v.id = i.voucher_id
+                 LEFT JOIN invoice_reversals r ON r.invoice_id = i.id
+                 LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
                  WHERE link.order_id = ?2 ORDER BY v.date, i.id",
             )?;
             let rows = stmt.query_map(params![company, id], |row| {
@@ -304,6 +308,7 @@ impl Store {
                     id: row.get(0)?,
                     date: row.get(1)?,
                     reference: row.get(2)?,
+                    reversal_date: row.get(3)?,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -355,7 +360,8 @@ impl Store {
                 "Invoice type and party must match the order".into(),
             ));
         }
-        if parse_date(&draft.date)? < parse_date(&order.date)? {
+        let invoice_date = parse_date(&draft.date)?;
+        if invoice_date < parse_date(&order.date)? {
             return Err(Error::Validation(
                 "Invoice date cannot precede the order date".into(),
             ));
@@ -364,6 +370,22 @@ impl Store {
             return Err(Error::Validation(
                 "Add an ordered item to fulfil this order".into(),
             ));
+        }
+        {
+            let mut stmt = tx.prepare(
+                "SELECT v.date FROM invoice_order_links link
+                 JOIN invoice_reversals r ON r.invoice_id = link.invoice_id
+                 JOIN vouchers v ON v.id = r.reversal_voucher_id
+                 WHERE link.order_id = ?1",
+            )?;
+            for row in stmt.query_map([id], |row| row.get::<_, String>(0))? {
+                if invoice_date < parse_date(&row?)? {
+                    return Err(Error::Validation(
+                        "Invoice date cannot precede an existing invoice reversal on the order"
+                            .into(),
+                    ));
+                }
+            }
         }
         let progress = order_lines(&tx, id)?;
         let mut remaining: HashMap<_, _> = progress
