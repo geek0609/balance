@@ -31,7 +31,7 @@ pub mod stock_sales;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 42;
+const SCHEMA_VERSION: i64 = 43;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -715,6 +715,10 @@ impl Store {
         if version < 42 {
             advances::migrate_allocations(&tx)?;
             tx.pragma_update(None, "user_version", 42)?;
+        }
+        if version < 43 {
+            advances::migrate_source_bill(&tx)?;
+            tx.pragma_update(None, "user_version", 43)?;
         }
         tx.commit()?;
         Ok(Self { conn })

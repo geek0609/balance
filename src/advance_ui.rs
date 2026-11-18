@@ -256,6 +256,12 @@ impl App {
             "Advance {} | Voucher {} | Cash or bank: {}",
             advance.id, advance.voucher_id, advance.bank
         ));
+        if let Some(bill) = &advance.source_bill {
+            ui.label(match &bill.reference {
+                Some(reference) => format!("Imported bill {} | {reference}", bill.kind),
+                None => format!("Imported bill {}", bill.kind),
+            });
+        }
         if !advance.narration.is_empty() {
             ui.label(&advance.narration);
         }

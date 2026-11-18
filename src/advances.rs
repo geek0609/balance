@@ -60,69 +60,95 @@ pub struct PartyAdvance {
     pub amount: i64,
     pub applied: i128,
     pub available: i128,
+    pub source_bill: Option<AdvanceSourceBill>,
     pub reversal: Option<AdvanceReversal>,
+}
+
+/// Optional original classification and bill reference for imported advances.
+#[derive(Debug, Clone)]
+pub struct AdvanceSourceBill {
+    pub kind: String,
+    pub reference: Option<String>,
+}
+
+pub(crate) fn migrate_source_bill(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE party_advances ADD COLUMN source_bill_type TEXT CHECK(source_bill_type IN ('Advance', 'On Account'));
+         ALTER TABLE party_advances ADD COLUMN source_bill_reference TEXT;",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn insert_party_advance(
+    conn: &Connection,
+    company: i64,
+    draft: &AdvanceDraft,
+    source_bill: Option<&AdvanceSourceBill>,
+) -> Result<(i64, i64)> {
+    let date = parse_date(&draft.date)?.format("%Y-%m-%d").to_string();
+    let reference = required(&draft.reference, "Advance reference")?;
+    if draft.amount <= 0 {
+        return Err(Error::Validation("Enter a positive advance amount".into()));
+    }
+    if !matches!(
+        ledger_category(conn, company, draft.party_ledger_id)?,
+        Category::Asset | Category::Liability
+    ) {
+        return Err(Error::Validation(
+            "The party ledger must be an asset or liability".into(),
+        ));
+    }
+    if ledger_category(conn, company, draft.bank_ledger_id)? != Category::Asset {
+        return Err(Error::Validation(
+            "The cash or bank ledger must be an asset".into(),
+        ));
+    }
+    if draft.party_ledger_id == draft.bank_ledger_id {
+        return Err(Error::Validation(
+            "Choose a different ledger for cash or bank".into(),
+        ));
+    }
+    let key = reference.to_lowercase();
+    let duplicate: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM party_advances
+                       WHERE company_id = ?1 AND kind = ?2 AND party_ledger_id = ?3 AND reference_key = ?4)",
+        params![company, draft.kind.as_str(), draft.party_ledger_id, key], |row| row.get(0),
+    )?;
+    if duplicate {
+        return Err(Error::Validation(
+            "An advance with this party, type and reference already exists".into(),
+        ));
+    }
+    let (voucher_kind, cash) = match draft.kind {
+        InvoiceKind::Sale => (VoucherKind::Receipt, draft.amount),
+        InvoiceKind::Purchase => (VoucherKind::Payment, -draft.amount),
+    };
+    conn.execute(
+        "INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![company, voucher_kind.as_str(), reference, date, draft.narration.trim()],
+    )?;
+    let voucher = conn.last_insert_rowid();
+    for (ledger, amount) in [(draft.bank_ledger_id, cash), (draft.party_ledger_id, -cash)] {
+        conn.execute(
+            "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
+            params![voucher, ledger, amount],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO party_advances(company_id, kind, party_ledger_id, bank_ledger_id, voucher_id, amount, reference_key, source_bill_type, source_bill_reference)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![company, draft.kind.as_str(), draft.party_ledger_id, draft.bank_ledger_id, voucher, draft.amount, key, source_bill.map(|v| v.kind.as_str()),
+            source_bill.and_then(|v| v.reference.as_deref())],
+    )?;
+    Ok((conn.last_insert_rowid(), voucher))
 }
 
 impl Store {
     pub fn post_party_advance(&mut self, company: i64, draft: &AdvanceDraft) -> Result<i64> {
-        let date = parse_date(&draft.date)?.format("%Y-%m-%d").to_string();
-        let reference = required(&draft.reference, "Advance reference")?;
-        if draft.amount <= 0 {
-            return Err(Error::Validation("Enter a positive advance amount".into()));
-        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !matches!(
-            ledger_category(&tx, company, draft.party_ledger_id)?,
-            Category::Asset | Category::Liability
-        ) {
-            return Err(Error::Validation(
-                "The party ledger must be an asset or liability".into(),
-            ));
-        }
-        if ledger_category(&tx, company, draft.bank_ledger_id)? != Category::Asset {
-            return Err(Error::Validation(
-                "The cash or bank ledger must be an asset".into(),
-            ));
-        }
-        if draft.party_ledger_id == draft.bank_ledger_id {
-            return Err(Error::Validation(
-                "Choose a different ledger for cash or bank".into(),
-            ));
-        }
-        let key = reference.to_lowercase();
-        let duplicate: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM party_advances
-                           WHERE company_id = ?1 AND kind = ?2 AND party_ledger_id = ?3 AND reference_key = ?4)",
-            params![company, draft.kind.as_str(), draft.party_ledger_id, key], |row| row.get(0),
-        )?;
-        if duplicate {
-            return Err(Error::Validation(
-                "An advance with this party, type and reference already exists".into(),
-            ));
-        }
-        let (voucher_kind, cash) = match draft.kind {
-            InvoiceKind::Sale => (VoucherKind::Receipt, draft.amount),
-            InvoiceKind::Purchase => (VoucherKind::Payment, -draft.amount),
-        };
-        tx.execute(
-            "INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![company, voucher_kind.as_str(), reference, date, draft.narration.trim()],
-        )?;
-        let voucher = tx.last_insert_rowid();
-        for (ledger, amount) in [(draft.bank_ledger_id, cash), (draft.party_ledger_id, -cash)] {
-            tx.execute(
-                "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-                params![voucher, ledger, amount],
-            )?;
-        }
-        tx.execute(
-            "INSERT INTO party_advances(company_id, kind, party_ledger_id, bank_ledger_id, voucher_id, amount, reference_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![company, draft.kind.as_str(), draft.party_ledger_id, draft.bank_ledger_id, voucher, draft.amount, key],
-        )?;
-        let advance = tx.last_insert_rowid();
+        let (advance, _) = insert_party_advance(&tx, company, draft, None)?;
         tx.commit()?;
         Ok(advance)
     }
@@ -197,7 +223,8 @@ impl Store {
         let through = through.map(parse_date).transpose()?;
         let mut stmt = self.conn.prepare(
             "SELECT a.id, a.kind, a.party_ledger_id, party.name, bank.name, v.id, v.date, v.reference,
-                    v.narration, a.amount, rv.id, rv.date, rv.reference, a.reversal_reason
+                    v.narration, a.amount, rv.id, rv.date, rv.reference, a.reversal_reason,
+                    a.source_bill_type, a.source_bill_reference
              FROM party_advances a JOIN vouchers v ON v.id = a.voucher_id AND v.company_id = a.company_id
              JOIN ledgers party ON party.id = a.party_ledger_id AND party.company_id = a.company_id
              JOIN ledgers bank ON bank.id = a.bank_ledger_id AND bank.company_id = a.company_id
@@ -243,6 +270,13 @@ impl Store {
                     "Allocations exceed the advance amount".into(),
                 ));
             }
+            let source_bill = match row.get::<_, Option<String>>(14)? {
+                Some(kind) => Some(AdvanceSourceBill {
+                    kind,
+                    reference: row.get(15)?,
+                }),
+                None => None,
+            };
             advances.push((
                 original_date,
                 PartyAdvance {
@@ -258,6 +292,7 @@ impl Store {
                     amount,
                     applied,
                     available,
+                    source_bill,
                     reversal,
                 },
             ));

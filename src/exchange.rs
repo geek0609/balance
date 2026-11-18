@@ -1,5 +1,6 @@
 //! Import of a limited accounting XML interchange format.
 //! Unsupported or ambiguous data is reported before any database writes.
+use crate::advances::{insert_party_advance, AdvanceDraft, AdvanceSourceBill};
 use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
@@ -139,6 +140,14 @@ struct ImportedBillAllocation {
     credit_days: Option<u32>,
 }
 #[derive(Debug, Clone)]
+enum ImportedBillUse {
+    Invoices(Vec<ImportedBillAllocation>),
+    Advance {
+        amount: i64,
+        source_bill: AdvanceSourceBill,
+    },
+}
+#[derive(Debug, Clone)]
 struct ImportedSettlement {
     kind: InvoiceKind,
     date: String,
@@ -147,7 +156,8 @@ struct ImportedSettlement {
     party: String,
     bank: String,
     existing_bank_id: Option<i64>,
-    allocations: Vec<ImportedBillAllocation>,
+    existing_party_id: Option<i64>,
+    bills: ImportedBillUse,
     metadata: SourceMetadata,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -233,7 +243,16 @@ impl ImportPlan {
         self.invoices.len()
     }
     pub fn settlement_count(&self) -> usize {
-        self.settlements.len()
+        self.settlements
+            .iter()
+            .filter(|row| matches!(row.bills, ImportedBillUse::Invoices(_)))
+            .count()
+    }
+    pub fn advance_count(&self) -> usize {
+        self.settlements
+            .iter()
+            .filter(|row| matches!(row.bills, ImportedBillUse::Advance { .. }))
+            .count()
     }
     pub fn opening_count(&self) -> usize {
         self.accounts.iter().filter(|a| a.opening.is_some()).count()
@@ -297,6 +316,7 @@ pub struct ImportCounts {
     pub vouchers: usize,
     pub invoices: usize,
     pub settlements: usize,
+    pub advances: usize,
     pub units: usize,
     pub stock_groups: usize,
     pub locations: usize,
@@ -932,7 +952,7 @@ fn parse_imported_settlement(
             "settlement requires exactly two ledger entries".into(),
         ));
     }
-    let mut party: Option<(String, i64, Vec<ImportedBillAllocation>)> = None;
+    let mut party: Option<(String, Option<i64>, i64, ImportedBillUse)> = None;
     let mut bank: Option<(String, Option<i64>, i64)> = None;
     for entry in entries {
         invoice_list_fields(
@@ -984,7 +1004,9 @@ fn parse_imported_settlement(
                     "settlement needs one party ledger".into(),
                 ));
             }
+            let bill_count = bills.len();
             let mut allocations = Vec::new();
+            let mut advance = None;
             let mut seen = HashSet::new();
             for bill in bills {
                 invoice_list_fields(
@@ -993,46 +1015,80 @@ fn parse_imported_settlement(
                     label,
                     issues,
                 );
-                let bill_reference = invoice_field(bill, "NAME")?;
-                if !seen.insert(normalized(&bill_reference)) {
-                    return Err(Error::Validation(
-                        "bill reference occurs more than once".into(),
-                    ));
-                }
-                if !invoice_field(bill, "BILLTYPE")?.eq_ignore_ascii_case("Agst Ref") {
-                    return Err(Error::Validation(
-                        "only allocations against existing invoices are supported".into(),
-                    ));
-                }
+                let bill_type = normalized(&invoice_field(bill, "BILLTYPE")?);
                 let bill_amount = xml_amount(&invoice_field(bill, "AMOUNT")?)?;
                 if bill_amount == 0 || (bill_amount > 0) != (amount > 0) {
                     return Err(Error::Validation(
                         "bill allocation direction is inconsistent".into(),
                     ));
                 }
+                let value = bill_amount
+                    .checked_abs()
+                    .ok_or_else(|| Error::Validation("bill amount is too large".into()))?;
+                let credit = direct_text(bill, "BILLCREDITPERIOD").filter(|v| !v.is_empty());
+                if matches!(bill_type.as_str(), "advance" | "on account") {
+                    if bill_count != 1 || bill_amount != amount {
+                        return Err(Error::Validation(
+                            "an advance must cover the entire party posting".into(),
+                        ));
+                    }
+                    if credit.is_some() {
+                        return Err(Error::Validation(
+                            "credit terms on advances are not supported".into(),
+                        ));
+                    }
+                    let source = if bill_type == "advance" {
+                        "Advance"
+                    } else {
+                        "On Account"
+                    };
+                    let reference = direct_text(bill, "NAME").filter(|value| !value.is_empty());
+                    if bill_type == "advance" && reference.is_none() {
+                        return Err(Error::Validation(
+                            "an advance needs a bill reference".into(),
+                        ));
+                    }
+                    advance = Some(ImportedBillUse::Advance {
+                        amount: value,
+                        source_bill: AdvanceSourceBill {
+                            kind: source.into(),
+                            reference,
+                        },
+                    });
+                    continue;
+                }
+                if bill_type != "agst ref" {
+                    return Err(Error::Validation("unsupported bill allocation type".into()));
+                }
+                let bill_reference = invoice_field(bill, "NAME")?;
+                if !seen.insert(normalized(&bill_reference)) {
+                    return Err(Error::Validation(
+                        "bill reference occurs more than once".into(),
+                    ));
+                }
                 allocations.push(ImportedBillAllocation {
                     reference: bill_reference,
-                    amount: bill_amount
-                        .checked_abs()
-                        .ok_or_else(|| Error::Validation("bill amount is too large".into()))?,
+                    amount: value,
                     existing_invoice_id: None,
                     expected_outstanding: 0,
-                    credit_days: direct_text(bill, "BILLCREDITPERIOD")
-                        .filter(|v| !v.is_empty())
-                        .map(|v| xml_credit_days(&v))
-                        .transpose()?,
+                    credit_days: credit.map(|v| xml_credit_days(&v)).transpose()?,
                 });
             }
-            let sum: i128 = allocations.iter().map(|v| i128::from(v.amount)).sum();
-            if sum != i128::from(amount).abs() {
-                return Err(Error::Validation(
-                    "bill allocations do not equal the party amount".into(),
-                ));
-            }
-            party = Some((ledger, amount, allocations));
+            let bills = if let Some(advance) = advance {
+                advance
+            } else {
+                let sum: i128 = allocations.iter().map(|v| i128::from(v.amount)).sum();
+                if sum != i128::from(amount).abs() {
+                    return Err(Error::Validation(
+                        "bill allocations do not equal the party amount".into(),
+                    ));
+                }
+                ImportedBillUse::Invoices(allocations)
+            };
+            party = Some((ledger, *existing_id, amount, bills));
         }
     }
-    let (party, party_amount, allocations) =
+    let (party, existing_party_id, party_amount, bills) =
         party.ok_or_else(|| Error::Validation("bill allocations are missing".into()))?;
     let (bank, existing_bank_id, bank_amount) =
         bank.ok_or_else(|| Error::Validation("cash or bank ledger is missing".into()))?;
@@ -1059,7 +1115,8 @@ fn parse_imported_settlement(
         party,
         bank,
         existing_bank_id,
-        allocations,
+        existing_party_id,
+        bills,
         metadata,
     })
 }
@@ -2937,6 +2994,17 @@ impl Store {
                         .push("Imported invoice references are ambiguous".into());
                 }
             }
+            let mut advance_references = self
+                .party_advances(company_id, None)?
+                .into_iter()
+                .map(|row| {
+                    (
+                        normalized(row.kind.as_str()),
+                        normalized(&row.party),
+                        normalized(&row.reference),
+                    )
+                })
+                .collect::<HashSet<_>>();
             for (node, label, metadata) in pending_settlements {
                 match parse_imported_settlement(
                     node,
@@ -2960,7 +3028,18 @@ impl Store {
                             "{label}: a voucher with the same type, date and number already exists"
                         ));
                         }
-                        for allocation in &mut settlement.allocations {
+                        let ImportedBillUse::Invoices(allocations) = &mut settlement.bills else {
+                            if !advance_references.insert((
+                                normalized(settlement.kind.as_str()),
+                                normalized(&settlement.party),
+                                normalized(&settlement.reference),
+                            )) {
+                                plan.issues.push(format!("{label}: an advance with this type, party and reference already exists"));
+                            }
+                            plan.settlements.push(settlement);
+                            continue;
+                        };
+                        for allocation in allocations {
                             let key = (
                                 normalized(settlement.kind.as_str()),
                                 normalized(&settlement.party),
@@ -3591,8 +3670,47 @@ impl Store {
                 find_ledger(&tx, plan.company_id, &settlement.party)?.ok_or_else(|| {
                     Error::Validation(format!("Ledger {} is missing", settlement.party))
                 })?;
+            if settlement
+                .existing_party_id
+                .is_some_and(|expected| expected != party_id)
+            {
+                return Err(Error::Validation(format!(
+                    "Ledger {} changed since preview",
+                    settlement.party
+                )));
+            }
+            let source_allocations = match &settlement.bills {
+                ImportedBillUse::Invoices(allocations) => allocations,
+                ImportedBillUse::Advance {
+                    amount,
+                    source_bill,
+                } => {
+                    let (_, voucher_id) = insert_party_advance(
+                        &tx,
+                        plan.company_id,
+                        &AdvanceDraft {
+                            kind: settlement.kind,
+                            party_ledger_id: party_id,
+                            bank_ledger_id: bank_id,
+                            date: settlement.date.clone(),
+                            reference: settlement.reference.clone(),
+                            amount: *amount,
+                            narration: settlement.narration.clone(),
+                        },
+                        Some(source_bill),
+                    )?;
+                    save_metadata(
+                        &tx,
+                        plan.company_id,
+                        "voucher",
+                        voucher_id,
+                        &settlement.metadata,
+                    )?;
+                    continue;
+                }
+            };
             let mut allocations = Vec::new();
-            for allocation in &settlement.allocations {
+            for allocation in source_allocations {
                 let mut stmt = tx.prepare("SELECT i.id, v.reference, i.tax_amount, i.credit_days FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3")?;
                 let mut found: Option<(i64, i64, Option<u32>)> = None;
                 for row in stmt.query_map(
@@ -3680,7 +3798,8 @@ impl Store {
             ledgers: plan.accounts.len(),
             vouchers: plan.transactions.len(),
             invoices: plan.invoices.len(),
-            settlements: plan.settlements.len(),
+            settlements: plan.settlement_count(),
+            advances: plan.advance_count(),
             units: plan.units.len(),
             stock_groups: plan.stock_groups.len(),
             locations: plan.locations.len(),
