@@ -1196,12 +1196,13 @@ impl Store {
                 "projected",
                 "reserved",
                 "unreserved",
+                "in_transit",
             ]),
         )?;
         contextual_row(
             &mut csv,
             &context,
-            &strings(&["context", "", "", "", "", "", "", "", "", "", ""]),
+            &strings(&["context", "", "", "", "", "", "", "", "", "", "", ""]),
         )?;
         for availability in self.order_availability(company)? {
             contextual_row(
@@ -1219,6 +1220,7 @@ impl Store {
                     format_quantity(availability.projected()),
                     format_quantity(availability.reserved),
                     format_quantity(availability.unreserved()),
+                    format_quantity(availability.in_transit),
                 ],
             )?;
         }
@@ -1338,6 +1340,75 @@ impl Store {
                     money(line.invoice_net),
                     line.variance().map(money).unwrap_or_default(),
                     format_quantity(i128::from(line.returned_quantity)),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
+    pub fn export_stock_dispatches_csv(
+        &self,
+        company: i64,
+        as_of: Option<&str>,
+        include_completed: bool,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let context = [
+            self.report_company_name(company)?,
+            optional_date(as_of)?,
+            if include_completed {
+                "all dispatches"
+            } else {
+                "in transit"
+            }
+            .into(),
+        ];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "as_of", "dispatch_scope"]),
+            &strings(&[
+                "row_type",
+                "reference",
+                "dispatch_date",
+                "item",
+                "unit",
+                "batch",
+                "source",
+                "destination",
+                "dispatched",
+                "received",
+                "returned",
+                "in_transit",
+                "reason",
+            ]),
+        )?;
+        contextual_row(
+            &mut csv,
+            &context,
+            &strings(&["context", "", "", "", "", "", "", "", "", "", "", "", ""]),
+        )?;
+        for row in self.stock_dispatches(company, as_of)? {
+            if !include_completed && row.in_transit() == 0 {
+                continue;
+            }
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "dispatch".into(),
+                    text_cell(&row.reference),
+                    row.date.clone(),
+                    text_cell(&row.item),
+                    text_cell(&row.unit),
+                    text_cell(row.batch.as_deref().unwrap_or_default()),
+                    text_cell(&row.from),
+                    text_cell(&row.to),
+                    format_quantity(row.quantity.into()),
+                    format_quantity(row.received.into()),
+                    format_quantity(row.returned.into()),
+                    format_quantity(row.in_transit().into()),
+                    text_cell(&row.reason),
                 ],
             )?;
         }

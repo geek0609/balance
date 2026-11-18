@@ -45,12 +45,13 @@ pub mod stock_notes;
 pub mod stock_reservations;
 pub mod stock_returns;
 pub mod stock_sales;
+pub mod stock_transit;
 pub mod tax_profiles;
 pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 67;
+const SCHEMA_VERSION: i64 = 68;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -390,6 +391,8 @@ impl Store {
             "stock_item_revisions",
             "stock_locations",
             "stock_transfers",
+            "stock_transfer_dispatches",
+            "stock_transfer_arrivals",
             "bank_clearances",
             "bank_clearance_events",
             "bank_statement_entries",
@@ -504,6 +507,9 @@ impl Store {
         store
             .conn
             .prepare("SELECT company_id, order_id, item_id, remaining FROM stock_reservation_balances LIMIT 0")?;
+        store
+            .conn
+            .prepare("SELECT company_id, item_id, location_id, quantity FROM stock_transfer_location_movements LIMIT 0")?;
         Ok(())
     }
     fn from_connection(mut conn: Connection) -> Result<Self> {
@@ -896,6 +902,10 @@ impl Store {
         if version < 67 {
             orders::migrate_amendments(&tx)?;
             tx.pragma_update(None, "user_version", 67)?;
+        }
+        if version < 68 {
+            stock_transit::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 68)?;
         }
         tx.commit()?;
         Ok(Self { conn })

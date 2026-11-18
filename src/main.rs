@@ -33,6 +33,7 @@ mod recurring_ui;
 mod shell;
 mod stock_count_ui;
 mod stock_note_ui;
+mod stock_transit_ui;
 mod tax_ui;
 mod theme;
 #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
@@ -205,6 +206,7 @@ struct App {
     transfer_date: String,
     transfer_quantity: String,
     transfer_reason: String,
+    stock_transit_screen: stock_transit_ui::StockTransitScreen,
     stock_as_of: String,
     reorder_selection: Option<i64>,
     reorder_editing: Option<i64>,
@@ -477,6 +479,7 @@ impl App {
             transfer_date: String::new(),
             transfer_quantity: String::new(),
             transfer_reason: String::new(),
+            stock_transit_screen: stock_transit_ui::StockTransitScreen::default(),
             stock_as_of: String::new(),
             reorder_selection: None,
             reorder_editing: None,
@@ -641,6 +644,7 @@ impl App {
         self.transfer_date.clear();
         self.transfer_quantity.clear();
         self.transfer_reason.clear();
+        self.stock_transit_screen = stock_transit_ui::StockTransitScreen::default();
         self.stock_register_item = None;
         self.invoice_party = None;
         self.invoice_trade = None;
@@ -2815,7 +2819,10 @@ impl App {
         }
         ui.separator();
         crate::theme::section(ui, "Transfer stock");
-        ui.label("Transfers change location quantities only and do not create accounting entries. Negative location balances are allowed.");
+        ui.checkbox(
+            &mut self.stock_transit_screen.separate_dispatch,
+            "Record dispatch and receipt separately",
+        );
         let previous_transfer_item = self.transfer_item;
         pick_stock(ui, "transfer-item", "Item", &items, &mut self.transfer_item);
         if previous_transfer_item != self.transfer_item {
@@ -2853,29 +2860,70 @@ impl App {
             ui.label("Reason");
             ui.text_edit_singleline(&mut self.transfer_reason);
         });
-        if ui.button("Save transfer").clicked() {
+        let separate = self.stock_transit_screen.separate_dispatch;
+        if separate {
+            ui.horizontal(|ui| {
+                ui.label("Dispatch reference");
+                ui.text_edit_singleline(&mut self.stock_transit_screen.reference);
+            });
+        }
+        if ui
+            .button(if separate {
+                "Dispatch stock"
+            } else {
+                "Save transfer"
+            })
+            .clicked()
+        {
             let result = (|| -> balance::Result<i64> {
-                self.store.transfer_stock_batch(
-                    company,
-                    self.transfer_item
-                        .ok_or_else(|| balance::Error::Validation("Select a stock item".into()))?,
-                    self.transfer_batch,
-                    self.transfer_from.ok_or_else(|| {
-                        balance::Error::Validation("Select a source location".into())
-                    })?,
-                    self.transfer_to.ok_or_else(|| {
-                        balance::Error::Validation("Select a destination location".into())
-                    })?,
-                    &self.transfer_date,
-                    parse_quantity(&self.transfer_quantity)?,
-                    &self.transfer_reason,
-                )
+                let item = self
+                    .transfer_item
+                    .ok_or_else(|| balance::Error::Validation("Select a stock item".into()))?;
+                let from = self
+                    .transfer_from
+                    .ok_or_else(|| balance::Error::Validation("Select a source location".into()))?;
+                let to = self.transfer_to.ok_or_else(|| {
+                    balance::Error::Validation("Select a destination location".into())
+                })?;
+                let quantity = parse_quantity(&self.transfer_quantity)?;
+                if separate {
+                    self.store.dispatch_stock(
+                        company,
+                        &balance::stock_transit::StockDispatchDraft {
+                            item_id: item,
+                            batch_id: self.transfer_batch,
+                            from_location_id: from,
+                            to_location_id: to,
+                            date: self.transfer_date.clone(),
+                            quantity,
+                            reference: self.stock_transit_screen.reference.clone(),
+                            reason: self.transfer_reason.clone(),
+                        },
+                    )
+                } else {
+                    self.store.transfer_stock_batch(
+                        company,
+                        item,
+                        self.transfer_batch,
+                        from,
+                        to,
+                        &self.transfer_date,
+                        quantity,
+                        &self.transfer_reason,
+                    )
+                }
             })();
             match result {
                 Ok(_) => {
                     self.transfer_quantity.clear();
                     self.transfer_reason.clear();
-                    self.message = "Stock transfer saved".into();
+                    self.stock_transit_screen.reference.clear();
+                    self.message = if separate {
+                        "Stock dispatched"
+                    } else {
+                        "Stock transfer saved"
+                    }
+                    .into();
                 }
                 Err(e) => self.failure(e),
             }
@@ -2900,6 +2948,11 @@ impl App {
                 Err(e) => {
                     ui.colored_label(crate::theme::DANGER, e.to_string());
                 }
+            }
+        });
+        egui::CollapsingHeader::new("Stock in transit").show(ui, |ui| {
+            if let Err(error) = self.stock_transit_view(ui, company) {
+                self.failure(error);
             }
         });
         ui.separator();

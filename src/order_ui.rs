@@ -451,6 +451,7 @@ impl App {
                     "Item",
                     "Unit",
                     "On hand",
+                    "In transit",
                     "Reserved",
                     "Unreserved",
                     "Open sales",
@@ -466,6 +467,7 @@ impl App {
                     ui.label(&row.item.unit);
                     for quantity in [
                         row.on_hand,
+                        row.in_transit,
                         row.reserved,
                         row.unreserved(),
                         row.open_sales,

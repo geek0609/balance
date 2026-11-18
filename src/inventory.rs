@@ -1339,13 +1339,9 @@ fn stock_bucket_movements(conn: &Connection) -> rusqlite::Result<rusqlite::Cache
          WHERE i.company_id = ?1 AND l.item_id = ?4 AND a.batch_id IS ?5
            AND (?2 IS NULL OR a.location_id IN (SELECT id FROM branch))
          UNION ALL
-         SELECT date, -quantity FROM stock_transfers
+         SELECT date, quantity FROM stock_transfer_location_movements
          WHERE company_id = ?1 AND item_id = ?4 AND batch_id IS ?5
-           AND (?2 IS NULL OR from_location_id IN (SELECT id FROM branch))
-         UNION ALL
-         SELECT date, quantity FROM stock_transfers
-         WHERE company_id = ?1 AND item_id = ?4 AND batch_id IS ?5
-           AND (?2 IS NULL OR to_location_id IN (SELECT id FROM branch))"
+           AND location_id IN (SELECT id FROM branch)"
     );
     conn.prepare_cached(&sql)
 }
@@ -1942,11 +1938,8 @@ impl Store {
              JOIN vouchers v ON v.id = i.voucher_id
              WHERE i.company_id = ?1 AND a.location_id IN (SELECT id FROM branch)
              UNION ALL
-             SELECT item_id, date, -quantity FROM stock_transfers
-             WHERE company_id = ?1 AND from_location_id IN (SELECT id FROM branch)
-             UNION ALL
-             SELECT item_id, date, quantity FROM stock_transfers
-             WHERE company_id = ?1 AND to_location_id IN (SELECT id FROM branch)",
+             SELECT item_id, date, quantity FROM stock_transfer_location_movements
+             WHERE company_id = ?1 AND location_id IN (SELECT id FROM branch)",
         ))?;
         let movements = stmt.query_map(
             params![company_id, location_id, include_descendants],
@@ -2156,17 +2149,18 @@ impl Store {
         if location_id.is_some() {
             let mut stmt = self.conn.prepare(&format!(
                 "{STOCK_LOCATION_BRANCH}
-                 SELECT t.id, t.date,
-                        CASE WHEN source.id IS NULL THEN t.quantity ELSE -t.quantity END,
-                        f.name, d.name, t.reason, b.name
-                 FROM stock_transfers t
+                 SELECT t.id, t.date, t.quantity, f.name, d.name, t.reason, b.name,
+                        t.kind, t.reference
+                 FROM stock_transfer_location_movements t
                  JOIN stock_locations f ON f.id = t.from_location_id AND f.company_id = t.company_id
                  JOIN stock_locations d ON d.id = t.to_location_id AND d.company_id = t.company_id
                  LEFT JOIN stock_batches b ON b.id = t.batch_id
-                 LEFT JOIN branch source ON source.id = t.from_location_id
-                 LEFT JOIN branch destination ON destination.id = t.to_location_id
                  WHERE t.company_id = ?1 AND t.item_id = ?4
-                   AND (source.id IS NULL) != (destination.id IS NULL)"
+                   AND t.location_id IN (SELECT id FROM branch)
+                   AND (t.kind != 'Transfer'
+                     OR t.from_location_id NOT IN (SELECT id FROM branch)
+                     OR t.to_location_id NOT IN (SELECT id FROM branch))
+                 ORDER BY t.kind, t.id"
             ))?;
             for row in stmt.query_map(scope, |r| {
                 Ok((
@@ -2177,15 +2171,33 @@ impl Store {
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             })? {
-                let (id, date, quantity, from, to, reason, batch) = row?;
+                let (id, date, quantity, from, to, reason, batch, kind, reference) = row?;
+                let route = match kind.as_str() {
+                    "Receipt" => format!("Receipt {} at {to}", reference.unwrap_or_default()),
+                    "Return to source" => {
+                        format!("Return {} to {from}", reference.unwrap_or_default())
+                    }
+                    "Dispatch" => format!(
+                        "Dispatch {} from {from} to {to}",
+                        reference.unwrap_or_default()
+                    ),
+                    _ => format!("Transfer {from} to {to}"),
+                };
+                let priority = match kind.as_str() {
+                    "Dispatch" => 3,
+                    "Receipt" | "Return to source" => 4,
+                    _ => 2,
+                };
                 raw.push((
                     parse_date(&date)?,
-                    2,
+                    priority,
                     id,
                     format!(
-                        "Transfer {from} to {to}, batch {}: {reason}",
+                        "{route} · batch {} · {reason}",
                         batch.as_deref().unwrap_or("unbatched")
                     ),
                     quantity,

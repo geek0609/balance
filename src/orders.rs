@@ -210,11 +210,12 @@ pub struct OrderAvailability {
     pub open_sales: i128,
     pub open_purchases: i128,
     pub reserved: i128,
+    pub in_transit: i128,
 }
 
 impl OrderAvailability {
     pub fn unreserved(&self) -> i128 {
-        self.on_hand - self.reserved
+        self.on_hand - self.reserved - self.in_transit
     }
 
     pub fn after_sales(&self) -> i128 {
@@ -600,6 +601,7 @@ impl Store {
         let snapshot = self.conn.unchecked_transaction()?;
         let balances = self.stock_balances(company, None)?;
         let reserved = crate::stock_reservations::reserved_by_item(&snapshot, company)?;
+        let in_transit = crate::stock_transit::in_transit_by_item(&snapshot, company)?;
         let mut commitments = HashMap::<i64, (i128, i128)>::new();
         {
             let mut stmt = snapshot.prepare(
@@ -636,6 +638,10 @@ impl Store {
                     .unwrap_or_default();
                 OrderAvailability {
                     reserved: reserved.get(&balance.item.id).copied().unwrap_or_default(),
+                    in_transit: in_transit
+                        .get(&balance.item.id)
+                        .copied()
+                        .unwrap_or_default(),
                     item: balance.item,
                     on_hand: balance.quantity,
                     open_sales,
@@ -1152,7 +1158,10 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP TABLE order_revision_lines;
+                "DROP VIEW stock_transfer_location_movements;
+             DROP TABLE stock_transfer_arrivals;
+             DROP TABLE stock_transfer_dispatches;
+             DROP TABLE order_revision_lines;
              DROP TABLE order_revisions;
              PRAGMA user_version = 66;",
             )
@@ -1307,7 +1316,10 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP TABLE order_revision_lines;
+                "DROP VIEW stock_transfer_location_movements;
+                 DROP TABLE stock_transfer_arrivals;
+                 DROP TABLE stock_transfer_dispatches;
+                 DROP TABLE order_revision_lines;
                  DROP TABLE order_revisions;
                  DROP VIEW stock_reservation_balances;
                  DROP TABLE stock_reservation_releases;
