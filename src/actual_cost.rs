@@ -1,0 +1,418 @@
+//! Company-wide weighted average inventory costs for receipts and issues.
+use crate::inventory::{InvoiceKind, StockItem};
+use crate::{parse_date, required, Error, Result, Store};
+use chrono::NaiveDate;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use std::collections::HashMap;
+
+pub(crate) fn migrate(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE stock_receipt_costs(
+            id INTEGER PRIMARY KEY,
+            adjustment_id INTEGER NOT NULL REFERENCES stock_adjustments(id),
+            amount INTEGER NOT NULL CHECK(amount >= 0),
+            reason TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX stock_receipt_costs_adjustment ON stock_receipt_costs(adjustment_id, id);",
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct StockReceipt {
+    pub id: i64,
+    pub date: String,
+    pub item: String,
+    pub unit: String,
+    pub location: String,
+    pub batch: Option<String>,
+    pub quantity: i64,
+    pub description: String,
+    pub cost: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiptCostEntry {
+    pub amount: i64,
+    pub reason: String,
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ActualCostIssue {
+    MissingReceiptCost { date: NaiveDate, receipt_id: i64 },
+    InsufficientStock { date: NaiveDate, source: String },
+}
+impl std::fmt::Display for ActualCostIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingReceiptCost { date, receipt_id } => {
+                write!(
+                    f,
+                    "Receipt {receipt_id} on {date} needs an acquisition cost"
+                )
+            }
+            Self::InsufficientStock { date, source } => {
+                write!(f, "{source} on {date} exceeds the available quantity")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AverageCostRow {
+    pub item: StockItem,
+    pub quantity: i128,
+    pub value: Option<i128>,
+    pub issue: Option<ActualCostIssue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AverageCostValuation {
+    pub date: NaiveDate,
+    pub rows: Vec<AverageCostRow>,
+    pub known_value: i128,
+    pub unavailable: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Movement {
+    Receipt(Option<i64>),
+    Sale,
+    SaleReversal,
+    PurchaseReversal,
+    AdjustmentOut,
+}
+impl Movement {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Receipt(_) => 0,
+            Self::SaleReversal => 1,
+            Self::Sale => 2,
+            Self::PurchaseReversal => 3,
+            Self::AdjustmentOut => 4,
+        }
+    }
+}
+
+struct Event {
+    date: NaiveDate,
+    source_id: i64,
+    quantity: i128,
+    movement: Movement,
+}
+
+#[derive(Default)]
+struct Pool {
+    quantity: i128,
+    value: i128,
+    sale_costs: HashMap<i64, i128>,
+}
+
+fn amount_too_large() -> Error {
+    Error::Validation("Weighted average stock value is too large".into())
+}
+
+impl Pool {
+    fn receive(&mut self, quantity: i128, value: i128) -> Result<()> {
+        self.quantity = self
+            .quantity
+            .checked_add(quantity)
+            .ok_or_else(amount_too_large)?;
+        self.value = self.value.checked_add(value).ok_or_else(amount_too_large)?;
+        Ok(())
+    }
+
+    /// Release a proportional share of available value, rounding to the nearest
+    /// hundredth. Issuing the remaining units clears the entire remaining value.
+    fn issue(&mut self, quantity: i128) -> Result<i128> {
+        let cost = if quantity == self.quantity {
+            self.value
+        } else {
+            let numerator = self
+                .value
+                .checked_mul(quantity)
+                .ok_or_else(amount_too_large)?;
+            let quotient = numerator / self.quantity;
+            let remainder = numerator % self.quantity;
+            quotient + i128::from(remainder >= self.quantity - remainder)
+        };
+        self.quantity -= quantity;
+        self.value -= cost;
+        Ok(cost)
+    }
+}
+
+fn calculate(events: &mut [Event]) -> Result<std::result::Result<Pool, ActualCostIssue>> {
+    events.sort_by_key(|event| (event.date, event.movement.priority(), event.source_id));
+    let mut pool = Pool::default();
+    for event in events {
+        match event.movement {
+            Movement::Receipt(Some(value)) => pool.receive(event.quantity, i128::from(value))?,
+            Movement::Receipt(None) => {
+                return Ok(Err(ActualCostIssue::MissingReceiptCost {
+                    date: event.date,
+                    receipt_id: event.source_id,
+                }));
+            }
+            Movement::SaleReversal => {
+                let restored = pool.sale_costs.remove(&event.source_id).ok_or_else(|| {
+                    Error::Validation("Original sale cost is missing for a reversal".into())
+                })?;
+                pool.receive(event.quantity, restored)?;
+            }
+            issue => {
+                if event.quantity > pool.quantity {
+                    let source = match issue {
+                        Movement::Sale => format!("Sale line {}", event.source_id),
+                        Movement::PurchaseReversal => {
+                            format!("Purchase reversal for line {}", event.source_id)
+                        }
+                        Movement::AdjustmentOut => format!("Stock adjustment {}", event.source_id),
+                        _ => unreachable!("only stock issue events reach this branch"),
+                    };
+                    return Ok(Err(ActualCostIssue::InsufficientStock {
+                        date: event.date,
+                        source,
+                    }));
+                }
+                let cost = pool.issue(event.quantity)?;
+                if matches!(issue, Movement::Sale) {
+                    pool.sale_costs.insert(event.source_id, cost);
+                }
+            }
+        }
+    }
+    Ok(Ok(pool))
+}
+
+fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64, Vec<Event>>> {
+    let mut events = HashMap::<i64, Vec<Event>>::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.item_id, a.date, a.quantity, (
+                SELECT c.amount FROM stock_receipt_costs c WHERE c.adjustment_id = a.id ORDER BY c.id DESC LIMIT 1
+             )
+             FROM stock_adjustments a WHERE a.company_id = ?1
+             AND NOT EXISTS(SELECT 1 FROM invoice_reversal_stock r WHERE r.adjustment_id = a.id)",
+        )?;
+        let mut rows = stmt.query([company])?;
+        while let Some(row) = rows.next()? {
+            let date = parse_date(&row.get::<_, String>(2)?)?;
+            if date > end {
+                continue;
+            }
+            let quantity = i128::from(row.get::<_, i64>(3)?);
+            let movement = if quantity > 0 {
+                Movement::Receipt(row.get(4)?)
+            } else {
+                Movement::AdjustmentOut
+            };
+            events.entry(row.get(1)?).or_default().push(Event {
+                date,
+                source_id: row.get(0)?,
+                quantity: quantity.abs(),
+                movement,
+            });
+        }
+    }
+    {
+        let mut stmt = conn.prepare(
+            "SELECT l.id, l.item_id, i.kind, v.date, l.quantity, l.amount, rv.date
+             FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id
+             JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = i.company_id
+             LEFT JOIN invoice_reversals r ON r.invoice_id = i.id AND r.company_id = i.company_id
+             LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
+             WHERE i.company_id = ?1",
+        )?;
+        let mut rows = stmt.query([company])?;
+        while let Some(row) = rows.next()? {
+            let date = parse_date(&row.get::<_, String>(3)?)?;
+            if date > end {
+                continue;
+            }
+            let reversal = row
+                .get::<_, Option<String>>(6)?
+                .as_deref()
+                .map(parse_date)
+                .transpose()?;
+            // No stock remains affected by an invoice reversed on the same day.
+            if reversal == Some(date) {
+                continue;
+            }
+            let kind = InvoiceKind::parse(&row.get::<_, String>(2)?)?;
+            let quantity = i128::from(row.get::<_, i64>(4)?);
+            let line: i64 = row.get(0)?;
+            let item_events = events.entry(row.get(1)?).or_default();
+            item_events.push(Event {
+                date,
+                source_id: line,
+                quantity,
+                movement: match kind {
+                    InvoiceKind::Sale => Movement::Sale,
+                    InvoiceKind::Purchase => Movement::Receipt(Some(row.get(5)?)),
+                },
+            });
+            if let Some(date) = reversal.filter(|date| *date <= end) {
+                item_events.push(Event {
+                    date,
+                    source_id: line,
+                    quantity,
+                    movement: match kind {
+                        InvoiceKind::Sale => Movement::SaleReversal,
+                        InvoiceKind::Purchase => Movement::PurchaseReversal,
+                    },
+                });
+            }
+        }
+    }
+    Ok(events)
+}
+
+impl Store {
+    /// List up to 100 quantity increases, optionally finding one by its adjustment ID.
+    pub fn stock_receipts(
+        &self,
+        company: i64,
+        adjustment: Option<i64>,
+    ) -> Result<Vec<StockReceipt>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, a.date, i.name, i.unit, l.name, b.name, a.quantity, a.reason, (
+                SELECT c.amount FROM stock_receipt_costs c WHERE c.adjustment_id = a.id ORDER BY id DESC LIMIT 1
+             )
+             FROM stock_adjustments a JOIN stock_items i ON i.id = a.item_id AND i.company_id = a.company_id
+             JOIN stock_locations l ON l.id = a.location_id AND l.company_id = a.company_id
+             LEFT JOIN stock_batches b ON b.id = a.batch_id
+             WHERE a.company_id = ?1 AND a.quantity > 0 AND (?2 IS NULL OR a.id = ?2)
+             AND NOT EXISTS(SELECT 1 FROM invoice_reversal_stock r WHERE r.adjustment_id = a.id)
+             ORDER BY a.date DESC, a.id DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map(params![company, adjustment], |row| {
+            Ok(StockReceipt {
+                id: row.get(0)?,
+                date: row.get(1)?,
+                item: row.get(2)?,
+                unit: row.get(3)?,
+                location: row.get(4)?,
+                batch: row.get(5)?,
+                quantity: row.get(6)?,
+                description: row.get(7)?,
+                cost: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_stock_receipt_cost(
+        &mut self,
+        company: i64,
+        receipt: i64,
+        amount: i64,
+        reason: &str,
+    ) -> Result<()> {
+        let reason = required(reason, "Reason for setting the acquisition cost")?;
+        if amount < 0 {
+            return Err(Error::Validation(
+                "Acquisition cost cannot be negative".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let date: String = tx.query_row(
+            "SELECT a.date FROM stock_adjustments a WHERE a.company_id = ?1 AND a.id = ?2 AND a.quantity > 0
+             AND NOT EXISTS(SELECT 1 FROM invoice_reversal_stock r WHERE r.adjustment_id = a.id)",
+             params![company, receipt], |row| row.get(0),
+        ).optional()?.ok_or_else(|| Error::Validation("Stock receipt adjustment not found in this company".into()))?;
+        let date = parse_date(&date)?;
+        if crate::periods::cutoff(&tx, company)?.is_some_and(|cutoff| date <= cutoff) {
+            return Err(Error::Validation(
+                crate::periods::LOCKED_PERIOD_MESSAGE.into(),
+            ));
+        }
+        let previous: Option<i64> = tx.query_row(
+            "SELECT amount FROM stock_receipt_costs WHERE adjustment_id = ?1 ORDER BY id DESC LIMIT 1",
+            [receipt], |row| row.get(0),
+        ).optional()?;
+        if previous == Some(amount) {
+            return Err(Error::Validation(
+                "This acquisition cost is already saved".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO stock_receipt_costs(adjustment_id, amount, reason) VALUES (?1, ?2, ?3)",
+            params![receipt, amount, reason],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn stock_receipt_cost_history(
+        &self,
+        company: i64,
+        receipt: i64,
+    ) -> Result<Vec<ReceiptCostEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.amount, c.reason, c.recorded_at FROM stock_receipt_costs c
+             JOIN stock_adjustments a ON a.id = c.adjustment_id
+             WHERE a.company_id = ?1 AND a.id = ?2 ORDER BY c.id DESC",
+        )?;
+        let rows = stmt.query_map(params![company, receipt], |row| {
+            Ok(ReceiptCostEntry {
+                amount: row.get(0)?,
+                reason: row.get(1)?,
+                recorded_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Report weighted average value for all company locations together.
+    pub fn stock_valuation_at_average_cost(
+        &self,
+        company: i64,
+        date: &str,
+    ) -> Result<AverageCostValuation> {
+        let end = parse_date(date)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let mut events = events(&tx, company, end)?;
+        let balances = self.stock_balances(company, Some(date))?;
+        let mut report = AverageCostValuation {
+            date: end,
+            rows: Vec::with_capacity(balances.len()),
+            known_value: 0,
+            unavailable: 0,
+        };
+        for balance in balances {
+            let (value, issue) =
+                match calculate(&mut events.remove(&balance.item.id).unwrap_or_default())? {
+                    Ok(pool) => {
+                        if pool.quantity != balance.quantity {
+                            return Err(Error::Validation(format!(
+                                "Stock movements do not reconcile for {}",
+                                balance.item.name
+                            )));
+                        }
+                        report.known_value = report
+                            .known_value
+                            .checked_add(pool.value)
+                            .ok_or_else(amount_too_large)?;
+                        (Some(pool.value), None)
+                    }
+                    Err(issue) => {
+                        report.unavailable += 1;
+                        (None, Some(issue))
+                    }
+                };
+            report.rows.push(AverageCostRow {
+                item: balance.item,
+                quantity: balance.quantity,
+                value,
+                issue,
+            });
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+}

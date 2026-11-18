@@ -15,10 +15,12 @@ use balance::terms::LedgerTerms;
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
 
+mod actual_cost_ui;
 mod cost_ui;
 mod order_ui;
 mod stock_count_ui;
 mod valuation_ui;
+use actual_cost_ui::ActualCostScreen;
 use cost_ui::CostScreen;
 use order_ui::OrderScreen;
 use stock_count_ui::StockCountScreen;
@@ -192,6 +194,7 @@ struct App {
     stock_count_screen: StockCountScreen,
     cost_screen: CostScreen,
     valuation_screen: ValuationScreen,
+    actual_cost_screen: ActualCostScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -432,6 +435,7 @@ impl App {
             stock_count_screen: StockCountScreen::default(),
             cost_screen: CostScreen::default(),
             valuation_screen: ValuationScreen::default(),
+            actual_cost_screen: ActualCostScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -548,6 +552,7 @@ impl App {
         self.stock_count_screen = StockCountScreen::default();
         self.cost_screen = CostScreen::default();
         self.valuation_screen = ValuationScreen::default();
+        self.actual_cost_screen = ActualCostScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -2719,7 +2724,7 @@ impl App {
                 ui.colored_label(Color32::from_rgb(155, 55, 35), e.to_string());
             }
         }
-        ui.small("Quantities may be negative. See Stock valuation for standard cost estimates.");
+        ui.small("Quantities may be negative. See Stock valuation for standard and weighted average costs.");
         ui.heading("Low stock across all locations");
         ui.small("Uses the as-of date above and current reorder settings, regardless of the location filter. Suggested quantities are fixed and do not account for pending orders.");
         match self.store.low_stock(company, end) {

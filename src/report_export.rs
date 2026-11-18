@@ -222,6 +222,65 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_average_stock_valuation_csv(
+        &self,
+        company: i64,
+        as_of: &str,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.stock_valuation_at_average_cost(company, as_of)?;
+        let context = [self.report_company_name(company)?, report.date.to_string()];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "as_of"]),
+            &strings(&[
+                "row_type",
+                "item_id",
+                "item",
+                "unit",
+                "quantity",
+                "weighted_average_stock_value",
+                "issue",
+                "items_unavailable",
+            ]),
+        )?;
+        for entry in report.rows {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "item".into(),
+                    entry.item.id.to_string(),
+                    text_cell(&entry.item.name),
+                    text_cell(&entry.item.unit),
+                    format_quantity(entry.quantity),
+                    entry.value.map(money).unwrap_or_default(),
+                    entry
+                        .issue
+                        .map(|issue| text_cell(&issue.to_string()))
+                        .unwrap_or_default(),
+                    String::new(),
+                ],
+            )?;
+        }
+        contextual_row(
+            &mut csv,
+            &context,
+            &[
+                "known_value".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                money(report.known_value),
+                String::new(),
+                report.unavailable.to_string(),
+            ],
+        )?;
+        save(csv, destination)
+    }
+
     pub fn export_standard_sales_cost_csv(
         &self,
         company: i64,

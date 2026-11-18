@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use std::{collections::HashMap, path::Path, str::FromStr};
 use thiserror::Error;
+pub mod actual_cost;
 pub mod banking;
 pub mod company;
 pub mod contacts;
@@ -28,7 +29,7 @@ pub mod stock_counts;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 39;
+const SCHEMA_VERSION: i64 = 40;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -404,6 +405,7 @@ impl Store {
             "cost_allocation_changes",
             "cost_allocation_change_lines",
             "standard_stock_costs",
+            "stock_receipt_costs",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -697,6 +699,10 @@ impl Store {
         if version < 39 {
             valuation::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 39)?;
+        }
+        if version < 40 {
+            actual_cost::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 40)?;
         }
         tx.commit()?;
         Ok(Self { conn })

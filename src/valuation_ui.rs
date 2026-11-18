@@ -20,7 +20,7 @@ pub(super) struct ValuationScreen {
 impl App {
     pub(super) fn valuation_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading("Stock valuation");
-        ui.small("These reports use standard costs. They do not change ledger balances.");
+        ui.small("Valuation reports do not change ledger balances.");
         egui::CollapsingHeader::new("Standard costs")
             .default_open(true)
             .show(ui, |ui| {
@@ -28,6 +28,9 @@ impl App {
             });
         ui.separator();
         self.report_export_path_field(ui);
+        egui::CollapsingHeader::new("Weighted average stock value").show(ui, |ui| {
+            self.average_cost_view(ui, company);
+        });
         egui::CollapsingHeader::new("Stock value at standard cost").show(ui, |ui| {
             self.standard_stock_view(ui, company);
         });
