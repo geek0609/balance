@@ -5,7 +5,7 @@ use crate::{
     check_ledgers, opening, parse_date, required, validate_voucher, Category, Error, Posting,
     Result, Store, VoucherKind,
 };
-use chrono::NaiveDate;
+use chrono::{Days, NaiveDate};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -27,6 +27,7 @@ pub struct OpeningBillDraft {
     pub original_date: String,
     pub opening_date: String,
     pub due_date: Option<String>,
+    pub credit_days: Option<u32>,
     pub amount: i64,
 }
 
@@ -187,7 +188,22 @@ pub(crate) fn insert_opening_bill(
     let reference = required(&draft.reference, "Original bill reference")?;
     let original = parse_date(&draft.original_date)?;
     let opening = parse_date(&draft.opening_date)?;
-    let due = draft.due_date.as_deref().map(parse_date).transpose()?;
+    let due = match (draft.due_date.as_deref(), draft.credit_days) {
+        (Some(_), Some(_)) => {
+            return Err(Error::Validation(
+                "Enter a due date or a credit period".into(),
+            ));
+        }
+        (Some(date), None) => Some(parse_date(date)?),
+        (None, Some(days)) => Some(
+            original
+                .checked_add_days(Days::new(u64::from(days)))
+                .ok_or_else(|| {
+                    Error::Validation("Credit period exceeds the supported date range".into())
+                })?,
+        ),
+        (None, None) => None,
+    };
     if original > opening || due.is_some_and(|due| due < original) {
         return Err(Error::Validation(
             "The original bill date must be on or before its opening date and due date".into(),
@@ -236,9 +252,10 @@ pub(crate) fn insert_opening_bill(
     let voucher = conn.last_insert_rowid();
     write_postings(conn, voucher, &postings)?;
     conn.execute(
-        "INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id, tax_amount, due_date)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-        params![company, voucher, draft.kind.as_str(), draft.party_ledger_id, control, due.map(|d| d.to_string())],
+        "INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id, tax_amount, due_date, credit_days)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+        params![company, voucher, draft.kind.as_str(), draft.party_ledger_id, control,
+            due.map(|d| d.to_string()), draft.credit_days],
     )?;
     let invoice = conn.last_insert_rowid();
     conn.execute(

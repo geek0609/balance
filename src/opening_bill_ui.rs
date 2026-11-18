@@ -102,6 +102,7 @@ impl App {
                 opening_date: form.opening_date.clone(),
                 due_date: (!form.due_date.trim().is_empty())
                     .then(|| form.due_date.trim().to_owned()),
+                credit_days: None,
                 amount: parse_amount(&form.amount)?,
             };
             let id = self.store.post_opening_bill(company, &draft)?;

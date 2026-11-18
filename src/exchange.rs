@@ -9,6 +9,7 @@ use crate::inventory::{
     InvoiceAllocation, InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine,
     SettlementAllocation,
 };
+use crate::opening_bills::OpeningBillDraft;
 use crate::{
     check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
     Store, VoucherKind,
@@ -36,7 +37,17 @@ struct Account {
     category: Category,
     profile: LedgerProfile,
     opening: Option<i64>,
+    opening_bills: Vec<ImportedOpeningBill>,
+    credit_days: Option<u32>,
     metadata: SourceMetadata,
+}
+#[derive(Debug, Clone)]
+struct ImportedOpeningBill {
+    kind: InvoiceKind,
+    reference: String,
+    original_date: String,
+    credit_days: Option<u32>,
+    amount: i64,
 }
 #[derive(Debug, Clone)]
 struct Unit {
@@ -209,7 +220,10 @@ impl ImportPlan {
         let Some(cutoff) = crate::periods::cutoff(conn, self.company_id)? else {
             return Ok(());
         };
-        let openings = self.accounts.iter().any(|row| row.opening.is_some())
+        let openings = self
+            .accounts
+            .iter()
+            .any(|row| row.opening.is_some() || !row.opening_bills.is_empty())
             || self
                 .items
                 .iter()
@@ -256,7 +270,13 @@ impl ImportPlan {
             .count()
     }
     pub fn opening_count(&self) -> usize {
-        self.accounts.iter().filter(|a| a.opening.is_some()).count()
+        self.accounts
+            .iter()
+            .filter(|a| a.opening.is_some() && a.opening_bills.is_empty())
+            .count()
+    }
+    pub fn opening_bill_count(&self) -> usize {
+        self.accounts.iter().map(|a| a.opening_bills.len()).sum()
     }
     pub fn unit_count(&self) -> usize {
         self.units.len()
@@ -314,6 +334,7 @@ impl ImportPlan {
 pub struct ImportCounts {
     pub groups: usize,
     pub ledgers: usize,
+    pub opening_bills: usize,
     pub vouchers: usize,
     pub invoices: usize,
     pub settlements: usize,
@@ -858,6 +879,158 @@ fn invoice_list_fields(
         ));
     }
 }
+fn xml_opening_bill(
+    node: Node<'_, '_>,
+    kind: InvoiceKind,
+    opening_date: NaiveDate,
+) -> Result<ImportedOpeningBill> {
+    let reference = invoice_field(node, "NAME")?;
+    let original_date = xml_date(&invoice_field(node, "BILLDATE")?)?;
+    let original = parse_date(&original_date)?;
+    if original > opening_date {
+        return Err(Error::Validation(
+            "Bill date follows the opening date".into(),
+        ));
+    }
+    if direct_text(node, "BILLTYPE")
+        .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("New Ref"))
+    {
+        return Err(Error::Validation(
+            "Opening bill must have a new reference".into(),
+        ));
+    }
+    let amount_field = |field| -> Result<Option<i64>> {
+        direct_text(node, field)
+            .filter(|value| !value.is_empty())
+            .as_deref()
+            .map(xml_amount)
+            .transpose()
+    };
+    let value = amount_field("OPENINGBALANCE")?;
+    let amount = amount_field("AMOUNT")?;
+    if value
+        .zip(amount)
+        .is_some_and(|(value, amount)| value != amount)
+    {
+        return Err(Error::Validation(
+            "Opening bill amount fields disagree".into(),
+        ));
+    }
+    let signed_amount = value
+        .or(amount)
+        .ok_or_else(|| Error::Validation("Opening bill amount is required".into()))?;
+    let matching_side = match kind {
+        InvoiceKind::Sale => signed_amount > 0,
+        InvoiceKind::Purchase => signed_amount < 0,
+    };
+    if !matching_side {
+        return Err(Error::Validation(
+            "Opening bill amount has the wrong debit or credit side".into(),
+        ));
+    }
+    let amount = signed_amount
+        .checked_abs()
+        .ok_or_else(|| Error::Validation("Opening bill amount is too large".into()))?;
+    let credit_days = direct_text(node, "BILLCREDITPERIOD")
+        .filter(|value| !value.is_empty())
+        .as_deref()
+        .map(xml_credit_days)
+        .transpose()?;
+    if credit_days.is_some_and(|days| {
+        original
+            .checked_add_days(chrono::Days::new(u64::from(days)))
+            .is_none()
+    }) {
+        return Err(Error::Validation(
+            "Opening bill credit period exceeds the supported date range".into(),
+        ));
+    }
+    Ok(ImportedOpeningBill {
+        kind,
+        reference,
+        original_date,
+        credit_days,
+        amount,
+    })
+}
+
+fn opening_bills(
+    node: Node<'_, '_>,
+    ledger_amount: Option<i64>,
+    category: Category,
+    opening_date: Option<&str>,
+    label: &str,
+    issues: &mut Vec<String>,
+) -> Vec<ImportedOpeningBill> {
+    let nodes: Vec<_> = node
+        .children()
+        .filter(|child| {
+            child.is_element()
+                && local_name(*child).eq_ignore_ascii_case("BILLALLOCATIONS.LIST")
+                && meaningful(*child)
+        })
+        .collect();
+    let billwise = direct_text(node, "ISBILLWISEON").unwrap_or_default();
+    if !billwise.is_empty()
+        && !billwise.eq_ignore_ascii_case("yes")
+        && !billwise.eq_ignore_ascii_case("no")
+    {
+        issues.push(format!("{label}: invalid bill-wise flag"));
+    } else if billwise.eq_ignore_ascii_case("no") && !nodes.is_empty() {
+        issues.push(format!(
+            "{label}: bill-wise flag conflicts with opening bills"
+        ));
+    }
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let kind = match (category, ledger_amount) {
+        (Category::Asset, Some(amount)) if amount > 0 => InvoiceKind::Sale,
+        (Category::Liability, Some(amount)) if amount < 0 => InvoiceKind::Purchase,
+        _ => {
+            issues.push(format!("{label}: opening bills need a debit opening balance for an asset or a credit opening balance for a liability"));
+            return Vec::new();
+        }
+    };
+    let Some(date) = opening_date.and_then(|date| parse_date(date).ok()) else {
+        issues.push(format!("{label}: provide an opening date for the bills"));
+        return Vec::new();
+    };
+    let mut bills = Vec::new();
+    let mut references = HashSet::new();
+    for node in nodes {
+        invoice_list_fields(
+            node,
+            &[
+                "NAME",
+                "BILLDATE",
+                "BILLTYPE",
+                "OPENINGBALANCE",
+                "AMOUNT",
+                "BILLCREDITPERIOD",
+            ],
+            label,
+            issues,
+        );
+        match xml_opening_bill(node, kind, date) {
+            Ok(bill) if references.insert(normalized(&bill.reference)) => bills.push(bill),
+            Ok(bill) => issues.push(format!(
+                "{label}: duplicate opening bill reference {}",
+                bill.reference
+            )),
+            Err(error) => issues.push(format!("{label}: opening bill: {error}")),
+        }
+    }
+    let total: i128 = bills.iter().map(|bill| i128::from(bill.amount)).sum();
+    if total != ledger_amount.map(i128::from).unwrap_or_default().abs() {
+        issues.push(format!(
+            "{label}: opening bill amounts must add up to the ledger opening balance"
+        ));
+    }
+    bills
+}
+
 fn parse_imported_settlement(
     node: Node<'_, '_>,
     label: &str,
@@ -1964,6 +2137,9 @@ impl Store {
                     "NAME",
                     "PARENT",
                     "OPENINGBALANCE",
+                    "ISBILLWISEON",
+                    "BILLCREDITPERIOD",
+                    "BILLALLOCATIONS.LIST",
                     "LANGUAGENAME.LIST",
                     "MAILINGNAME.LIST",
                     "ADDRESS.LIST",
@@ -2052,12 +2228,39 @@ impl Store {
                     "Ledger {name}: name is reserved for opening balances"
                 ));
             }
+            let opening_bills = opening_bills(
+                node,
+                opening,
+                category,
+                plan.opening_date.as_deref(),
+                &label,
+                &mut plan.issues,
+            );
+            let credit_days = direct_text(node, "BILLCREDITPERIOD")
+                .filter(|value| !value.is_empty())
+                .and_then(|value| {
+                    if !matches!(category, Category::Asset | Category::Liability) {
+                        plan.issues.push(format!(
+                            "{label}: a credit period requires an asset or liability ledger"
+                        ));
+                        return None;
+                    }
+                    match xml_credit_days(&value) {
+                        Ok(days) => Some(days),
+                        Err(error) => {
+                            plan.issues.push(format!("{label}: {error}"));
+                            None
+                        }
+                    }
+                });
             plan.accounts.push(Account {
                 name,
                 group,
                 category,
                 profile,
                 opening,
+                opening_bills,
+                credit_days,
                 metadata,
             });
         }
@@ -2713,6 +2916,20 @@ impl Store {
             }
         }
         let mut pending_settlements = Vec::new();
+        for account in &plan.accounts {
+            for bill in &account.opening_bills {
+                if !invoice_references.insert((
+                    normalized(bill.kind.as_str()),
+                    normalized(&account.name),
+                    normalized(&bill.reference),
+                )) {
+                    plan.issues.push(format!(
+                        "Ledger {}: opening bill reference {} already exists",
+                        account.name, bill.reference
+                    ));
+                }
+            }
+        }
         let mut references: HashSet<(String, String, String)> = self
             .vouchers(company_id)?
             .iter()
@@ -3043,6 +3260,35 @@ impl Store {
                         .push("Imported invoice references are ambiguous".into());
                 }
             }
+            if let Some(opening_date) = &plan.opening_date {
+                for account in &plan.accounts {
+                    for bill in &account.opening_bills {
+                        let key = (
+                            normalized(bill.kind.as_str()),
+                            normalized(&account.name),
+                            normalized(&bill.reference),
+                        );
+                        if invoice_balances
+                            .insert(
+                                key,
+                                (
+                                    None,
+                                    opening_date.clone(),
+                                    bill.reference.clone(),
+                                    i128::from(bill.amount),
+                                    None,
+                                    bill.credit_days,
+                                    HashSet::new(),
+                                ),
+                            )
+                            .is_some()
+                        {
+                            plan.issues
+                                .push("Opening bill references are ambiguous".into());
+                        }
+                    }
+                }
+            }
             let mut advance_references = self
                 .party_advances(company_id, None)?
                 .into_iter()
@@ -3363,11 +3609,34 @@ impl Store {
             let ledger_id = tx.last_insert_rowid();
             save_metadata(&tx, plan.company_id, "ledger", ledger_id, &account.metadata)?;
             insert_new_profile(&tx, plan.company_id, ledger_id, &account.profile)?;
-            if let Some(amount) = account.opening {
-                let ledger_id =
-                    find_ledger(&tx, plan.company_id, &account.name)?.ok_or_else(|| {
-                        Error::Validation(format!("Ledger {} is missing", account.name))
-                    })?;
+            if let Some(days) = account.credit_days {
+                tx.execute(
+                    "INSERT INTO ledger_terms(company_id, ledger_id, credit_days) VALUES (?1, ?2, ?3)",
+                    params![plan.company_id, ledger_id, days],
+                )?;
+            }
+            if !account.opening_bills.is_empty() {
+                let date = plan
+                    .opening_date
+                    .as_deref()
+                    .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
+                for bill in &account.opening_bills {
+                    crate::opening_bills::insert_opening_bill(
+                        &tx,
+                        plan.company_id,
+                        &OpeningBillDraft {
+                            kind: bill.kind,
+                            party_ledger_id: ledger_id,
+                            reference: bill.reference.clone(),
+                            original_date: bill.original_date.clone(),
+                            opening_date: date.to_owned(),
+                            due_date: None,
+                            credit_days: bill.credit_days,
+                            amount: bill.amount,
+                        },
+                    )?;
+                }
+            } else if let Some(amount) = account.opening {
                 let date = plan
                     .opening_date
                     .as_deref()
@@ -3858,6 +4127,7 @@ impl Store {
         Ok(ImportCounts {
             groups: plan.groups.len(),
             ledgers: plan.accounts.len(),
+            opening_bills: plan.opening_bill_count(),
             vouchers: plan.transactions.len(),
             invoices: plan.invoices.len(),
             settlements: plan.settlement_count(),
