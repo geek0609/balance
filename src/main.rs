@@ -20,6 +20,7 @@ use eframe::egui::{self, Color32, RichText};
 mod actual_cost_ui;
 mod advance_ui;
 mod budget_ui;
+mod cash_flow_ui;
 mod cost_ui;
 mod currency_ui;
 mod manufacturing_ui;
@@ -31,6 +32,7 @@ mod valuation_ui;
 use actual_cost_ui::ActualCostScreen;
 use advance_ui::AdvanceScreen;
 use budget_ui::BudgetScreen;
+use cash_flow_ui::CashFlowScreen;
 use cost_ui::CostScreen;
 use currency_ui::CurrencyScreen;
 use manufacturing_ui::ManufacturingScreen;
@@ -65,6 +67,7 @@ enum Page {
     TaxRegister,
     Payroll,
     Currencies,
+    CashFlow,
 }
 struct App {
     store: Store,
@@ -227,6 +230,7 @@ struct App {
     tax_profile_screen: TaxProfileScreen,
     payroll_screen: PayrollScreen,
     currency_screen: CurrencyScreen,
+    cash_flow_screen: CashFlowScreen,
     invoice_document_path: String,
     settlement_invoice: Option<i64>,
     settlement_bank: Option<i64>,
@@ -485,6 +489,7 @@ impl App {
             tax_profile_screen: TaxProfileScreen::default(),
             payroll_screen: PayrollScreen::default(),
             currency_screen: CurrencyScreen::default(),
+            cash_flow_screen: CashFlowScreen::default(),
             invoice_document_path: String::new(),
             settlement_invoice: None,
             settlement_bank: None,
@@ -609,6 +614,7 @@ impl App {
         self.tax_profile_screen = TaxProfileScreen::default();
         self.payroll_screen = PayrollScreen::default();
         self.currency_screen = CurrencyScreen::default();
+        self.cash_flow_screen = CashFlowScreen::default();
         self.invoice_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
@@ -5388,6 +5394,7 @@ impl eframe::App for App {
                 ("Invoice register", Page::InvoiceRegister),
                 ("Tax register", Page::TaxRegister),
                 ("Bank clearance", Page::Bank),
+                ("Cash flow", Page::CashFlow),
                 ("Stock", Page::Stock),
                 ("Stock counts", Page::StockCounts),
                 ("Stock valuation", Page::Valuation),
@@ -5437,6 +5444,7 @@ impl eframe::App for App {
                     Page::InvoiceRegister => self.invoice_register_page(ui, company),
                     Page::TaxRegister => self.tax_register_page(ui, company),
                     Page::Bank => self.bank_page(ui, company),
+                    Page::CashFlow => self.cash_flow_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),
                     Page::StockCounts => self.stock_counts_page(ui, company),
                     Page::Valuation => self.valuation_page(ui, company),

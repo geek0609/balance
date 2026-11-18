@@ -731,6 +731,85 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_cash_flow_csv(
+        &self,
+        company: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.cash_flow_report(company, start, end)?;
+        let context = [
+            self.report_company_name(company)?,
+            optional_date(start)?,
+            optional_date(end)?,
+        ];
+        let mut csv = writer();
+        let details = strings(&[
+            "row_type",
+            "date",
+            "voucher_id",
+            "voucher_type",
+            "reference",
+            "classification",
+            "counterpart",
+            "reason",
+            "inflows",
+            "outflows",
+            "net",
+            "balance",
+        ]);
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "period_start", "period_end"]),
+            &details,
+        )?;
+        let mut opening = vec![String::new(); details.len()];
+        opening[0] = "opening".into();
+        opening[11] = money(report.opening);
+        contextual_row(&mut csv, &context, &opening)?;
+        for entry in report.entries {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "voucher".into(),
+                    entry.date,
+                    entry.voucher_id.to_string(),
+                    entry.kind.as_str().into(),
+                    text_cell(&entry.reference),
+                    entry
+                        .class
+                        .map(|class| class.label())
+                        .unwrap_or("Net zero")
+                        .into(),
+                    entry
+                        .counterpart
+                        .map(|name| text_cell(&name))
+                        .unwrap_or_default(),
+                    entry.explanation.into(),
+                    money(entry.amount.max(0)),
+                    money((-entry.amount).max(0)),
+                    money(entry.amount),
+                    String::new(),
+                ],
+            )?;
+        }
+        for (class, amount) in report.totals {
+            let mut total = vec![String::new(); details.len()];
+            total[0] = "classification_total".into();
+            total[5] = class.label().into();
+            total[8] = money(amount.inflows);
+            total[9] = money(amount.outflows);
+            total[10] = money(amount.net());
+            contextual_row(&mut csv, &context, &total)?;
+        }
+        opening[0] = "closing".into();
+        opening[11] = money(report.closing);
+        contextual_row(&mut csv, &context, &opening)?;
+        save(csv, destination)
+    }
+
     pub fn export_day_book_csv(
         &self,
         company: i64,

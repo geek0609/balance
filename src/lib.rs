@@ -10,6 +10,7 @@ pub mod actual_cost;
 pub mod advances;
 pub mod banking;
 pub mod budgets;
+pub mod cash_flow;
 pub mod company;
 pub mod contacts;
 pub mod costs;
@@ -38,7 +39,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 51;
+const SCHEMA_VERSION: i64 = 52;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -442,6 +443,8 @@ impl Store {
             "foreign_rates",
             "foreign_vouchers",
             "foreign_posting_amounts",
+            "cash_flow_ledger_rules",
+            "cash_flow_voucher_rules",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -783,6 +786,10 @@ impl Store {
         if version < 51 {
             currencies::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 51)?;
+        }
+        if version < 52 {
+            cash_flow::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 52)?;
         }
         tx.commit()?;
         Ok(Self { conn })
