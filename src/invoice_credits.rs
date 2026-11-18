@@ -294,6 +294,109 @@ fn available_for_credit(
     Ok(invoice_total(conn, id, invoice.tax_amount)? - credits.applied - advances.applied - paid)
 }
 
+pub(crate) fn insert_invoice_credit(
+    tx: &Connection,
+    company: i64,
+    id: i64,
+    date: NaiveDate,
+    reference: &str,
+    reason: &str,
+    lines: &[CreditLineDraft],
+    reductions_only: bool,
+) -> Result<i64> {
+    crate::opening_bills::ensure_trade_invoice(tx, company, id)?;
+    if crate::invoice_reversals::for_invoice(tx, company, id)?.is_some() {
+        return Err(Error::Validation(
+            "A reversed invoice cannot accept a credit or debit note".into(),
+        ));
+    }
+    let invoice = invoice_header(tx, company, id)?;
+    let maximum = available_for_credit(tx, company, id, &invoice, date)?;
+    let parts = components(tx, company, id, &invoice)?;
+    let mut seen = HashSet::new();
+    let mut reductions = Vec::new();
+    let mut amounts = BTreeMap::<i64, i128>::new();
+    let mut total = 0_i128;
+    for line in lines {
+        let component = parts
+            .iter()
+            .find(|p| p.ledger_id == line.ledger_id && p.is_tax == line.is_tax)
+            .ok_or_else(|| {
+                Error::Validation("A selected credit component is unavailable".into())
+            })?;
+        if line.amount <= 0
+            || (reductions_only && component.remaining < 0)
+            || i128::from(line.amount) > component.remaining.abs()
+            || !seen.insert((line.ledger_id, line.is_tax))
+        {
+            return Err(Error::Validation(format!(
+                "Enter one positive amount within the remaining amount for {}",
+                component.ledger
+            )));
+        }
+        let reduction = if component.remaining > 0 {
+            line.amount
+        } else {
+            -line.amount
+        };
+        reductions.push((line.ledger_id, line.is_tax, reduction));
+        *amounts.entry(line.ledger_id).or_default() +=
+            invoice.reduction_sign() * i128::from(reduction);
+        total += i128::from(reduction);
+    }
+    if total <= 0 || total > maximum {
+        return Err(Error::Validation(
+            "The note must reduce the invoice by a positive amount within its unpaid balance"
+                .into(),
+        ));
+    }
+    let total_amount = i64::try_from(total)
+        .map_err(|_| Error::Validation("Note amount exceeds the supported range".into()))?;
+    if amounts
+        .insert(invoice.party, -invoice.reduction_sign() * total)
+        .is_some()
+    {
+        return Err(Error::Validation(
+            "The party ledger cannot also be a credit component".into(),
+        ));
+    }
+    let postings = amounts
+        .into_iter()
+        .filter(|(_, amount)| *amount != 0)
+        .map(|(ledger_id, amount)| {
+            Ok(Posting {
+                ledger_id,
+                amount: i64::try_from(amount).map_err(|_| {
+                    Error::Validation("Note posting exceeds the supported range".into())
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_voucher(&date.to_string(), &postings)?;
+    let kind = match invoice.kind {
+        InvoiceKind::Sale => VoucherKind::CreditNote,
+        InvoiceKind::Purchase => VoucherKind::DebitNote,
+    };
+    let voucher = insert_voucher(tx, company, kind, reference, date, reason, &postings)?;
+    if tx.execute(
+        "INSERT INTO invoice_credit_notes(company_id, invoice_id, voucher_id, reference_key, amount, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(invoice_id, reference_key) DO NOTHING",
+        params![company, id, voucher, reference.to_lowercase(), total_amount, reason],
+    )? != 1 {
+        return Err(Error::Validation("This invoice already has a note with that reference".into()));
+    }
+    let note = tx.last_insert_rowid();
+    for (ledger, tax, reduction) in reductions {
+        tx.execute(
+            "INSERT INTO invoice_credit_lines(note_id, ledger_id, is_tax, reduction)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![note, ledger, tax, reduction],
+        )?;
+    }
+    Ok(note)
+}
+
 impl Store {
     pub fn invoice_credit_notes(&self, company: i64, invoice: i64) -> Result<Vec<CreditNote>> {
         notes(&self.conn, company, invoice)
@@ -323,95 +426,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        crate::opening_bills::ensure_trade_invoice(&tx, company, id)?;
-        if crate::invoice_reversals::for_invoice(&tx, company, id)?.is_some() {
-            return Err(Error::Validation(
-                "A reversed invoice cannot accept a credit or debit note".into(),
-            ));
-        }
-        let invoice = invoice_header(&tx, company, id)?;
-        let maximum = available_for_credit(&tx, company, id, &invoice, date)?;
-        let parts = components(&tx, company, id, &invoice)?;
-        let mut seen = HashSet::new();
-        let mut reductions = Vec::new();
-        let mut amounts = BTreeMap::<i64, i128>::new();
-        let mut total = 0_i128;
-        for line in lines {
-            let component = parts
-                .iter()
-                .find(|p| p.ledger_id == line.ledger_id && p.is_tax == line.is_tax)
-                .ok_or_else(|| {
-                    Error::Validation("A selected credit component is unavailable".into())
-                })?;
-            if line.amount <= 0
-                || i128::from(line.amount) > component.remaining.abs()
-                || !seen.insert((line.ledger_id, line.is_tax))
-            {
-                return Err(Error::Validation(format!(
-                    "Enter one positive amount within the remaining amount for {}",
-                    component.ledger
-                )));
-            }
-            let reduction = if component.remaining > 0 {
-                line.amount
-            } else {
-                -line.amount
-            };
-            reductions.push((line.ledger_id, line.is_tax, reduction));
-            *amounts.entry(line.ledger_id).or_default() +=
-                invoice.reduction_sign() * i128::from(reduction);
-            total += i128::from(reduction);
-        }
-        if total <= 0 || total > maximum {
-            return Err(Error::Validation(
-                "The note must reduce the invoice by a positive amount within its unpaid balance"
-                    .into(),
-            ));
-        }
-        let total_amount = i64::try_from(total)
-            .map_err(|_| Error::Validation("Note amount exceeds the supported range".into()))?;
-        if amounts
-            .insert(invoice.party, -invoice.reduction_sign() * total)
-            .is_some()
-        {
-            return Err(Error::Validation(
-                "The party ledger cannot also be a credit component".into(),
-            ));
-        }
-        let postings = amounts
-            .into_iter()
-            .filter(|(_, amount)| *amount != 0)
-            .map(|(ledger_id, amount)| {
-                Ok(Posting {
-                    ledger_id,
-                    amount: i64::try_from(amount).map_err(|_| {
-                        Error::Validation("Note posting exceeds the supported range".into())
-                    })?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        validate_voucher(&date.to_string(), &postings)?;
-        let kind = match invoice.kind {
-            InvoiceKind::Sale => VoucherKind::CreditNote,
-            InvoiceKind::Purchase => VoucherKind::DebitNote,
-        };
-        let voucher = insert_voucher(&tx, company, kind, reference, date, reason, &postings)?;
-        if tx.execute(
-            "INSERT INTO invoice_credit_notes(company_id, invoice_id, voucher_id, reference_key, amount, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(invoice_id, reference_key) DO NOTHING",
-            params![company, id, voucher, reference.to_lowercase(), total_amount, reason],
-        )? != 1 {
-            return Err(Error::Validation("This invoice already has a note with that reference".into()));
-        }
-        let note = tx.last_insert_rowid();
-        for (ledger, tax, reduction) in reductions {
-            tx.execute(
-                "INSERT INTO invoice_credit_lines(note_id, ledger_id, is_tax, reduction)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![note, ledger, tax, reduction],
-            )?;
-        }
+        let note = insert_invoice_credit(&tx, company, id, date, reference, reason, lines, false)?;
         tx.commit()?;
         Ok(note)
     }
@@ -449,6 +464,13 @@ impl Store {
         )?;
         let voucher = tx.last_insert_rowid();
         crate::reversals::write_counter_postings(&tx, company, original, voucher, &postings)?;
+        crate::invoice_returns::reverse_movements(
+            &tx,
+            company,
+            note,
+            date,
+            &format!("Invoice return {note} reversal: {reason}"),
+        )?;
         tx.execute(
             "UPDATE invoice_credit_notes SET reversal_voucher_id = ?1, reversal_reason = ?2
              WHERE company_id = ?3 AND id = ?4",

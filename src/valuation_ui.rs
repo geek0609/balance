@@ -273,7 +273,7 @@ impl App {
                         ui.end_row();
                         for row in &report.rows {
                             ui.label(row.date.to_string());
-                            ui.label(if row.reversal { "Reversal" } else { "Sale" });
+                            ui.label(row.document.label());
                             ui.label(&row.reference);
                             ui.label(&row.item);
                             ui.label(format!("{} {}", format_quantity(row.quantity), row.unit));

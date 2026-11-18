@@ -290,6 +290,21 @@ impl Store {
                 escape(reversal_reason.as_deref().unwrap_or_default())
             );
         }
+        let returned = self.invoice_return_lines(company, note)?;
+        let document_label = if returned.is_empty() {
+            "Financial adjustment record"
+        } else {
+            "Stock and accounting return record"
+        };
+        if !returned.is_empty() {
+            html.push_str("<table><thead><tr><th>Item</th><th>Location</th><th>Batch</th><th class=\"num\">Returned</th><th class=\"num\">Net item credit</th></tr></thead><tbody>");
+            for line in returned {
+                let _ = write!(html, "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{} {}</td><td class=\"num\">{}</td></tr>",
+                    escape(&line.item), escape(&line.location), escape(line.batch.as_deref().unwrap_or("Unbatched")),
+                    format_quantity(line.quantity.into()), escape(&line.unit), format_amount(line.net_amount));
+            }
+            html.push_str("</tbody></table>");
+        }
         html.push_str("<table><thead><tr><th>Ledger</th><th>Component</th><th class=\"num\">Reduction</th></tr></thead><tbody>");
         {
             let mut stmt = tx.prepare(
@@ -318,7 +333,7 @@ impl Store {
             }
         }
         tx.commit()?;
-        let _ = write!(html, "</tbody><tfoot><tr class=\"total\"><td colspan=\"2\">Net invoice reduction</td><td class=\"num\">{}</td></tr></tfoot></table><p class=\"note\">Financial adjustment record</p></body></html>", format_amount(amount));
+        let _ = write!(html, "</tbody><tfoot><tr class=\"total\"><td colspan=\"2\">Net invoice reduction</td><td class=\"num\">{}</td></tr></tfoot></table><p class=\"note\">{document_label}</p></body></html>", format_amount(amount));
         write_html(destination, &html)
     }
 

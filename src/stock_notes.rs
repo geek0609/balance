@@ -183,6 +183,7 @@ pub struct StockNoteLine {
     pub batch: Option<String>,
     pub billed: i64,
     pub returned: i64,
+    pub returned_after_invoice: i64,
 }
 
 impl StockNoteLine {
@@ -209,7 +210,9 @@ const NOTES: &str =
                    LEFT JOIN stock_note_billed_quantities b ON b.note_line_id = l.id
                    LEFT JOIN stock_note_returned_quantities ret ON ret.note_line_id = l.id
                    WHERE l.note_id = n.id AND l.quantity > COALESCE(b.billed, 0) + COALESCE(ret.returned, 0)),
-            EXISTS(SELECT 1 FROM stock_returns ret WHERE ret.note_id = n.id AND ret.reversed_on IS NULL)
+            (EXISTS(SELECT 1 FROM stock_returns ret WHERE ret.note_id = n.id AND ret.reversed_on IS NULL)
+             OR EXISTS(SELECT 1 FROM stock_note_lines src JOIN invoice_returned_quantities ret
+                       ON ret.delivery_line = src.id WHERE src.note_id = n.id))
      FROM stock_notes n JOIN ledgers p ON p.id = n.party_ledger_id AND p.company_id = n.company_id
      WHERE n.company_id = ?1";
 
@@ -243,7 +246,8 @@ pub(crate) fn get_note(conn: &Connection, company: i64, note: i64) -> Result<Sto
 pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<Vec<StockNoteLine>> {
     let mut stmt = conn.prepare(
         "SELECT l.id, l.item_id, l.location_id, l.batch_id, l.quantity, l.unit_price,
-                i.name, i.unit, loc.name, b.name, COALESCE(q.billed, 0), COALESCE(ret.returned, 0)
+                i.name, i.unit, loc.name, b.name, COALESCE(q.billed, 0), COALESCE(ret.returned, 0),
+                COALESCE((SELECT SUM(rq.returned) FROM invoice_returned_quantities rq WHERE rq.delivery_line = l.id), 0)
          FROM stock_note_lines l JOIN stock_notes n ON n.id = l.note_id
          JOIN stock_items i ON i.id = l.item_id AND i.company_id = n.company_id
          JOIN stock_locations loc ON loc.id = l.location_id AND loc.company_id = n.company_id
@@ -269,6 +273,7 @@ pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<V
                 batch: row.get(9)?,
                 billed: row.get(10)?,
                 returned: row.get(11)?,
+                returned_after_invoice: row.get(12)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -344,6 +349,20 @@ pub(crate) fn allocate_spans(
     let rows = stmt.query_map([note_line.id], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
     })?;
+    reserve_spans(
+        capacity,
+        quantity,
+        note_line.billed + note_line.returned,
+        rows,
+    )
+}
+
+pub(crate) fn reserve_spans(
+    capacity: i64,
+    quantity: i64,
+    occupied: i64,
+    rows: impl IntoIterator<Item = rusqlite::Result<(i64, i64)>>,
+) -> Result<Vec<Range<i64>>> {
     let mut spans = Vec::new();
     let mut remaining = quantity;
     let mut cursor = 0;
@@ -362,14 +381,13 @@ pub(crate) fn allocate_spans(
         cursor = end;
         already_allocated += used;
     }
-    if already_allocated != note_line.billed + note_line.returned {
+    if already_allocated != occupied {
         return Err(invalid_spans());
     }
     if remaining > capacity - cursor {
-        return Err(Error::Validation(format!(
-            "Quantity exceeds the unbilled amount for {}",
-            note_line.item
-        )));
+        return Err(Error::Validation(
+            "Quantity exceeds the remaining amount on the source stock line".into(),
+        ));
     }
     if remaining > 0 {
         spans.push(cursor..cursor + remaining);
@@ -384,6 +402,35 @@ pub(crate) struct InvoiceQuantityShare {
 }
 
 impl InvoiceQuantityShare {
+    pub(crate) fn new(quantity: i64, spans: Vec<Range<i64>>) -> Self {
+        Self { quantity, spans }
+    }
+
+    pub(crate) fn spans(&self) -> &[Range<i64>] {
+        &self.spans
+    }
+
+    /// Map spans relative to an invoice line onto the delivery that supplied it.
+    pub(crate) fn project(&self, share: &Self) -> Result<Self> {
+        let mut offset = 0_i64;
+        let mut projected = Vec::new();
+        for base in &self.spans {
+            let next = offset + (base.end - base.start);
+            for target in &share.spans {
+                let start = target.start.max(offset);
+                let end = target.end.min(next);
+                if start < end {
+                    projected.push(base.start + (start - offset)..base.start + (end - offset));
+                }
+            }
+            offset = next;
+        }
+        if offset != share.quantity {
+            return Err(invalid_spans());
+        }
+        Ok(Self::new(self.quantity, projected))
+    }
+
     pub(crate) fn quantity(&self) -> i64 {
         self.quantity
     }
@@ -531,6 +578,7 @@ impl Store {
                 draft.kind,
                 draft.party_ledger_id,
                 date,
+                crate::orders::FulfilmentChange::NewDocument,
                 draft.lines.iter().map(|line| (line.item_id, line.quantity)),
             )?;
         }

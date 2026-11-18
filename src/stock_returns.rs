@@ -163,7 +163,7 @@ pub(crate) fn cost_share(
     stock_notes::read_quantity_share(&mut stmt, line, capacity, quantity)
 }
 
-fn require_available(
+pub(crate) fn require_available(
     conn: &Connection,
     company: i64,
     date: NaiveDate,
@@ -366,6 +366,7 @@ impl Store {
                 source.kind,
                 source.party_ledger_id,
                 date,
+                crate::orders::FulfilmentChange::ReverseReturn,
                 lines.iter().map(|(_, line)| (line.item_id, line.quantity)),
             )?;
         }

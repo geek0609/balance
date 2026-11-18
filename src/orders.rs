@@ -320,6 +320,12 @@ pub(crate) fn insert_order(conn: &Connection, company: i64, draft: &OrderDraft) 
     Ok(order)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FulfilmentChange {
+    NewDocument,
+    ReverseReturn,
+}
+
 pub(crate) fn check_fulfilment(
     conn: &Connection,
     company: i64,
@@ -327,10 +333,11 @@ pub(crate) fn check_fulfilment(
     kind: InvoiceKind,
     party: i64,
     date: NaiveDate,
+    change: FulfilmentChange,
     items: impl IntoIterator<Item = (i64, i64)>,
 ) -> Result<()> {
     let order = order_summary(conn, company, id)?;
-    if !order.status.has_pending() {
+    if change == FulfilmentChange::NewDocument && !order.status.has_pending() {
         return Err(Error::Validation(
             "This order has no unfulfilled quantities".into(),
         ));
@@ -354,7 +361,10 @@ pub(crate) fn check_fulfilment(
          UNION ALL
          SELECT reversed_on FROM stock_notes WHERE order_id = ?1 AND reversed_on IS NOT NULL
          UNION ALL
-         SELECT r.date FROM stock_returns r JOIN stock_notes n ON n.id = r.note_id WHERE n.order_id = ?1",
+         SELECT r.date FROM stock_returns r JOIN stock_notes n ON n.id = r.note_id WHERE n.order_id = ?1
+         UNION ALL
+         SELECT DISTINCT r.date FROM invoice_stock_return_history r
+         JOIN invoice_order_links i ON i.invoice_id = r.invoice_id WHERE i.order_id = ?1",
     )?;
     for row in stmt.query_map([id], |row| row.get::<_, String>(0))? {
         if date < parse_date(&row?)? {
@@ -584,6 +594,7 @@ impl Store {
             draft.kind,
             draft.party_ledger_id,
             parse_date(&draft.date)?,
+            FulfilmentChange::NewDocument,
             draft.lines.iter().map(|line| (line.item_id, line.quantity)),
         )?;
         let (invoice, _) = insert_invoice_on_connection(&tx, company, draft)?;

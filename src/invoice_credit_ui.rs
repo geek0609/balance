@@ -1,7 +1,8 @@
 use crate::{money, App};
-use balance::inventory::{InvoiceKind, InvoiceSummary};
+use balance::inventory::{format_quantity, parse_quantity, InvoiceKind, InvoiceSummary};
 use balance::invoice_credits::{CreditComponent, CreditLineDraft};
-use balance::{parse_amount, Result};
+use balance::invoice_returns::{ReturnAllocation, ReturnLineDraft};
+use balance::{parse_amount, Error, Result};
 use eframe::egui;
 
 pub(crate) struct NoteForm {
@@ -11,6 +12,7 @@ pub(crate) struct NoteForm {
     reference: String,
     reason: String,
     lines: Vec<(CreditComponent, String)>,
+    returns: Vec<(ReturnAllocation, String)>,
 }
 
 impl NoteForm {
@@ -25,7 +27,21 @@ impl NoteForm {
                 .into_iter()
                 .map(|part| (part, String::new()))
                 .collect(),
+            returns: Vec::new(),
         }
+    }
+
+    fn quantities(&self) -> Result<Vec<ReturnLineDraft>> {
+        self.returns
+            .iter()
+            .filter(|(_, value)| !value.trim().is_empty())
+            .map(|(part, value)| {
+                Ok(ReturnLineDraft {
+                    allocation: part.id,
+                    quantity: parse_quantity(value)?,
+                })
+            })
+            .collect()
     }
 
     fn amounts(&self) -> Result<Vec<CreditLineDraft>> {
@@ -87,6 +103,21 @@ impl App {
                             note.voucher_id,
                             note.reason
                         ));
+                        match self.store.invoice_return_lines(company, note.id) {
+                            Ok(lines) => {
+                                for line in lines {
+                                    ui.label(format!(
+                                        "{} {} returned · {} · {} · {}",
+                                        format_quantity(line.quantity.into()),
+                                        line.unit,
+                                        line.item,
+                                        line.location,
+                                        line.batch.as_deref().unwrap_or("Unbatched")
+                                    ));
+                                }
+                            }
+                            Err(e) => self.failure(e),
+                        }
                         if ui.button("Export printable note").clicked() {
                             match self.store.export_invoice_credit_html(
                                 company,
@@ -124,15 +155,45 @@ impl App {
                     .add_enabled(can_add, egui::Button::new(format!("Add partial {label}")))
                     .clicked()
                 {
-                    match self.store.invoice_credit_components(company, invoice.id) {
-                        Ok(components) => {
-                            self.invoice_credit = Some(NoteForm::new(invoice.id, None, components));
-                        }
-                        Err(e) => self.failure(e),
-                    }
+                    self.start_invoice_note(company, invoice.id, false);
+                }
+                if !invoice.lines.is_empty()
+                    && ui
+                        .add_enabled(can_add, egui::Button::new("Return invoiced items"))
+                        .clicked()
+                {
+                    self.start_invoice_note(company, invoice.id, true);
                 }
                 self.edit_invoice_note(ui, company, invoice);
             });
+    }
+
+    fn start_invoice_note(&mut self, company: i64, invoice: i64, stock: bool) {
+        let result = (|| -> Result<NoteForm> {
+            let mut components = self.store.invoice_credit_components(company, invoice)?;
+            if stock {
+                components.retain(|part| part.is_tax);
+            }
+            let mut form = NoteForm::new(invoice, None, components);
+            if stock {
+                form.returns = self
+                    .store
+                    .invoice_return_allocations(company, invoice)?
+                    .into_iter()
+                    .map(|part| (part, String::new()))
+                    .collect();
+                if form.returns.is_empty() {
+                    return Err(Error::Validation(
+                        "This invoice has no quantities available to return".into(),
+                    ));
+                }
+            }
+            Ok(form)
+        })();
+        match result {
+            Ok(form) => self.invoice_credit = Some(form),
+            Err(e) => self.failure(e),
+        }
     }
 
     fn edit_invoice_note(&mut self, ui: &mut egui::Ui, company: i64, invoice: &InvoiceSummary) {
@@ -144,29 +205,66 @@ impl App {
             return;
         };
         if form.reversal.is_none() {
+            if !form.returns.is_empty() {
+                egui::Grid::new(("invoice-return-items", invoice.id)).show(ui, |ui| {
+                    for title in ["Item", "Location", "Batch", "Returnable", "Return quantity"] {
+                        ui.strong(title);
+                    }
+                    ui.end_row();
+                    for (part, quantity) in &mut form.returns {
+                        ui.label(&part.item);
+                        ui.label(&part.location);
+                        ui.label(part.batch.as_deref().unwrap_or("Unbatched"));
+                        ui.label(format!(
+                            "{} {}",
+                            format_quantity(part.remaining.into()),
+                            part.unit
+                        ));
+                        ui.add(egui::TextEdit::singleline(quantity).desired_width(80.0));
+                        ui.end_row();
+                    }
+                });
+                if let Ok(quantities) = form.quantities() {
+                    if !quantities.is_empty() {
+                        match self
+                            .store
+                            .invoice_return_subtotal(company, invoice.id, &quantities)
+                        {
+                            Ok(subtotal) => {
+                                ui.label(format!("Return subtotal before tax {}", money(subtotal)));
+                            }
+                            Err(e) => {
+                                ui.label(e.to_string());
+                            }
+                        }
+                    }
+                }
+            }
             ui.small(format!(
-                "Unpaid balance {}. Enter positive amounts for the components to adjust.",
+                "Unpaid balance {}. Enter positive amounts for any components to adjust.",
                 money(invoice.outstanding)
             ));
-            egui::Grid::new(("note-components", invoice.id)).show(ui, |ui| {
-                for heading in ["Component", "Remaining", "Amount"] {
-                    ui.strong(heading);
-                }
-                ui.end_row();
-                for (part, value) in &mut form.lines {
-                    let category = if part.is_tax {
-                        " (tax)"
-                    } else if part.remaining < 0 {
-                        " (deduction)"
-                    } else {
-                        ""
-                    };
-                    ui.label(format!("{}{category}", part.ledger));
-                    ui.label(money(part.remaining));
-                    ui.add(egui::TextEdit::singleline(value).desired_width(90.0));
+            if !form.lines.is_empty() {
+                egui::Grid::new(("note-components", invoice.id)).show(ui, |ui| {
+                    for heading in ["Component", "Remaining", "Amount"] {
+                        ui.strong(heading);
+                    }
                     ui.end_row();
-                }
-            });
+                    for (part, value) in &mut form.lines {
+                        let category = if part.is_tax {
+                            " (tax)"
+                        } else if part.remaining < 0 {
+                            " (deduction)"
+                        } else {
+                            ""
+                        };
+                        ui.label(format!("{}{category}", part.ledger));
+                        ui.label(money(part.remaining));
+                        ui.add(egui::TextEdit::singleline(value).desired_width(90.0));
+                        ui.end_row();
+                    }
+                });
+            }
         }
         egui::Grid::new(("note-fields", invoice.id)).show(ui, |ui| {
             for (label, value) in [
@@ -200,6 +298,19 @@ impl App {
                         &form.reason,
                     )
                     .map(|id| format!("Note reversal voucher {id} posted"))
+            } else if !form.returns.is_empty() {
+                (|| {
+                    self.store.post_invoice_stock_return(
+                        company,
+                        invoice.id,
+                        &form.date,
+                        &form.reference,
+                        &form.reason,
+                        &form.quantities()?,
+                        &form.amounts()?,
+                    )
+                })()
+                .map(|id| format!("Invoice stock return {id} posted"))
             } else {
                 form.amounts()
                     .and_then(|lines| {

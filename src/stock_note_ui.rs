@@ -427,8 +427,12 @@ impl App {
                         format_quantity(i128::from(line.values.quantity)),
                         line.unit
                     ));
-                    ui.label(format_quantity(i128::from(line.billed)));
-                    ui.label(format_quantity(i128::from(line.returned)));
+                    ui.label(format_quantity(i128::from(
+                        line.billed - line.returned_after_invoice,
+                    )));
+                    ui.label(format_quantity(i128::from(
+                        line.returned + line.returned_after_invoice,
+                    )));
                     if note.reversed_on.is_none() {
                         ui.label(format_quantity(i128::from(line.unbilled())));
                     } else {

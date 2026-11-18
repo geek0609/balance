@@ -67,6 +67,10 @@ fn reconcile(
         Ok(as_of.is_none_or(|end| date <= end)
             && reversed.is_none_or(|reversed| as_of.is_some_and(|end| reversed > end)))
     };
+    let mut returns = conn.prepare(
+        "SELECT id, quantity, net_amount, date, reversed_on FROM invoice_stock_return_history
+         WHERE company_id = ?1 AND line_id = ?2",
+    )?;
     let mut rows = receipts.query([company])?;
     let mut report = Vec::new();
     while let Some(receipt) = rows.next()? {
@@ -77,7 +81,7 @@ fn reconcile(
         }
         let note_line: i64 = receipt.get(4)?;
         let received_quantity: i64 = receipt.get(5)?;
-        let returned_quantity = crate::stock_returns::returned_on(conn, note_line, as_of)?;
+        let mut returned_quantity = crate::stock_returns::returned_on(conn, note_line, as_of)?;
         let receipt_cost = receipt.get::<_, Option<i64>>(10)?.map(i128::from);
         let mut invoice_net = 0_i128;
         let mut quantity = 0_i128;
@@ -96,9 +100,37 @@ fn reconcile(
             }
             quantity += i128::from(billed);
             invoice_net += i128::from(invoice.get::<_, i64>(2)?);
+            let line_id: i64 = invoice.get(0)?;
+            let mut return_rows = returns.query(rusqlite::params![company, line_id])?;
+            while let Some(returned) = return_rows.next()? {
+                let date = parse_date(&returned.get::<_, String>(3)?)?;
+                let reversed = returned.get::<_, Option<String>>(4)?;
+                if !is_effective(date, reversed.as_deref())? {
+                    continue;
+                }
+                let units: i64 = returned.get(1)?;
+                quantity -= i128::from(units);
+                returned_quantity = returned_quantity
+                    .checked_add(units)
+                    .ok_or_else(crate::stock_notes::invalid_spans)?;
+                invoice_net -= i128::from(returned.get::<_, i64>(2)?);
+                if let Some(cost) = receipt_cost {
+                    let share = crate::invoice_returns::cost_share(
+                        conn,
+                        returned.get(0)?,
+                        line_id,
+                        billed,
+                        units,
+                        Some(received_quantity),
+                    )?;
+                    allocated_cost -= share.apportion(cost);
+                }
+            }
         }
-        if quantity + i128::from(returned_quantity) > i128::from(received_quantity)
-            || receipt_cost.is_some_and(|cost| allocated_cost > cost)
+        if quantity < 0
+            || quantity + i128::from(returned_quantity) > i128::from(received_quantity)
+            || invoice_net < 0
+            || receipt_cost.is_some_and(|cost| !(0..=cost).contains(&allocated_cost))
         {
             return Err(Error::Validation(
                 "Receipt and invoice quantities do not reconcile".into(),

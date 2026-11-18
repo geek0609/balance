@@ -436,11 +436,7 @@ impl Store {
                 &mut csv,
                 &context,
                 &[
-                    if sale.reversal {
-                        "reversal".into()
-                    } else {
-                        "sale".into()
-                    },
+                    sale.document.label().to_ascii_lowercase().replace(' ', "_"),
                     sale.invoice_id.to_string(),
                     sale.voucher_id.to_string(),
                     sale.line_id.to_string(),
@@ -513,11 +509,11 @@ impl Store {
                 &mut csv,
                 &context,
                 &[
-                    if entry.reversal {
-                        "reversal".into()
-                    } else {
-                        "sale".into()
-                    },
+                    entry
+                        .document
+                        .label()
+                        .to_ascii_lowercase()
+                        .replace(' ', "_"),
                     entry.invoice_id.to_string(),
                     entry.voucher_id.to_string(),
                     entry.date.to_string(),

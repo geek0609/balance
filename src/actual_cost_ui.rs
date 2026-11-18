@@ -184,7 +184,7 @@ impl App {
                         for row in &report.rows {
                             let sale = &row.sale;
                             ui.label(sale.date.to_string());
-                            ui.label(if sale.reversal { "Reversal" } else { "Sale" });
+                            ui.label(sale.document.label());
                             ui.label(&sale.reference);
                             ui.label(&sale.item);
                             ui.label(format!("{} {}", format_quantity(sale.quantity), sale.unit));

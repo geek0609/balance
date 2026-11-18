@@ -137,7 +137,7 @@ enum Movement {
         retain_cost: bool,
     },
     IssueReversal(IssueOrigin),
-    DeliveryReturn {
+    SaleReturn {
         origin: IssueOrigin,
         same_day_adjustment: Option<i64>,
         share: crate::stock_notes::InvoiceQuantityShare,
@@ -157,14 +157,18 @@ impl Event {
         let priority = match &self.movement {
             Movement::Receipt(_) => 0,
             Movement::Purchase(_) => 1,
-            Movement::DeliveryReturn {
+            Movement::SaleReturn {
                 same_day_adjustment: Some(source),
                 ..
             } => {
                 // On the delivery date, restore the units after costing their issue.
                 return (self.date, 3, *source, true, self.source_id);
             }
-            Movement::IssueReversal(_) | Movement::DeliveryReturn { .. } => 2,
+            Movement::IssueReversal(_) | Movement::SaleReturn { .. } => 2,
+            Movement::Issue {
+                origin: IssueOrigin::Sale(SaleCostOrigin::ReturnCounter(_)),
+                ..
+            } => 5,
             Movement::Issue {
                 origin: IssueOrigin::Sale(_),
                 ..
@@ -291,7 +295,7 @@ fn calculate(
                     pool.receive(layer)?;
                 }
             }
-            Movement::DeliveryReturn { origin, share, .. } => {
+            Movement::SaleReturn { origin, share, .. } => {
                 let issued = pool.issue_layers.get(origin).ok_or_else(|| {
                     Error::Validation("Original delivery cost is missing for a return".into())
                 })?;
@@ -312,10 +316,14 @@ fn calculate(
                             ..
                         } => format!("Delivery note line {line}"),
                         Movement::Issue {
+                            origin: IssueOrigin::Sale(SaleCostOrigin::ReturnCounter(id)),
+                            ..
+                        } => format!("Customer return reversal movement {id}"),
+                        Movement::Issue {
                             origin: IssueOrigin::SupplierReturn(line),
                             ..
                         } => {
-                            format!("Supplier return line {line}")
+                            format!("Supplier return movement {line}")
                         }
                         Movement::PurchaseReversal => {
                             format!("Purchase reversal for line {}", event.source_id)
@@ -352,7 +360,7 @@ fn calculate(
 
 fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64, Vec<Event>>> {
     let mut events = HashMap::<i64, Vec<Event>>::new();
-    let delivery_costs = return_events(conn, company, end, &mut events)?;
+    let retained_costs = return_events(conn, company, end, &mut events)?;
     {
         let mut stmt = conn.prepare(
             "SELECT a.id, a.item_id, a.date, a.quantity, (
@@ -364,7 +372,8 @@ fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64
              WHERE a.company_id = ?1
              AND NOT EXISTS(SELECT 1 FROM invoice_reversal_stock r WHERE r.adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM stock_note_lines r WHERE r.reversal_adjustment_id = a.id)
-             AND NOT EXISTS(SELECT 1 FROM stock_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)",
+             AND NOT EXISTS(SELECT 1 FROM stock_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)
+             AND NOT EXISTS(SELECT 1 FROM invoice_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)",
         )?;
         let mut rows = stmt.query([company])?;
         while let Some(row) = rows.next()? {
@@ -388,7 +397,8 @@ fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64
             } else if let Some(line) = delivery {
                 Movement::Issue {
                     origin: IssueOrigin::Sale(SaleCostOrigin::Delivery(line)),
-                    retain_cost: reversal.is_some() || delivery_costs.contains(&line),
+                    retain_cost: reversal.is_some()
+                        || retained_costs.contains(&SaleCostOrigin::Delivery(line)),
                 }
             } else {
                 Movement::AdjustmentOut
@@ -456,7 +466,8 @@ fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64
                 movement: match kind {
                     InvoiceKind::Sale => Movement::Issue {
                         origin: IssueOrigin::Sale(SaleCostOrigin::Invoice(line)),
-                        retain_cost: reversal.is_some_and(|date| date <= end),
+                        retain_cost: reversal.is_some_and(|date| date <= end)
+                            || retained_costs.contains(&SaleCostOrigin::Invoice(line)),
                     },
                     InvoiceKind::Purchase => Movement::Purchase(row.get(5)?),
                 },
@@ -484,17 +495,23 @@ fn return_events(
     company: i64,
     end: NaiveDate,
     events: &mut HashMap<i64, Vec<Event>>,
-) -> Result<HashSet<i64>> {
+) -> Result<HashSet<SaleCostOrigin>> {
     let mut stmt = conn.prepare(
         "SELECT l.id, l.quantity, l.adjustment_id, l.reversal_adjustment_id, r.date, r.reversed_on,
-                src.id, src.item_id, src.quantity, src.adjustment_id, n.kind, n.date
+                src.id, src.item_id, src.quantity, src.adjustment_id, n.kind, n.date, NULL, NULL, NULL
          FROM stock_return_lines l JOIN stock_returns r ON r.id = l.return_id
          JOIN stock_note_lines src ON src.id = l.note_line_id
          JOIN stock_notes n ON n.id = src.note_id AND n.company_id = r.company_id
-         WHERE r.company_id = ?1",
+         WHERE r.company_id = ?1
+         UNION ALL
+         SELECT r.id, r.quantity, r.adjustment_id, r.reversal_adjustment_id, r.date, r.reversed_on,
+                COALESCE(r.delivery_line, r.line_id), r.item_id, COALESCE(r.delivery_quantity, r.invoice_quantity),
+                COALESCE(r.delivery_adjustment_id, r.line_id), r.kind, COALESCE(r.delivery_date, r.invoice_date),
+                r.line_id, r.invoice_quantity, r.delivery_quantity
+         FROM invoice_stock_return_history r WHERE r.company_id = ?1",
     )?;
     let mut rows = stmt.query([company])?;
-    let mut delivery_costs = HashSet::new();
+    let mut retained_costs = HashSet::new();
     while let Some(row) = rows.next()? {
         let date = parse_date(&row.get::<_, String>(4)?)?;
         if date > end {
@@ -511,43 +528,68 @@ fn return_events(
         let reversal = reversal.filter(|day| *day <= end);
         let kind = InvoiceKind::parse(&row.get::<_, String>(10)?)?;
         let id = row.get(0)?;
+        let movement_id = row.get(2)?;
         let quantity = row.get::<_, i64>(1)?;
+        let supplier_origin = IssueOrigin::SupplierReturn(movement_id);
         let movement = if kind == InvoiceKind::Sale {
-            let delivery = row.get(6)?;
-            delivery_costs.insert(delivery);
-            let delivery_date = parse_date(&row.get::<_, String>(11)?)?;
-            Movement::DeliveryReturn {
-                origin: IssueOrigin::Sale(SaleCostOrigin::Delivery(delivery)),
-                same_day_adjustment: (delivery_date == date).then_some(row.get(9)?),
-                share: crate::stock_returns::cost_share(conn, id, row.get(8)?, quantity)?,
+            let physical_line = row.get(6)?;
+            let invoice_line = row.get::<_, Option<i64>>(12)?;
+            let delivery_quantity = row.get::<_, Option<i64>>(14)?;
+            let origin = match (invoice_line, delivery_quantity) {
+                (Some(line), None) => SaleCostOrigin::Invoice(line),
+                _ => SaleCostOrigin::Delivery(physical_line),
+            };
+            let share = if let Some(line) = invoice_line {
+                crate::invoice_returns::cost_share(
+                    conn,
+                    id,
+                    line,
+                    row.get(13)?,
+                    quantity,
+                    delivery_quantity,
+                )?
+            } else {
+                crate::stock_returns::cost_share(conn, id, row.get(8)?, quantity)?
+            };
+            retained_costs.insert(origin);
+            let source_date = parse_date(&row.get::<_, String>(11)?)?;
+            Movement::SaleReturn {
+                origin: IssueOrigin::Sale(origin),
+                same_day_adjustment: (source_date == date).then_some(row.get(9)?),
+                share,
             }
         } else {
             Movement::Issue {
-                origin: IssueOrigin::SupplierReturn(id),
+                origin: supplier_origin,
                 retain_cost: reversal.is_some(),
             }
         };
         let item_events = events.entry(row.get(7)?).or_default();
         item_events.push(Event {
             date,
-            source_id: row.get(2)?,
+            source_id: movement_id,
             quantity: i128::from(quantity),
             movement,
         });
         if let Some(date) = reversal {
+            let counter_id = row.get(3)?;
             let movement = match kind {
+                InvoiceKind::Sale if row.get::<_, Option<i64>>(12)?.is_some() => Movement::Issue {
+                    origin: IssueOrigin::Sale(SaleCostOrigin::ReturnCounter(counter_id)),
+                    retain_cost: false,
+                },
                 InvoiceKind::Sale => Movement::AdjustmentOut,
-                InvoiceKind::Purchase => Movement::IssueReversal(IssueOrigin::SupplierReturn(id)),
+                InvoiceKind::Purchase => Movement::IssueReversal(supplier_origin),
             };
             item_events.push(Event {
                 date,
-                source_id: row.get(3)?,
+                source_id: counter_id,
                 quantity: i128::from(quantity),
                 movement,
             });
         }
     }
-    Ok(delivery_costs)
+    Ok(retained_costs)
 }
 
 pub(crate) fn insert_receipt_cost(
@@ -581,6 +623,7 @@ impl Store {
              AND NOT EXISTS(SELECT 1 FROM invoice_reversal_stock r WHERE r.adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM stock_note_lines r WHERE r.reversal_adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM stock_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)
+             AND NOT EXISTS(SELECT 1 FROM invoice_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)
              ORDER BY a.date DESC, a.id DESC LIMIT 100",
         )?;
         let rows = stmt.query_map(params![company, adjustment], |row| {
@@ -619,7 +662,8 @@ impl Store {
             "SELECT a.date FROM stock_adjustments a WHERE a.company_id = ?1 AND a.id = ?2 AND a.quantity > 0
              AND NOT EXISTS(SELECT 1 FROM invoice_reversal_stock r WHERE r.adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM stock_note_lines r WHERE r.reversal_adjustment_id = a.id)
-             AND NOT EXISTS(SELECT 1 FROM stock_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)",
+             AND NOT EXISTS(SELECT 1 FROM stock_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)
+             AND NOT EXISTS(SELECT 1 FROM invoice_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)",
              params![company, receipt], |row| row.get(0),
         ).optional()?.ok_or_else(|| Error::Validation("Stock receipt adjustment not found in this company".into()))?;
         let date = parse_date(&date)?;
@@ -775,9 +819,13 @@ impl Store {
                 .net_sales
                 .checked_add(sale.net_sales)
                 .ok_or_else(amount_too_large)?;
-            let cost = costs
-                .get(&sale.cost_origin)
-                .map(|&amount| sale.allocated_issue_cost(amount));
+            let cost = if let Some(id) = sale.counter_issue {
+                costs.get(&SaleCostOrigin::ReturnCounter(id)).copied()
+            } else {
+                costs
+                    .get(&sale.cost_origin)
+                    .map(|&amount| sale.allocated_issue_cost(amount))
+            };
             let mut issue = None;
             if let Some(cost) = cost {
                 report.costed_net_sales = report
