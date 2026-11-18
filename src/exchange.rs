@@ -3601,6 +3601,7 @@ impl Store {
                 trade_ledger_id: trade_id,
                 tax_ledger_id: None,
                 tax_amount: 0,
+                additional_taxes: Vec::new(),
                 lines,
                 adjustments: invoice
                     .adjustments

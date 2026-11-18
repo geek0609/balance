@@ -1,5 +1,6 @@
 //! Stock quantities and basic sales/purchase invoices.
 //! Quantities use thousandths; prices and accounting amounts use hundredths.
+use crate::taxes::{InvoiceTaxDetail, InvoiceTaxLine};
 use crate::{
     check_ledgers, parse_date, required, validate_voucher, Category, Error, Posting, Result, Store,
     VoucherKind,
@@ -166,6 +167,7 @@ pub struct InvoiceDraft {
     pub trade_ledger_id: i64,
     pub tax_ledger_id: Option<i64>,
     pub tax_amount: i64,
+    pub additional_taxes: Vec<InvoiceTaxLine>,
     pub lines: Vec<InvoiceLine>,
     pub adjustments: Vec<InvoiceAdjustment>,
 }
@@ -182,6 +184,7 @@ pub struct InvoiceSummary {
     pub party_ledger_id: i64,
     pub total: i128,
     pub tax_amount: i64,
+    pub taxes: Vec<InvoiceTaxDetail>,
     pub settled: i128,
     pub advance_applied: i128,
     pub outstanding: i128,
@@ -222,6 +225,7 @@ pub struct InvoiceRevision {
     pub trade: String,
     pub tax_ledger: Option<String>,
     pub tax_amount: i64,
+    pub taxes: Vec<InvoiceTaxDetail>,
     pub lines: Vec<InvoiceDetailLine>,
     pub adjustments: Vec<InvoiceAdjustmentDetail>,
 }
@@ -395,23 +399,17 @@ fn prepare_invoice(
             "An invoice needs at least one item or service / charge line".into(),
         ));
     }
-    if draft.tax_amount < 0
-        || (draft.tax_amount > 0 && draft.tax_ledger_id.is_none())
-        || (draft.tax_amount == 0 && draft.tax_ledger_id.is_some())
-    {
+    if draft.party_ledger_id == draft.trade_ledger_id {
         return Err(Error::Validation(
-            "Choose a tax ledger exactly when a positive tax amount is entered".into(),
+            "The party and trade ledgers must be different".into(),
         ));
     }
-    if draft.party_ledger_id == draft.trade_ledger_id
-        || draft
-            .tax_ledger_id
-            .is_some_and(|id| id == draft.party_ledger_id || id == draft.trade_ledger_id)
-    {
-        return Err(Error::Validation(
-            "Party, trade and tax ledgers must be different".into(),
-        ));
-    }
+    let taxes = crate::taxes::validate_draft_taxes(conn, company_id, draft)?;
+    let tax_ledgers = taxes
+        .iter()
+        .map(|line| line.ledger_id)
+        .collect::<HashSet<_>>();
+    let total_tax = crate::taxes::checked_total(taxes.iter().map(|line| line.amount))?;
     let party = ledger_category(conn, company_id, draft.party_ledger_id)?;
     let trade = ledger_category(conn, company_id, draft.trade_ledger_id)?;
     if !matches!(party, Category::Asset | Category::Liability) {
@@ -426,16 +424,6 @@ fn prepare_invoice(
         return Err(Error::Validation(
             "The trade ledger has an incompatible category".into(),
         ));
-    }
-    if let Some(id) = draft.tax_ledger_id {
-        if !matches!(
-            ledger_category(conn, company_id, id)?,
-            Category::Asset | Category::Liability
-        ) {
-            return Err(Error::Validation(
-                "The tax ledger must be an asset or liability".into(),
-            ));
-        }
     }
     let mut stmt = conn.prepare("SELECT v.reference FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3 AND (?4 IS NULL OR i.id != ?4)")?;
     for existing in stmt.query_map(
@@ -508,7 +496,7 @@ fn prepare_invoice(
             ));
         }
         let trade_id = line.trade_ledger_id.unwrap_or(draft.trade_ledger_id);
-        if trade_id == draft.party_ledger_id || draft.tax_ledger_id == Some(trade_id) {
+        if trade_id == draft.party_ledger_id || tax_ledgers.contains(&trade_id) {
             return Err(Error::Validation(
                 "An item ledger must differ from the party and tax ledgers".into(),
             ));
@@ -531,7 +519,7 @@ fn prepare_invoice(
     }
     let subtotal = i64::try_from(subtotal)
         .map_err(|_| Error::Validation("Invoice amount is too large".into()))?;
-    let mut total = i128::from(subtotal) + i128::from(draft.tax_amount);
+    let mut total = i128::from(subtotal) + i128::from(total_tax);
     let mut has_service_base = false;
     for adjustment in &draft.adjustments {
         if adjustment.amount == 0
@@ -584,10 +572,10 @@ fn prepare_invoice(
             });
         }
     }
-    if let Some(tax_id) = draft.tax_ledger_id {
+    for tax in taxes {
         postings.push(Posting {
-            ledger_id: tax_id,
-            amount: -direction * draft.tax_amount,
+            ledger_id: tax.ledger_id,
+            amount: -direction * tax.amount,
         });
     }
     for adjustment in &draft.adjustments {
@@ -861,6 +849,7 @@ pub(crate) fn insert_invoice_on_connection(
         &prepared.discounts,
     )?;
     write_invoice_adjustments(conn, invoice_id, &draft.adjustments)?;
+    crate::taxes::write_additional(conn, invoice_id, &draft.additional_taxes)?;
     Ok((invoice_id, voucher_id))
 }
 pub(crate) fn ledger_category(
@@ -1061,7 +1050,8 @@ pub(crate) fn create_stock_item_on_connection(
 pub(crate) fn invoice_total(conn: &Connection, invoice: i64, tax: i64) -> Result<i128> {
     let mut stmt = conn.prepare(
         "SELECT amount FROM invoice_lines WHERE invoice_id = ?1
-         UNION ALL SELECT amount FROM invoice_adjustments WHERE invoice_id = ?1",
+         UNION ALL SELECT amount FROM invoice_adjustments WHERE invoice_id = ?1
+         UNION ALL SELECT amount FROM invoice_additional_taxes WHERE invoice_id = ?1",
     )?;
     let mut total = i128::from(tax);
     for row in stmt.query_map([invoice], |row| row.get::<_, i64>(0))? {
@@ -2042,6 +2032,7 @@ impl Store {
             trade_ledger_id,
             tax_ledger_id,
             tax_amount,
+            additional_taxes: crate::taxes::additional_lines(&self.conn, invoice_id)?,
             lines,
             adjustments,
         })
@@ -2099,6 +2090,9 @@ impl Store {
         tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![voucher_revision, voucher_id])?;
         tx.execute("INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days) SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days FROM invoices WHERE id = ?2 AND company_id = ?3", params![voucher_revision, invoice_id, company_id])?;
         let revision_id = tx.last_insert_rowid();
+        tx.execute("INSERT INTO invoice_revision_additional_taxes(revision_id, ledger_id, amount)
+                    SELECT ?1, ledger_id, amount FROM invoice_additional_taxes WHERE invoice_id = ?2 ORDER BY id",
+                   params![revision_id, invoice_id])?;
         copy_invoice_line_revisions(&tx, invoice_id, revision_id)?;
         tx.execute("INSERT INTO invoice_revision_adjustments(revision_id, ledger_id, amount, description) SELECT ?1, ledger_id, amount, description FROM invoice_adjustments WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;
         tx.execute("UPDATE vouchers SET kind = ?1, reference = ?2, date = ?3, narration = ?4 WHERE id = ?5 AND company_id = ?6", params![draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim(), voucher_id, company_id])?;
@@ -2122,6 +2116,11 @@ impl Store {
             &prepared.discounts,
         )?;
         write_invoice_adjustments(&tx, invoice_id, &draft.adjustments)?;
+        tx.execute(
+            "DELETE FROM invoice_additional_taxes WHERE invoice_id = ?1",
+            [invoice_id],
+        )?;
+        crate::taxes::write_additional(&tx, invoice_id, &draft.additional_taxes)?;
         tx.commit()?;
         Ok(())
     }
@@ -2197,6 +2196,9 @@ impl Store {
             for (line_id, line) in raw_lines {
                 lines.push(attach_allocation_details(&self.conn, line_id, true, line)?);
             }
+            let taxes =
+                crate::taxes::tax_details(&self.conn, id, true, tax_ledger.as_deref(), tax_amount)?;
+            let total_tax = crate::taxes::checked_total(taxes.iter().map(|tax| tax.amount))?;
             result.push(InvoiceRevision {
                 changed_at,
                 date,
@@ -2208,7 +2210,8 @@ impl Store {
                 party,
                 trade,
                 tax_ledger,
-                tax_amount,
+                tax_amount: total_tax,
+                taxes,
                 lines,
                 adjustments: read_invoice_adjustments(&self.conn, id, true)?,
             });
@@ -2216,7 +2219,7 @@ impl Store {
         Ok(result)
     }
     pub fn invoices(&self, company_id: i64) -> Result<Vec<InvoiceSummary>> {
-        let mut stmt = self.conn.prepare("SELECT i.id, i.voucher_id, i.kind, v.date, v.reference, l.name, i.tax_amount, i.due_date, i.credit_days, i.party_ledger_id FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1 ORDER BY v.date DESC, i.id DESC")?;
+        let mut stmt = self.conn.prepare("SELECT i.id, i.voucher_id, i.kind, v.date, v.reference, l.name, i.tax_amount, i.due_date, i.credit_days, i.party_ledger_id, x.name FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id LEFT JOIN ledgers x ON x.id = i.tax_ledger_id WHERE i.company_id = ?1 ORDER BY v.date DESC, i.id DESC")?;
         let rows = stmt.query_map([company_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -2229,6 +2232,7 @@ impl Store {
                 r.get::<_, Option<String>>(7)?,
                 r.get::<_, Option<u32>>(8)?,
                 r.get::<_, i64>(9)?,
+                r.get::<_, Option<String>>(10)?,
             ))
         })?;
         let mut result = Vec::new();
@@ -2244,6 +2248,7 @@ impl Store {
                 due_date,
                 credit_days,
                 party_ledger_id,
+                primary_tax_name,
             ) = row?;
             let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name, l.id FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, i.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
             let line_amounts = amounts.query_map([id], |r| {
@@ -2264,6 +2269,9 @@ impl Store {
                     },
                 ))
             })?;
+            let taxes =
+                crate::taxes::tax_details(&self.conn, id, false, primary_tax_name.as_deref(), tax)?;
+            let tax = crate::taxes::checked_total(taxes.iter().map(|line| line.amount))?;
             let mut total = i128::from(tax);
             let mut lines = Vec::new();
             for line in line_amounts {
@@ -2306,6 +2314,7 @@ impl Store {
                 party_ledger_id,
                 total,
                 tax_amount: tax,
+                taxes,
                 settled,
                 outstanding,
                 reversal,

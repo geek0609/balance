@@ -144,11 +144,12 @@ impl Store {
             "<tr><td>Stock items after discounts</td><td class=\"num\">{}</td></tr>",
             money(subtotal)
         );
-        if invoice.tax_amount != 0 {
+        for tax in &invoice.taxes {
             let _ = write!(
                 html,
-                "<tr><td>Tax (manual)</td><td class=\"num\">{}</td></tr>",
-                format_amount(invoice.tax_amount)
+                "<tr><td>Tax in {}</td><td class=\"num\">{}</td></tr>",
+                escape(&tax.ledger),
+                format_amount(tax.amount)
             );
         }
         for adjustment in &invoice.adjustments {

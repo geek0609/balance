@@ -11,6 +11,7 @@ use balance::inventory::{
 };
 use balance::pricing::PriceList;
 use balance::reorder::ReorderRule;
+use balance::taxes::InvoiceTaxLine;
 use balance::terms::LedgerTerms;
 use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
 use eframe::egui::{self, Color32, RichText};
@@ -194,6 +195,7 @@ struct App {
     invoice_trade: Option<i64>,
     invoice_tax_ledger: Option<i64>,
     invoice_tax_amount: String,
+    invoice_additional_taxes: Vec<InvoiceTaxForm>,
     invoice_lines: Vec<InvoiceLineForm>,
     invoice_adjustments: Vec<InvoiceAdjustmentForm>,
     editing_invoice: Option<i64>,
@@ -229,6 +231,11 @@ struct InvoiceReversalForm {
 }
 struct SettlementLineForm {
     invoice: Option<i64>,
+    amount: String,
+}
+#[derive(Default)]
+struct InvoiceTaxForm {
+    ledger: Option<i64>,
     amount: String,
 }
 struct InvoiceAdjustmentForm {
@@ -438,6 +445,7 @@ impl App {
             invoice_trade: None,
             invoice_tax_ledger: None,
             invoice_tax_amount: String::new(),
+            invoice_additional_taxes: Vec::new(),
             invoice_lines: vec![InvoiceLineForm::new()],
             invoice_adjustments: Vec::new(),
             editing_invoice: None,
@@ -576,6 +584,7 @@ impl App {
         self.invoice_due_date.clear();
         self.invoice_credit_days.clear();
         self.invoice_tax_amount.clear();
+        self.invoice_additional_taxes.clear();
         self.settlement_invoice = None;
         self.settlement_bank = None;
         self.settlement_reference.clear();
@@ -2875,6 +2884,14 @@ impl App {
         } else {
             format_amount(draft.tax_amount)
         };
+        self.invoice_additional_taxes = draft
+            .additional_taxes
+            .into_iter()
+            .map(|tax| InvoiceTaxForm {
+                ledger: Some(tax.ledger_id),
+                amount: format_amount(tax.amount),
+            })
+            .collect();
         self.invoice_lines = draft
             .lines
             .into_iter()
@@ -3107,6 +3124,34 @@ impl App {
             ui.label("Tax amount");
             ui.add(egui::TextEdit::singleline(&mut self.invoice_tax_amount).hint_text("0.00"));
         });
+        let mut remove_tax = None;
+        for (index, tax) in self.invoice_additional_taxes.iter_mut().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                pick_account(
+                    ui,
+                    ("invoice-additional-tax", index),
+                    "Tax ledger",
+                    &ledgers,
+                    &mut tax.ledger,
+                    false,
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut tax.amount)
+                        .hint_text("Tax amount")
+                        .desired_width(100.0),
+                );
+                if ui.button("Remove tax").clicked() {
+                    remove_tax = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove_tax {
+            self.invoice_additional_taxes.remove(index);
+        }
+        if ui.button("Add tax component").clicked() {
+            self.invoice_additional_taxes
+                .push(InvoiceTaxForm::default());
+        }
         ui.small("Tax is entered manually; statutory rules and filing are not implemented. Percentage discounts apply to the gross line amount after it is rounded to two decimal places.");
         let mut remove = None;
         for (index, line) in self.invoice_lines.iter_mut().enumerate() {
@@ -3322,6 +3367,7 @@ impl App {
             self.invoice_lines = vec![InvoiceLineForm::new()];
             self.invoice_adjustments.clear();
             self.invoice_tax_amount.clear();
+            self.invoice_additional_taxes.clear();
             self.invoice_tax_ledger = None;
         }
         if ui.button("Save invoice").clicked() {
@@ -3363,6 +3409,20 @@ impl App {
                 } else {
                     parse_amount(&self.invoice_tax_amount)?
                 };
+                let additional_taxes = self
+                    .invoice_additional_taxes
+                    .iter()
+                    .map(|tax| {
+                        Ok(InvoiceTaxLine {
+                            ledger_id: tax.ledger.ok_or_else(|| {
+                                balance::Error::Validation(
+                                    "Choose a ledger for every tax component".into(),
+                                )
+                            })?,
+                            amount: parse_amount(&tax.amount)?,
+                        })
+                    })
+                    .collect::<balance::Result<Vec<_>>>()?;
                 let mut adjustments = Vec::new();
                 for line in &self.invoice_adjustments {
                     let amount = parse_amount(&line.amount)?;
@@ -3405,6 +3465,7 @@ impl App {
                     })?,
                     tax_ledger_id: self.invoice_tax_ledger,
                     tax_amount,
+                    additional_taxes,
                     lines,
                     adjustments,
                 };
@@ -3427,6 +3488,7 @@ impl App {
                     self.invoice_lines = vec![InvoiceLineForm::new()];
                     self.invoice_adjustments.clear();
                     self.invoice_tax_amount.clear();
+                    self.invoice_additional_taxes.clear();
                     self.invoice_tax_ledger = None;
                     self.editing_invoice = None;
                     self.copying_invoice = false;
@@ -3723,8 +3785,12 @@ impl App {
                             ));
                         }
                     }
-                    if invoice.tax_amount > 0 {
-                        ui.label(format!("  Tax: {}", format_amount(invoice.tax_amount)));
+                    for tax in &invoice.taxes {
+                        ui.label(format!(
+                            "  Tax in {} | {}",
+                            tax.ledger,
+                            format_amount(tax.amount)
+                        ));
                     }
                     for adjustment in invoice.adjustments {
                         ui.label(format!(
@@ -3788,12 +3854,14 @@ impl App {
                                             revision.reference,
                                             revision.party
                                         ));
-                                        ui.label(format!(
-                                            "Ledger: {} • {} • Tax: {}",
-                                            revision.trade,
-                                            revision.tax_ledger.unwrap_or_default(),
-                                            format_amount(revision.tax_amount)
-                                        ));
+                                        ui.label(format!("Trade ledger: {}", revision.trade));
+                                        for tax in &revision.taxes {
+                                            ui.label(format!(
+                                                "Tax in {} | {}",
+                                                tax.ledger,
+                                                format_amount(tax.amount)
+                                            ));
+                                        }
                                         if let Some(due_date) = &revision.due_date {
                                             ui.label(format!("Due: {due_date}"));
                                         }
