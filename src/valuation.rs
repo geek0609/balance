@@ -234,71 +234,33 @@ impl Store {
             costed_margin: 0,
             missing_rates: 0,
         };
-        {
-            let mut stmt = tx.prepare(
-                "SELECT i.id, v.id, v.date, v.reference, s.id, s.name, s.unit, l.quantity, l.amount,
-                        rv.id, rv.date, rv.reference
-                 FROM invoices i JOIN invoice_lines l ON l.invoice_id = i.id
-                 JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = i.company_id
-                 JOIN stock_items s ON s.id = l.item_id AND s.company_id = i.company_id
-                 LEFT JOIN invoice_reversals r ON r.invoice_id = i.id AND r.company_id = i.company_id
-                 LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
-                 WHERE i.company_id = ?1 AND i.kind = 'Sale' ORDER BY v.id, l.id",
-            )?;
-            let mut rows = stmt.query([company])?;
-            while let Some(row) = rows.next()? {
-                let invoice_id: i64 = row.get(0)?;
-                let date = parse_date(&row.get::<_, String>(2)?)?;
-                let unit_cost = effective(&schedule, row.get(4)?, date);
-                let item: String = row.get(5)?;
-                let unit: String = row.get(6)?;
-                let quantity = i128::from(row.get::<_, i64>(7)?);
-                let net_sales = i128::from(row.get::<_, i64>(8)?);
-                let events: [Option<(i64, NaiveDate, String, i128)>; 2] = [
-                    Some((row.get(1)?, date, row.get(3)?, 1)),
-                    match row.get::<_, Option<i64>>(9)? {
-                        Some(voucher) => Some((
-                            voucher,
-                            parse_date(&row.get::<_, String>(10)?)?,
-                            row.get(11)?,
-                            -1,
-                        )),
-                        None => None,
-                    },
-                ];
-                for (voucher_id, date, reference, direction) in events.into_iter().flatten() {
-                    if start.is_some_and(|start| date < start) || end.is_some_and(|end| date > end)
-                    {
-                        continue;
-                    }
-                    let quantity = quantity * direction;
-                    let net_sales = net_sales * direction;
-                    let standard_cost = unit_cost.map(|cost| priced(quantity, cost)).transpose()?;
-                    report.net_sales = add(report.net_sales, net_sales)?;
-                    if let Some(cost) = standard_cost {
-                        report.costed_net_sales = add(report.costed_net_sales, net_sales)?;
-                        report.standard_cost = add(report.standard_cost, cost)?;
-                        report.costed_margin = add(report.costed_margin, net_sales - cost)?;
-                    } else {
-                        report.missing_rates += 1;
-                    }
-                    report.rows.push(SalesCostRow {
-                        invoice_id,
-                        voucher_id,
-                        date,
-                        reference,
-                        reversal: direction < 0,
-                        item: item.clone(),
-                        unit: unit.clone(),
-                        quantity,
-                        net_sales,
-                        unit_cost,
-                        standard_cost,
-                    });
-                }
+        for sale in crate::stock_sales::stock_sales(&tx, company, start, end)? {
+            let unit_cost = effective(&schedule, sale.item_id, sale.original_date);
+            let standard_cost = unit_cost
+                .map(|cost| priced(sale.quantity, cost))
+                .transpose()?;
+            report.net_sales = add(report.net_sales, sale.net_sales)?;
+            if let Some(cost) = standard_cost {
+                report.costed_net_sales = add(report.costed_net_sales, sale.net_sales)?;
+                report.standard_cost = add(report.standard_cost, cost)?;
+                report.costed_margin = add(report.costed_margin, sale.net_sales - cost)?;
+            } else {
+                report.missing_rates += 1;
             }
+            report.rows.push(SalesCostRow {
+                invoice_id: sale.invoice_id,
+                voucher_id: sale.voucher_id,
+                date: sale.date,
+                reference: sale.reference,
+                reversal: sale.reversal,
+                item: sale.item,
+                unit: sale.unit,
+                quantity: sale.quantity,
+                net_sales: sale.net_sales,
+                unit_cost,
+                standard_cost,
+            });
         }
-        report.rows.sort_by_key(|row| (row.date, row.voucher_id));
         tx.commit()?;
         Ok(report)
     }

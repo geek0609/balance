@@ -1,9 +1,10 @@
 //! Company-wide inventory costs for receipts and issues.
 use crate::inventory::{InvoiceKind, StockItem};
+use crate::stock_sales::{stock_sales, StockSale};
 use crate::{parse_date, required, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -92,6 +93,30 @@ pub struct ActualCostValuation {
     pub rows: Vec<ActualCostRow>,
     pub known_value: i128,
     pub unavailable: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActualSalesCostRow {
+    pub sale: StockSale,
+    pub cost: Option<i128>,
+    pub issue: Option<ActualCostIssue>,
+}
+impl ActualSalesCostRow {
+    pub fn margin(&self) -> Option<i128> {
+        self.cost
+            .and_then(|cost| self.sale.net_sales.checked_sub(cost))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ActualSalesCostReport {
+    pub method: ActualCostMethod,
+    pub rows: Vec<ActualSalesCostRow>,
+    pub net_sales: i128,
+    pub costed_net_sales: i128,
+    pub cost_of_sales: i128,
+    pub costed_margin: i128,
+    pub unavailable_lines: usize,
 }
 
 pub type AverageCostRow = ActualCostRow;
@@ -208,6 +233,7 @@ impl Pool {
 fn calculate(
     events: &mut [Event],
     method: ActualCostMethod,
+    mut reported_sale_costs: Option<&mut HashMap<i64, i128>>,
 ) -> Result<std::result::Result<Pool, ActualCostIssue>> {
     events.sort_by_key(|event| (event.date, event.movement.priority(), event.source_id));
     let mut pool = Pool {
@@ -252,6 +278,14 @@ fn calculate(
                     }));
                 }
                 let portions = pool.issue(event.quantity)?;
+                if matches!(issue, Movement::Sale { .. }) {
+                    if let Some(reported_sale_costs) = reported_sale_costs.as_deref_mut() {
+                        reported_sale_costs.insert(
+                            event.source_id,
+                            portions.iter().map(|layer| layer.value).sum(),
+                        );
+                    }
+                }
                 if matches!(issue, Movement::Sale { reversed: true }) {
                     pool.sale_costs.insert(event.source_id, portions);
                 }
@@ -474,6 +508,7 @@ impl Store {
             let (value, issue) = match calculate(
                 &mut events.remove(&balance.item.id).unwrap_or_default(),
                 method,
+                None,
             )? {
                 Ok(pool) => {
                     if pool.available.quantity != balance.quantity {
@@ -499,6 +534,95 @@ impl Store {
                 value,
                 issue,
             });
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// Cost item sales and reversals with the same valuation rules as the stock report.
+    pub fn sales_at_actual_cost(
+        &self,
+        company: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        method: ActualCostMethod,
+    ) -> Result<ActualSalesCostReport> {
+        let start = start.map(parse_date).transpose()?;
+        let end = end.map(parse_date).transpose()?;
+        if matches!((start, end), (Some(start), Some(end)) if start > end) {
+            return Err(Error::Validation(
+                "Report start date must not follow the end date".into(),
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut sales = stock_sales(&tx, company, start, end)?;
+        sales.retain(|sale| !sale.reversed_same_day);
+        let mut report = ActualSalesCostReport {
+            method,
+            rows: Vec::with_capacity(sales.len()),
+            net_sales: 0,
+            costed_net_sales: 0,
+            cost_of_sales: 0,
+            costed_margin: 0,
+            unavailable_lines: 0,
+        };
+        if sales.is_empty() {
+            tx.commit()?;
+            return Ok(report);
+        }
+        let mut events = events(&tx, company, end.unwrap_or(NaiveDate::MAX))?;
+        let items = sales
+            .iter()
+            .map(|sale| sale.item_id)
+            .collect::<HashSet<_>>();
+        let mut issues = HashMap::new();
+        let mut costs = HashMap::new();
+        for item in items {
+            if let Err(issue) = calculate(
+                &mut events.remove(&item).unwrap_or_default(),
+                method,
+                Some(&mut costs),
+            )? {
+                issues.insert(item, issue);
+            }
+        }
+        for sale in sales {
+            report.net_sales = report
+                .net_sales
+                .checked_add(sale.net_sales)
+                .ok_or_else(amount_too_large)?;
+            let cost = costs
+                .get(&sale.line_id)
+                .map(|&amount| if sale.reversal { -amount } else { amount });
+            let mut issue = None;
+            if let Some(cost) = cost {
+                report.costed_net_sales = report
+                    .costed_net_sales
+                    .checked_add(sale.net_sales)
+                    .ok_or_else(amount_too_large)?;
+                report.cost_of_sales = report
+                    .cost_of_sales
+                    .checked_add(cost)
+                    .ok_or_else(amount_too_large)?;
+                let margin = sale
+                    .net_sales
+                    .checked_sub(cost)
+                    .ok_or_else(amount_too_large)?;
+                report.costed_margin = report
+                    .costed_margin
+                    .checked_add(margin)
+                    .ok_or_else(amount_too_large)?;
+            } else {
+                let problem = issues.get(&sale.item_id).ok_or_else(|| {
+                    Error::Validation(format!(
+                        "Sale line {} has no matching cost event",
+                        sale.line_id
+                    ))
+                })?;
+                issue = Some(problem.clone());
+                report.unavailable_lines += 1;
+            }
+            report.rows.push(ActualSalesCostRow { sale, cost, issue });
         }
         tx.commit()?;
         Ok(report)

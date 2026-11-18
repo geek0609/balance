@@ -301,6 +301,88 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_actual_sales_cost_csv(
+        &self,
+        company: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        method: ActualCostMethod,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let report = self.sales_at_actual_cost(company, start, end, method)?;
+        let context = [
+            self.report_company_name(company)?,
+            optional_date(start)?,
+            optional_date(end)?,
+            report.method.label().into(),
+        ];
+        let mut csv = writer();
+        let details = strings(&[
+            "row_type",
+            "invoice_id",
+            "voucher_id",
+            "line_id",
+            "date",
+            "reference",
+            "item_id",
+            "item",
+            "unit",
+            "quantity",
+            "net_item_sales",
+            "cost_of_sales",
+            "item_margin",
+            "cost_issue",
+            "lines_without_cost",
+        ]);
+        contextual_row(
+            &mut csv,
+            &strings(&["company", "period_start", "period_end", "cost_method"]),
+            &details,
+        )?;
+        for row in report.rows {
+            let sale = &row.sale;
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    if sale.reversal {
+                        "reversal".into()
+                    } else {
+                        "sale".into()
+                    },
+                    sale.invoice_id.to_string(),
+                    sale.voucher_id.to_string(),
+                    sale.line_id.to_string(),
+                    sale.date.to_string(),
+                    text_cell(&sale.reference),
+                    sale.item_id.to_string(),
+                    text_cell(&sale.item),
+                    text_cell(&sale.unit),
+                    format_quantity(sale.quantity),
+                    money(sale.net_sales),
+                    row.cost.map(money).unwrap_or_default(),
+                    row.margin().map(money).unwrap_or_default(),
+                    row.issue
+                        .map(|issue| text_cell(&issue.to_string()))
+                        .unwrap_or_default(),
+                    String::new(),
+                ],
+            )?;
+        }
+        let mut summary = vec![String::new(); details.len()];
+        summary[0] = "all_sales".into();
+        summary[10] = money(report.net_sales);
+        summary[14] = report.unavailable_lines.to_string();
+        contextual_row(&mut csv, &context, &summary)?;
+        summary[0] = "costed_sales".into();
+        summary[10] = money(report.costed_net_sales);
+        summary[11] = money(report.cost_of_sales);
+        summary[12] = money(report.costed_margin);
+        summary[14].clear();
+        contextual_row(&mut csv, &context, &summary)?;
+        save(csv, destination)
+    }
+
     pub fn export_standard_sales_cost_csv(
         &self,
         company: i64,

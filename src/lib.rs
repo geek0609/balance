@@ -26,6 +26,7 @@ pub mod reorder;
 pub mod report_export;
 pub mod reversals;
 pub mod stock_counts;
+pub mod stock_sales;
 pub mod terms;
 pub mod valuation;
 

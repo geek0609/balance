@@ -34,6 +34,9 @@ impl App {
         egui::CollapsingHeader::new("Stock value at standard cost").show(ui, |ui| {
             self.standard_stock_view(ui, company);
         });
+        egui::CollapsingHeader::new("Item sales and actual margin").show(ui, |ui| {
+            self.actual_sales_view(ui, company);
+        });
         egui::CollapsingHeader::new("Item sales and standard margin").show(ui, |ui| {
             self.standard_sales_view(ui, company);
         });
