@@ -2001,6 +2001,9 @@ fn palette_row(ui: &mut egui::Ui, p: &Palette, entry: &Entry, selected: bool) ->
 mod tests {
     use super::{classify, NAV};
     use crate::theme::Tone;
+    use crate::App;
+    use balance::{Category, Posting, Store};
+    use eframe::egui;
 
     #[test]
     fn classifies_status_messages() {
@@ -2029,5 +2032,56 @@ mod tests {
         pages.dedup();
         assert_eq!(pages.len(), total);
         assert_eq!(total, 27);
+    }
+
+    #[test]
+    fn dashboard_renders_with_a_consistent_cutoff() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Dashboard demo").unwrap();
+        let cash = store
+            .create_ledger(company, "Cash", Category::Asset)
+            .unwrap();
+        let income = store
+            .create_ledger(company, "Services", Category::Income)
+            .unwrap();
+        for (date, amount) in [("2000-01-01", 1000), ("9999-12-31", 9000)] {
+            store
+                .post_voucher(
+                    company,
+                    date,
+                    "Example",
+                    &[
+                        Posting {
+                            ledger_id: cash,
+                            amount,
+                        },
+                        Posting {
+                            ledger_id: income,
+                            amount: -amount,
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let mut app = App::new(store, "demo.db".into());
+        app.switch_company(company);
+        let frame = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1360.0, 860.0),
+                )),
+                ..Default::default()
+            },
+            |context| app.shell_update(context),
+        );
+        assert!(!frame.shapes.is_empty());
+        let dashboard = app.shell.dashboard.as_ref().unwrap().data.as_ref().unwrap();
+        assert_eq!(dashboard.voucher_count, 1);
+        assert_eq!(dashboard.recent[0].voucher.date, "2000-01-01");
+        assert_eq!(dashboard.income, 1000);
+        assert_eq!(dashboard.assets, 1000);
     }
 }
