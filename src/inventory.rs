@@ -13,6 +13,27 @@ use std::{
     str::FromStr,
 };
 
+const STOCK_LOCATION_BRANCH: &str = "WITH RECURSIVE branch(id) AS (
+    SELECT id FROM stock_locations WHERE company_id = ?1 AND id = ?2
+    UNION
+    SELECT l.id FROM stock_locations l JOIN branch b ON b.id = l.parent_id
+    WHERE l.company_id = ?1 AND ?3
+)";
+
+fn check_stock_location(conn: &Connection, company: i64, location: i64) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM stock_locations WHERE id = ?1 AND company_id = ?2)",
+        params![location, company],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(Error::Validation(
+            "Stock location not found in the selected company".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct StockItem {
     pub id: i64,
@@ -1222,15 +1243,45 @@ pub(crate) fn stock_bucket_quantity(
     location: Option<i64>,
     end: Option<chrono::NaiveDate>,
 ) -> Result<i128> {
-    let sql = "SELECT date, quantity FROM stock_adjustments WHERE company_id = ?1 AND item_id = ?2 AND batch_id IS ?3 AND (?4 IS NULL OR location_id = ?4)
-        UNION ALL SELECT v.date, CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND a.batch_id IS ?3 AND (?4 IS NULL OR a.location_id = ?4)
-        UNION ALL SELECT date, -quantity FROM stock_transfers WHERE company_id = ?1 AND item_id = ?2 AND batch_id IS ?3 AND (?4 IS NULL OR from_location_id = ?4)
-        UNION ALL SELECT date, quantity FROM stock_transfers WHERE company_id = ?1 AND item_id = ?2 AND batch_id IS ?3 AND (?4 IS NULL OR to_location_id = ?4)";
-    let mut stmt = conn.prepare(sql)?;
+    stock_bucket_quantity_in_scope(conn, company, item, batch, location, false, end)
+}
+
+fn stock_bucket_quantity_in_scope(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    batch: Option<i64>,
+    location: Option<i64>,
+    include_descendants: bool,
+    end: Option<chrono::NaiveDate>,
+) -> Result<i128> {
+    let sql = format!(
+        "{STOCK_LOCATION_BRANCH}
+         SELECT date, quantity FROM stock_adjustments
+         WHERE company_id = ?1 AND item_id = ?4 AND batch_id IS ?5
+           AND (?2 IS NULL OR location_id IN (SELECT id FROM branch))
+         UNION ALL
+         SELECT v.date, CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END
+         FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id
+         JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id
+         WHERE i.company_id = ?1 AND l.item_id = ?4 AND a.batch_id IS ?5
+           AND (?2 IS NULL OR a.location_id IN (SELECT id FROM branch))
+         UNION ALL
+         SELECT date, -quantity FROM stock_transfers
+         WHERE company_id = ?1 AND item_id = ?4 AND batch_id IS ?5
+           AND (?2 IS NULL OR from_location_id IN (SELECT id FROM branch))
+         UNION ALL
+         SELECT date, quantity FROM stock_transfers
+         WHERE company_id = ?1 AND item_id = ?4 AND batch_id IS ?5
+           AND (?2 IS NULL OR to_location_id IN (SELECT id FROM branch))"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let mut total = 0_i128;
-    for row in stmt.query_map(params![company, item, batch, location], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-    })? {
+    let rows = stmt.query_map(
+        params![company, location, include_descendants, item, batch],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+    )?;
+    for row in rows {
         let (date, quantity) = row?;
         let date = parse_date(&date)?;
         if end.is_none_or(|limit| date <= limit) {
@@ -1292,20 +1343,31 @@ impl Store {
         location: Option<i64>,
         as_of: Option<&str>,
     ) -> Result<i128> {
+        self.stock_batch_quantity_in_scope(company, item, batch, location, false, as_of)
+    }
+    pub fn stock_batch_quantity_in_scope(
+        &self,
+        company: i64,
+        item: i64,
+        batch: i64,
+        location: Option<i64>,
+        include_descendants: bool,
+        as_of: Option<&str>,
+    ) -> Result<i128> {
         check_stock_batch(&self.conn, company, item, Some(batch))?;
         if let Some(location) = location {
-            if !self
-                .stock_locations(company)?
-                .iter()
-                .any(|l| l.id == location)
-            {
-                return Err(Error::Validation(
-                    "Stock location not found in the selected company".into(),
-                ));
-            }
+            check_stock_location(&self.conn, company, location)?;
         }
         let end = as_of.map(parse_date).transpose()?;
-        stock_bucket_quantity(&self.conn, company, item, Some(batch), location, end)
+        stock_bucket_quantity_in_scope(
+            &self.conn,
+            company,
+            item,
+            Some(batch),
+            location,
+            include_descendants,
+            end,
+        )
     }
     pub fn stock_locations(&self, company_id: i64) -> Result<Vec<StockLocation>> {
         let mut stmt = self.conn.prepare(
@@ -1703,26 +1765,11 @@ impl Store {
         include_descendants: bool,
         as_of: Option<&str>,
     ) -> Result<Vec<StockBalance>> {
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM stock_locations WHERE id = ?1 AND company_id = ?2)",
-            params![location_id, company_id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(Error::Validation(
-                "Stock location not found in the selected company".into(),
-            ));
-        }
-
+        check_stock_location(&self.conn, company_id, location_id)?;
         let end = as_of.map(parse_date).transpose()?;
         let mut sums = HashMap::<i64, i128>::new();
-        let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE branch(id) AS (
-                SELECT id FROM stock_locations WHERE company_id = ?1 AND id = ?2
-                UNION
-                SELECT l.id FROM stock_locations l JOIN branch b ON b.id = l.parent_id
-                WHERE l.company_id = ?1 AND ?3
-             )
+        let mut stmt = self.conn.prepare(&format!(
+            "{STOCK_LOCATION_BRANCH}
              SELECT a.item_id, a.date, a.quantity
              FROM stock_adjustments a
              WHERE a.company_id = ?1 AND a.location_id IN (SELECT id FROM branch)
@@ -1739,7 +1786,7 @@ impl Store {
              UNION ALL
              SELECT item_id, date, quantity FROM stock_transfers
              WHERE company_id = ?1 AND to_location_id IN (SELECT id FROM branch)",
-        )?;
+        ))?;
         let movements = stmt.query_map(
             params![company_id, location_id, include_descendants],
             |row| {
@@ -1841,16 +1888,20 @@ impl Store {
         start: Option<&str>,
         end: Option<&str>,
     ) -> Result<StockRegister> {
+        self.stock_register_in_scope(company_id, item_id, location_id, false, start, end)
+    }
+
+    pub fn stock_register_in_scope(
+        &self,
+        company_id: i64,
+        item_id: i64,
+        location_id: Option<i64>,
+        include_descendants: bool,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<StockRegister> {
         if let Some(location) = location_id {
-            if !self
-                .stock_locations(company_id)?
-                .iter()
-                .any(|l| l.id == location)
-            {
-                return Err(Error::Validation(
-                    "Stock location not found in the selected company".into(),
-                ));
-            }
+            check_stock_location(&self.conn, company_id, location)?;
         }
         let start = start.map(parse_date).transpose()?;
         let end = end.map(parse_date).transpose()?;
@@ -1867,8 +1918,16 @@ impl Store {
                 Error::Validation("Stock item not found in the selected company".into())
             })?;
         let mut raw = Vec::<(chrono::NaiveDate, u8, i64, String, i64)>::new();
-        let mut stmt = self.conn.prepare("SELECT a.id, a.date, a.quantity, a.reason, loc.name, b.name FROM stock_adjustments a JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = a.company_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.company_id = ?1 AND a.item_id = ?2 AND (?3 IS NULL OR a.location_id = ?3)")?;
-        let rows = stmt.query_map(params![company_id, item_id, location_id], |r| {
+        let mut stmt = self.conn.prepare(&format!(
+            "{STOCK_LOCATION_BRANCH}
+             SELECT a.id, a.date, a.quantity, a.reason, loc.name, b.name FROM stock_adjustments a
+             JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = a.company_id
+             LEFT JOIN stock_batches b ON b.id = a.batch_id
+             WHERE a.company_id = ?1 AND a.item_id = ?4
+               AND (?2 IS NULL OR a.location_id IN (SELECT id FROM branch))"
+        ))?;
+        let scope = params![company_id, location_id, include_descendants, item_id];
+        let rows = stmt.query_map(scope, |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -1891,8 +1950,17 @@ impl Store {
                 qty,
             ));
         }
-        let mut stmt = self.conn.prepare("SELECT a.id, v.date, i.kind, v.reference, a.quantity, loc.name, b.name FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = i.company_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE i.company_id = ?1 AND l.item_id = ?2 AND (?3 IS NULL OR a.location_id = ?3)")?;
-        let rows = stmt.query_map(params![company_id, item_id, location_id], |r| {
+        let mut stmt = self.conn.prepare(&format!(
+            "{STOCK_LOCATION_BRANCH}
+             SELECT a.id, v.date, i.kind, v.reference, a.quantity, loc.name, b.name
+             FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id
+             JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id
+             JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = i.company_id
+             LEFT JOIN stock_batches b ON b.id = a.batch_id
+             WHERE i.company_id = ?1 AND l.item_id = ?4
+               AND (?2 IS NULL OR a.location_id IN (SELECT id FROM branch))"
+        ))?;
+        let rows = stmt.query_map(scope, |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -1924,26 +1992,33 @@ impl Store {
                 },
             ));
         }
-        if let Some(location) = location_id {
-            let mut stmt = self.conn.prepare("SELECT t.id, t.date, t.quantity, t.from_location_id, f.name, d.name, t.reason, b.name FROM stock_transfers t JOIN stock_locations f ON f.id = t.from_location_id AND f.company_id = t.company_id JOIN stock_locations d ON d.id = t.to_location_id AND d.company_id = t.company_id LEFT JOIN stock_batches b ON b.id = t.batch_id WHERE t.company_id = ?1 AND t.item_id = ?2 AND (t.from_location_id = ?3 OR t.to_location_id = ?3)")?;
-            for row in stmt.query_map(params![company_id, item_id, location], |r| {
+        if location_id.is_some() {
+            let mut stmt = self.conn.prepare(&format!(
+                "{STOCK_LOCATION_BRANCH}
+                 SELECT t.id, t.date,
+                        CASE WHEN source.id IS NULL THEN t.quantity ELSE -t.quantity END,
+                        f.name, d.name, t.reason, b.name
+                 FROM stock_transfers t
+                 JOIN stock_locations f ON f.id = t.from_location_id AND f.company_id = t.company_id
+                 JOIN stock_locations d ON d.id = t.to_location_id AND d.company_id = t.company_id
+                 LEFT JOIN stock_batches b ON b.id = t.batch_id
+                 LEFT JOIN branch source ON source.id = t.from_location_id
+                 LEFT JOIN branch destination ON destination.id = t.to_location_id
+                 WHERE t.company_id = ?1 AND t.item_id = ?4
+                   AND (source.id IS NULL) != (destination.id IS NULL)"
+            ))?;
+            for row in stmt.query_map(scope, |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(6)?,
                 ))
             })? {
-                let (id, date, quantity, from_id, from, to, reason, batch) = row?;
-                let change = if from_id == location {
-                    -quantity
-                } else {
-                    quantity
-                };
+                let (id, date, quantity, from, to, reason, batch) = row?;
                 raw.push((
                     parse_date(&date)?,
                     2,
@@ -1952,7 +2027,7 @@ impl Store {
                         "Transfer {from} to {to}, batch {}: {reason}",
                         batch.as_deref().unwrap_or("unbatched")
                     ),
-                    change,
+                    quantity,
                 ));
             }
         }

@@ -2503,17 +2503,18 @@ impl App {
             }
         }
         if let Some(item) = self.batch_item {
-            ui.small("Batch quantities use the stock location and as-of filters below. Existing unbatched quantities are not included.");
+            ui.small("Batch quantities use the location and as-of filters below. They include movements assigned to the selected batch.");
             match self.store.stock_batches(company, item) {
                 Ok(batches) => {
                     for batch in batches {
                         let as_of = (!self.stock_as_of.trim().is_empty())
                             .then_some(self.stock_as_of.trim());
-                        match self.store.stock_batch_quantity(
+                        match self.store.stock_batch_quantity_in_scope(
                             company,
                             item,
                             batch.id,
                             self.stock_balance_location,
+                            self.stock_balance_descendants,
                             as_of,
                         ) {
                             Ok(qty) => {
@@ -2855,7 +2856,7 @@ impl App {
             Some(location) => {
                 ui.checkbox(
                     &mut self.stock_balance_descendants,
-                    "Include child locations in quantity totals",
+                    "Include descendant locations",
                 );
                 if ui
                     .button("Export selected location totals as CSV")
@@ -2922,7 +2923,7 @@ impl App {
         }
         ui.separator();
         ui.heading("Stock activity");
-        ui.small("The location filter above also applies to stock activity; transfers are shown when a location is selected.");
+        ui.small("Stock activity uses the location scope above. It shows transfers into or out of that scope.");
         pick_stock(
             ui,
             "stock-register-item",
@@ -2955,10 +2956,14 @@ impl App {
             } else {
                 Some(self.stock_register_to.trim())
             };
-            match self
-                .store
-                .stock_register_at(company, item, self.stock_balance_location, from, to)
-            {
+            match self.store.stock_register_in_scope(
+                company,
+                item,
+                self.stock_balance_location,
+                self.stock_balance_descendants,
+                from,
+                to,
+            ) {
                 Ok(register) => {
                     ui.label(format!(
                         "Opening: {} {}",
