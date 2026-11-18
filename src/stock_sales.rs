@@ -3,11 +3,19 @@ use crate::{parse_date, Result};
 use chrono::NaiveDate;
 use rusqlite::Connection;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SaleCostOrigin {
+    Invoice(i64),
+    Delivery(i64),
+}
+
 #[derive(Debug, Clone)]
 pub struct StockSale {
     pub line_id: i64,
     pub item_id: i64,
     pub original_date: NaiveDate,
+    pub(crate) cost_date: NaiveDate,
+    pub(crate) cost_origin: SaleCostOrigin,
     pub invoice_id: i64,
     pub voucher_id: i64,
     pub date: NaiveDate,
@@ -28,18 +36,31 @@ pub(crate) fn stock_sales(
 ) -> Result<Vec<StockSale>> {
     let mut stmt = conn.prepare(
         "SELECT i.id, v.id, v.date, v.reference, s.id, s.name, s.unit, l.quantity, l.amount,
-                rv.id, rv.date, rv.reference, l.id
+                rv.id, rv.date, rv.reference, l.id, nl.note_line_id, note.date
          FROM invoices i JOIN invoice_lines l ON l.invoice_id = i.id
          JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = i.company_id
          JOIN stock_items s ON s.id = l.item_id AND s.company_id = i.company_id
          LEFT JOIN invoice_reversals r ON r.invoice_id = i.id AND r.company_id = i.company_id
          LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
+         LEFT JOIN stock_note_invoice_lines nl ON nl.invoice_line_id = l.id
+         LEFT JOIN stock_note_invoices sn ON sn.invoice_id = i.id
+         LEFT JOIN stock_notes note ON note.id = sn.note_id AND note.company_id = i.company_id
          WHERE i.company_id = ?1 AND i.kind = 'Sale' ORDER BY v.id, l.id",
     )?;
     let mut rows = stmt.query([company])?;
     let mut sales = Vec::new();
     while let Some(row) = rows.next()? {
         let original_date = parse_date(&row.get::<_, String>(2)?)?;
+        let line_id = row.get(12)?;
+        let cost_origin = row
+            .get::<_, Option<i64>>(13)?
+            .map_or(SaleCostOrigin::Invoice(line_id), SaleCostOrigin::Delivery);
+        let cost_date = row
+            .get::<_, Option<String>>(14)?
+            .as_deref()
+            .map(parse_date)
+            .transpose()?
+            .unwrap_or(original_date);
         let reversal_date = row
             .get::<_, Option<String>>(10)?
             .as_deref()
@@ -57,9 +78,11 @@ pub(crate) fn stock_sales(
                 continue;
             }
             sales.push(StockSale {
-                line_id: row.get(12)?,
+                line_id,
                 item_id: row.get(4)?,
                 original_date,
+                cost_date,
+                cost_origin,
                 invoice_id: row.get(0)?,
                 voucher_id,
                 date,

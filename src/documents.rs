@@ -1,8 +1,9 @@
-//! Printable invoice, quotation and payroll records.
+//! Printable invoice, quotation, stock note and payroll records.
 use crate::{
     format_amount,
     inventory::{format_quantity, line_amount, InvoiceDiscount},
     quotations::quotation,
+    stock_notes::{get_note, note_label},
     Error, Result, Store,
 };
 use std::{fmt::Write as _, io::Write as _, path::Path};
@@ -62,6 +63,53 @@ fn write_html(destination: &Path, html: &str) -> Result<()> {
 }
 
 impl Store {
+    pub fn export_stock_note_html(
+        &self,
+        company_id: i64,
+        note_id: i64,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let destination = html_destination(destination.as_ref())?;
+        let company = self
+            .companies()?
+            .into_iter()
+            .find(|company| company.id == company_id)
+            .ok_or_else(|| Error::Validation("Company not found".into()))?;
+        let note = get_note(&self.conn, company_id, note_id)?;
+        let lines = self.stock_note_lines(company_id, note_id)?;
+        let title = format!("{} {}", note_label(note.kind), note.reference);
+        let mut html = printable_html(&title);
+        let _ = write!(
+            html,
+            "<h1>{}</h1><p><strong>{}</strong><br>Party: {}<br>Date: {}",
+            escape(&title),
+            escape(&company.name),
+            escape(&note.party),
+            escape(&note.date),
+        );
+        if let Some(date) = &note.reversed_on {
+            let _ = write!(html, "<br><strong>Reversed {}</strong>", escape(date));
+        }
+        html.push_str("</p><table><thead><tr><th>Item</th><th>Location</th><th>Batch</th><th class=\"num\">Quantity</th></tr></thead><tbody>");
+        for line in lines {
+            let _ = write!(
+                html,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{} {}</td></tr>",
+                escape(&line.item),
+                escape(&line.location),
+                escape(line.batch.as_deref().unwrap_or("Unbatched")),
+                format_quantity(i128::from(line.values.quantity)),
+                escape(&line.unit),
+            );
+        }
+        html.push_str("</tbody></table>");
+        if !note.narration.is_empty() {
+            let _ = write!(html, "<p>{}</p>", escape(&note.narration));
+        }
+        html.push_str("</body></html>");
+        write_html(destination, &html)
+    }
+
     pub fn export_quotation_html(
         &self,
         company_id: i64,

@@ -235,7 +235,7 @@ impl Store {
             missing_rates: 0,
         };
         for sale in crate::stock_sales::stock_sales(&tx, company, start, end)? {
-            let unit_cost = effective(&schedule, sale.item_id, sale.original_date);
+            let unit_cost = effective(&schedule, sale.item_id, sale.cost_date);
             let standard_cost = unit_cost
                 .map(|cost| priced(sale.quantity, cost))
                 .transpose()?;

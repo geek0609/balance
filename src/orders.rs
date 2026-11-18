@@ -113,6 +113,7 @@ pub struct OrderLineProgress {
     pub item: String,
     pub unit: String,
     pub fulfilled: i64,
+    pub billed: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -171,8 +172,7 @@ const ORDER_SUMMARIES: &str =
     "SELECT o.id, o.kind, o.party_ledger_id, l.name, o.reference, o.date,
             o.expected_on, o.notes, o.closed_at, o.close_reason,
             EXISTS(SELECT 1 FROM order_line_progress p WHERE p.order_id = o.id AND p.fulfilled < p.quantity),
-            EXISTS(SELECT 1 FROM invoice_order_links link WHERE link.order_id = o.id
-                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id))
+            EXISTS(SELECT 1 FROM order_line_progress p WHERE p.order_id = o.id AND p.fulfilled > 0)
      FROM orders o JOIN ledgers l ON l.id = o.party_ledger_id AND l.company_id = o.company_id
      WHERE o.company_id = ?1";
 
@@ -182,12 +182,12 @@ fn read_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrderSummary> {
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(err)))?;
     let closed_at: Option<String> = row.get(8)?;
     let pending: bool = row.get(10)?;
-    let has_invoices: bool = row.get(11)?;
+    let has_fulfilment: bool = row.get(11)?;
     let status = if closed_at.is_some() {
         OrderStatus::Closed
     } else if !pending {
         OrderStatus::Fulfilled
-    } else if has_invoices {
+    } else if has_fulfilment {
         OrderStatus::Partial
     } else {
         OrderStatus::Open
@@ -219,7 +219,7 @@ fn order_summary(conn: &Connection, company: i64, order: i64) -> Result<OrderSum
 
 fn order_lines(conn: &Connection, order: i64) -> Result<Vec<OrderLineProgress>> {
     let mut stmt = conn.prepare(
-        "SELECT p.item_id, p.quantity, p.unit_price, s.name, s.unit, p.fulfilled
+        "SELECT p.item_id, p.quantity, p.unit_price, s.name, s.unit, p.fulfilled, p.billed
          FROM order_line_progress p JOIN stock_items s ON s.id = p.item_id
          WHERE p.order_id = ?1 ORDER BY p.id",
     )?;
@@ -233,13 +233,15 @@ fn order_lines(conn: &Connection, order: i64) -> Result<Vec<OrderLineProgress>> 
             item: row.get(3)?,
             unit: row.get(4)?,
             fulfilled: row.get(5)?,
+            billed: row.get(6)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     if rows.is_empty()
-        || rows
-            .iter()
-            .any(|row| !(0..=row.line.quantity).contains(&row.fulfilled))
+        || rows.iter().any(|row| {
+            !(0..=row.line.quantity).contains(&row.fulfilled)
+                || !(0..=row.fulfilled).contains(&row.billed)
+        })
     {
         return Err(Error::Validation(
             "Order quantities are inconsistent".into(),
@@ -316,6 +318,70 @@ pub(crate) fn insert_order(conn: &Connection, company: i64, draft: &OrderDraft) 
             )?;
     }
     Ok(order)
+}
+
+pub(crate) fn check_fulfilment(
+    conn: &Connection,
+    company: i64,
+    id: i64,
+    kind: InvoiceKind,
+    party: i64,
+    date: NaiveDate,
+    items: impl IntoIterator<Item = (i64, i64)>,
+) -> Result<()> {
+    let order = order_summary(conn, company, id)?;
+    if !order.status.has_pending() {
+        return Err(Error::Validation(
+            "This order has no unfulfilled quantities".into(),
+        ));
+    }
+    if kind != order.kind || party != order.party_ledger_id {
+        return Err(Error::Validation(
+            "Document type and party must match the order".into(),
+        ));
+    }
+    if date < parse_date(&order.date)? {
+        return Err(Error::Validation(
+            "The document date cannot precede the order date".into(),
+        ));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT v.date FROM invoice_order_links link
+         JOIN invoice_reversals r ON r.invoice_id = link.invoice_id
+         JOIN vouchers v ON v.id = r.reversal_voucher_id
+         WHERE link.order_id = ?1
+           AND NOT EXISTS(SELECT 1 FROM stock_note_invoices n WHERE n.invoice_id = link.invoice_id)
+         UNION ALL
+         SELECT reversed_on FROM stock_notes WHERE order_id = ?1 AND reversed_on IS NOT NULL",
+    )?;
+    for row in stmt.query_map([id], |row| row.get::<_, String>(0))? {
+        if date < parse_date(&row?)? {
+            return Err(Error::Validation(
+                "The document date cannot precede an existing stock reversal on the order".into(),
+            ));
+        }
+    }
+    let progress = order_lines(conn, id)?;
+    let mut remaining: HashMap<_, _> = progress
+        .iter()
+        .map(|row| (row.line.item_id, (row.unfulfilled(), row.item.as_str())))
+        .collect();
+    let mut items = items.into_iter().peekable();
+    if items.peek().is_none() {
+        return Err(Error::Validation("Add an item to fulfil this order".into()));
+    }
+    for (item, quantity) in items {
+        let (pending, name) = remaining
+            .get_mut(&item)
+            .ok_or_else(|| Error::Validation("Every stock item must appear on the order".into()))?;
+        if quantity <= 0 || quantity > *pending {
+            return Err(Error::Validation(format!(
+                "Quantity for {name} exceeds the pending amount or is not positive"
+            )));
+        }
+        *pending -= quantity;
+    }
+    Ok(())
 }
 
 impl Store {
@@ -509,62 +575,15 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let order = order_summary(&tx, company, id)?;
-        if !order.status.has_pending() {
-            return Err(Error::Validation(
-                "This order has no pending quantities to invoice".into(),
-            ));
-        }
-        if draft.kind != order.kind || draft.party_ledger_id != order.party_ledger_id {
-            return Err(Error::Validation(
-                "Invoice type and party must match the order".into(),
-            ));
-        }
-        let invoice_date = parse_date(&draft.date)?;
-        if invoice_date < parse_date(&order.date)? {
-            return Err(Error::Validation(
-                "Invoice date cannot precede the order date".into(),
-            ));
-        }
-        if draft.lines.is_empty() {
-            return Err(Error::Validation(
-                "Add an ordered item to fulfil this order".into(),
-            ));
-        }
-        {
-            let mut stmt = tx.prepare(
-                "SELECT v.date FROM invoice_order_links link
-                 JOIN invoice_reversals r ON r.invoice_id = link.invoice_id
-                 JOIN vouchers v ON v.id = r.reversal_voucher_id
-                 WHERE link.order_id = ?1",
-            )?;
-            for row in stmt.query_map([id], |row| row.get::<_, String>(0))? {
-                if invoice_date < parse_date(&row?)? {
-                    return Err(Error::Validation(
-                        "Invoice date cannot precede an existing invoice reversal on the order"
-                            .into(),
-                    ));
-                }
-            }
-        }
-        let progress = order_lines(&tx, id)?;
-        let mut remaining: HashMap<_, _> = progress
-            .iter()
-            .map(|row| (row.line.item_id, (row.unfulfilled(), row.item.as_str())))
-            .collect();
-        for line in &draft.lines {
-            let (quantity, name) = remaining.get_mut(&line.item_id).ok_or_else(|| {
-                Error::Validation(
-                    "Every stock item on this invoice must appear on the order".into(),
-                )
-            })?;
-            if line.quantity <= 0 || line.quantity > *quantity {
-                return Err(Error::Validation(format!(
-                    "Quantity for {name} exceeds the pending amount or is not positive"
-                )));
-            }
-            *quantity -= line.quantity;
-        }
+        check_fulfilment(
+            &tx,
+            company,
+            id,
+            draft.kind,
+            draft.party_ledger_id,
+            parse_date(&draft.date)?,
+            draft.lines.iter().map(|line| (line.item_id, line.quantity)),
+        )?;
         let (invoice, _) = insert_invoice_on_connection(&tx, company, draft)?;
         tx.execute(
             "INSERT INTO invoice_order_links(invoice_id, order_id) VALUES (?1, ?2)",

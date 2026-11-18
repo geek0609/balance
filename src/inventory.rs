@@ -20,7 +20,7 @@ const STOCK_LOCATION_BRANCH: &str = "WITH RECURSIVE branch(id) AS (
     WHERE l.company_id = ?1 AND ?3
 )";
 
-fn check_stock_location(conn: &Connection, company: i64, location: i64) -> Result<()> {
+pub(crate) fn check_stock_location(conn: &Connection, company: i64, location: i64) -> Result<()> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM stock_locations WHERE id = ?1 AND company_id = ?2)",
         params![location, company],
@@ -216,6 +216,7 @@ pub struct InvoiceSummary {
     pub has_settlement_history: bool,
     pub has_advance_history: bool,
     pub order_id: Option<i64>,
+    pub stock_note_id: Option<i64>,
     pub reversal: Option<crate::invoice_reversals::InvoiceReversal>,
     pub lines: Vec<InvoiceDetailLine>,
     pub adjustments: Vec<InvoiceAdjustmentDetail>,
@@ -1262,7 +1263,7 @@ fn stock_bucket_quantity_in_scope(
            AND (?2 IS NULL OR location_id IN (SELECT id FROM branch))
          UNION ALL
          SELECT v.date, CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END
-         FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id
+         FROM invoice_line_allocations a JOIN physical_invoice_lines l ON l.id = a.line_id
          JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id
          WHERE i.company_id = ?1 AND l.item_id = ?4 AND a.batch_id IS ?5
            AND (?2 IS NULL OR a.location_id IN (SELECT id FROM branch))
@@ -1776,7 +1777,7 @@ impl Store {
              UNION ALL
              SELECT l.item_id, v.date, CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END
              FROM invoice_line_allocations a
-             JOIN invoice_lines l ON l.id = a.line_id
+             JOIN physical_invoice_lines l ON l.id = a.line_id
              JOIN invoices i ON i.id = l.invoice_id
              JOIN vouchers v ON v.id = i.voucher_id
              WHERE i.company_id = ?1 AND a.location_id IN (SELECT id FROM branch)
@@ -1840,7 +1841,7 @@ impl Store {
                 *sums.entry(id).or_default() += i128::from(quantity);
             }
         }
-        let mut invoices = self.conn.prepare("SELECT l.item_id, v.date, i.kind, l.quantity FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1")?;
+        let mut invoices = self.conn.prepare("SELECT l.item_id, v.date, i.kind, l.quantity FROM physical_invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1")?;
         let rows = invoices.query_map([company_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -1953,7 +1954,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "{STOCK_LOCATION_BRANCH}
              SELECT a.id, v.date, i.kind, v.reference, a.quantity, loc.name, b.name
-             FROM invoice_line_allocations a JOIN invoice_lines l ON l.id = a.line_id
+             FROM invoice_line_allocations a JOIN physical_invoice_lines l ON l.id = a.line_id
              JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id
              JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = i.company_id
              LEFT JOIN stock_batches b ON b.id = a.batch_id
@@ -2189,6 +2190,11 @@ impl Store {
         if crate::orders::linked_order(&tx, invoice_id)?.is_some() {
             return Err(Error::Validation(
                 "An invoice linked to an order cannot yet be edited".into(),
+            ));
+        }
+        if crate::stock_notes::linked_note(&tx, invoice_id)?.is_some() {
+            return Err(Error::Validation(
+                "An invoice linked to a stock note cannot be edited. Reverse it and create a replacement.".into(),
             ));
         }
         if crate::advances::invoice_allocation_state(&tx, company_id, invoice_id, None)?.has_history
@@ -2452,6 +2458,7 @@ impl Store {
                 has_advance_history: advances.has_history,
                 advance_applied: advances.applied,
                 order_id: crate::orders::linked_order(&self.conn, id)?,
+                stock_note_id: crate::stock_notes::linked_note(&self.conn, id)?,
                 lines,
                 adjustments,
             });

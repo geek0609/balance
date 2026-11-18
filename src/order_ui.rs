@@ -1,6 +1,7 @@
-use super::{money, pick_account, pick_stock, App, InvoiceLineForm, Page};
+use super::{money, pick_account, pick_stock, App, InvoiceLineForm, InvoiceSource};
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind};
 use balance::orders::{OrderDetail, OrderDraft, OrderLine, OrderStatus};
+use balance::stock_notes::note_label;
 use balance::{format_amount, parse_amount, Category, Error, Result};
 use eframe::egui;
 
@@ -634,7 +635,14 @@ impl App {
         egui::Grid::new(("order-detail", order.id))
             .striped(true)
             .show(ui, |ui| {
-                for label in ["Item", "Ordered", "Invoiced", "Unfulfilled", "Unit price"] {
+                for label in [
+                    "Item",
+                    "Ordered",
+                    "Fulfilled",
+                    "Invoiced",
+                    "Unfulfilled",
+                    "Unit price",
+                ] {
                     ui.strong(label);
                 }
                 ui.end_row();
@@ -646,6 +654,7 @@ impl App {
                         row.unit
                     ));
                     ui.label(format_quantity(row.fulfilled.into()));
+                    ui.label(format_quantity(row.billed.into()));
                     ui.label(format_quantity(row.unfulfilled().into()));
                     ui.label(format_amount(row.line.unit_price));
                     ui.end_row();
@@ -671,7 +680,33 @@ impl App {
         if let (Some(at), Some(reason)) = (&order.closed_at, &order.close_reason) {
             ui.label(format!("Closed {at} UTC | {reason}"));
         }
+        match self.store.stock_notes(company, Some(order.id)) {
+            Ok(notes) => {
+                for note in notes {
+                    let label = format!(
+                        "{} {} · {} · {}",
+                        note_label(note.kind),
+                        note.reference,
+                        note.date,
+                        note.status()
+                    );
+                    if ui.link(label).clicked() {
+                        self.open_stock_note(note.id);
+                    }
+                }
+            }
+            Err(error) => self.failure(error),
+        }
         if order.status.has_pending() {
+            if ui
+                .button(format!(
+                    "Prepare {} (replace note draft)",
+                    note_label(order.kind).to_lowercase()
+                ))
+                .clicked()
+            {
+                self.prepare_order_stock_note(detail);
+            }
             if ui
                 .add_enabled(
                     !self.invoice_draft_in_use(),
@@ -688,7 +723,7 @@ impl App {
                 );
                 if ui
                     .add_enabled(
-                        self.invoice_order != Some(order.id)
+                        self.invoice_source != Some(InvoiceSource::Order(order.id))
                             && !self.order_screen.close_reason.trim().is_empty(),
                         egui::Button::new("Close unfulfilled quantities"),
                     )
@@ -711,21 +746,7 @@ impl App {
 
     fn prepare_order_invoice(&mut self, detail: &OrderDetail) {
         let order = &detail.summary;
-        self.invoice_order = Some(order.id);
-        self.invoice_kind = order.kind;
-        self.invoice_party = Some(order.party_ledger_id);
-        self.invoice_trade = None;
-        self.invoice_date.clear();
-        self.invoice_reference.clear();
-        self.invoice_narration.clear();
-        self.invoice_due_date.clear();
-        self.invoice_credit_days.clear();
-        self.invoice_tax_amount.clear();
-        self.invoice_additional_taxes.clear();
-        self.clear_invoice_tax_context();
-        self.invoice_tax_ledger = None;
-        self.invoice_adjustments.clear();
-        self.invoice_lines = detail
+        let lines = detail
             .lines
             .iter()
             .filter(|line| line.unfulfilled() > 0)
@@ -737,7 +758,11 @@ impl App {
                 form
             })
             .collect();
-        self.page = Page::Invoice;
-        self.message.clear();
+        self.prepare_linked_invoice(
+            InvoiceSource::Order(order.id),
+            order.kind,
+            order.party_ledger_id,
+            lines,
+        );
     }
 }

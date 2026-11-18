@@ -28,6 +28,7 @@ mod order_ui;
 mod payroll_ui;
 mod recurring_ui;
 mod stock_count_ui;
+mod stock_note_ui;
 mod tax_ui;
 #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
 mod updates;
@@ -43,6 +44,7 @@ use order_ui::OrderScreen;
 use payroll_ui::PayrollScreen;
 use recurring_ui::RecurringJournalScreen;
 use stock_count_ui::StockCountScreen;
+use stock_note_ui::StockNoteScreen;
 use tax_ui::{TaxProfileScreen, TaxRegisterScreen};
 use valuation_ui::ValuationScreen;
 
@@ -55,6 +57,7 @@ enum Page {
     Import,
     Stock,
     StockCounts,
+    StockNotes,
     Valuation,
     Manufacturing,
     Invoice,
@@ -74,6 +77,12 @@ enum Page {
     CashFlow,
     Recurring,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InvoiceSource {
+    Order(i64),
+    StockNote(i64),
+}
+
 struct App {
     store: Store,
     #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
@@ -226,9 +235,10 @@ struct App {
     invoice_adjustments: Vec<InvoiceAdjustmentForm>,
     editing_invoice: Option<i64>,
     copying_invoice: bool,
-    invoice_order: Option<i64>,
+    invoice_source: Option<InvoiceSource>,
     order_screen: OrderScreen,
     stock_count_screen: StockCountScreen,
+    stock_note_screen: StockNoteScreen,
     cost_screen: CostScreen,
     valuation_screen: ValuationScreen,
     actual_cost_screen: ActualCostScreen,
@@ -490,9 +500,10 @@ impl App {
             invoice_adjustments: Vec::new(),
             editing_invoice: None,
             copying_invoice: false,
-            invoice_order: None,
+            invoice_source: None,
             order_screen: OrderScreen::default(),
             stock_count_screen: StockCountScreen::default(),
+            stock_note_screen: StockNoteScreen::default(),
             cost_screen: CostScreen::default(),
             valuation_screen: ValuationScreen::default(),
             actual_cost_screen: ActualCostScreen::default(),
@@ -618,9 +629,10 @@ impl App {
         self.invoice_adjustments.clear();
         self.editing_invoice = None;
         self.copying_invoice = false;
-        self.invoice_order = None;
+        self.invoice_source = None;
         self.order_screen = OrderScreen::default();
         self.stock_count_screen = StockCountScreen::default();
+        self.stock_note_screen = StockNoteScreen::default();
         self.cost_screen = CostScreen::default();
         self.valuation_screen = ValuationScreen::default();
         self.actual_cost_screen = ActualCostScreen::default();
@@ -3004,11 +3016,37 @@ impl App {
         }
     }
     fn invoice_draft_in_use(&self) -> bool {
-        self.editing_invoice.is_some() || self.copying_invoice || self.invoice_order.is_some()
+        self.editing_invoice.is_some() || self.copying_invoice || self.invoice_source.is_some()
+    }
+
+    fn prepare_linked_invoice(
+        &mut self,
+        source: InvoiceSource,
+        kind: InvoiceKind,
+        party: i64,
+        lines: Vec<InvoiceLineForm>,
+    ) {
+        self.invoice_source = Some(source);
+        self.invoice_kind = kind;
+        self.invoice_party = Some(party);
+        self.invoice_trade = None;
+        self.invoice_date.clear();
+        self.invoice_reference.clear();
+        self.invoice_narration.clear();
+        self.invoice_due_date.clear();
+        self.invoice_credit_days.clear();
+        self.invoice_tax_amount.clear();
+        self.invoice_additional_taxes.clear();
+        self.clear_invoice_tax_context();
+        self.invoice_tax_ledger = None;
+        self.invoice_adjustments.clear();
+        self.invoice_lines = lines;
+        self.page = Page::Invoice;
+        self.message.clear();
     }
 
     fn load_invoice_form(&mut self, draft: InvoiceDraft, edit: Option<i64>) {
-        self.invoice_order = None;
+        self.invoice_source = None;
         self.editing_invoice = edit;
         self.copying_invoice = edit.is_none();
         self.invoice_kind = draft.kind;
@@ -3102,13 +3140,23 @@ impl App {
     fn invoice_page(&mut self, ui: &mut egui::Ui, company: i64) {
         ui.heading(match self.editing_invoice {
             Some(id) => format!("Edit invoice {id}"),
-            None if self.invoice_order.is_some() => "New invoice for an order".into(),
+            None if self.invoice_source.is_some() => "Invoice linked stock".into(),
             None if self.copying_invoice => "New invoice from copy".into(),
             None => "Sales and purchase invoices".into(),
         });
-        ui.label("Save an invoice to create its accounting voucher and any stock movements together. For services, remove all item lines and add a positive service / charge line. Item prices are per unit; each line rounds to two decimal places.");
-        if let Some(order) = self.invoice_order {
-            ui.label(format!("Order {order}. Adjust the quantities for this invoice and check the prices before saving."));
+        let from_note = matches!(self.invoice_source, Some(InvoiceSource::StockNote(_)));
+        match self.invoice_source {
+            Some(InvoiceSource::Order(order)) => {
+                ui.label(format!(
+                    "Order {order}. Review quantities and prices before saving."
+                ));
+            }
+            Some(InvoiceSource::StockNote(note)) => {
+                ui.label(format!("Stock note {note}. Quantities, locations and batches come from the note. Review prices and tax before posting the invoice."));
+            }
+            None => {
+                ui.label("Save an invoice to create its accounting voucher and any stock movements together. For services, remove all item lines and add a positive service / charge line. Item prices are per unit; each line rounds to two decimal places.");
+            }
         }
         let items = match self.store.stock_items(company) {
             Ok(v) => v,
@@ -3150,13 +3198,15 @@ impl App {
             }
         };
         ui.horizontal(|ui| {
-            egui::ComboBox::from_label("Type")
-                .selected_text(self.invoice_kind.as_str())
-                .show_ui(ui, |ui| {
-                    for kind in InvoiceKind::ALL {
-                        ui.selectable_value(&mut self.invoice_kind, kind, kind.as_str());
-                    }
-                });
+            ui.add_enabled_ui(!from_note, |ui| {
+                egui::ComboBox::from_label("Type")
+                    .selected_text(self.invoice_kind.as_str())
+                    .show_ui(ui, |ui| {
+                        for kind in InvoiceKind::ALL {
+                            ui.selectable_value(&mut self.invoice_kind, kind, kind.as_str());
+                        }
+                    });
+            });
             ui.label("Date");
             ui.add(egui::TextEdit::singleline(&mut self.invoice_date).hint_text("YYYY-MM-DD"));
             ui.label("Due date (optional)");
@@ -3226,14 +3276,16 @@ impl App {
             }
         });
         ui.small("Price lookup uses the invoice date and only fills blank prices. A saved invoice keeps its entered price, not the price-list link.");
-        pick_account(
-            ui,
-            "invoice-party",
-            "Party",
-            &ledgers,
-            &mut self.invoice_party,
-            false,
-        );
+        ui.add_enabled_ui(!from_note, |ui| {
+            pick_account(
+                ui,
+                "invoice-party",
+                "Party",
+                &ledgers,
+                &mut self.invoice_party,
+                false,
+            );
+        });
         if let Some(party) = self.invoice_party {
             if ledgers.iter().any(|ledger| {
                 ledger.id == party
@@ -3324,25 +3376,27 @@ impl App {
         for (index, line) in self.invoice_lines.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("{}.", index + 1));
-                let previous_item = line.item;
-                pick_stock(ui, ("invoice-item", index), "Item", &items, &mut line.item);
-                if previous_item != line.item {
-                    line.batch = None;
-                    for allocation in &mut line.extra_allocations {
-                        allocation.batch = None;
+                ui.add_enabled_ui(!from_note, |ui| {
+                    let previous_item = line.item;
+                    pick_stock(ui, ("invoice-item", index), "Item", &items, &mut line.item);
+                    if previous_item != line.item {
+                        line.batch = None;
+                        for allocation in &mut line.extra_allocations {
+                            allocation.batch = None;
+                        }
                     }
-                }
-                if let Some(batches) = line.item.and_then(|item| item_batches.get(&item)) {
-                    pick_batch(ui, ("invoice-batch", index), batches, &mut line.batch);
-                }
-                pick_location(
-                    ui,
-                    ("invoice-location", index),
-                    "Location",
-                    &locations,
-                    &mut line.location,
-                    false,
-                );
+                    if let Some(batches) = line.item.and_then(|item| item_batches.get(&item)) {
+                        pick_batch(ui, ("invoice-batch", index), batches, &mut line.batch);
+                    }
+                    pick_location(
+                        ui,
+                        ("invoice-location", index),
+                        "Location",
+                        &locations,
+                        &mut line.location,
+                        false,
+                    );
+                });
                 let trade = ledgers
                     .iter()
                     .find(|ledger| Some(ledger.id) == line.trade_ledger)
@@ -3360,11 +3414,13 @@ impl App {
                             );
                         }
                     });
-                ui.add(
-                    egui::TextEdit::singleline(&mut line.quantity)
-                        .hint_text("Quantity")
-                        .desired_width(90.0),
-                );
+                ui.add_enabled_ui(!from_note, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut line.quantity)
+                            .hint_text("Quantity")
+                            .desired_width(90.0),
+                    );
+                });
                 ui.add(
                     egui::TextEdit::singleline(&mut line.price)
                         .hint_text("Unit price")
@@ -3413,7 +3469,7 @@ impl App {
                         ));
                     }
                 }
-                if ui.button("Remove").clicked() {
+                if !from_note && ui.button("Remove").clicked() {
                     remove = Some(index);
                 }
             });
@@ -3453,7 +3509,7 @@ impl App {
             if !line.extra_allocations.is_empty() {
                 ui.small("The first location receives the remaining quantity.");
             }
-            if ui.button("Add location or batch allocation").clicked() {
+            if !from_note && ui.button("Add location or batch allocation").clicked() {
                 line.extra_allocations.push(InvoiceAllocationForm {
                     location: main_location,
                     batch: None,
@@ -3464,7 +3520,7 @@ impl App {
         if let Some(index) = remove {
             self.invoice_lines.remove(index);
         }
-        if ui.button("Add item line").clicked() {
+        if !from_note && ui.button("Add item line").clicked() {
             self.invoice_lines.push(InvoiceLineForm::new());
         }
         ui.heading("Services, charges and deductions");
@@ -3523,7 +3579,7 @@ impl App {
         if self.invoice_draft_in_use() && ui.button("Cancel invoice draft").clicked() {
             self.editing_invoice = None;
             self.copying_invoice = false;
-            self.invoice_order = None;
+            self.invoice_source = None;
             self.invoice_date.clear();
             self.invoice_party = None;
             self.invoice_trade = None;
@@ -3649,10 +3705,16 @@ impl App {
                 if let Some(id) = self.editing_invoice {
                     self.store.update_invoice(company, id, &draft)?;
                     Ok(id)
-                } else if let Some(order) = self.invoice_order {
-                    self.store.invoice_order(company, order, &draft)
                 } else {
-                    self.store.create_invoice(company, &draft)
+                    match self.invoice_source {
+                        Some(InvoiceSource::Order(order)) => {
+                            self.store.invoice_order(company, order, &draft)
+                        }
+                        Some(InvoiceSource::StockNote(note)) => {
+                            self.store.invoice_stock_note(company, note, &draft)
+                        }
+                        None => self.store.create_invoice(company, &draft),
+                    }
                 }
             })();
             match result {
@@ -3670,7 +3732,7 @@ impl App {
                     self.invoice_tax_ledger = None;
                     self.editing_invoice = None;
                     self.copying_invoice = false;
-                    self.invoice_order = None;
+                    self.invoice_source = None;
                 }
                 Err(e) => self.failure(e),
             }
@@ -3897,6 +3959,7 @@ impl App {
                                 && !invoice.has_advance_history
                                 && invoice.reversal.is_none()
                                 && invoice.order_id.is_none()
+                                && invoice.stock_note_id.is_none()
                                 && !self.invoice_draft_in_use(),
                             egui::Button::new("Edit invoice"),
                         )
@@ -3926,6 +3989,11 @@ impl App {
                         }
                     }
                     self.invoice_reversal_form(ui, company, &invoice);
+                    if let Some(note) = invoice.stock_note_id {
+                        if ui.link(format!("View stock note {note}")).clicked() {
+                            self.open_stock_note(note);
+                        }
+                    }
                     if let Some(order) = invoice.order_id {
                         if ui.link(format!("View linked order {order}")).clicked() {
                             self.order_screen.select(order);
@@ -4169,7 +4237,11 @@ impl App {
         if form.invoice_id != invoice.id {
             return;
         }
-        ui.small("This reverses the whole invoice and its stock quantities. The original invoice remains in the history.");
+        if invoice.stock_note_id.is_some() {
+            ui.small("This posts a financial reversal. Reverse the linked stock note separately if the goods movement also needs correction.");
+        } else {
+            ui.small("This reverses the whole invoice and its stock quantities. The original invoice remains in the history.");
+        }
         egui::Grid::new(("reverse-invoice", invoice.id)).show(ui, |ui| {
             for (label, value) in [
                 ("Note date (YYYY-MM-DD)", &mut form.date),
@@ -5512,6 +5584,7 @@ impl eframe::App for App {
                 ("Cash flow", Page::CashFlow),
                 ("Stock", Page::Stock),
                 ("Stock counts", Page::StockCounts),
+                ("Delivery and receipt notes", Page::StockNotes),
                 ("Stock valuation", Page::Valuation),
                 ("Manufacturing", Page::Manufacturing),
                 ("Invoices", Page::Invoice),
@@ -5563,6 +5636,7 @@ impl eframe::App for App {
                     Page::CashFlow => self.cash_flow_page(ui, company),
                     Page::Stock => self.stock_page(ui, company),
                     Page::StockCounts => self.stock_counts_page(ui, company),
+                    Page::StockNotes => self.stock_notes_page(ui, company),
                     Page::Valuation => self.valuation_page(ui, company),
                     Page::Manufacturing => self.manufacturing_page(ui, company),
                     Page::Invoice => self.invoice_page(ui, company),
