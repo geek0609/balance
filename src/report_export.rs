@@ -992,7 +992,12 @@ impl Store {
                 &mut csv,
                 &context,
                 &[
-                    "invoice".into(),
+                    if entry.opening_date.is_some() {
+                        "opening_bill"
+                    } else {
+                        "invoice"
+                    }
+                    .into(),
                     entry.invoice_id.to_string(),
                     entry.kind.as_str().into(),
                     text_cell(&entry.party),

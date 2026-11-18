@@ -188,6 +188,7 @@ impl Store {
         invoice_id: i64,
         destination: impl AsRef<Path>,
     ) -> Result<()> {
+        crate::opening_bills::ensure_trade_invoice(&self.conn, company_id, invoice_id)?;
         let destination = html_destination(destination.as_ref())?;
         let company = self
             .companies()?

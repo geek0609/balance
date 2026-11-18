@@ -24,7 +24,7 @@ pub struct OpeningClear {
     pub reason: String,
 }
 
-fn control_id(conn: &Connection, company: i64) -> Result<Option<i64>> {
+pub(crate) fn control_id(conn: &Connection, company: i64) -> Result<Option<i64>> {
     Ok(conn.query_row("SELECT c.opening_difference_ledger_id FROM company_controls c JOIN ledgers l ON l.id = c.opening_difference_ledger_id AND l.company_id = c.company_id WHERE c.company_id = ?1", [company], |r| r.get(0)).optional()?)
 }
 pub(crate) fn check_no_control_postings(
@@ -39,7 +39,7 @@ pub(crate) fn check_no_control_postings(
     }
     Ok(())
 }
-fn ensure_control(conn: &Connection, company: i64) -> Result<i64> {
+pub(crate) fn ensure_control(conn: &Connection, company: i64) -> Result<i64> {
     if let Some(id) = control_id(conn, company)? {
         return Ok(id);
     }
@@ -71,7 +71,9 @@ pub(crate) fn save_opening_in_transaction(
     date: &str,
     amount: i64,
 ) -> Result<i64> {
-    let date = parse_date(date)?.format("%Y-%m-%d").to_string();
+    let parsed_date = parse_date(date)?;
+    crate::opening_bills::check_aggregate_opening(conn, company, ledger, parsed_date)?;
+    let date = parsed_date.format("%Y-%m-%d").to_string();
     let last_clear: Option<String> = conn.query_row("SELECT MAX(v.date) FROM opening_balance_clears c JOIN vouchers v ON v.id = c.clearing_voucher_id AND v.company_id = c.company_id WHERE c.company_id = ?1 AND c.ledger_id = ?2", params![company, ledger], |r| r.get(0))?;
     if last_clear
         .as_deref()

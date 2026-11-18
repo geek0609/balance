@@ -217,9 +217,19 @@ pub struct InvoiceSummary {
     pub has_advance_history: bool,
     pub order_id: Option<i64>,
     pub stock_note_id: Option<i64>,
+    pub opening_bill: Option<crate::opening_bills::OpeningBill>,
     pub reversal: Option<crate::invoice_reversals::InvoiceReversal>,
     pub lines: Vec<InvoiceDetailLine>,
     pub adjustments: Vec<InvoiceAdjustmentDetail>,
+}
+impl InvoiceSummary {
+    pub fn document_type(&self) -> &'static str {
+        if self.opening_bill.is_some() {
+            crate::opening_bills::label(self.kind)
+        } else {
+            self.kind.as_str()
+        }
+    }
 }
 #[derive(Debug, Clone)]
 pub struct Settlement {
@@ -259,6 +269,7 @@ pub struct InvoiceRevision {
 #[derive(Debug, Clone)]
 pub struct OutstandingInvoice {
     pub invoice_id: i64,
+    pub opening_date: Option<String>,
     pub kind: InvoiceKind,
     pub date: String,
     pub due_date: Option<String>,
@@ -452,22 +463,14 @@ fn prepare_invoice(
             "The trade ledger has an incompatible category".into(),
         ));
     }
-    let mut stmt = conn.prepare("SELECT v.reference FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3 AND (?4 IS NULL OR i.id != ?4)")?;
-    for existing in stmt.query_map(
-        params![
-            company_id,
-            draft.kind.as_str(),
-            draft.party_ledger_id,
-            excluding
-        ],
-        |r| r.get::<_, String>(0),
-    )? {
-        if existing?.trim().to_lowercase() == reference.to_lowercase() {
-            return Err(Error::Validation(
-                "An invoice with this type, party and reference already exists".into(),
-            ));
-        }
-    }
+    check_invoice_reference(
+        conn,
+        company_id,
+        draft.kind,
+        draft.party_ledger_id,
+        &reference,
+        excluding,
+    )?;
     let mut amounts = Vec::with_capacity(draft.lines.len());
     let mut discounts = Vec::with_capacity(draft.lines.len());
     let mut subtotal = 0_i128;
@@ -635,7 +638,29 @@ fn prepare_invoice(
         discounts,
     })
 }
-fn write_postings(conn: &Connection, voucher: i64, postings: &[Posting]) -> Result<()> {
+pub(crate) fn check_invoice_reference(
+    conn: &Connection,
+    company_id: i64,
+    kind: InvoiceKind,
+    party: i64,
+    reference: &str,
+    excluding: Option<i64>,
+) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT v.reference FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3 AND (?4 IS NULL OR i.id != ?4)")?;
+    let key = reference.to_lowercase();
+    for existing in stmt.query_map(params![company_id, kind.as_str(), party, excluding], |r| {
+        r.get::<_, String>(0)
+    })? {
+        if existing?.trim().to_lowercase() == key {
+            return Err(Error::Validation(
+                "An invoice with this type, party and reference already exists".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_postings(conn: &Connection, voucher: i64, postings: &[Posting]) -> Result<()> {
     for posting in postings {
         conn.execute(
             "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
@@ -1090,7 +1115,8 @@ pub(crate) fn invoice_total(conn: &Connection, invoice: i64, tax: i64) -> Result
     let mut stmt = conn.prepare(
         "SELECT amount FROM invoice_lines WHERE invoice_id = ?1
          UNION ALL SELECT amount FROM invoice_adjustments WHERE invoice_id = ?1
-         UNION ALL SELECT amount FROM invoice_additional_taxes WHERE invoice_id = ?1",
+         UNION ALL SELECT amount FROM invoice_additional_taxes WHERE invoice_id = ?1
+         UNION ALL SELECT amount FROM opening_bills WHERE invoice_id = ?1",
     )?;
     let mut total = i128::from(tax);
     for row in stmt.query_map([invoice], |row| row.get::<_, i64>(0))? {
@@ -2068,6 +2094,7 @@ impl Store {
     }
     /// Return a complete editable draft, scoped to the company.
     pub fn invoice_draft(&self, company_id: i64, invoice_id: i64) -> Result<InvoiceDraft> {
+        crate::opening_bills::ensure_trade_invoice(&self.conn, company_id, invoice_id)?;
         let (kind, date, reference, narration, party_ledger_id, trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days): (String, String, String, String, i64, i64, Option<i64>, i64, Option<String>, Option<u32>) = self.conn.query_row("SELECT i.kind, v.date, v.reference, v.narration, i.party_ledger_id, i.trade_ledger_id, i.tax_ledger_id, i.tax_amount, i.due_date, i.credit_days FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
         let mut stmt = self.conn.prepare("SELECT id, item_id, quantity, unit_price, location_id, batch_id, trade_ledger_id, discount_kind, discount_value, amount, discount_amount FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
         let raw_lines = stmt
@@ -2164,6 +2191,7 @@ impl Store {
         draft: &InvoiceDraft,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
+        crate::opening_bills::ensure_trade_invoice(&tx, company_id, invoice_id)?;
         let voucher_id: i64 = tx
             .query_row(
                 "SELECT voucher_id FROM invoices WHERE id = ?1 AND company_id = ?2",
@@ -2415,6 +2443,10 @@ impl Store {
                 total += i128::from(line.amount);
                 lines.push(line);
             }
+            let opening_bill = crate::opening_bills::for_invoice(&self.conn, company_id, id)?;
+            if let Some(bill) = &opening_bill {
+                total += i128::from(bill.amount);
+            }
             let adjustments = read_invoice_adjustments(&self.conn, id, false)?;
             for adjustment in &adjustments {
                 total += i128::from(adjustment.amount);
@@ -2459,6 +2491,7 @@ impl Store {
                 advance_applied: advances.applied,
                 order_id: crate::orders::linked_order(&self.conn, id)?,
                 stock_note_id: crate::stock_notes::linked_note(&self.conn, id)?,
+                opening_bill,
                 lines,
                 adjustments,
             });
@@ -2708,10 +2741,16 @@ impl Store {
                 .map(parse_date)
                 .transpose()?
                 .map(|due| (end - due).num_days().max(0));
+            let (bill_date, opening_date) = match invoice.opening_bill {
+                Some(bill) => (bill.original_date, Some(invoice.date)),
+                None => (invoice.date, None),
+            };
+            let age = (end - parse_date(&bill_date)?).num_days();
             result.push(OutstandingInvoice {
                 invoice_id: invoice.id,
+                opening_date,
                 kind: invoice.kind,
-                date: invoice.date,
+                date: bill_date,
                 due_date: invoice.due_date,
                 reference: invoice.reference,
                 party: invoice.party,
@@ -2720,7 +2759,7 @@ impl Store {
                 settled,
                 advance_applied,
                 outstanding,
-                age_days: (end - date).num_days(),
+                age_days: age,
                 overdue_days,
             });
         }

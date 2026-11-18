@@ -134,13 +134,26 @@ impl Store {
                 "Note date cannot precede an advance release".into(),
             ));
         }
-        let (voucher_kind, direction) = match InvoiceKind::parse(&kind)? {
+        let kind = InvoiceKind::parse(&kind)?;
+        let (mut voucher_kind, direction) = match kind {
             InvoiceKind::Sale => (VoucherKind::CreditNote, 1),
             InvoiceKind::Purchase => (VoucherKind::DebitNote, -1),
         };
         let date = date.format("%Y-%m-%d").to_string();
-        let postings = crate::reversals::counter_postings(&tx, company, original, &date)?;
-        let note_reason = format!("Invoice {invoice} reversal: {reason}");
+        let (postings, note_reason) =
+            if let Some(bill) = crate::opening_bills::for_invoice(&tx, company, invoice)? {
+                voucher_kind = VoucherKind::Journal;
+                (
+                    crate::opening_bills::clearing_postings(&tx, company, invoice, kind, &bill)?
+                        .to_vec(),
+                    format!("Opening bill {invoice} clearing: {reason}"),
+                )
+            } else {
+                (
+                    crate::reversals::counter_postings(&tx, company, original, &date)?,
+                    format!("Invoice {invoice} reversal: {reason}"),
+                )
+            };
         tx.execute(
             "INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![company, voucher_kind.as_str(), reference, date, note_reason],

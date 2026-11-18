@@ -24,6 +24,7 @@ mod cash_flow_ui;
 mod cost_ui;
 mod currency_ui;
 mod manufacturing_ui;
+mod opening_bill_ui;
 mod order_ui;
 mod payroll_ui;
 mod recurring_ui;
@@ -85,6 +86,7 @@ enum InvoiceSource {
 
 struct App {
     store: Store,
+    opening_bill: opening_bill_ui::OpeningBillForm,
     #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
     updates: updates::Updates,
     database_path: std::path::PathBuf,
@@ -350,6 +352,7 @@ impl App {
     fn new(store: Store, database_path: std::path::PathBuf) -> Self {
         Self {
             store,
+            opening_bill: opening_bill_ui::OpeningBillForm::default(),
             #[cfg(all(windows, target_arch = "x86_64", feature = "windows-updater"))]
             updates: updates::Updates::default(),
             database_path,
@@ -542,6 +545,7 @@ impl App {
         self.narration.clear();
     }
     fn reset_company_forms(&mut self) {
+        self.opening_bill = opening_bill_ui::OpeningBillForm::default();
         self.company_profile_selection = None;
         self.company_profile = CompanyProfile::default();
         self.company_profile_original = CompanyProfile::default();
@@ -1154,6 +1158,8 @@ impl App {
                     }
                 });
         }
+        ui.separator();
+        self.opening_bill_panel(ui, company, &ledgers);
         ui.separator();
         ui.heading("Ledger details");
         let dirty = self.profile_ledger.is_some() && self.ledger_profile != self.profile_original;
@@ -3783,7 +3789,7 @@ impl App {
                     .map(|invoice| {
                         format!(
                             "{} {} — outstanding {}",
-                            invoice.kind.as_str(),
+                            invoice.document_type(),
                             invoice.reference,
                             money(invoice.outstanding)
                         )
@@ -3799,7 +3805,7 @@ impl App {
                                     Some(invoice.id),
                                     format!(
                                         "{} {} — {} ({})",
-                                        invoice.kind.as_str(),
+                                        invoice.document_type(),
                                         invoice.reference,
                                         invoice.party,
                                         money(invoice.outstanding)
@@ -3836,7 +3842,7 @@ impl App {
                             .map(|invoice| {
                                 format!(
                                     "{} {} — {} ({})",
-                                    invoice.kind.as_str(),
+                                    invoice.document_type(),
                                     invoice.reference,
                                     invoice.party,
                                     money(invoice.outstanding)
@@ -3853,7 +3859,7 @@ impl App {
                                             Some(invoice.id),
                                             format!(
                                                 "{} {} — {} ({})",
-                                                invoice.kind.as_str(),
+                                                invoice.document_type(),
                                                 invoice.reference,
                                                 invoice.party,
                                                 money(invoice.outstanding)
@@ -3933,7 +3939,7 @@ impl App {
                     ui.strong(format!(
                         "{}  {}  {}  {}  Total {}  Cash {}  Advances {}  Outstanding {}",
                         invoice.date,
-                        invoice.kind.as_str(),
+                        invoice.document_type(),
                         invoice.reference,
                         invoice.party,
                         money(invoice.total),
@@ -3941,7 +3947,12 @@ impl App {
                         money(invoice.advance_applied),
                         money(invoice.outstanding)
                     ));
-                    if ui.button("Export printable invoice").clicked() {
+                    if let Some(bill) = &invoice.opening_bill {
+                        ui.label(format!("Original bill date {}", bill.original_date));
+                    }
+                    if invoice.opening_bill.is_none()
+                        && ui.button("Export printable invoice").clicked()
+                    {
                         match self.store.export_invoice_html(
                             company,
                             invoice.id,
@@ -3958,6 +3969,7 @@ impl App {
                                 && invoice.reversal.is_none()
                                 && invoice.order_id.is_none()
                                 && invoice.stock_note_id.is_none()
+                                && invoice.opening_bill.is_none()
                                 && !self.invoice_draft_in_use(),
                             egui::Button::new("Edit invoice"),
                         )
@@ -3973,7 +3985,7 @@ impl App {
                     }
                     if ui
                         .add_enabled(
-                            !self.invoice_draft_in_use(),
+                            !self.invoice_draft_in_use() && invoice.opening_bill.is_none(),
                             egui::Button::new("Prepare copy (replace draft)"),
                         )
                         .clicked()
@@ -4204,9 +4216,10 @@ impl App {
             ));
             return;
         }
-        let note = match invoice.kind {
-            InvoiceKind::Sale => "credit note",
-            InvoiceKind::Purchase => "debit note",
+        let note = match (invoice.opening_bill.is_some(), invoice.kind) {
+            (true, _) => "clearing entry",
+            (false, InvoiceKind::Sale) => "credit note",
+            (false, InvoiceKind::Purchase) => "debit note",
         };
         let can_reverse = invoice.settled == 0
             && invoice.advance_applied == 0
@@ -4235,7 +4248,9 @@ impl App {
         if form.invoice_id != invoice.id {
             return;
         }
-        if invoice.stock_note_id.is_some() {
+        if invoice.opening_bill.is_some() {
+            ui.small("This offsets the opening bill against the opening difference account.");
+        } else if invoice.stock_note_id.is_some() {
             ui.small("This posts a financial reversal. Reverse the linked stock note separately if the goods movement also needs correction.");
         } else {
             ui.small("This reverses the whole invoice and its stock quantities. The original invoice remains in the history.");
@@ -5030,7 +5045,7 @@ impl App {
                                 InvoiceKind::Purchase => purchases += invoice.total,
                             }
                             ui.label(&invoice.date);
-                            ui.label(invoice.kind.as_str());
+                            ui.label(invoice.document_type());
                             ui.label(invoice.id.to_string());
                             ui.label(&invoice.party);
                             ui.label(&invoice.reference);
@@ -5139,7 +5154,12 @@ impl App {
                             payable_age[bucket] += row.outstanding;
                             payable_due[due_bucket] += row.outstanding;
                         }
-                        ui.label(row.kind.as_str());
+                        if let Some(date) = &row.opening_date {
+                            ui.label(balance::opening_bills::label(row.kind))
+                                .on_hover_text(format!("Posted to the books on {date}"));
+                        } else {
+                            ui.label(row.kind.as_str());
+                        }
                         ui.label(row.party);
                         ui.label(row.date);
                         ui.label(row.due_date.as_deref().unwrap_or("—"));

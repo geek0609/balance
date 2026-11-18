@@ -45,6 +45,9 @@ impl Store {
         let search = search.trim().to_lowercase();
         let mut result = Vec::new();
         for mut invoice in self.invoices(company)? {
+            if invoice.opening_bill.is_some() {
+                continue;
+            }
             let date = parse_date(&invoice.date)?;
             if from.is_some_and(|value| date < value)
                 || to.is_some_and(|value| date > value)
