@@ -16,6 +16,7 @@ pub struct ReceiptReconciliationRow {
     pub location: String,
     pub batch: Option<String>,
     pub received_quantity: i64,
+    pub returned_quantity: i64,
     pub invoiced_quantity: i64,
     pub receipt_cost: Option<i128>,
     pub invoiced_receipt_cost: Option<i128>,
@@ -24,7 +25,7 @@ pub struct ReceiptReconciliationRow {
 
 impl ReceiptReconciliationRow {
     pub fn unbilled_quantity(&self) -> i64 {
-        self.received_quantity - self.invoiced_quantity
+        self.received_quantity - self.invoiced_quantity - self.returned_quantity
     }
 
     pub fn variance(&self) -> Option<i128> {
@@ -76,6 +77,7 @@ fn reconcile(
         }
         let note_line: i64 = receipt.get(4)?;
         let received_quantity: i64 = receipt.get(5)?;
+        let returned_quantity = crate::stock_returns::returned_on(conn, note_line, as_of)?;
         let receipt_cost = receipt.get::<_, Option<i64>>(10)?.map(i128::from);
         let mut invoice_net = 0_i128;
         let mut quantity = 0_i128;
@@ -95,7 +97,7 @@ fn reconcile(
             quantity += i128::from(billed);
             invoice_net += i128::from(invoice.get::<_, i64>(2)?);
         }
-        if quantity > i128::from(received_quantity)
+        if quantity + i128::from(returned_quantity) > i128::from(received_quantity)
             || receipt_cost.is_some_and(|cost| allocated_cost > cost)
         {
             return Err(Error::Validation(
@@ -112,6 +114,7 @@ fn reconcile(
             location: receipt.get(8)?,
             batch: receipt.get(9)?,
             received_quantity,
+            returned_quantity,
             invoiced_quantity: quantity as i64,
             receipt_cost,
             invoiced_receipt_cost: receipt_cost.map(|_| allocated_cost),

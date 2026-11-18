@@ -352,12 +352,14 @@ pub(crate) fn check_fulfilment(
          WHERE link.order_id = ?1
            AND NOT EXISTS(SELECT 1 FROM stock_note_invoices n WHERE n.invoice_id = link.invoice_id)
          UNION ALL
-         SELECT reversed_on FROM stock_notes WHERE order_id = ?1 AND reversed_on IS NOT NULL",
+         SELECT reversed_on FROM stock_notes WHERE order_id = ?1 AND reversed_on IS NOT NULL
+         UNION ALL
+         SELECT r.date FROM stock_returns r JOIN stock_notes n ON n.id = r.note_id WHERE n.order_id = ?1",
     )?;
     for row in stmt.query_map([id], |row| row.get::<_, String>(0))? {
         if date < parse_date(&row?)? {
             return Err(Error::Validation(
-                "The document date cannot precede an existing stock reversal on the order".into(),
+                "The document date cannot precede an existing stock return or reversal on the order".into(),
             ));
         }
     }

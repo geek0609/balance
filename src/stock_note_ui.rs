@@ -7,6 +7,7 @@ use balance::orders::OrderDetail;
 use balance::stock_notes::{
     note_label, StockNote, StockNoteDraft, StockNoteLine, StockNoteLineDraft,
 };
+use balance::stock_returns::StockReturnLineDraft;
 use balance::{format_amount, parse_amount, Category, Error, Result};
 use eframe::egui;
 
@@ -27,6 +28,15 @@ struct NoteForm {
     date: String,
     narration: String,
     lines: Vec<NoteLineForm>,
+}
+
+#[derive(Default)]
+struct ReturnDraft {
+    reversal: Option<i64>,
+    date: String,
+    reference: String,
+    reason: String,
+    quantities: std::collections::HashMap<i64, String>,
 }
 
 impl Default for NoteForm {
@@ -84,6 +94,7 @@ pub(super) struct StockNoteScreen {
     reverse_reason: String,
     document_path: String,
     reconcile_as_of: String,
+    return_draft: Option<ReturnDraft>,
 }
 
 impl StockNoteScreen {
@@ -91,6 +102,7 @@ impl StockNoteScreen {
         self.selected = id;
         self.reverse_date.clear();
         self.reverse_reason.clear();
+        self.return_draft = None;
     }
 }
 
@@ -292,6 +304,7 @@ impl App {
                     "Item",
                     "Received",
                     "Invoiced",
+                    "Returned",
                     "Unbilled",
                     "Receipt cost",
                     "Billed cost",
@@ -317,6 +330,7 @@ impl App {
                     for quantity in [
                         row.received_quantity,
                         row.invoiced_quantity,
+                        row.returned_quantity,
                         row.unbilled_quantity(),
                     ] {
                         ui.label(format!(
@@ -397,6 +411,7 @@ impl App {
                     "Batch",
                     "Quantity",
                     "Invoiced",
+                    "Returned",
                     "Unbilled",
                     "Unit price",
                 ] {
@@ -413,6 +428,7 @@ impl App {
                         line.unit
                     ));
                     ui.label(format_quantity(i128::from(line.billed)));
+                    ui.label(format_quantity(i128::from(line.returned)));
                     if note.reversed_on.is_none() {
                         ui.label(format_quantity(i128::from(line.unbilled())));
                     } else {
@@ -457,6 +473,7 @@ impl App {
                 note.reversal_reason.as_deref().unwrap_or_default()
             ));
         }
+        self.stock_return_panel(ui, company, note, &lines)?;
         if note.reversed_on.is_none()
             && note.has_unbilled_stock
             && ui
@@ -468,7 +485,7 @@ impl App {
         {
             self.prepare_stock_note_invoice(note, &lines);
         }
-        if note.reversed_on.is_none() && !note.has_active_invoices {
+        if note.reversed_on.is_none() && !note.has_active_invoices && !note.has_active_returns {
             ui.collapsing("Reverse stock movement", |ui| -> Result<()> {
                 let form = &mut self.stock_note_screen;
                 ui.horizontal(|ui| {
@@ -493,6 +510,164 @@ impl App {
             })
             .body_returned
             .transpose()?;
+        }
+        Ok(())
+    }
+
+    fn stock_return_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        note: &StockNote,
+        lines: &[StockNoteLine],
+    ) -> Result<()> {
+        let returns = self.store.stock_note_returns(company, note.id)?;
+        let can_post = note.reversed_on.is_none() && note.has_unbilled_stock;
+        if returns.is_empty() && !can_post {
+            return Ok(());
+        }
+        egui::CollapsingHeader::new("Stock returns")
+            .id_salt(note.id)
+            .show(ui, |ui| -> Result<()> {
+                for recorded in &returns {
+                    ui.push_id(recorded.id, |ui| -> Result<()> {
+                        ui.strong(format!("{} · {}", recorded.date, recorded.reference));
+                        ui.label(&recorded.reason);
+                        for line in &recorded.lines {
+                            ui.label(format!(
+                                "{} · {} · {} · {} {}",
+                                line.item,
+                                line.location,
+                                line.batch.as_deref().unwrap_or("Unbatched"),
+                                format_quantity(line.quantity.into()),
+                                line.unit
+                            ));
+                        }
+                        if ui.button("Export printable return").clicked() {
+                            self.store.export_stock_return_html(
+                                company,
+                                note.id,
+                                recorded.id,
+                                self.stock_note_screen.document_path.trim(),
+                            )?;
+                            self.message = "Return document exported".into();
+                        }
+                        if let Some(date) = &recorded.reversed_on {
+                            ui.label(format!(
+                                "Reversed {date} · {}",
+                                recorded.reversal_reason.as_deref().unwrap_or_default()
+                            ));
+                        } else if self.stock_note_screen.return_draft.is_none()
+                            && ui.button("Reverse return").clicked()
+                        {
+                            self.stock_note_screen.return_draft = Some(ReturnDraft {
+                                reversal: Some(recorded.id),
+                                ..Default::default()
+                            });
+                        }
+                        Ok(())
+                    })
+                    .inner?;
+                }
+                if can_post
+                    && self.stock_note_screen.return_draft.is_none()
+                    && ui.button("Return unbilled stock").clicked()
+                {
+                    self.stock_note_screen.return_draft = Some(ReturnDraft::default());
+                }
+                self.edit_stock_return(ui, company, note.id, lines)
+            })
+            .body_returned
+            .transpose()?;
+        Ok(())
+    }
+
+    fn edit_stock_return(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        note: i64,
+        lines: &[StockNoteLine],
+    ) -> Result<()> {
+        let Some(form) = self.stock_note_screen.return_draft.as_mut() else {
+            return Ok(());
+        };
+        egui::Grid::new(("stock-return", note)).show(ui, |ui| {
+            ui.label("Date (YYYY-MM-DD)");
+            ui.text_edit_singleline(&mut form.date);
+            ui.end_row();
+            if form.reversal.is_none() {
+                ui.label("Reference");
+                ui.text_edit_singleline(&mut form.reference);
+                ui.end_row();
+            }
+            ui.label("Reason");
+            ui.text_edit_singleline(&mut form.reason);
+            ui.end_row();
+        });
+        if form.reversal.is_none() {
+            ui.small("Enter quantities for the unbilled lines to return. Goods move at the original location and batch.");
+            egui::Grid::new(("stock-return-quantities", note)).show(ui, |ui| {
+                for label in ["Item", "Location", "Batch", "Unbilled", "Return quantity"] {
+                    ui.strong(label);
+                }
+                ui.end_row();
+                for line in lines.iter().filter(|line| line.unbilled() > 0) {
+                    ui.label(&line.item);
+                    ui.label(&line.location);
+                    ui.label(line.batch.as_deref().unwrap_or("Unbatched"));
+                    ui.label(format!(
+                        "{} {}",
+                        format_quantity(line.unbilled().into()),
+                        line.unit
+                    ));
+                    ui.add(
+                        egui::TextEdit::singleline(form.quantities.entry(line.id).or_default())
+                            .desired_width(75.0),
+                    );
+                    ui.end_row();
+                }
+            });
+        }
+        let label = if form.reversal.is_some() {
+            "Post return reversal"
+        } else {
+            "Post return"
+        };
+        let (post, cancel) = ui
+            .horizontal(|ui| (ui.button(label).clicked(), ui.button("Cancel").clicked()))
+            .inner;
+        if post {
+            let message = if let Some(id) = form.reversal {
+                self.store
+                    .reverse_stock_return(company, id, &form.date, &form.reason)?;
+                format!("Stock return {id} reversed")
+            } else {
+                let quantities = form
+                    .quantities
+                    .iter()
+                    .filter(|(_, value)| !value.trim().is_empty())
+                    .map(|(&note_line, value)| {
+                        Ok(StockReturnLineDraft {
+                            note_line,
+                            quantity: parse_quantity(value)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let id = self.store.post_stock_return(
+                    company,
+                    note,
+                    &form.date,
+                    &form.reference,
+                    &form.reason,
+                    &quantities,
+                )?;
+                format!("Stock return {id} posted")
+            };
+            self.message = message;
+            self.stock_note_screen.return_draft = None;
+        } else if cancel {
+            self.stock_note_screen.return_draft = None;
         }
         Ok(())
     }

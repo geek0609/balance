@@ -145,6 +145,7 @@ pub struct StockNote {
     pub order_id: Option<i64>,
     pub narration: String,
     pub has_active_invoices: bool,
+    pub has_active_returns: bool,
     pub has_unbilled_stock: bool,
     pub reversed_on: Option<String>,
     pub reversal_reason: Option<String>,
@@ -154,10 +155,18 @@ impl StockNote {
     pub fn status(&self) -> &'static str {
         if self.reversed_on.is_some() {
             "Reversed"
+        } else if !self.has_unbilled_stock && self.has_active_returns {
+            if self.has_active_invoices {
+                "Invoiced and returned"
+            } else {
+                "Returned"
+            }
         } else if !self.has_unbilled_stock {
             "Invoiced"
         } else if self.has_active_invoices {
             "Partially invoiced"
+        } else if self.has_active_returns {
+            "Partially returned"
         } else {
             "Awaiting invoice"
         }
@@ -173,11 +182,12 @@ pub struct StockNoteLine {
     pub location: String,
     pub batch: Option<String>,
     pub billed: i64,
+    pub returned: i64,
 }
 
 impl StockNoteLine {
     pub fn unbilled(&self) -> i64 {
-        self.values.quantity - self.billed
+        self.values.quantity - self.billed - self.returned
     }
 }
 
@@ -197,7 +207,9 @@ const NOTES: &str =
                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id)),
             EXISTS(SELECT 1 FROM stock_note_lines l
                    LEFT JOIN stock_note_billed_quantities b ON b.note_line_id = l.id
-                   WHERE l.note_id = n.id AND l.quantity > COALESCE(b.billed, 0))
+                   LEFT JOIN stock_note_returned_quantities ret ON ret.note_line_id = l.id
+                   WHERE l.note_id = n.id AND l.quantity > COALESCE(b.billed, 0) + COALESCE(ret.returned, 0)),
+            EXISTS(SELECT 1 FROM stock_returns ret WHERE ret.note_id = n.id AND ret.reversed_on IS NULL)
      FROM stock_notes n JOIN ledgers p ON p.id = n.party_ledger_id AND p.company_id = n.company_id
      WHERE n.company_id = ?1";
 
@@ -215,6 +227,7 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<StockNote> {
         reversal_reason: row.get(9)?,
         has_active_invoices: row.get(10)?,
         has_unbilled_stock: row.get(11)?,
+        has_active_returns: row.get(12)?,
     })
 }
 
@@ -227,15 +240,16 @@ pub(crate) fn get_note(conn: &Connection, company: i64, note: i64) -> Result<Sto
     read_note(row)
 }
 
-fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<Vec<StockNoteLine>> {
+pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<Vec<StockNoteLine>> {
     let mut stmt = conn.prepare(
         "SELECT l.id, l.item_id, l.location_id, l.batch_id, l.quantity, l.unit_price,
-                i.name, i.unit, loc.name, b.name, COALESCE(q.billed, 0)
+                i.name, i.unit, loc.name, b.name, COALESCE(q.billed, 0), COALESCE(ret.returned, 0)
          FROM stock_note_lines l JOIN stock_notes n ON n.id = l.note_id
          JOIN stock_items i ON i.id = l.item_id AND i.company_id = n.company_id
          JOIN stock_locations loc ON loc.id = l.location_id AND loc.company_id = n.company_id
          LEFT JOIN stock_batches b ON b.id = l.batch_id
          LEFT JOIN stock_note_billed_quantities q ON q.note_line_id = l.id
+         LEFT JOIN stock_note_returned_quantities ret ON ret.note_line_id = l.id
          WHERE n.company_id = ?1 AND n.id = ?2 ORDER BY l.id",
     )?;
     let rows = stmt
@@ -254,6 +268,7 @@ fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<Vec<StockNot
                 location: row.get(8)?,
                 batch: row.get(9)?,
                 billed: row.get(10)?,
+                returned: row.get(11)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -284,7 +299,7 @@ fn invoice_history(conn: &Connection, company: i64, note: i64) -> Result<Vec<Sto
     Ok(rows)
 }
 
-fn check_after_invoice_reversals(
+pub(crate) fn check_after_invoice_reversals(
     conn: &Connection,
     company: i64,
     note: i64,
@@ -307,7 +322,7 @@ fn check_after_invoice_reversals(
     Ok(())
 }
 
-fn allocate_spans(
+pub(crate) fn allocate_spans(
     conn: &Connection,
     note_line: &StockNoteLine,
     quantity: i64,
@@ -320,7 +335,11 @@ fn allocate_spans(
          JOIN invoice_lines l ON l.id = link.invoice_line_id
          WHERE link.note_line_id = ?1
            AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = l.invoice_id)
-         ORDER BY s.start_quantity",
+         UNION ALL
+         SELECT s.start_quantity, s.quantity FROM stock_return_lines l
+         JOIN stock_returns r ON r.id = l.return_id AND r.reversed_on IS NULL
+         JOIN stock_return_spans s ON s.return_line_id = l.id WHERE l.note_line_id = ?1
+         ORDER BY start_quantity",
     )?;
     let rows = stmt.query_map([note_line.id], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
@@ -328,7 +347,7 @@ fn allocate_spans(
     let mut spans = Vec::new();
     let mut remaining = quantity;
     let mut cursor = 0;
-    let mut already_billed = 0;
+    let mut already_allocated = 0;
     for row in rows {
         let (start, used) = row?;
         let end = start.checked_add(used).ok_or_else(invalid_spans)?;
@@ -341,9 +360,9 @@ fn allocate_spans(
             remaining -= available;
         }
         cursor = end;
-        already_billed += used;
+        already_allocated += used;
     }
-    if already_billed != note_line.billed {
+    if already_allocated != note_line.billed + note_line.returned {
         return Err(invalid_spans());
     }
     if remaining > capacity - cursor {
@@ -398,10 +417,19 @@ pub(crate) fn invoice_quantity_share(
         "SELECT start_quantity, quantity FROM stock_note_invoice_spans
          WHERE invoice_line_id = ?1 ORDER BY start_quantity",
     )?;
+    read_quantity_share(&mut stmt, invoice_line, note_quantity, invoice_quantity)
+}
+
+pub(crate) fn read_quantity_share(
+    stmt: &mut rusqlite::Statement<'_>,
+    source_id: i64,
+    note_quantity: i64,
+    allocated_quantity: i64,
+) -> Result<InvoiceQuantityShare> {
     let mut spans = Vec::new();
     let mut previous_end = 0;
     let mut subtotal = 0;
-    for row in stmt.query_map([invoice_line], |row| {
+    for row in stmt.query_map([source_id], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
     })? {
         let (start, quantity) = row?;
@@ -413,7 +441,7 @@ pub(crate) fn invoice_quantity_share(
         previous_end = end;
         subtotal += quantity;
     }
-    if subtotal != invoice_quantity || spans.is_empty() {
+    if subtotal != allocated_quantity || spans.is_empty() {
         return Err(invalid_spans());
     }
     Ok(InvoiceQuantityShare {
@@ -422,8 +450,8 @@ pub(crate) fn invoice_quantity_share(
     })
 }
 
-fn invalid_spans() -> Error {
-    Error::Validation("Stock note invoice quantities do not reconcile".into())
+pub(crate) fn invalid_spans() -> Error {
+    Error::Validation("Stock note quantities do not reconcile".into())
 }
 
 pub(crate) fn linked_note(conn: &Connection, invoice: i64) -> Result<Option<i64>> {
@@ -436,7 +464,7 @@ pub(crate) fn linked_note(conn: &Connection, invoice: i64) -> Result<Option<i64>
         .optional()?)
 }
 
-fn insert_movement(
+pub(crate) fn insert_movement(
     conn: &Connection,
     company: i64,
     date: NaiveDate,
@@ -453,7 +481,7 @@ fn insert_movement(
     Ok(conn.last_insert_rowid())
 }
 
-fn stock_direction(kind: InvoiceKind) -> i64 {
+pub(crate) fn stock_direction(kind: InvoiceKind) -> i64 {
     match kind {
         InvoiceKind::Sale => -1,
         InvoiceKind::Purchase => 1,
@@ -593,6 +621,7 @@ impl Store {
             ));
         }
         check_after_invoice_reversals(&tx, company, id, date, false)?;
+        crate::stock_returns::check_after_returns(&tx, company, id, date, false)?;
         let movement_reason = format!(
             "{} {} (#{id}) reversal: {reason}",
             note_label(note.kind),
@@ -654,6 +683,7 @@ impl Store {
             ));
         }
         check_after_invoice_reversals(&tx, company, id, date, true)?;
+        crate::stock_returns::check_after_returns(&tx, company, id, date, true)?;
 
         let lines = note_lines(&tx, company, id)?;
         let mut expected: HashMap<_, _> = lines

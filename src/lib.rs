@@ -39,13 +39,14 @@ pub mod report_export;
 pub mod reversals;
 pub mod stock_counts;
 pub mod stock_notes;
+pub mod stock_returns;
 pub mod stock_sales;
 pub mod tax_profiles;
 pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 59;
+const SCHEMA_VERSION: i64 = 60;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -465,6 +466,9 @@ impl Store {
             "opening_bills",
             "invoice_credit_notes",
             "invoice_credit_lines",
+            "stock_returns",
+            "stock_return_lines",
+            "stock_return_spans",
         ] {
             let exists: bool = store.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
@@ -840,6 +844,10 @@ impl Store {
         if version < 59 {
             invoice_credits::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 59)?;
+        }
+        if version < 60 {
+            stock_returns::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 60)?;
         }
         tx.commit()?;
         Ok(Self { conn })

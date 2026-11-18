@@ -1259,9 +1259,10 @@ impl Store {
                 "cost_for_invoiced_quantity",
                 "invoice_net",
                 "price_variance",
+                "returned_quantity",
             ]),
         )?;
-        let mut empty = vec![String::new(); 16];
+        let mut empty = vec![String::new(); 17];
         empty[0] = "context".into();
         contextual_row(&mut csv, &context, &empty)?;
         for line in self.receipt_reconciliation(company, as_of)? {
@@ -1285,6 +1286,7 @@ impl Store {
                     line.invoiced_receipt_cost.map(money).unwrap_or_default(),
                     money(line.invoice_net),
                     line.variance().map(money).unwrap_or_default(),
+                    format_quantity(i128::from(line.returned_quantity)),
                 ],
             )?;
         }

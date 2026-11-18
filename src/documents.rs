@@ -369,6 +369,60 @@ impl Store {
         write_html(destination, &html)
     }
 
+    pub fn export_stock_return_html(
+        &self,
+        company_id: i64,
+        note_id: i64,
+        return_id: i64,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let destination = html_destination(destination.as_ref())?;
+        let tx = self.conn.unchecked_transaction()?;
+        let company = self
+            .companies()?
+            .into_iter()
+            .find(|company| company.id == company_id)
+            .ok_or_else(|| Error::Validation("Company not found".into()))?;
+        let note = get_note(&tx, company_id, note_id)?;
+        let returned = self
+            .stock_note_returns(company_id, note_id)?
+            .into_iter()
+            .find(|stock_return| stock_return.id == return_id)
+            .ok_or_else(|| Error::Validation("Return not found for this stock note".into()))?;
+        tx.commit()?;
+        let label = match note.kind {
+            InvoiceKind::Sale => "Customer stock return",
+            InvoiceKind::Purchase => "Supplier stock return",
+        };
+        let title = format!("{label} {}", returned.reference);
+        let mut html = printable_html(&title);
+        let _ = write!(html, "<h1>{}</h1><p><strong>{}</strong><br>Party {}<br>Date {}<br>Against {} {} ({})</p><p>{}</p>",
+            escape(&title), escape(&company.name), escape(&note.party), escape(&returned.date),
+            note_label(note.kind), escape(&note.reference), escape(&note.date), escape(&returned.reason));
+        if let (Some(date), Some(reason)) = (&returned.reversed_on, &returned.reversal_reason) {
+            let _ = write!(
+                html,
+                "<p><strong>Reversed {}</strong><br>{}</p>",
+                escape(date),
+                escape(reason)
+            );
+        }
+        html.push_str("<table><thead><tr><th>Item</th><th>Location</th><th>Batch</th><th class=\"num\">Returned quantity</th></tr></thead><tbody>");
+        for line in returned.lines {
+            let _ = write!(
+                html,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{} {}</td></tr>",
+                escape(&line.item),
+                escape(&line.location),
+                escape(line.batch.as_deref().unwrap_or("Unbatched")),
+                format_quantity(line.quantity.into()),
+                escape(&line.unit)
+            );
+        }
+        html.push_str("</tbody></table></body></html>");
+        write_html(destination, &html)
+    }
+
     pub fn export_order_html(
         &self,
         company_id: i64,
