@@ -1,4 +1,4 @@
-//! Printable invoice, adjustment note, quotation, stock note and payroll records.
+//! Printable orders, invoices, adjustment notes, quotations, stock notes and payroll records.
 use crate::{
     format_amount,
     inventory::{format_quantity, line_amount, InvoiceDiscount, InvoiceKind},
@@ -187,6 +187,80 @@ impl Store {
         html.push_str("</tbody></table>");
         if !note.narration.is_empty() {
             let _ = write!(html, "<p>{}</p>", escape(&note.narration));
+        }
+        html.push_str("</body></html>");
+        write_html(destination, &html)
+    }
+
+    pub fn export_order_html(
+        &self,
+        company_id: i64,
+        order_id: i64,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let destination = html_destination(destination.as_ref())?;
+        let company = self
+            .companies()?
+            .into_iter()
+            .find(|c| c.id == company_id)
+            .ok_or_else(|| Error::Validation("Company not found".into()))?;
+        let detail = self.order_detail(company_id, order_id)?;
+        let order = &detail.summary;
+        let label = match order.kind {
+            InvoiceKind::Sale => "Sales order",
+            InvoiceKind::Purchase => "Purchase order",
+        };
+        let title = format!("{label} {}", order.reference);
+        let mut html = printable_html(&title);
+        let _ = write!(
+            html,
+            "<h1>{}</h1><p><strong>{}</strong><br>Party: {}<br>Date: {}<br>Status: {}",
+            escape(&title),
+            escape(&company.name),
+            escape(&order.party),
+            escape(&order.date),
+            order.status.label(),
+        );
+        if let Some(date) = &order.expected_on {
+            let _ = write!(html, "<br>Expected delivery: {}", escape(date));
+        }
+        if let Some(currency) = self.company_base_currency(company_id)? {
+            let _ = write!(html, "<br>Currency: {}", escape(&currency));
+        }
+        if let Some(reference) = self.order_quotation(company_id, order_id)? {
+            let _ = write!(html, "<br>Quotation: {}", escape(&reference));
+        }
+        html.push_str("</p><table><thead><tr><th>Item</th><th class=\"num\">Ordered</th><th class=\"num\">Fulfilled</th><th class=\"num\">Invoiced</th><th class=\"num\">Unit price</th><th class=\"num\">Amount</th></tr></thead><tbody>");
+        for row in detail.lines {
+            let line = row.line;
+            let amount = line_amount(line.quantity, line.unit_price)?;
+            let _ = write!(
+                html,
+                "<tr><td>{}</td><td class=\"num\">{} {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+                escape(&row.item),
+                format_quantity(line.quantity.into()),
+                escape(&row.unit),
+                format_quantity(row.fulfilled.into()),
+                format_quantity(row.billed.into()),
+                format_amount(line.unit_price),
+                format_amount(amount),
+            );
+        }
+        let _ = write!(html, "</tbody></table><table class=\"totals\"><tr class=\"total\"><td>Order subtotal</td><td class=\"num\">{}</td></tr></table>", money(detail.total));
+        if !order.notes.is_empty() {
+            let _ = write!(
+                html,
+                "<p><strong>Notes</strong><br>{}</p>",
+                escape(&order.notes)
+            );
+        }
+        if let (Some(date), Some(reason)) = (&order.closed_at, &order.close_reason) {
+            let _ = write!(
+                html,
+                "<p><strong>Closed {} UTC</strong><br>{}</p>",
+                escape(date),
+                escape(reason)
+            );
         }
         html.push_str("</body></html>");
         write_html(destination, &html)

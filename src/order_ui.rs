@@ -88,6 +88,7 @@ pub(super) struct OrderScreen {
     search: String,
     selected: Option<i64>,
     close_reason: String,
+    document_path: String,
     schedule_kind: Option<InvoiceKind>,
     schedule_through: String,
     quotation: QuotationForm,
@@ -625,6 +626,22 @@ impl App {
             self.order_screen.selected = None;
             self.order_screen.close_reason.clear();
         }
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.order_screen.document_path)
+                    .hint_text("Absolute path to a new .html file"),
+            );
+            if ui.button("Export printable order").clicked() {
+                match self.store.export_order_html(
+                    company,
+                    order.id,
+                    self.order_screen.document_path.trim(),
+                ) {
+                    Ok(()) => self.message = "Order document created".into(),
+                    Err(error) => self.failure(error),
+                }
+            }
+        });
         ui.label(format!("{} | {}", order.date, order.party));
         if let Some(date) = &order.expected_on {
             ui.label(format!("Expected {date}"));
