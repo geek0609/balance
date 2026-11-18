@@ -81,6 +81,21 @@ struct QuotationForm {
 }
 
 #[derive(Default)]
+struct LineClosureForm {
+    item: Option<i64>,
+    date: String,
+    quantity: String,
+    reason: String,
+}
+
+#[derive(Default)]
+struct LineReopenForm {
+    closure: Option<i64>,
+    date: String,
+    reason: String,
+}
+
+#[derive(Default)]
 pub(super) struct OrderScreen {
     form: CreateOrderForm,
     kind: Option<InvoiceKind>,
@@ -88,6 +103,8 @@ pub(super) struct OrderScreen {
     search: String,
     selected: Option<i64>,
     close_reason: String,
+    line_closure: LineClosureForm,
+    line_reopen: LineReopenForm,
     document_path: String,
     schedule_kind: Option<InvoiceKind>,
     schedule_through: String,
@@ -98,6 +115,8 @@ impl OrderScreen {
     pub(super) fn select(&mut self, order: i64) {
         self.selected = Some(order);
         self.close_reason.clear();
+        self.line_closure = LineClosureForm::default();
+        self.line_reopen = LineReopenForm::default();
     }
 }
 
@@ -660,6 +679,7 @@ impl App {
                     "Ordered",
                     "Fulfilled",
                     "Invoiced",
+                    "Pre-closed",
                     "Unfulfilled",
                     "Unit price",
                 ] {
@@ -675,6 +695,7 @@ impl App {
                     ));
                     ui.label(format_quantity(row.fulfilled.into()));
                     ui.label(format_quantity(row.billed.into()));
+                    ui.label(format_quantity(row.preclosed.into()));
                     ui.label(format_quantity(row.unfulfilled().into()));
                     ui.label(format_amount(row.line.unit_price));
                     ui.end_row();
@@ -699,6 +720,11 @@ impl App {
         }
         if let (Some(at), Some(reason)) = (&order.closed_at, &order.close_reason) {
             ui.label(format!("Closed {at} UTC | {reason}"));
+        }
+        if order.status.has_pending() || !detail.line_closures.is_empty() {
+            egui::CollapsingHeader::new("Line closures")
+                .id_salt(order.id)
+                .show(ui, |ui| self.order_line_closures(ui, company, detail));
         }
         match self.store.stock_notes(company, Some(order.id)) {
             Ok(notes) => {
@@ -761,6 +787,118 @@ impl App {
                     }
                 }
             });
+        }
+    }
+
+    fn order_line_closures(&mut self, ui: &mut egui::Ui, company: i64, detail: &OrderDetail) {
+        let order = &detail.summary;
+        if order.status.has_pending() {
+            let pending = detail.lines.iter().filter(|line| line.unfulfilled() > 0);
+            ui.horizontal_wrapped(|ui| {
+                let form = &mut self.order_screen.line_closure;
+                egui::ComboBox::from_id_salt(("preclose-order-item", order.id))
+                    .selected_text(
+                        pending
+                            .clone()
+                            .find(|line| Some(line.line.item_id) == form.item)
+                            .map(|line| line.item.as_str())
+                            .unwrap_or("Select item"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for line in pending {
+                            let caption = format!(
+                                "{} · {} {} pending",
+                                line.item,
+                                format_quantity(line.unfulfilled().into()),
+                                line.unit,
+                            );
+                            if ui
+                                .selectable_value(&mut form.item, Some(line.line.item_id), caption)
+                                .clicked()
+                            {
+                                form.quantity = format_quantity(line.unfulfilled().into());
+                            }
+                        }
+                    });
+                ui.add(egui::TextEdit::singleline(&mut form.date).hint_text("YYYY-MM-DD"));
+                ui.add(egui::TextEdit::singleline(&mut form.quantity).hint_text("Quantity"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.reason).hint_text("Reason for closing"),
+                );
+                let save =
+                    ui.add_enabled(form.item.is_some(), egui::Button::new("Pre-close quantity"));
+                if let (true, Some(item)) = (save.clicked(), form.item) {
+                    let result = parse_quantity(&form.quantity).and_then(|quantity| {
+                        self.store.preclose_order_line(
+                            company,
+                            order.id,
+                            item,
+                            &form.date,
+                            quantity,
+                            &form.reason,
+                        )
+                    });
+                    match result {
+                        Ok(_) => {
+                            *form = LineClosureForm::default();
+                            self.message = "Order line quantity pre-closed".into();
+                        }
+                        Err(error) => self.failure(error),
+                    }
+                }
+            });
+        }
+        for closure in &detail.line_closures {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!(
+                    "{} · {} {} {} · {}",
+                    closure.closed_on,
+                    closure.item,
+                    format_quantity(closure.quantity.into()),
+                    closure.unit,
+                    closure.reason,
+                ));
+                if let (Some(date), Some(reason)) = (&closure.reopened_on, &closure.reopen_reason) {
+                    ui.label(format!("Reopened {date} · {reason}"));
+                } else if order.closed_at.is_none() && ui.button("Reopen quantity").clicked() {
+                    self.order_screen.line_reopen = LineReopenForm {
+                        closure: Some(closure.id),
+                        ..LineReopenForm::default()
+                    };
+                }
+            });
+            if self.order_screen.line_reopen.closure == Some(closure.id)
+                && closure.reopened_on.is_none()
+                && order.closed_at.is_none()
+            {
+                ui.push_id(closure.id, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let form = &mut self.order_screen.line_reopen;
+                        ui.add(egui::TextEdit::singleline(&mut form.date).hint_text("YYYY-MM-DD"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.reason)
+                                .hint_text("Reason for reopening"),
+                        );
+                        if ui.button("Confirm reopening").clicked() {
+                            match self.store.reopen_order_line(
+                                company,
+                                order.id,
+                                closure.id,
+                                &form.date,
+                                &form.reason,
+                            ) {
+                                Ok(()) => {
+                                    *form = LineReopenForm::default();
+                                    self.message = "Order line quantity reopened".into();
+                                }
+                                Err(error) => self.failure(error),
+                            }
+                        } else if ui.button("Cancel").clicked() {
+                            *form = LineReopenForm::default();
+                        }
+                    });
+                });
+            }
         }
     }
 

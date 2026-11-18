@@ -551,8 +551,20 @@ mod tests {
         delivery.reference = "REPLACE".into();
         delivery.lines[0].quantity = 2000;
         assert!(store.post_stock_note(company, &delivery).is_err());
+        let closure = store
+            .preclose_order_line(company, order, item, "2026-01-02", 1000, "Reduce order")
+            .unwrap();
+        assert!(store
+            .reverse_stock_return(company, returned, "2026-01-03", "Over pending quantity")
+            .is_err());
         store
-            .reverse_stock_return(company, returned, "2026-01-03", "Reaccepted")
+            .reopen_order_line(company, order, closure, "2026-01-04", "Restore quantity")
+            .unwrap();
+        assert!(store
+            .reverse_stock_return(company, returned, "2026-01-03", "Before reopening")
+            .is_err());
+        store
+            .reverse_stock_return(company, returned, "2026-01-04", "Reaccepted")
             .unwrap();
         assert_eq!(
             store.order_detail(company, order).unwrap().lines[0].fulfilled,
@@ -565,10 +577,10 @@ mod tests {
         invoice.reference = "INV-02".into();
         invoice.lines[0].quantity = 2000;
         assert!(store.invoice_stock_note(company, note, &invoice).is_err());
-        invoice.date = "2026-01-03".into();
+        invoice.date = "2026-01-04".into();
         store.invoice_stock_note(company, note, &invoice).unwrap();
         let snapshot = store
-            .stock_valuation_at_actual_cost(company, "2026-01-03", ActualCostMethod::Fifo)
+            .stock_valuation_at_actual_cost(company, "2026-01-04", ActualCostMethod::Fifo)
             .unwrap();
         assert_eq!(snapshot.unavailable, 0);
         assert_eq!(snapshot.known_value, 0);

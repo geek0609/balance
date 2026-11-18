@@ -50,6 +50,27 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_line_closures(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE order_line_closures(
+            id INTEGER PRIMARY KEY,
+            order_line_id INTEGER NOT NULL REFERENCES order_lines(id),
+            quantity INTEGER NOT NULL CHECK(quantity > 0),
+            closed_on TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            reopened_on TEXT,
+            reopen_reason TEXT,
+            CHECK((reopened_on IS NULL) = (reopen_reason IS NULL))
+        );
+        CREATE INDEX order_line_closures_line ON order_line_closures(order_line_id);
+        CREATE VIEW order_line_availability AS
+            SELECT p.*, COALESCE((SELECT SUM(c.quantity) FROM order_line_closures c
+                WHERE c.order_line_id = p.id AND c.reopened_on IS NULL), 0) AS preclosed
+            FROM order_line_progress p;",
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct OrderLine {
     pub item_id: i64,
@@ -114,6 +135,19 @@ pub struct OrderLineProgress {
     pub unit: String,
     pub fulfilled: i64,
     pub billed: i64,
+    pub preclosed: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderLineClosure {
+    pub id: i64,
+    pub item: String,
+    pub unit: String,
+    pub quantity: i64,
+    pub closed_on: String,
+    pub reason: String,
+    pub reopened_on: Option<String>,
+    pub reopen_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +182,7 @@ pub struct PendingOrderLine {
 }
 impl OrderLineProgress {
     pub fn unfulfilled(&self) -> i64 {
-        self.line.quantity - self.fulfilled
+        self.line.quantity - self.fulfilled - self.preclosed
     }
 }
 
@@ -165,14 +199,26 @@ pub struct OrderDetail {
     pub summary: OrderSummary,
     pub lines: Vec<OrderLineProgress>,
     pub invoices: Vec<OrderInvoice>,
+    pub line_closures: Vec<OrderLineClosure>,
     pub total: i128,
+}
+
+fn remaining_quantity(ordered: i64, fulfilled: i64, preclosed: i64) -> Result<i64> {
+    if !(0..=ordered).contains(&fulfilled) || !(0..=ordered - fulfilled).contains(&preclosed) {
+        return Err(Error::Validation(
+            "Order quantities are inconsistent".into(),
+        ));
+    }
+    Ok(ordered - fulfilled - preclosed)
 }
 
 const ORDER_SUMMARIES: &str =
     "SELECT o.id, o.kind, o.party_ledger_id, l.name, o.reference, o.date,
             o.expected_on, o.notes, o.closed_at, o.close_reason,
-            EXISTS(SELECT 1 FROM order_line_progress p WHERE p.order_id = o.id AND p.fulfilled < p.quantity),
-            EXISTS(SELECT 1 FROM order_line_progress p WHERE p.order_id = o.id AND p.fulfilled > 0)
+            EXISTS(SELECT 1 FROM order_line_availability p WHERE p.order_id = o.id AND p.quantity - p.fulfilled > p.preclosed),
+            EXISTS(SELECT 1 FROM order_line_progress p WHERE p.order_id = o.id AND p.fulfilled > 0),
+            EXISTS(SELECT 1 FROM order_lines ol JOIN order_line_closures c ON c.order_line_id = ol.id
+                   WHERE ol.order_id = o.id AND c.reopened_on IS NULL)
      FROM orders o JOIN ledgers l ON l.id = o.party_ledger_id AND l.company_id = o.company_id
      WHERE o.company_id = ?1";
 
@@ -183,7 +229,8 @@ fn read_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrderSummary> {
     let closed_at: Option<String> = row.get(8)?;
     let pending: bool = row.get(10)?;
     let has_fulfilment: bool = row.get(11)?;
-    let status = if closed_at.is_some() {
+    let has_preclosure: bool = row.get(12)?;
+    let status = if closed_at.is_some() || (!pending && has_preclosure) {
         OrderStatus::Closed
     } else if !pending {
         OrderStatus::Fulfilled
@@ -219,8 +266,8 @@ fn order_summary(conn: &Connection, company: i64, order: i64) -> Result<OrderSum
 
 fn order_lines(conn: &Connection, order: i64) -> Result<Vec<OrderLineProgress>> {
     let mut stmt = conn.prepare(
-        "SELECT p.item_id, p.quantity, p.unit_price, s.name, s.unit, p.fulfilled, p.billed
-         FROM order_line_progress p JOIN stock_items s ON s.id = p.item_id
+        "SELECT p.item_id, p.quantity, p.unit_price, s.name, s.unit, p.fulfilled, p.billed, p.preclosed
+         FROM order_line_availability p JOIN stock_items s ON s.id = p.item_id
          WHERE p.order_id = ?1 ORDER BY p.id",
     )?;
     let rows = stmt.query_map([order], |row| {
@@ -234,13 +281,14 @@ fn order_lines(conn: &Connection, order: i64) -> Result<Vec<OrderLineProgress>> 
             unit: row.get(4)?,
             fulfilled: row.get(5)?,
             billed: row.get(6)?,
+            preclosed: row.get(7)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     if rows.is_empty()
         || rows.iter().any(|row| {
-            !(0..=row.line.quantity).contains(&row.fulfilled)
-                || !(0..=row.fulfilled).contains(&row.billed)
+            !(0..=row.fulfilled).contains(&row.billed)
+                || remaining_quantity(row.line.quantity, row.fulfilled, row.preclosed).is_err()
         })
     {
         return Err(Error::Validation(
@@ -330,6 +378,50 @@ pub(crate) enum FulfilmentChange {
     ReverseReturn,
 }
 
+fn check_order_stock_release_date(conn: &Connection, order: i64, date: NaiveDate) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT v.date FROM invoice_order_links link
+         JOIN invoice_reversals r ON r.invoice_id = link.invoice_id
+         JOIN vouchers v ON v.id = r.reversal_voucher_id
+         WHERE link.order_id = ?1
+           AND NOT EXISTS(SELECT 1 FROM stock_note_invoices n WHERE n.invoice_id = link.invoice_id)
+         UNION ALL
+         SELECT reversed_on FROM stock_notes WHERE order_id = ?1 AND reversed_on IS NOT NULL
+         UNION ALL
+         SELECT r.date FROM stock_returns r JOIN stock_notes n ON n.id = r.note_id WHERE n.order_id = ?1
+         UNION ALL
+         SELECT DISTINCT r.date FROM invoice_stock_return_history r
+         LEFT JOIN stock_note_lines nl ON nl.id = r.delivery_line
+         LEFT JOIN stock_notes n ON n.id = nl.note_id
+         LEFT JOIN invoice_order_links i ON i.invoice_id = r.invoice_id AND r.delivery_line IS NULL
+         WHERE COALESCE(n.order_id, i.order_id) = ?1",
+    )?;
+    for row in stmt.query_map([order], |row| row.get::<_, String>(0))? {
+        if date < parse_date(&row?)? {
+            return Err(Error::Validation(
+                "The date cannot precede an existing stock return or reversal on the order".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_line_reopen_date(conn: &Connection, order: i64, item: i64, date: NaiveDate) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.reopened_on FROM order_line_closures c
+         JOIN order_lines ol ON ol.id = c.order_line_id
+         WHERE ol.order_id = ?1 AND ol.item_id = ?2 AND c.reopened_on IS NOT NULL",
+    )?;
+    for row in stmt.query_map(params![order, item], |row| row.get::<_, String>(0))? {
+        if date < parse_date(&row?)? {
+            return Err(Error::Validation(
+                "The date cannot precede the latest reopening of this order line".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn check_fulfilment(
     conn: &Connection,
     company: i64,
@@ -351,36 +443,22 @@ pub(crate) fn check_fulfilment(
             "Document type and party must match the order".into(),
         ));
     }
+    check_order_quantities(conn, &order, date, items)
+}
+
+fn check_order_quantities(
+    conn: &Connection,
+    order: &OrderSummary,
+    date: NaiveDate,
+    items: impl IntoIterator<Item = (i64, i64)>,
+) -> Result<()> {
     if date < parse_date(&order.date)? {
         return Err(Error::Validation(
-            "The document date cannot precede the order date".into(),
+            "The date cannot precede the order date".into(),
         ));
     }
-    let mut stmt = conn.prepare(
-        "SELECT v.date FROM invoice_order_links link
-         JOIN invoice_reversals r ON r.invoice_id = link.invoice_id
-         JOIN vouchers v ON v.id = r.reversal_voucher_id
-         WHERE link.order_id = ?1
-           AND NOT EXISTS(SELECT 1 FROM stock_note_invoices n WHERE n.invoice_id = link.invoice_id)
-         UNION ALL
-         SELECT reversed_on FROM stock_notes WHERE order_id = ?1 AND reversed_on IS NOT NULL
-         UNION ALL
-         SELECT r.date FROM stock_returns r JOIN stock_notes n ON n.id = r.note_id WHERE n.order_id = ?1
-         UNION ALL
-         SELECT DISTINCT r.date FROM invoice_stock_return_history r
-         LEFT JOIN stock_note_lines nl ON nl.id = r.delivery_line
-         LEFT JOIN stock_notes n ON n.id = nl.note_id
-         LEFT JOIN invoice_order_links i ON i.invoice_id = r.invoice_id AND r.delivery_line IS NULL
-         WHERE COALESCE(n.order_id, i.order_id) = ?1",
-    )?;
-    for row in stmt.query_map([id], |row| row.get::<_, String>(0))? {
-        if date < parse_date(&row?)? {
-            return Err(Error::Validation(
-                "The document date cannot precede an existing stock return or reversal on the order".into(),
-            ));
-        }
-    }
-    let progress = order_lines(conn, id)?;
+    check_order_stock_release_date(conn, order.id, date)?;
+    let progress = order_lines(conn, order.id)?;
     let mut remaining: HashMap<_, _> = progress
         .iter()
         .map(|row| (row.line.item_id, (row.unfulfilled(), row.item.as_str())))
@@ -398,6 +476,7 @@ pub(crate) fn check_fulfilment(
                 "Quantity for {name} exceeds the pending amount or is not positive"
             )));
         }
+        check_line_reopen_date(conn, order.id, item, date)?;
         *pending -= quantity;
     }
     Ok(())
@@ -411,8 +490,8 @@ impl Store {
         let mut commitments = HashMap::<i64, (i128, i128)>::new();
         {
             let mut stmt = snapshot.prepare(
-                "SELECT p.item_id, o.kind, p.quantity, p.fulfilled
-                 FROM orders o JOIN order_line_progress p ON p.order_id = o.id
+                "SELECT p.item_id, o.kind, p.quantity, p.fulfilled, p.preclosed
+                 FROM orders o JOIN order_line_availability p ON p.order_id = o.id
                  WHERE o.company_id = ?1 AND o.closed_at IS NULL",
             )?;
             let rows = stmt.query_map([company], |row| {
@@ -421,17 +500,13 @@ impl Store {
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })?;
             for row in rows {
-                let (item, kind, ordered, fulfilled) = row?;
-                if !(0..=ordered).contains(&fulfilled) {
-                    return Err(Error::Validation(
-                        "Order quantities are inconsistent".into(),
-                    ));
-                }
+                let (item, kind, ordered, fulfilled, preclosed) = row?;
                 let (sales, purchases) = commitments.entry(item).or_default();
-                let remaining = i128::from(ordered - fulfilled);
+                let remaining = i128::from(remaining_quantity(ordered, fulfilled, preclosed)?);
                 match InvoiceKind::parse(&kind)? {
                     InvoiceKind::Sale => *sales += remaining,
                     InvoiceKind::Purchase => *purchases += remaining,
@@ -466,12 +541,12 @@ impl Store {
         let through = expected_through.map(parse_date).transpose()?;
         let mut stmt = self.conn.prepare(
             "SELECT o.id, o.kind, o.reference, l.name, o.expected_on,
-                    p.item_id, s.name, s.unit, p.quantity, p.fulfilled
+                    p.item_id, s.name, s.unit, p.quantity, p.fulfilled, p.preclosed
              FROM orders o
-             JOIN order_line_progress p ON p.order_id = o.id
+             JOIN order_line_availability p ON p.order_id = o.id
              JOIN ledgers l ON l.id = o.party_ledger_id AND l.company_id = o.company_id
              JOIN stock_items s ON s.id = p.item_id AND s.company_id = o.company_id
-             WHERE o.company_id = ?1 AND o.closed_at IS NULL AND p.fulfilled != p.quantity
+             WHERE o.company_id = ?1 AND o.closed_at IS NULL AND p.quantity - p.fulfilled != p.preclosed
                AND (?2 IS NULL OR o.kind = ?2)
              ORDER BY o.id, p.id",
         )?;
@@ -487,17 +562,25 @@ impl Store {
                 row.get::<_, String>(7)?,
                 row.get::<_, i64>(8)?,
                 row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
             ))
         })?;
         let mut schedule = Vec::new();
         for row in rows {
-            let (order_id, kind, reference, party, date, item_id, item, unit, ordered, fulfilled) =
-                row?;
-            if !(0..=ordered).contains(&fulfilled) {
-                return Err(Error::Validation(
-                    "Order quantities are inconsistent".into(),
-                ));
-            }
+            let (
+                order_id,
+                kind,
+                reference,
+                party,
+                date,
+                item_id,
+                item,
+                unit,
+                ordered,
+                fulfilled,
+                preclosed,
+            ) = row?;
+            let remaining = remaining_quantity(ordered, fulfilled, preclosed)?;
             let expected_on = date.as_deref().map(parse_date).transpose()?;
             if through.is_some_and(|limit| expected_on.is_none_or(|date| date > limit)) {
                 continue;
@@ -511,7 +594,7 @@ impl Store {
                 item_id,
                 item,
                 unit,
-                remaining: ordered - fulfilled,
+                remaining,
             });
         }
         schedule.sort_by_key(|line| (line.expected_on.is_none(), line.expected_on));
@@ -559,6 +642,27 @@ impl Store {
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut total = 0_i128;
+        let line_closures = {
+            let mut stmt = tx.prepare(
+                "SELECT c.id, s.name, s.unit, c.quantity, c.closed_on, c.reason, c.reopened_on, c.reopen_reason
+                 FROM order_line_closures c JOIN order_lines ol ON ol.id = c.order_line_id
+                 JOIN stock_items s ON s.id = ol.item_id WHERE ol.order_id = ?1
+                 ORDER BY c.closed_on DESC, c.id DESC",
+            )?;
+            let rows = stmt.query_map([id], |row| {
+                Ok(OrderLineClosure {
+                    id: row.get(0)?,
+                    item: row.get(1)?,
+                    unit: row.get(2)?,
+                    quantity: row.get(3)?,
+                    closed_on: row.get(4)?,
+                    reason: row.get(5)?,
+                    reopened_on: row.get(6)?,
+                    reopen_reason: row.get(7)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         for row in &lines {
             total += i128::from(line_amount(row.line.quantity, row.line.unit_price)?);
         }
@@ -567,8 +671,88 @@ impl Store {
             summary,
             lines,
             invoices,
+            line_closures,
             total,
         })
+    }
+
+    /// Release part or all of an item line's remaining quantity.
+    pub fn preclose_order_line(
+        &mut self,
+        company: i64,
+        order: i64,
+        item: i64,
+        date: &str,
+        quantity: i64,
+        reason: &str,
+    ) -> Result<i64> {
+        let date = parse_date(date)?;
+        let reason = required(reason, "Reason for closing the order quantity")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::advances::check_open_date(&tx, company, date)?;
+        let summary = order_summary(&tx, company, order)?;
+        if !summary.status.has_pending() {
+            return Err(Error::Validation(
+                "This order has no unfulfilled quantities".into(),
+            ));
+        }
+        check_order_quantities(&tx, &summary, date, [(item, quantity)])?;
+        check_quantity_precision(&tx, company, item, quantity)?;
+        tx.execute(
+            "INSERT INTO order_line_closures(order_line_id, quantity, closed_on, reason)
+             SELECT id, ?3, ?4, ?5 FROM order_lines WHERE order_id = ?1 AND item_id = ?2",
+            params![order, item, quantity, date.to_string(), reason],
+        )?;
+        let closure = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(closure)
+    }
+
+    pub fn reopen_order_line(
+        &mut self,
+        company: i64,
+        order: i64,
+        closure: i64,
+        date: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let date = parse_date(date)?;
+        let reason = required(reason, "Reason for reopening the order quantity")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::advances::check_open_date(&tx, company, date)?;
+        if order_summary(&tx, company, order)?.closed_at.is_some() {
+            return Err(Error::Validation("The entire order is closed".into()));
+        }
+        let (closed_on, reopened_on): (String, Option<String>) = tx
+            .query_row(
+                "SELECT c.closed_on, c.reopened_on FROM order_line_closures c
+                 JOIN order_lines ol ON ol.id = c.order_line_id JOIN orders o ON o.id = ol.order_id
+                 WHERE o.company_id = ?1 AND o.id = ?2 AND c.id = ?3",
+                params![company, order, closure],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| Error::Validation("Closure not found on this order".into()))?;
+        if reopened_on.is_some() {
+            return Err(Error::Validation(
+                "This quantity has already been reopened".into(),
+            ));
+        }
+        if date < parse_date(&closed_on)? {
+            return Err(Error::Validation(
+                "Reopening cannot precede the closure date".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE order_line_closures SET reopened_on = ?1, reopen_reason = ?2 WHERE id = ?3",
+            params![date.to_string(), reason, closure],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn close_order(&mut self, company: i64, id: i64, reason: &str) -> Result<()> {
@@ -611,5 +795,135 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(invoice)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_closures_adjust_commitments_and_keep_history_per_order() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let other = store.create_company("Other").unwrap();
+        let supplier = store
+            .create_ledger(company, "Supplier", Category::Liability)
+            .unwrap();
+        let part = store.create_stock_item(company, "Part", "Each").unwrap();
+        let box_id = store.create_stock_item(company, "Box", "Each").unwrap();
+        let order = store
+            .create_order(
+                company,
+                &OrderDraft {
+                    kind: InvoiceKind::Purchase,
+                    party_ledger_id: supplier,
+                    reference: "PO-01".into(),
+                    date: "2026-01-01".into(),
+                    expected_on: Some("2026-01-31".into()),
+                    notes: String::new(),
+                    lines: vec![
+                        OrderLine {
+                            item_id: part,
+                            quantity: 4000,
+                            unit_price: 1500,
+                        },
+                        OrderLine {
+                            item_id: box_id,
+                            quantity: 2000,
+                            unit_price: 200,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP VIEW order_line_availability;
+                 DROP TABLE order_line_closures;
+                 PRAGMA user_version = 64;",
+            )
+            .unwrap();
+        let mut store = Store::from_connection(store.conn).unwrap();
+        let detail = store.order_detail(company, order).unwrap();
+        assert!(detail.line_closures.is_empty());
+        assert_eq!(detail.lines[0].unfulfilled(), 4000);
+        assert!(store
+            .preclose_order_line(company, order, part, "2025-12-31", 1000, "Too early")
+            .is_err());
+        assert!(store
+            .preclose_order_line(other, order, part, "2026-01-02", 1000, "Wrong company")
+            .is_err());
+        assert!(store
+            .preclose_order_line(company, order, part, "2026-01-02", 5000, "Too many")
+            .is_err());
+
+        let closure = store
+            .preclose_order_line(company, order, part, "2026-01-02", 1000, "Reduce quantity")
+            .unwrap();
+        store
+            .set_period_lock(company, Some("2026-01-02"), "Month closed")
+            .unwrap();
+        assert!(store
+            .reopen_order_line(company, order, closure, "2026-01-02", "Locked date")
+            .is_err());
+        assert!(store
+            .preclose_order_line(company, order, box_id, "2026-01-02", 1000, "Locked date")
+            .is_err());
+        store
+            .preclose_order_line(company, order, part, "2026-01-03", 3000, "Close balance")
+            .unwrap();
+        let detail = store.order_detail(company, order).unwrap();
+        assert_eq!(detail.summary.status, OrderStatus::Open);
+        assert_eq!(detail.lines[0].preclosed, 4000);
+        assert_eq!(detail.lines[0].unfulfilled(), 0);
+        assert_eq!(detail.lines[1].unfulfilled(), 2000);
+        assert_eq!(detail.total, 6400);
+        let pending = store
+            .pending_order_schedule(company, Some(InvoiceKind::Purchase), Some("2026-01-31"))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!((pending[0].item_id, pending[0].remaining), (box_id, 2000));
+
+        store
+            .preclose_order_line(
+                company,
+                order,
+                box_id,
+                "2026-01-04",
+                2000,
+                "Close other item",
+            )
+            .unwrap();
+        assert_eq!(
+            store.order_detail(company, order).unwrap().summary.status,
+            OrderStatus::Closed
+        );
+        assert!(store
+            .reopen_order_line(other, order, closure, "2026-01-05", "Wrong company")
+            .is_err());
+        store
+            .reopen_order_line(company, order, closure, "2026-01-05", "Need one unit")
+            .unwrap();
+        let detail = store.order_detail(company, order).unwrap();
+        assert_eq!(detail.summary.status, OrderStatus::Open);
+        let history = detail
+            .line_closures
+            .iter()
+            .find(|line| line.id == closure)
+            .unwrap();
+        assert_eq!(history.reason, "Reduce quantity");
+        assert_eq!(history.reopened_on.as_deref(), Some("2026-01-05"));
+        assert_eq!(history.reopen_reason.as_deref(), Some("Need one unit"));
+        assert!(store
+            .reopen_order_line(company, order, closure, "2026-01-05", "Repeated")
+            .is_err());
+        let available = store.order_availability(company).unwrap();
+        let part_balance = available.iter().find(|row| row.item.id == part).unwrap();
+        assert_eq!(
+            (part_balance.on_hand, part_balance.open_purchases),
+            (0, 1000)
+        );
     }
 }

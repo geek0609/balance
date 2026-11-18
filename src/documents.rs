@@ -485,18 +485,19 @@ impl Store {
         if let Some(reference) = self.order_quotation(company_id, order_id)? {
             let _ = write!(html, "<br>Quotation: {}", escape(&reference));
         }
-        html.push_str("</p><table><thead><tr><th>Item</th><th class=\"num\">Ordered</th><th class=\"num\">Fulfilled</th><th class=\"num\">Invoiced</th><th class=\"num\">Unit price</th><th class=\"num\">Amount</th></tr></thead><tbody>");
+        html.push_str("</p><table><thead><tr><th>Item</th><th class=\"num\">Ordered</th><th class=\"num\">Fulfilled</th><th class=\"num\">Invoiced</th><th class=\"num\">Pre-closed</th><th class=\"num\">Unit price</th><th class=\"num\">Amount</th></tr></thead><tbody>");
         for row in detail.lines {
             let line = row.line;
             let amount = line_amount(line.quantity, line.unit_price)?;
             let _ = write!(
                 html,
-                "<tr><td>{}</td><td class=\"num\">{} {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+                "<tr><td>{}</td><td class=\"num\">{} {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
                 escape(&row.item),
                 format_quantity(line.quantity.into()),
                 escape(&row.unit),
                 format_quantity(row.fulfilled.into()),
                 format_quantity(row.billed.into()),
+                format_quantity(row.preclosed.into()),
                 format_amount(line.unit_price),
                 format_amount(amount),
             );

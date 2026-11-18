@@ -49,7 +49,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 64;
+const SCHEMA_VERSION: i64 = 65;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -416,6 +416,7 @@ impl Store {
             "period_lock_events",
             "orders",
             "order_lines",
+            "order_line_closures",
             "invoice_order_links",
             "stock_counts",
             "stock_count_lines",
@@ -491,7 +492,10 @@ impl Store {
         }
         store
             .conn
-            .prepare("SELECT id, fulfilled FROM order_line_progress LIMIT 0")?;
+            .prepare("SELECT id, fulfilled, preclosed FROM order_line_availability LIMIT 0")?;
+        store
+            .conn
+            .prepare("SELECT quantity, closed_on, reopened_on FROM order_line_closures LIMIT 0")?;
         Ok(())
     }
     fn from_connection(mut conn: Connection) -> Result<Self> {
@@ -872,6 +876,10 @@ impl Store {
         if version < 64 {
             stock_notes::migrate_combined_billing(&tx)?;
             tx.pragma_update(None, "user_version", 64)?;
+        }
+        if version < 65 {
+            orders::migrate_line_closures(&tx)?;
+            tx.pragma_update(None, "user_version", 65)?;
         }
         tx.commit()?;
         Ok(Self { conn })
