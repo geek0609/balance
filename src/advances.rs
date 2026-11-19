@@ -65,11 +65,21 @@ pub struct PartyAdvance {
     pub reversal: Option<AdvanceReversal>,
 }
 
-/// Optional original classification and bill reference for imported advances.
+/// Original bill reference, classification and terms for an imported advance.
 #[derive(Debug, Clone)]
 pub struct AdvanceSourceBill {
     pub kind: String,
     pub reference: Option<String>,
+    pub due_date: Option<String>,
+    pub credit_days: Option<u32>,
+}
+
+impl AdvanceSourceBill {
+    pub(crate) fn named_reference(&self) -> Option<&str> {
+        self.reference
+            .as_deref()
+            .filter(|_| matches!(self.kind.as_str(), "Advance" | "New Ref"))
+    }
 }
 
 pub(crate) fn migrate_source_bill(conn: &Connection) -> Result<()> {
@@ -98,6 +108,29 @@ pub(crate) fn migrate_combined_reversal_guard(conn: &Connection) -> Result<()> {
              SELECT RAISE(ABORT, 'Reverse the entire combined receipt or payment');
          END;",
     )?;
+    Ok(())
+}
+
+pub(crate) fn migrate_source_bill_terms(conn: &Connection) -> Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('party_advances') WHERE name = 'source_bill_credit_days')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        conn.execute_batch(
+            "ALTER TABLE party_advances RENAME COLUMN source_bill_type TO previous_source_bill_type;
+             ALTER TABLE party_advances ADD COLUMN source_bill_type TEXT
+                 CHECK(source_bill_type IN ('Advance', 'On Account', 'New Ref'));
+             ALTER TABLE party_advances ADD COLUMN source_bill_due_date TEXT;
+             ALTER TABLE party_advances ADD COLUMN source_bill_credit_days INTEGER
+                 CHECK(source_bill_credit_days IS NULL OR
+                     (source_bill_credit_days BETWEEN 0 AND 4294967295 AND source_bill_due_date IS NULL));
+             UPDATE party_advances SET source_bill_type = previous_source_bill_type
+                 WHERE previous_source_bill_type IS NOT NULL;
+             ALTER TABLE party_advances DROP COLUMN previous_source_bill_type;",
+        )?;
+    }
     Ok(())
 }
 
@@ -163,10 +196,22 @@ pub(crate) fn insert_party_advance(
         )?;
     }
     conn.execute(
-        "INSERT INTO party_advances(company_id, kind, party_ledger_id, bank_ledger_id, voucher_id, amount, reference_key, source_bill_type, source_bill_reference)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![company, draft.kind.as_str(), draft.party_ledger_id, draft.bank_ledger_id, voucher, draft.amount, key, source_bill.map(|v| v.kind.as_str()),
-            source_bill.and_then(|v| v.reference.as_deref())],
+        "INSERT INTO party_advances(company_id, kind, party_ledger_id, bank_ledger_id, voucher_id, amount, reference_key,
+                                    source_bill_type, source_bill_reference, source_bill_due_date, source_bill_credit_days)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            company,
+            draft.kind.as_str(),
+            draft.party_ledger_id,
+            draft.bank_ledger_id,
+            voucher,
+            draft.amount,
+            key,
+            source_bill.map(|bill| bill.kind.as_str()),
+            source_bill.and_then(|bill| bill.reference.as_deref()),
+            source_bill.and_then(|bill| bill.due_date.as_deref()),
+            source_bill.and_then(|bill| bill.credit_days),
+        ],
     )?;
     Ok((conn.last_insert_rowid(), voucher))
 }
@@ -285,7 +330,7 @@ pub(crate) fn read_party_advances(
     let mut stmt = conn.prepare(
             "SELECT a.id, a.kind, a.party_ledger_id, party.name, bank.name, v.id, v.date, v.reference,
                     v.narration, a.amount, rv.id, rv.date, rv.reference, a.reversal_reason,
-                    a.source_bill_type, a.source_bill_reference,
+                    a.source_bill_type, a.source_bill_reference, a.source_bill_due_date, a.source_bill_credit_days,
                     EXISTS(SELECT 1 FROM invoice_settlements s WHERE s.voucher_id = a.voucher_id AND s.company_id = a.company_id)
              FROM party_advances a JOIN vouchers v ON v.id = a.voucher_id AND v.company_id = a.company_id
              JOIN ledgers party ON party.id = a.party_ledger_id AND party.company_id = a.company_id
@@ -334,6 +379,8 @@ pub(crate) fn read_party_advances(
             Some(kind) => Some(AdvanceSourceBill {
                 kind,
                 reference: row.get(15)?,
+                due_date: row.get(16)?,
+                credit_days: row.get(17)?,
             }),
             None => None,
         };
@@ -350,7 +397,7 @@ pub(crate) fn read_party_advances(
                 reference: row.get(7)?,
                 narration: row.get(8)?,
                 amount,
-                includes_settlements: row.get(16)?,
+                includes_settlements: row.get(18)?,
                 applied,
                 available,
                 source_bill,

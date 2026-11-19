@@ -54,7 +54,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 78;
+const SCHEMA_VERSION: i64 = 79;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -981,6 +981,10 @@ impl Store {
         if version < 78 {
             advances::migrate_combined_reversal_guard(&tx)?;
             tx.pragma_update(None, "user_version", 78)?;
+        }
+        if version < 79 {
+            advances::migrate_source_bill_terms(&tx)?;
+            tx.pragma_update(None, "user_version", 79)?;
         }
         tx.commit()?;
         Ok(Self { conn })

@@ -158,6 +158,7 @@ struct ImportedInvoice {
 struct ImportedAdvanceApplication {
     reference: String,
     amount: i64,
+    terms: BillTerms,
     existing_advance_id: Option<i64>,
     expected_available: i128,
 }
@@ -901,6 +902,54 @@ fn xml_credit_days(term: &str) -> Result<u32> {
         .parse::<u32>()
         .map_err(|_| Error::Validation("credit period is too large".into()))
 }
+#[derive(Debug, Clone, Default)]
+struct BillTerms {
+    due_date: Option<String>,
+    credit_days: Option<u32>,
+}
+
+impl BillTerms {
+    fn is_specified(&self) -> bool {
+        self.due_date.is_some() || self.credit_days.is_some()
+    }
+
+    fn due_date_from(&self, date: NaiveDate) -> Result<Option<NaiveDate>> {
+        if let Some(due_date) = &self.due_date {
+            return parse_date(due_date).map(Some);
+        }
+        self.credit_days
+            .map(|days| {
+                date.checked_add_days(chrono::Days::new(u64::from(days)))
+                    .ok_or_else(|| {
+                        Error::Validation("Credit period produces an invalid due date".into())
+                    })
+            })
+            .transpose()
+    }
+}
+
+fn xml_bill_terms(value: Option<&str>) -> Result<BillTerms> {
+    let Some(value) = value else {
+        return Ok(BillTerms::default());
+    };
+    if let Ok(date) = xml_date(value) {
+        return Ok(BillTerms {
+            due_date: Some(date),
+            credit_days: None,
+        });
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%d-%b-%Y") {
+        return Ok(BillTerms {
+            due_date: Some(date.to_string()),
+            credit_days: None,
+        });
+    }
+    Ok(BillTerms {
+        due_date: None,
+        credit_days: Some(xml_credit_days(value)?),
+    })
+}
+
 fn invoice_side(node: Node<'_, '_>, field: &str, debit: bool) -> Result<()> {
     if let Some(value) = direct_text(node, field).filter(|v| !v.is_empty()) {
         if !value.eq_ignore_ascii_case(if debit { "yes" } else { "no" }) {
@@ -1238,33 +1287,37 @@ fn parse_imported_settlement(
                     .checked_abs()
                     .ok_or_else(|| Error::Validation("bill amount is too large".into()))?;
                 let credit = direct_text(bill, "BILLCREDITPERIOD").filter(|v| !v.is_empty());
-                if matches!(bill_type.as_str(), "advance" | "on account") {
+                if matches!(bill_type.as_str(), "advance" | "new ref" | "on account") {
                     if advance.is_some() {
                         return Err(Error::Validation(
                             "only one advance or on-account allocation per receipt or payment is supported".into(),
                         ));
                     }
-                    if credit.is_some() {
-                        return Err(Error::Validation(
-                            "credit terms on advances are not supported".into(),
-                        ));
-                    }
-                    let source = if bill_type == "advance" {
-                        "Advance"
-                    } else {
-                        "On Account"
+                    let source = match bill_type.as_str() {
+                        "advance" => "Advance",
+                        "new ref" => "New Ref",
+                        _ => "On Account",
                     };
                     let reference = direct_text(bill, "NAME").filter(|value| !value.is_empty());
-                    if bill_type == "advance" && reference.is_none() {
+                    if source != "On Account" && reference.is_none() {
                         return Err(Error::Validation(
-                            "an advance needs a bill reference".into(),
+                            "a named advance needs a bill reference".into(),
                         ));
                     }
+                    let terms = xml_bill_terms(credit.as_deref())?;
+                    if source == "On Account" && terms.is_specified() {
+                        return Err(Error::Validation(
+                            "on-account allocations cannot carry credit terms".into(),
+                        ));
+                    }
+                    terms.due_date_from(parse_date(&date)?)?;
                     advance = Some(ImportedAdvance {
                         amount: value,
                         source_bill: AdvanceSourceBill {
                             kind: source.into(),
                             reference,
+                            due_date: terms.due_date,
+                            credit_days: terms.credit_days,
                         },
                     });
                     continue;
@@ -1553,13 +1606,9 @@ fn parse_imported_invoice(
                 signed_total += i128::from(bill_amount);
                 let credit =
                     direct_text(bill, "BILLCREDITPERIOD").filter(|value| !value.is_empty());
+                let terms = xml_bill_terms(credit.as_deref())?;
                 match normalized(&invoice_field(bill, "BILLTYPE")?).as_str() {
                     "agst ref" => {
-                        if credit.is_some() {
-                            return Err(Error::Validation(
-                                "An application of an advance cannot carry credit terms".into(),
-                            ));
-                        }
                         if !advance_references.insert(normalized(&reference)) {
                             return Err(Error::Validation(format!(
                                 "Advance reference {reference} occurs more than once"
@@ -1568,6 +1617,7 @@ fn parse_imported_invoice(
                         advance_applications.push(ImportedAdvanceApplication {
                             reference,
                             amount,
+                            terms,
                             existing_advance_id: None,
                             expected_available: 0,
                         });
@@ -1580,29 +1630,12 @@ fn parse_imported_invoice(
                         ))
                     }
                 }
-                let (due_date, credit_days) = match credit {
-                    Some(value) => match xml_date(&value).or_else(|_| {
-                        NaiveDate::parse_from_str(&value, "%d-%b-%Y")
-                            .map(|date| date.to_string())
-                            .map_err(|_| Error::Validation("Invalid bill due date".into()))
-                    }) {
-                        Ok(date) => (Some(date), None),
-                        Err(_) => (None, Some(xml_credit_days(&value)?)),
-                    },
-                    None => (None, None),
-                };
-                if let Some(days) = credit_days {
-                    parse_date(&date)?
-                        .checked_add_days(chrono::Days::new(u64::from(days)))
-                        .ok_or_else(|| {
-                            Error::Validation("Credit period produces an invalid due date".into())
-                        })?;
-                }
+                terms.due_date_from(parse_date(&date)?)?;
                 schedule.push(BillSplitDraft {
                     reference,
                     amount,
-                    due_date,
-                    credit_days,
+                    due_date: terms.due_date,
+                    credit_days: terms.credit_days,
                 });
             }
             if signed_total != i128::from(amount) {
@@ -1989,6 +2022,7 @@ struct NamedAdvance {
     id: Option<i64>,
     reference: String,
     date: NaiveDate,
+    due_date: Option<NaiveDate>,
     latest_release: Option<NaiveDate>,
     available: i128,
 }
@@ -2015,12 +2049,19 @@ fn add_named_advance(
 fn read_named_advances(conn: &Connection, company: i64) -> Result<NamedAdvances> {
     let mut advances = HashMap::new();
     for row in read_party_advances(conn, company, None)? {
-        let reference = match row.source_bill {
-            Some(source) if source.kind == "Advance" => source.reference,
-            Some(_) => None,
-            None => Some(row.reference),
+        let date = parse_date(&row.date)?;
+        let (reference, due_date) = if let Some(source) = row.source_bill {
+            let Some(reference) = source.named_reference().map(str::to_owned) else {
+                continue;
+            };
+            let terms = BillTerms {
+                due_date: source.due_date,
+                credit_days: source.credit_days,
+            };
+            (reference, terms.due_date_from(date)?)
+        } else {
+            (row.reference, None)
         };
-        let Some(reference) = reference else { continue };
         add_named_advance(
             &mut advances,
             row.kind,
@@ -2028,7 +2069,8 @@ fn read_named_advances(conn: &Connection, company: i64) -> Result<NamedAdvances>
             NamedAdvance {
                 id: Some(row.id),
                 reference,
-                date: parse_date(&row.date)?,
+                date,
+                due_date,
                 latest_release: advance_allocation_state(conn, company, row.id, None)?
                     .latest_release,
                 available: row.available,
@@ -2070,6 +2112,13 @@ fn named_advance<'a>(
             "Application precedes advance {reference} or its latest release"
         )));
     }
+    if application.terms.is_specified()
+        && application.terms.due_date_from(advance.date)? != advance.due_date
+    {
+        return Err(Error::Validation(format!(
+            "Credit terms differ from the saved advance {reference}"
+        )));
+    }
     if i128::from(application.amount) > advance.available {
         return Err(Error::Validation(format!(
             "Application exceeds the available amount on advance {reference}"
@@ -2090,19 +2139,21 @@ fn preview_advance_applications(
             source_bill,
         }) = &settlement.bills.advance
         {
-            if let Some(reference) = source_bill
-                .reference
-                .as_ref()
-                .filter(|_| source_bill.kind == "Advance")
-            {
+            if let Some(reference) = source_bill.named_reference() {
+                let date = parse_date(&settlement.date)?;
+                let terms = BillTerms {
+                    due_date: source_bill.due_date.clone(),
+                    credit_days: source_bill.credit_days,
+                };
                 add_named_advance(
                     &mut advances,
                     settlement.kind,
                     &settlement.party,
                     NamedAdvance {
                         id: None,
-                        reference: reference.clone(),
-                        date: parse_date(&settlement.date)?,
+                        reference: reference.into(),
+                        date,
+                        due_date: terms.due_date_from(date)?,
                         latest_release: None,
                         available: (*amount).into(),
                     },
@@ -4838,12 +4889,28 @@ mod tests {
                 )
             };
             // Keep the source advance bill name distinct from the cash voucher number.
-            let advance = cash_voucher("20260101", "CASH-ADV", "DEPOSIT", "Advance", 80);
+            let with_terms = |xml: String, term: &str| {
+                xml.replacen(
+                    "</BILLALLOCATIONS.LIST>",
+                    &format!("<BILLCREDITPERIOD>{term}</BILLCREDITPERIOD></BILLALLOCATIONS.LIST>"),
+                    1,
+                )
+            };
+            let source_term = if kind == "Sales" {
+                "15-Feb-2026"
+            } else {
+                "45 Days"
+            };
+            let advance = with_terms(
+                cash_voucher("20260101", "CASH-ADV", "DEPOSIT", "New Ref", 80),
+                source_term,
+            );
             let first = invoice(
                 "20260110",
                 "INV-1",
                 100,
-                allocation("DEPOSIT", "Agst Ref", 50) + &allocation("OPEN", "New Ref", 50),
+                with_terms(allocation("DEPOSIT", "Agst Ref", 50), "20260215")
+                    + &allocation("OPEN", "New Ref", 50),
             );
             let second = invoice(
                 "20260112",
@@ -4869,11 +4936,32 @@ mod tests {
                     "exceeds the available",
                 ),
                 (
+                    transactions.replace("20260215", "20260216"),
+                    "Credit terms differ",
+                ),
+                (
                     transactions.replace(
-                        "<BILLTYPE>Advance</BILLTYPE>",
-                        "<BILLTYPE>On Account</BILLTYPE>",
+                        &advance,
+                        &cash_voucher("20260101", "CASH-ADV", "DEPOSIT", "On Account", 80),
                     ),
                     "unavailable",
+                ),
+                (
+                    transactions.replace(
+                        &advance,
+                        &with_terms(
+                            cash_voucher("20260101", "CASH-ADV", "DEPOSIT", "On Account", 80),
+                            source_term,
+                        ),
+                    ),
+                    "on-account allocations cannot carry credit terms",
+                ),
+                (
+                    transactions.replace(
+                        &advance,
+                        &cash_voucher("20260101", "CASH-ADV", "", "New Ref", 80),
+                    ),
+                    "needs a bill reference",
                 ),
             ] {
                 let blocked = store
@@ -4905,9 +4993,19 @@ mod tests {
             let advances = store.party_advances(company, None).unwrap();
             let advance = &advances[0];
             assert_eq!((advance.applied, advance.available), (7500, 500));
+            let source = advance.source_bill.as_ref().unwrap();
             assert_eq!(
-                advance.source_bill.as_ref().unwrap().reference.as_deref(),
-                Some("DEPOSIT")
+                (source.kind.as_str(), source.reference.as_deref()),
+                ("New Ref", Some("DEPOSIT"))
+            );
+            let expected_terms = if kind == "Sales" {
+                (Some("2026-02-15"), None)
+            } else {
+                (None, Some(45))
+            };
+            assert_eq!(
+                (source.due_date.as_deref(), source.credit_days),
+                expected_terms
             );
             let history = store
                 .advance_allocations(company, advance.id, None)

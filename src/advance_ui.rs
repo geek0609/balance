@@ -147,7 +147,12 @@ impl App {
                 .is_some_and(|kind| kind != advance.kind)
                 || (!search.is_empty()
                     && !advance.party.to_lowercase().contains(&search)
-                    && !advance.reference.to_lowercase().contains(&search))
+                    && !advance.reference.to_lowercase().contains(&search)
+                    && !advance
+                        .source_bill
+                        .as_ref()
+                        .and_then(|bill| bill.reference.as_deref())
+                        .is_some_and(|reference| reference.to_lowercase().contains(&search)))
             {
                 continue;
             }
@@ -263,6 +268,12 @@ impl App {
                 Some(reference) => format!("Imported bill {} | {reference}", bill.kind),
                 None => format!("Imported bill {}", bill.kind),
             });
+            if let Some(date) = &bill.due_date {
+                ui.label(format!("Due date {date}"));
+            }
+            if let Some(days) = bill.credit_days {
+                ui.label(format!("Credit period {days} days"));
+            }
         }
         if !advance.narration.is_empty() {
             ui.label(&advance.narration);
