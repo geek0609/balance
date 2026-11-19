@@ -1523,10 +1523,18 @@ fn parse_imported_invoice(
                         "Each bill must be a new reference in the party's direction".into(),
                     ));
                 }
-                let credit_days = direct_text(bill, "BILLCREDITPERIOD")
-                    .filter(|v| !v.is_empty())
-                    .map(|value| xml_credit_days(&value))
-                    .transpose()?;
+                let (due_date, credit_days) =
+                    match direct_text(bill, "BILLCREDITPERIOD").filter(|value| !value.is_empty()) {
+                        Some(value) => match xml_date(&value).or_else(|_| {
+                            NaiveDate::parse_from_str(&value, "%d-%b-%Y")
+                                .map(|date| date.to_string())
+                                .map_err(|_| Error::Validation("Invalid bill due date".into()))
+                        }) {
+                            Ok(date) => (Some(date), None),
+                            Err(_) => (None, Some(xml_credit_days(&value)?)),
+                        },
+                        None => (None, None),
+                    };
                 if let Some(days) = credit_days {
                     parse_date(&date)?
                         .checked_add_days(chrono::Days::new(u64::from(days)))
@@ -1540,7 +1548,7 @@ fn parse_imported_invoice(
                     amount: bill_amount
                         .checked_abs()
                         .ok_or_else(|| Error::Validation("Bill amount is too large".into()))?,
-                    due_date: None,
+                    due_date,
                     credit_days,
                 });
             }
@@ -4163,7 +4171,11 @@ impl Store {
                 kind: invoice.kind,
                 entry_mode: invoice.entry_mode,
                 date: invoice.date.clone(),
-                due_date: None,
+                due_date: if invoice.bills.len() == 1 {
+                    invoice.bills[0].due_date.clone()
+                } else {
+                    None
+                },
                 credit_days: if invoice.bills.len() == 1 {
                     invoice.bills[0].credit_days
                 } else {
@@ -4454,7 +4466,7 @@ mod tests {
                 <BILLALLOCATIONS.LIST><NAME>FIRST</NAME><BILLTYPE>New Ref</BILLTYPE>
                     <AMOUNT>-35.00</AMOUNT><BILLCREDITPERIOD>10 Days</BILLCREDITPERIOD></BILLALLOCATIONS.LIST>
                 <BILLALLOCATIONS.LIST><NAME>SECOND</NAME><BILLTYPE>New Ref</BILLTYPE>
-                    <AMOUNT>-65.00</AMOUNT><BILLCREDITPERIOD>30 Days</BILLCREDITPERIOD></BILLALLOCATIONS.LIST>
+                    <AMOUNT>-65.00</AMOUNT><BILLCREDITPERIOD>31-Jan-2026</BILLCREDITPERIOD></BILLALLOCATIONS.LIST>
             </LEDGERENTRIES.LIST>
             <LEDGERENTRIES.LIST><LEDGERNAME>Sales</LEDGERNAME><AMOUNT>100.00</AMOUNT></LEDGERENTRIES.LIST>
         </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#;
@@ -4488,6 +4500,7 @@ mod tests {
             [("FIRST".into(), 1500), ("SECOND".into(), 2500)]
         );
         let report = store.outstanding_invoices(company, "2026-01-15").unwrap();
+        assert_eq!(report[1].due_date.as_deref(), Some("2026-01-31"));
         assert_eq!(
             report
                 .iter()
@@ -4749,7 +4762,7 @@ mod tests {
             </MESSAGE></DATA></BODY></ENVELOPE>"#
             )
         };
-        let sale = invoice("INV-01", "BILL-07");
+        let sale = invoice("INV-01", "BILL-07").replace("30 Days", "20260201");
         let other = invoice("BILL-07", "INV-01")
             .replace("<ISINVOICE>Yes", "<ISINVOICE>No")
             .replace("Invoice Voucher View", "Accounting Voucher View");
