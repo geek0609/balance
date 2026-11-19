@@ -219,7 +219,10 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP TABLE quotation_revisions;
+                "ALTER TABLE postings DROP COLUMN is_party;
+                 ALTER TABLE revision_postings DROP COLUMN is_party;
+                 ALTER TABLE recurring_journal_lines DROP COLUMN is_party;
+                 DROP TABLE quotation_revisions;
                  DROP VIEW active_stock_reservation_balances;
                  DROP TABLE stock_reservation_expiries;
                  DROP VIEW warehouse_stock_movements;

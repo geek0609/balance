@@ -2,7 +2,7 @@
 
 use crate::inventory::{invoice_total, InvoiceKind};
 use crate::{
-    insert_voucher, parse_date, required, validate_voucher, Error, Posting, Result, Store,
+    insert_voucher_draft, parse_date, required, Error, Posting, Result, Store, VoucherDraft,
     VoucherKind,
 };
 use chrono::NaiveDate;
@@ -439,12 +439,22 @@ pub(crate) fn insert_invoice_credit(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    validate_voucher(&date.to_string(), &postings)?;
     let kind = match invoice.kind {
         InvoiceKind::Sale => VoucherKind::CreditNote,
         InvoiceKind::Purchase => VoucherKind::DebitNote,
     };
-    let voucher = insert_voucher(tx, company, kind, reference, date, reason, &postings)?;
+    let voucher = insert_voucher_draft(
+        tx,
+        company,
+        VoucherDraft {
+            kind,
+            reference,
+            date: &date.to_string(),
+            narration: reason,
+            postings: &postings,
+            party_lines: &[],
+        },
+    )?;
     if tx.execute(
         "INSERT INTO invoice_credit_notes(company_id, invoice_id, voucher_id, reference_key, amount, reason)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)

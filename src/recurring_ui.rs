@@ -62,19 +62,22 @@ impl RecurringJournalScreen {
             ui.label(&journal.narration);
         }
         let ledgers = store.ledgers(company)?;
-        let postings = store.monthly_journal_lines(company, journal.id)?;
+        let (postings, party_lines) = store.monthly_journal_postings(company, journal.id)?;
         egui::Grid::new("monthly-journal-postings").show(ui, |ui| {
             ui.strong("Ledger");
             ui.strong("Debit");
             ui.strong("Credit");
             ui.end_row();
-            for posting in postings {
+            for (index, posting) in postings.into_iter().enumerate() {
                 let ledger = ledgers.iter().find(|ledger| ledger.id == posting.ledger_id);
-                ui.label(
-                    ledger
-                        .map(|ledger| ledger.name.as_str())
-                        .unwrap_or("Unavailable ledger"),
-                );
+                let name = ledger
+                    .map(|ledger| ledger.name.as_str())
+                    .unwrap_or("Unavailable ledger");
+                ui.label(if party_lines.contains(&index) {
+                    format!("{name} (party)")
+                } else {
+                    name.to_owned()
+                });
                 let amount = format_amount(posting.amount);
                 if posting.amount > 0 {
                     ui.label(&amount);

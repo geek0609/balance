@@ -53,7 +53,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 71;
+const SCHEMA_VERSION: i64 = 72;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -177,6 +177,16 @@ pub struct Posting {
     /// Positive for debit, negative for credit, in hundredths.
     pub amount: i64,
 }
+#[derive(Debug, Clone, Copy)]
+pub struct VoucherDraft<'a> {
+    pub kind: VoucherKind,
+    pub reference: &'a str,
+    pub date: &'a str,
+    pub narration: &'a str,
+    pub postings: &'a [Posting],
+    /// Zero-based indices of the party postings in this draft.
+    pub party_lines: &'a [usize],
+}
 #[derive(Debug, Clone)]
 pub struct Voucher {
     pub id: i64,
@@ -185,6 +195,8 @@ pub struct Voucher {
     pub date: String,
     pub narration: String,
     pub postings: Vec<Posting>,
+    /// Zero-based indices of the postings marked as party entries.
+    pub party_lines: Vec<usize>,
 }
 #[derive(Debug, Clone)]
 pub struct VoucherRevision {
@@ -927,6 +939,14 @@ impl Store {
             quotations::migrate_revisions(&tx)?;
             tx.pragma_update(None, "user_version", 71)?;
         }
+        if version < 72 {
+            tx.execute_batch(
+                "ALTER TABLE postings ADD COLUMN is_party INTEGER NOT NULL DEFAULT 0 CHECK(is_party IN (0, 1));
+                 ALTER TABLE revision_postings ADD COLUMN is_party INTEGER NOT NULL DEFAULT 0 CHECK(is_party IN (0, 1));
+                 ALTER TABLE recurring_journal_lines ADD COLUMN is_party INTEGER NOT NULL DEFAULT 0 CHECK(is_party IN (0, 1));",
+            )?;
+            tx.pragma_update(None, "user_version", 72)?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
@@ -1083,9 +1103,21 @@ impl Store {
         narration: &str,
         postings: &[Posting],
     ) -> Result<i64> {
-        let date = validate_voucher(date, postings)?;
+        self.post_voucher_draft(
+            company_id,
+            VoucherDraft {
+                kind,
+                reference,
+                date,
+                narration,
+                postings,
+                party_lines: &[],
+            },
+        )
+    }
+    pub fn post_voucher_draft(&mut self, company_id: i64, draft: VoucherDraft<'_>) -> Result<i64> {
         let tx = self.conn.transaction()?;
-        let id = insert_voucher(&tx, company_id, kind, reference, date, narration, postings)?;
+        let id = insert_voucher_draft(&tx, company_id, draft)?;
         tx.commit()?;
         Ok(id)
     }
@@ -1156,10 +1188,39 @@ impl Store {
         narration: &str,
         postings: &[Posting],
     ) -> Result<()> {
-        let date = validate_voucher(date, postings)?;
+        self.save_voucher_revision(
+            company_id,
+            voucher_id,
+            VoucherDraft {
+                kind,
+                reference,
+                date,
+                narration,
+                postings,
+                party_lines: &[],
+            },
+            false,
+        )
+    }
+    pub fn update_voucher_draft(
+        &mut self,
+        company_id: i64,
+        voucher_id: i64,
+        draft: VoucherDraft<'_>,
+    ) -> Result<()> {
+        self.save_voucher_revision(company_id, voucher_id, draft, true)
+    }
+    fn save_voucher_revision(
+        &mut self,
+        company_id: i64,
+        voucher_id: i64,
+        draft: VoucherDraft<'_>,
+        edit_party_lines: bool,
+    ) -> Result<()> {
+        let date = validate_voucher(draft.date, draft.postings)?;
         let tx = self.conn.transaction()?;
-        check_ledgers(&tx, company_id, postings)?;
-        opening::check_no_control_postings(&tx, company_id, postings)?;
+        check_ledgers(&tx, company_id, draft.postings)?;
+        opening::check_no_control_postings(&tx, company_id, draft.postings)?;
         let invoice_backed: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM invoices WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE reversal_voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM party_advances WHERE company_id = ?2 AND ?1 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_accruals WHERE company_id = ?2 AND ?1 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_payments WHERE company_id = ?2 AND ?1 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM foreign_vouchers WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM opening_balances WHERE voucher_id = ?1 AND company_id = ?2 UNION ALL SELECT 1 FROM voucher_reversals WHERE company_id = ?2 AND (original_voucher_id = ?1 OR reversal_voucher_id = ?1) UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?2 AND (original_voucher_id = ?1 OR clearing_voucher_id = ?1))",
             params![voucher_id, company_id],
@@ -1175,6 +1236,17 @@ impl Store {
         }
         costs::ensure_unallocated(&tx, voucher_id)?;
         banking::ensure_no_bank_clearance(&tx, company_id, voucher_id)?;
+        if !edit_party_lines
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM postings WHERE voucher_id = ?1 AND is_party = 1)",
+                [voucher_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(Error::Validation(
+                "Use a voucher draft with the party lines to edit this voucher".into(),
+            ));
+        }
         let saved = tx.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![voucher_id, company_id])?;
         if saved != 1 {
             return Err(Error::Validation(
@@ -1182,16 +1254,16 @@ impl Store {
             ));
         }
         let revision_id = tx.last_insert_rowid();
-        tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![revision_id, voucher_id])?;
+        tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount, is_party) SELECT ?1, ledger_id, amount, is_party FROM postings WHERE voucher_id = ?2 ORDER BY id", params![revision_id, voucher_id])?;
         let changed = tx.execute(
             "UPDATE vouchers SET date = ?1, narration = ?2, kind = ?5, reference = ?6 WHERE id = ?3 AND company_id = ?4",
             params![
                 date.format("%Y-%m-%d").to_string(),
-                narration.trim(),
+                draft.narration.trim(),
                 voucher_id,
                 company_id,
-                kind.as_str(),
-                reference.trim()
+                draft.kind.as_str(),
+                draft.reference.trim()
             ],
         )?;
         if changed != 1 {
@@ -1200,12 +1272,7 @@ impl Store {
             ));
         }
         tx.execute("DELETE FROM postings WHERE voucher_id = ?1", [voucher_id])?;
-        for p in postings {
-            tx.execute(
-                "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-                params![voucher_id, p.ledger_id, p.amount],
-            )?;
-        }
+        write_voucher_postings(&tx, voucher_id, draft.postings, draft.party_lines)?;
         tx.commit()?;
         Ok(())
     }
@@ -1217,19 +1284,12 @@ impl Store {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
             .collect::<rusqlite::Result<Vec<(i64, String, String, String, String)>>>()?;
-        let mut postings_stmt = self
-            .conn
-            .prepare("SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
+        let mut postings_stmt = self.conn.prepare(
+            "SELECT ledger_id, amount, is_party FROM postings WHERE voucher_id = ?1 ORDER BY id",
+        )?;
         let mut vouchers = Vec::with_capacity(rows.len());
         for (id, date, narration, kind, reference) in rows {
-            let postings = postings_stmt
-                .query_map([id], |r| {
-                    Ok(Posting {
-                        ledger_id: r.get(0)?,
-                        amount: r.get(1)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let (postings, party_lines) = read_voucher_postings(&mut postings_stmt.query([id])?)?;
             vouchers.push(Voucher {
                 id,
                 kind: VoucherKind::parse(&kind)?,
@@ -1237,6 +1297,7 @@ impl Store {
                 date,
                 narration,
                 postings,
+                party_lines,
             });
         }
         // Older databases may contain valid dates without zero-padding.
@@ -1318,18 +1379,12 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<(i64, String, String, String, String, String)>>>()?;
         let mut posting_stmt = self.conn.prepare(
-            "SELECT ledger_id, amount FROM revision_postings WHERE revision_id = ?1 ORDER BY id",
+            "SELECT ledger_id, amount, is_party FROM revision_postings WHERE revision_id = ?1 ORDER BY id",
         )?;
         let mut revisions = Vec::with_capacity(rows.len());
         for (revision_id, changed_at, date, narration, kind, reference) in rows {
-            let postings = posting_stmt
-                .query_map([revision_id], |r| {
-                    Ok(Posting {
-                        ledger_id: r.get(0)?,
-                        amount: r.get(1)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let (postings, party_lines) =
+                read_voucher_postings(&mut posting_stmt.query([revision_id])?)?;
             revisions.push(VoucherRevision {
                 changed_at,
                 voucher: Voucher {
@@ -1339,6 +1394,7 @@ impl Store {
                     date,
                     narration,
                     postings,
+                    party_lines,
                 },
             });
         }
@@ -1563,29 +1619,67 @@ fn validate_voucher(date: &str, postings: &[Posting]) -> Result<NaiveDate> {
     }
     Ok(date)
 }
-fn insert_voucher(
+fn insert_voucher_draft(
     conn: &Connection,
     company_id: i64,
-    kind: VoucherKind,
-    reference: &str,
-    date: NaiveDate,
-    narration: &str,
-    postings: &[Posting],
+    draft: VoucherDraft<'_>,
 ) -> Result<i64> {
-    check_ledgers(conn, company_id, postings)?;
-    opening::check_no_control_postings(conn, company_id, postings)?;
+    let date = validate_voucher(draft.date, draft.postings)?;
+    check_ledgers(conn, company_id, draft.postings)?;
+    opening::check_no_control_postings(conn, company_id, draft.postings)?;
     conn.execute(
         "INSERT INTO vouchers(company_id, date, narration, kind, reference) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![company_id, date.format("%Y-%m-%d").to_string(), narration.trim(), kind.as_str(), reference.trim()],
+        params![company_id, date.format("%Y-%m-%d").to_string(), draft.narration.trim(), draft.kind.as_str(), draft.reference.trim()],
     )?;
     let id = conn.last_insert_rowid();
-    for posting in postings {
-        conn.execute(
-            "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-            params![id, posting.ledger_id, posting.amount],
-        )?;
-    }
+    write_voucher_postings(conn, id, draft.postings, draft.party_lines)?;
     Ok(id)
+}
+fn party_posting_flags(line_count: usize, party_lines: &[usize]) -> Result<Vec<bool>> {
+    let mut flags = vec![false; line_count];
+    for &index in party_lines {
+        let flag = flags.get_mut(index).ok_or_else(|| {
+            Error::Validation("A party line must identify a voucher posting".into())
+        })?;
+        if std::mem::replace(flag, true) {
+            return Err(Error::Validation("A party line was specified twice".into()));
+        }
+    }
+    Ok(flags)
+}
+fn write_voucher_postings(
+    conn: &Connection,
+    voucher: i64,
+    postings: &[Posting],
+    party_lines: &[usize],
+) -> Result<()> {
+    let flags = party_posting_flags(postings.len(), party_lines)?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO postings(voucher_id, ledger_id, amount, is_party) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (posting, is_party) in postings.iter().zip(flags) {
+        stmt.execute(params![
+            voucher,
+            posting.ledger_id,
+            posting.amount,
+            is_party
+        ])?;
+    }
+    Ok(())
+}
+fn read_voucher_postings(rows: &mut rusqlite::Rows<'_>) -> Result<(Vec<Posting>, Vec<usize>)> {
+    let mut postings = Vec::new();
+    let mut party_lines = Vec::new();
+    while let Some(row) = rows.next()? {
+        if row.get::<_, bool>(2)? {
+            party_lines.push(postings.len());
+        }
+        postings.push(Posting {
+            ledger_id: row.get(0)?,
+            amount: row.get(1)?,
+        });
+    }
+    Ok((postings, party_lines))
 }
 fn check_ledgers(conn: &Connection, company_id: i64, postings: &[Posting]) -> Result<()> {
     for p in postings {

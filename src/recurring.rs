@@ -1,8 +1,9 @@
 //! Fixed monthly journal schedules with explicitly posted or skipped occurrences.
 
 use crate::{
-    check_ledgers, insert_voucher, opening, parse_date, required, validate_voucher, Error, Posting,
-    Result, Store, VoucherKind,
+    check_ledgers, insert_voucher_draft, opening, parse_date, party_posting_flags,
+    read_voucher_postings, required, validate_voucher, Error, Posting, Result, Store, VoucherDraft,
+    VoucherKind,
 };
 use chrono::{Datelike, Months, NaiveDate};
 use rusqlite::{params, Connection, TransactionBehavior};
@@ -98,21 +99,18 @@ fn journals(conn: &Connection, company: i64, id: Option<i64>) -> Result<Vec<Mont
     rows
 }
 
-fn journal_lines(conn: &Connection, company: i64, journal: i64) -> Result<Vec<Posting>> {
+fn journal_lines(
+    conn: &Connection,
+    company: i64,
+    journal: i64,
+) -> Result<(Vec<Posting>, Vec<usize>)> {
     let mut stmt = conn.prepare(
-        "SELECT l.ledger_id, l.amount FROM recurring_journal_lines l
+        "SELECT l.ledger_id, l.amount, l.is_party FROM recurring_journal_lines l
          JOIN recurring_journals j ON j.id = l.journal_id
          WHERE j.company_id = ?1 AND j.id = ?2 ORDER BY l.line_number",
     )?;
-    let rows = stmt
-        .query_map(params![company, journal], |row| {
-            Ok(Posting {
-                ledger_id: row.get(0)?,
-                amount: row.get(1)?,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
+    let mut rows = stmt.query(params![company, journal])?;
+    read_voucher_postings(&mut rows)
 }
 
 pub(crate) fn contains_voucher(conn: &Connection, company: i64, voucher: i64) -> Result<bool> {
@@ -136,8 +134,31 @@ impl Store {
         narration: &str,
         postings: &[Posting],
     ) -> Result<i64> {
-        let name = required(name, "Schedule name")?;
-        let first_date = validate_voucher(first_date, postings)?;
+        self.create_monthly_journal_from_draft(
+            company,
+            VoucherDraft {
+                kind: VoucherKind::Journal,
+                reference: name,
+                date: first_date,
+                narration,
+                postings,
+                party_lines: &[],
+            },
+        )
+    }
+
+    pub fn create_monthly_journal_from_draft(
+        &mut self,
+        company: i64,
+        draft: VoucherDraft<'_>,
+    ) -> Result<i64> {
+        if draft.kind != VoucherKind::Journal {
+            return Err(Error::Validation(
+                "Select a journal for the schedule".into(),
+            ));
+        }
+        let name = required(draft.reference, "Schedule name")?;
+        let first_date = validate_voucher(draft.date, draft.postings)?;
         if !(1..=9999).contains(&first_date.year()) {
             return Err(Error::Validation(
                 "First date must use a four-digit year from 0001 to 9999".into(),
@@ -147,8 +168,9 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_ledgers(&tx, company, postings)?;
-        opening::check_no_control_postings(&tx, company, postings)?;
+        check_ledgers(&tx, company, draft.postings)?;
+        opening::check_no_control_postings(&tx, company, draft.postings)?;
+        let flags = party_posting_flags(draft.postings.len(), draft.party_lines)?;
         let duplicate: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM recurring_journals
                            WHERE company_id = ?1 AND name = ?2 AND closed_at IS NULL)",
@@ -164,16 +186,27 @@ impl Store {
         tx.execute(
             "INSERT INTO recurring_journals(company_id, name, first_date, narration)
              VALUES (?1, ?2, ?3, ?4)",
-            params![company, name, first_date.to_string(), narration.trim()],
+            params![
+                company,
+                name,
+                first_date.to_string(),
+                draft.narration.trim()
+            ],
         )?;
         let id = tx.last_insert_rowid();
         {
             let mut insert = tx.prepare(
-                "INSERT INTO recurring_journal_lines(journal_id, line_number, ledger_id, amount)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO recurring_journal_lines(journal_id, line_number, ledger_id, amount, is_party)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
-            for (index, posting) in postings.iter().enumerate() {
-                insert.execute(params![id, index, posting.ledger_id, posting.amount])?;
+            for (index, (posting, is_party)) in draft.postings.iter().zip(flags).enumerate() {
+                insert.execute(params![
+                    id,
+                    index,
+                    posting.ledger_id,
+                    posting.amount,
+                    is_party
+                ])?;
             }
         }
         tx.commit()?;
@@ -185,6 +218,15 @@ impl Store {
     }
 
     pub fn monthly_journal_lines(&self, company: i64, journal: i64) -> Result<Vec<Posting>> {
+        Ok(self.monthly_journal_postings(company, journal)?.0)
+    }
+
+    /// Return scheduled postings with the zero-based indices of their party lines.
+    pub fn monthly_journal_postings(
+        &self,
+        company: i64,
+        journal: i64,
+    ) -> Result<(Vec<Posting>, Vec<usize>)> {
         journal_lines(&self.conn, company, journal)
     }
 
@@ -260,16 +302,18 @@ impl Store {
 
         let date_text = date.to_string();
         let voucher_id = if skip_reason.is_none() {
-            let postings = journal_lines(&tx, company, id)?;
-            validate_voucher(&date_text, &postings)?;
-            Some(insert_voucher(
+            let (postings, party_lines) = journal_lines(&tx, company, id)?;
+            Some(insert_voucher_draft(
                 &tx,
                 company,
-                VoucherKind::Journal,
-                &format!("MJ-{id}-{date_text}"),
-                date,
-                &journal.narration,
-                &postings,
+                VoucherDraft {
+                    kind: VoucherKind::Journal,
+                    reference: &format!("MJ-{id}-{date_text}"),
+                    date: &date_text,
+                    narration: &journal.narration,
+                    postings: &postings,
+                    party_lines: &party_lines,
+                },
             )?)
         } else {
             None
@@ -303,5 +347,56 @@ impl Store {
 
     pub fn is_monthly_journal_voucher(&self, company: i64, voucher: i64) -> Result<bool> {
         contains_voucher(&self.conn, company, voucher)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Category;
+
+    #[test]
+    fn scheduled_journal_carries_its_party_line_into_each_occurrence() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let customer = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        let income = store
+            .create_ledger(company, "Income", Category::Income)
+            .unwrap();
+        let postings = [
+            Posting {
+                ledger_id: customer,
+                amount: 5000,
+            },
+            Posting {
+                ledger_id: income,
+                amount: -5000,
+            },
+        ];
+        let schedule = store
+            .create_monthly_journal_from_draft(
+                company,
+                VoucherDraft {
+                    kind: VoucherKind::Journal,
+                    reference: "Service charge",
+                    date: "2026-01-31",
+                    narration: "",
+                    postings: &postings,
+                    party_lines: &[0],
+                },
+            )
+            .unwrap();
+        let (_, party_lines) = store.monthly_journal_postings(company, schedule).unwrap();
+        assert_eq!(party_lines, [0]);
+        for date in ["2026-01-31", "2026-02-28"] {
+            store
+                .post_monthly_journal(company, schedule, parse_date(date).unwrap())
+                .unwrap();
+        }
+        let vouchers = store.vouchers(company).unwrap();
+        assert_eq!(vouchers.len(), 2);
+        assert!(vouchers.iter().all(|voucher| voucher.party_lines == [0]));
     }
 }

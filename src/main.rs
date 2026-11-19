@@ -14,7 +14,9 @@ use balance::reorder::ReorderRule;
 use balance::tax_profiles::TaxCalculation;
 use balance::taxes::InvoiceTaxLine;
 use balance::terms::LedgerTerms;
-use balance::{format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherKind};
+use balance::{
+    format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherDraft, VoucherKind,
+};
 use eframe::egui;
 
 mod actual_cost_ui;
@@ -354,6 +356,7 @@ struct VoucherLine {
     ledger: Option<i64>,
     debit: bool,
     amount: String,
+    is_party: bool,
 }
 impl VoucherLine {
     fn new(debit: bool) -> Self {
@@ -361,6 +364,7 @@ impl VoucherLine {
             ledger: None,
             debit,
             amount: String::new(),
+            is_party: false,
         }
     }
 }
@@ -1564,6 +1568,7 @@ impl App {
                         .hint_text("Amount")
                         .desired_width(110.0),
                 );
+                ui.checkbox(&mut line.is_party, "Party");
                 if ui.button("Remove").clicked() {
                     remove = Some(index);
                 }
@@ -1610,7 +1615,8 @@ impl App {
         if submit || save_schedule {
             let result = (|| -> balance::Result<i64> {
                 let mut postings = Vec::with_capacity(self.lines.len());
-                for line in &self.lines {
+                let mut party_lines = Vec::new();
+                for (index, line) in self.lines.iter().enumerate() {
                     let ledger_id = line.ledger.ok_or_else(|| {
                         balance::Error::Validation("Select a ledger for each line".into())
                     })?;
@@ -1624,35 +1630,25 @@ impl App {
                         ledger_id,
                         amount: if line.debit { amount } else { -amount },
                     });
+                    if line.is_party {
+                        party_lines.push(index);
+                    }
                 }
+                let draft = VoucherDraft {
+                    kind: self.voucher_kind,
+                    reference: &self.voucher_reference,
+                    date: &self.date,
+                    narration: &self.narration,
+                    postings: &postings,
+                    party_lines: &party_lines,
+                };
                 if save_schedule {
-                    self.store.create_monthly_journal(
-                        company,
-                        &self.voucher_reference,
-                        &self.date,
-                        &self.narration,
-                        &postings,
-                    )
+                    self.store.create_monthly_journal_from_draft(company, draft)
                 } else if let Some(id) = self.editing_voucher {
-                    self.store.update_voucher_with_reference(
-                        company,
-                        id,
-                        self.voucher_kind,
-                        &self.voucher_reference,
-                        &self.date,
-                        &self.narration,
-                        &postings,
-                    )?;
+                    self.store.update_voucher_draft(company, id, draft)?;
                     Ok(id)
                 } else {
-                    self.store.post_voucher_with_reference(
-                        company,
-                        self.voucher_kind,
-                        &self.voucher_reference,
-                        &self.date,
-                        &self.narration,
-                        &postings,
-                    )
+                    self.store.post_voucher_draft(company, draft)
                 }
             })();
             match result {
@@ -1760,12 +1756,14 @@ impl App {
                             self.lines = voucher
                                 .postings
                                 .iter()
-                                .map(|p| VoucherLine {
+                                .enumerate()
+                                .map(|(index, p)| VoucherLine {
                                     ledger: Some(p.ledger_id),
                                     debit: p.amount > 0,
                                     amount: format_amount(p.amount)
                                         .trim_start_matches('-')
                                         .to_owned(),
+                                    is_party: voucher.party_lines.contains(&index),
                                 })
                                 .collect();
                             self.message.clear();
@@ -1796,15 +1794,20 @@ impl App {
                             reversal.reason
                         ));
                     }
-                    for p in &voucher.postings {
+                    for (index, p) in voucher.postings.iter().enumerate() {
                         let name = ledgers
                             .iter()
                             .find(|l| l.id == p.ledger_id)
                             .map(|l| l.name.as_str())
                             .unwrap_or("Unknown ledger");
                         ui.label(format!(
-                            "  {}  {}  {}",
+                            "  {}{}  {}  {}",
                             name,
+                            if voucher.party_lines.contains(&index) {
+                                " (party)"
+                            } else {
+                                ""
+                            },
                             if p.amount > 0 { "Dr" } else { "Cr" },
                             format_amount(p.amount).trim_start_matches('-')
                         ));
@@ -1826,15 +1829,22 @@ impl App {
                                             revision.voucher.reference,
                                             revision.voucher.narration
                                         ));
-                                        for p in revision.voucher.postings {
+                                        for (index, p) in
+                                            revision.voucher.postings.iter().enumerate()
+                                        {
                                             let name = ledgers
                                                 .iter()
                                                 .find(|l| l.id == p.ledger_id)
                                                 .map(|l| l.name.as_str())
                                                 .unwrap_or("Unknown ledger");
                                             ui.label(format!(
-                                                "  {}  {}  {}",
+                                                "  {}{}  {}  {}",
                                                 name,
+                                                if revision.voucher.party_lines.contains(&index) {
+                                                    " (party)"
+                                                } else {
+                                                    ""
+                                                },
                                                 if p.amount > 0 { "Dr" } else { "Cr" },
                                                 format_amount(p.amount).trim_start_matches('-')
                                             ));

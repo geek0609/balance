@@ -11,8 +11,8 @@ use crate::inventory::{
 };
 use crate::opening_bills::OpeningBillDraft;
 use crate::{
-    check_ledgers, parse_amount, parse_date, validate_voucher, Category, Error, Posting, Result,
-    Store, VoucherKind,
+    insert_voucher_draft, parse_amount, parse_date, Category, Error, Posting, Result, Store,
+    VoucherDraft, VoucherKind,
 };
 use chrono::NaiveDate;
 use roxmltree::{Document, Node, ParsingOptions};
@@ -93,6 +93,7 @@ struct StockOpening {
 struct Line {
     ledger: String,
     amount: i64,
+    is_party: bool,
 }
 #[derive(Debug, Clone)]
 struct Transaction {
@@ -687,6 +688,14 @@ fn parse_kind(value: &str) -> Option<VoucherKind> {
         _ => None,
     }
 }
+fn party_flag(entry: Node<'_, '_>) -> Result<bool> {
+    match direct_text(entry, "ISPARTYLEDGER").as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("yes") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("no") || value.is_empty() => Ok(false),
+        None => Ok(false),
+        _ => Err(Error::Validation("invalid party flag".into())),
+    }
+}
 fn xml_date(value: &str) -> Result<String> {
     let parsed = if value.trim().len() == 8 && value.trim().bytes().all(|b| b.is_ascii_digit()) {
         NaiveDate::parse_from_str(value.trim(), "%Y%m%d")
@@ -1149,11 +1158,7 @@ fn parse_imported_settlement(
         }
         invoice_side(entry, "ISDEEMEDPOSITIVE", amount > 0)?;
         invoice_side(entry, "ISLASTDEEMEDPOSITIVE", amount > 0)?;
-        if direct_text(entry, "ISPARTYLEDGER").is_some_and(|v| {
-            !v.is_empty() && !v.eq_ignore_ascii_case("yes") && !v.eq_ignore_ascii_case("no")
-        }) {
-            return Err(Error::Validation("invalid party flag".into()));
-        }
+        party_flag(entry)?;
         let bills: Vec<_> = entry
             .children()
             .filter(|n| {
@@ -1417,12 +1422,7 @@ fn parse_imported_invoice(
         }
         invoice_side(entry, "ISDEEMEDPOSITIVE", amount > 0)?;
         invoice_side(entry, "ISLASTDEEMEDPOSITIVE", amount > 0)?;
-        let is_party = match direct_text(entry, "ISPARTYLEDGER").as_deref() {
-            Some(v) if v.eq_ignore_ascii_case("yes") => true,
-            Some(v) if v.eq_ignore_ascii_case("no") || v.is_empty() => false,
-            None => false,
-            _ => return Err(Error::Validation("invalid party flag".into())),
-        };
+        let is_party = party_flag(entry)?;
         let bills: Vec<_> = entry
             .children()
             .filter(|n| {
@@ -3145,13 +3145,13 @@ impl Store {
                     &label,
                     &mut plan.issues,
                 );
-                if direct_text(entry, "ISPARTYLEDGER")
-                    .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
-                {
-                    plan.issues.push(format!(
-                        "{label}: party-specific information is not supported"
-                    ));
-                }
+                let is_party = match party_flag(entry) {
+                    Ok(is_party) => is_party,
+                    Err(error) => {
+                        plan.issues.push(format!("{label}: {error}"));
+                        continue;
+                    }
+                };
                 let ledger = direct_text(entry, "LEDGERNAME").unwrap_or_default();
                 if !known_ledgers.contains(&normalized(&ledger)) {
                     plan.issues
@@ -3183,7 +3183,11 @@ impl Store {
                             .push(format!("{label}: debit or credit direction is ambiguous"));
                     }
                 }
-                lines.push(Line { ledger, amount });
+                lines.push(Line {
+                    ledger,
+                    amount,
+                    is_party,
+                });
             }
             if lines.len() < 2
                 || lines.iter().map(|l| i128::from(l.amount)).sum::<i128>() != 0
@@ -3805,7 +3809,8 @@ impl Store {
                 )));
             }
             let mut postings = Vec::new();
-            for line in &voucher.lines {
+            let mut party_lines = Vec::new();
+            for (index, line) in voucher.lines.iter().enumerate() {
                 let ledger_id =
                     find_ledger(&tx, plan.company_id, &line.ledger)?.ok_or_else(|| {
                         Error::Validation(format!("Ledger {} is missing", line.ledger))
@@ -3814,19 +3819,23 @@ impl Store {
                     ledger_id,
                     amount: line.amount,
                 });
+                if line.is_party {
+                    party_lines.push(index);
+                }
             }
-            validate_voucher(&voucher.date, &postings)?;
-            check_ledgers(&tx, plan.company_id, &postings)?;
-            crate::opening::check_no_control_postings(&tx, plan.company_id, &postings)?;
-            tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![plan.company_id, voucher.kind.as_str(), voucher.reference, voucher.date, voucher.narration])?;
-            let id = tx.last_insert_rowid();
+            let id = insert_voucher_draft(
+                &tx,
+                plan.company_id,
+                VoucherDraft {
+                    kind: voucher.kind,
+                    reference: &voucher.reference,
+                    date: &voucher.date,
+                    narration: &voucher.narration,
+                    postings: &postings,
+                    party_lines: &party_lines,
+                },
+            )?;
             save_metadata(&tx, plan.company_id, "voucher", id, &voucher.metadata)?;
-            for posting in postings {
-                tx.execute(
-                    "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-                    params![id, posting.ledger_id, posting.amount],
-                )?;
-            }
         }
         for invoice in &plan.invoices {
             let voucher_kind = if invoice.kind == InvoiceKind::Sale {
@@ -4198,6 +4207,124 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_voucher_party_lines_survive_import_edits_and_reversal() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let customer = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        store
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        let xml = r#"<ENVELOPE><BODY><DATA><MESSAGE>
+            <VOUCHER>
+                <DATE>20260102</DATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>S-1</VOUCHERNUMBER>
+                <PERSISTEDVIEW>Accounting Voucher View</PERSISTEDVIEW><ISINVOICE>No</ISINVOICE>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME>
+                    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                    <ISPARTYLEDGER>Yes</ISPARTYLEDGER><AMOUNT>-40.00</AMOUNT>
+                </LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME>
+                    <ISPARTYLEDGER>No</ISPARTYLEDGER><AMOUNT>-10.00</AMOUNT>
+                </LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Sales</LEDGERNAME>
+                    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>50.00</AMOUNT>
+                </LEDGERENTRIES.LIST>
+            </VOUCHER>
+        </MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let invalid = xml.replace("<ISPARTYLEDGER>Yes", "<ISPARTYLEDGER>Unknown");
+        let preview = store
+            .preview_xml_import(company, invalid.as_bytes())
+            .unwrap();
+        assert!(!preview.can_apply());
+        assert!(preview
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("invalid party flag")));
+        let with_bill = xml.replace(
+            "<AMOUNT>-40.00</AMOUNT>",
+            "<AMOUNT>-40.00</AMOUNT><BILLALLOCATIONS.LIST><NAME>Bill-1</NAME>\
+             <BILLTYPE>New Ref</BILLTYPE><AMOUNT>-40.00</AMOUNT></BILLALLOCATIONS.LIST>",
+        );
+        let preview = store
+            .preview_xml_import(company, with_bill.as_bytes())
+            .unwrap();
+        assert!(!preview.can_apply());
+        assert!(preview
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("bill allocations require a receipt or payment")));
+
+        let preview = store.preview_xml_import(company, xml.as_bytes()).unwrap();
+        assert!(preview.can_apply(), "{:?}", preview.issues());
+        assert_eq!(store.apply_xml_import(&preview).unwrap().vouchers, 1);
+        assert!(store.invoices(company).unwrap().is_empty());
+        let voucher = store.vouchers(company).unwrap().remove(0);
+        assert_eq!(voucher.kind, VoucherKind::Sales);
+        assert_eq!(voucher.party_lines, [0]);
+        assert_eq!(voucher.postings[0].ledger_id, customer);
+        assert_eq!(voucher.postings[0].amount, 4000);
+        assert_eq!(voucher.postings[1].ledger_id, customer);
+
+        assert!(store
+            .update_voucher(
+                company,
+                voucher.id,
+                &voucher.date,
+                "Legacy edit",
+                &voucher.postings
+            )
+            .is_err());
+        assert!(store
+            .voucher_revisions(company, voucher.id)
+            .unwrap()
+            .is_empty());
+        let mut reordered = voucher.postings;
+        reordered.rotate_left(1);
+        store
+            .update_voucher_draft(
+                company,
+                voucher.id,
+                VoucherDraft {
+                    kind: voucher.kind,
+                    reference: &voucher.reference,
+                    date: &voucher.date,
+                    narration: "Reordered postings",
+                    postings: &reordered,
+                    party_lines: &[2],
+                },
+            )
+            .unwrap();
+        let revision = store
+            .voucher_revisions(company, voucher.id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(revision.voucher.party_lines, [0]);
+        assert_eq!(store.vouchers(company).unwrap()[0].party_lines, [2]);
+
+        let reversal = store
+            .reverse_voucher(company, voucher.id, "2026-01-03", "R-1", "Cancel sale")
+            .unwrap();
+        let counter = store
+            .vouchers(company)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == reversal)
+            .unwrap();
+        assert_eq!(counter.party_lines, [2]);
+        assert_eq!(counter.postings[2].ledger_id, customer);
+        assert_eq!(counter.postings[2].amount, -4000);
+        assert_eq!(
+            store
+                .ledger_register(company, customer, None, None)
+                .unwrap()
+                .closing_balance,
+            0
+        );
+    }
 
     #[test]
     fn separate_master_and_transaction_exports_share_one_import() {

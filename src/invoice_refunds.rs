@@ -2,7 +2,8 @@
 
 use crate::inventory::{ledger_category, InvoiceKind};
 use crate::{
-    insert_voucher, parse_date, required, Category, Error, Posting, Result, Store, VoucherKind,
+    insert_voucher_draft, parse_date, required, Category, Error, Posting, Result, Store,
+    VoucherDraft, VoucherKind,
 };
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -274,14 +275,17 @@ impl Store {
                 amount: -cash_amount,
             },
         ];
-        let voucher = insert_voucher(
+        let voucher = insert_voucher_draft(
             &tx,
             company,
-            kind,
-            reference,
-            date,
-            &format!("Refund against invoice note {note}"),
-            &postings,
+            VoucherDraft {
+                kind,
+                reference,
+                date: &date.to_string(),
+                narration: &format!("Refund against invoice note {note}"),
+                postings: &postings,
+                party_lines: &[],
+            },
         )?;
         if tx.execute(
             "INSERT INTO invoice_credit_refunds(company_id, note_id, voucher_id, bank_ledger_id, reference_key, amount)

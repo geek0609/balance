@@ -108,19 +108,22 @@ pub(crate) fn write_counter_postings(
     reversal: i64,
     counters: &[Posting],
 ) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT id FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
-    let ids = stmt
-        .query_map([original], |row| row.get::<_, i64>(0))?
+    let mut stmt =
+        conn.prepare("SELECT id, is_party FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
+    let originals = stmt
+        .query_map([original], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if ids.len() != counters.len() {
+    if originals.len() != counters.len() {
         return Err(Error::Validation(
             "Original postings changed during reversal".into(),
         ));
     }
-    for (&source_id, posting) in ids.iter().zip(counters) {
+    for ((source_id, is_party), posting) in originals.into_iter().zip(counters) {
         conn.execute(
-            "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-            params![reversal, posting.ledger_id, posting.amount],
+            "INSERT INTO postings(voucher_id, ledger_id, amount, is_party) VALUES (?1, ?2, ?3, ?4)",
+            params![reversal, posting.ledger_id, posting.amount, is_party],
         )?;
         crate::costs::copy_reversal_allocation(conn, company, source_id, conn.last_insert_rowid())?;
     }
