@@ -1,7 +1,7 @@
 //! Opening balances are represented by balanced vouchers against a visible
 //! opening-difference ledger. Changes retain the earlier voucher revision.
 use crate::{
-    check_ledgers, parse_date, required, validate_voucher, Error, Posting, Result, Store,
+    check_ledgers, parse_date, required, validate_voucher, Category, Error, Posting, Result, Store,
     VoucherKind,
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -15,6 +15,7 @@ pub struct OpeningBalance {
     pub date: String,
     pub amount: i64,
     pub voucher_id: i64,
+    pub on_account: bool,
 }
 #[derive(Debug, Clone)]
 pub struct OpeningClear {
@@ -22,6 +23,7 @@ pub struct OpeningClear {
     pub clearing_voucher_id: i64,
     pub date: String,
     pub reason: String,
+    pub on_account: bool,
 }
 
 pub(crate) fn control_id(conn: &Connection, company: i64) -> Result<Option<i64>> {
@@ -64,15 +66,55 @@ pub(crate) fn ensure_control(conn: &Connection, company: i64) -> Result<i64> {
     )?;
     Ok(id)
 }
+pub(crate) fn migrate_on_account(conn: &Connection) -> Result<()> {
+    for table in ["opening_balances", "opening_balance_clears"] {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'on_account')",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN on_account INTEGER NOT NULL DEFAULT 0
+                 CHECK(on_account IN (0, 1));",
+            ))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS opening_clear_preserves_on_account
+         BEFORE INSERT ON opening_balance_clears
+         WHEN EXISTS (
+             SELECT 1 FROM opening_balances b
+             WHERE b.company_id = NEW.company_id AND b.ledger_id = NEW.ledger_id
+                 AND b.voucher_id = NEW.original_voucher_id AND b.on_account != NEW.on_account
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'Opening balance clearing must preserve its on-account classification');
+         END;",
+    )?;
+    Ok(())
+}
+
 pub(crate) fn save_opening_in_transaction(
     conn: &Connection,
     company: i64,
     ledger: i64,
     date: &str,
     amount: i64,
+    on_account: bool,
 ) -> Result<i64> {
     let parsed_date = parse_date(date)?;
-    crate::opening_bills::check_aggregate_opening(conn, company, ledger, parsed_date)?;
+    if on_account
+        && !matches!(
+            crate::inventory::ledger_category(conn, company, ledger)?,
+            Category::Asset | Category::Liability
+        )
+    {
+        return Err(Error::Validation(
+            "An opening balance on account requires an asset or liability ledger".into(),
+        ));
+    }
+    crate::opening_bills::check_aggregate_opening(conn, company, ledger, parsed_date, on_account)?;
     let date = parsed_date.format("%Y-%m-%d").to_string();
     let last_clear: Option<String> = conn.query_row("SELECT MAX(v.date) FROM opening_balance_clears c JOIN vouchers v ON v.id = c.clearing_voucher_id AND v.company_id = c.company_id WHERE c.company_id = ?1 AND c.ledger_id = ?2", params![company, ledger], |r| r.get(0))?;
     if last_clear
@@ -116,14 +158,19 @@ pub(crate) fn save_opening_in_transaction(
     ];
     validate_voucher(&date, &postings)?;
     check_ledgers(conn, company, &postings)?;
-    let existing: Option<i64> = conn
+    let existing: Option<(i64, bool)> = conn
         .query_row(
-            "SELECT voucher_id FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2",
+            "SELECT voucher_id, on_account FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2",
             params![company, ledger],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let voucher_id = if let Some(id) = existing {
+    let voucher_id = if let Some((id, existing_on_account)) = existing {
+        if existing_on_account != on_account {
+            return Err(Error::Validation(
+                "Clear the current opening balance before changing its type".into(),
+            ));
+        }
         crate::banking::ensure_no_bank_clearance(conn, company, id)?;
         conn.execute("INSERT INTO voucher_revisions(voucher_id, company_id, date, narration, kind, reference) SELECT id, company_id, date, narration, kind, reference FROM vouchers WHERE id = ?1 AND company_id = ?2", params![id, company])?;
         let revision = conn.last_insert_rowid();
@@ -136,9 +183,18 @@ pub(crate) fn save_opening_in_transaction(
         conn.execute("UPDATE opening_balances SET date = ?1, amount = ?2 WHERE company_id = ?3 AND ledger_id = ?4", params![date, amount, company, ledger])?;
         id
     } else {
-        conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, '', ?3, 'Opening balance')", params![company, VoucherKind::Journal.as_str(), date])?;
+        let narration = if on_account {
+            "Opening balance on account"
+        } else {
+            "Opening balance"
+        };
+        conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, '', ?3, ?4)", params![company, VoucherKind::Journal.as_str(), date, narration])?;
         let id = conn.last_insert_rowid();
-        conn.execute("INSERT INTO opening_balances(company_id, ledger_id, voucher_id, date, amount) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, ledger, id, date, amount])?;
+        conn.execute(
+            "INSERT INTO opening_balances(company_id, ledger_id, voucher_id, date, amount, on_account)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![company, ledger, id, date, amount, on_account],
+        )?;
         id
     };
     for posting in postings {
@@ -149,6 +205,32 @@ pub(crate) fn save_opening_in_transaction(
     }
     Ok(voucher_id)
 }
+pub(crate) fn opening_on_account_as_of(
+    conn: &Connection,
+    company: i64,
+    date: chrono::NaiveDate,
+) -> Result<Vec<(i64, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT l.id, l.name, b.amount
+         FROM opening_balances b JOIN ledgers l ON l.id = b.ledger_id AND l.company_id = b.company_id
+         WHERE b.company_id = ?1 AND b.on_account = 1 AND b.date <= ?2
+         UNION ALL
+         SELECT l.id, l.name, p.amount
+         FROM opening_balance_clears c
+         JOIN ledgers l ON l.id = c.ledger_id AND l.company_id = c.company_id
+         JOIN vouchers original ON original.id = c.original_voucher_id AND original.company_id = c.company_id
+         JOIN vouchers clearing ON clearing.id = c.clearing_voucher_id AND clearing.company_id = c.company_id
+         JOIN postings p ON p.voucher_id = original.id AND p.ledger_id = l.id
+         WHERE c.company_id = ?1 AND c.on_account = 1 AND original.date <= ?2 AND clearing.date > ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![company, date.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
 impl Store {
     /// Post a counter-entry and retain both vouchers and their link as history.
     pub fn clear_opening_balance(
@@ -163,7 +245,7 @@ impl Store {
         let reference = required(reference, "Clearing reference")?;
         let reason = required(reason, "Clearing reason")?;
         let tx = self.conn.transaction()?;
-        let (original, original_date, amount): (i64, String, i64) = tx.query_row("SELECT voucher_id, date, amount FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2", params![company, ledger], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|e| match e {
+        let (original, original_date, amount, on_account): (i64, String, i64, bool) = tx.query_row("SELECT voucher_id, date, amount, on_account FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2", params![company, ledger], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Error::Validation("No opening balance exists for this ledger".into()),
             other => Error::Database(other),
         })?;
@@ -227,7 +309,11 @@ impl Store {
                 params![clearing, posting.ledger_id, posting.amount],
             )?;
         }
-        tx.execute("INSERT INTO opening_balance_clears(company_id, ledger_id, original_voucher_id, clearing_voucher_id, reason) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, ledger, original, clearing, reason])?;
+        tx.execute(
+            "INSERT INTO opening_balance_clears(company_id, ledger_id, original_voucher_id, clearing_voucher_id, reason, on_account)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![company, ledger, original, clearing, reason, on_account],
+        )?;
         tx.execute(
             "DELETE FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2",
             params![company, ledger],
@@ -247,7 +333,7 @@ impl Store {
                 "Ledger not found in the selected company".into(),
             ));
         }
-        let mut stmt = self.conn.prepare("SELECT c.original_voucher_id, c.clearing_voucher_id, v.date, c.reason FROM opening_balance_clears c JOIN vouchers v ON v.id = c.clearing_voucher_id AND v.company_id = c.company_id WHERE c.company_id = ?1 AND c.ledger_id = ?2 ORDER BY c.id DESC")?;
+        let mut stmt = self.conn.prepare("SELECT c.original_voucher_id, c.clearing_voucher_id, v.date, c.reason, c.on_account FROM opening_balance_clears c JOIN vouchers v ON v.id = c.clearing_voucher_id AND v.company_id = c.company_id WHERE c.company_id = ?1 AND c.ledger_id = ?2 ORDER BY c.id DESC")?;
         let rows = stmt
             .query_map(params![company, ledger], |r| {
                 Ok(OpeningClear {
@@ -255,6 +341,7 @@ impl Store {
                     clearing_voucher_id: r.get(1)?,
                     date: r.get(2)?,
                     reason: r.get(3)?,
+                    on_account: r.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -272,7 +359,16 @@ impl Store {
                 "Ledger not found in the selected company".into(),
             ));
         }
-        Ok(self.conn.query_row("SELECT date, amount, voucher_id FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2", params![company, ledger], |r| Ok(OpeningBalance { date: r.get(0)?, amount: r.get(1)?, voucher_id: r.get(2)? })).optional()?)
+        Ok(self.conn.query_row(
+            "SELECT date, amount, voucher_id, on_account FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2",
+            params![company, ledger],
+            |r| Ok(OpeningBalance {
+                date: r.get(0)?,
+                amount: r.get(1)?,
+                voucher_id: r.get(2)?,
+                on_account: r.get(3)?,
+            }),
+        ).optional()?)
     }
     pub fn set_opening_balance(
         &mut self,
@@ -281,8 +377,30 @@ impl Store {
         date: &str,
         amount: i64,
     ) -> Result<i64> {
+        self.set_opening_balance_mode(company, ledger, date, amount, false)
+    }
+
+    /// Record the portion of the opening balance that is unallocated to bills.
+    pub fn set_opening_on_account_balance(
+        &mut self,
+        company: i64,
+        ledger: i64,
+        date: &str,
+        amount: i64,
+    ) -> Result<i64> {
+        self.set_opening_balance_mode(company, ledger, date, amount, true)
+    }
+
+    fn set_opening_balance_mode(
+        &mut self,
+        company: i64,
+        ledger: i64,
+        date: &str,
+        amount: i64,
+        on_account: bool,
+    ) -> Result<i64> {
         let tx = self.conn.transaction()?;
-        let id = save_opening_in_transaction(&tx, company, ledger, date, amount)?;
+        let id = save_opening_in_transaction(&tx, company, ledger, date, amount, on_account)?;
         tx.commit()?;
         Ok(id)
     }

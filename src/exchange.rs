@@ -306,6 +306,12 @@ impl ImportPlan {
     pub fn opening_bill_count(&self) -> usize {
         self.accounts.iter().map(|a| a.opening_bills.len()).sum()
     }
+    pub fn opening_on_account_count(&self) -> usize {
+        self.accounts
+            .iter()
+            .filter(|a| a.opening.is_some() && !a.opening_bills.is_empty())
+            .count()
+    }
     pub fn unit_count(&self) -> usize {
         self.units.len()
     }
@@ -363,6 +369,7 @@ pub struct ImportCounts {
     pub groups: usize,
     pub ledgers: usize,
     pub opening_bills: usize,
+    pub opening_on_account: usize,
     pub vouchers: usize,
     pub invoices: usize,
     pub settlements: usize,
@@ -993,6 +1000,12 @@ fn xml_opening_bill(
     opening_date: NaiveDate,
 ) -> Result<ImportedOpeningBill> {
     let reference = invoice_field(node, "NAME")?;
+    let is_advance = direct_text(node, "ISADVANCE").unwrap_or_default();
+    if !is_advance.is_empty() && !is_advance.eq_ignore_ascii_case("no") {
+        return Err(Error::Validation(
+            "Only non-advance named opening bills are supported".into(),
+        ));
+    }
     let original_date = xml_date(&invoice_field(node, "BILLDATE")?)?;
     let original = parse_date(&original_date)?;
     if original > opening_date {
@@ -1090,10 +1103,10 @@ fn opening_bills(
     }
 
     let kind = match (category, ledger_amount) {
-        (Category::Asset, Some(amount)) if amount > 0 => InvoiceKind::Sale,
-        (Category::Liability, Some(amount)) if amount < 0 => InvoiceKind::Purchase,
+        (Category::Asset, Some(_)) => InvoiceKind::Sale,
+        (Category::Liability, Some(_)) => InvoiceKind::Purchase,
         _ => {
-            issues.push(format!("{label}: opening bills need a debit opening balance for an asset or a credit opening balance for a liability"));
+            issues.push(format!("{label}: opening bills require a declared opening balance on an asset or liability ledger"));
             return Vec::new();
         }
     };
@@ -1110,6 +1123,7 @@ fn opening_bills(
                 "NAME",
                 "BILLDATE",
                 "BILLTYPE",
+                "ISADVANCE",
                 "OPENINGBALANCE",
                 "AMOUNT",
                 "BILLCREDITPERIOD",
@@ -1125,12 +1139,6 @@ fn opening_bills(
             )),
             Err(error) => issues.push(format!("{label}: opening bill: {error}")),
         }
-    }
-    let total: i128 = bills.iter().map(|bill| i128::from(bill.amount)).sum();
-    if total != ledger_amount.map(i128::from).unwrap_or_default().abs() {
-        issues.push(format!(
-            "{label}: opening bill amounts must add up to the ledger opening balance"
-        ));
     }
     bills
 }
@@ -2646,9 +2654,9 @@ impl Store {
                 tax_id: direct_text(node, "PARTYGSTIN").unwrap_or_default(),
                 tax_registration_type: direct_text(node, "GSTREGISTRATIONTYPE").unwrap_or_default(),
             };
-            let opening = match direct_text(node, "OPENINGBALANCE").filter(|s| !s.is_empty()) {
+            let net_opening = match direct_text(node, "OPENINGBALANCE").filter(|s| !s.is_empty()) {
                 Some(value) => match xml_amount(&value) {
-                    Ok(0) => None,
+                    Ok(0) => Some(0),
                     Ok(amount) => {
                         if plan.opening_date.is_none() {
                             plan.issues
@@ -2683,12 +2691,30 @@ impl Store {
             }
             let opening_bills = opening_bills(
                 node,
-                opening,
+                net_opening,
                 category,
                 plan.opening_date.as_deref(),
                 &label,
                 &mut plan.issues,
             );
+            let signed_bills: i128 = opening_bills
+                .iter()
+                .map(|bill| match bill.kind {
+                    InvoiceKind::Sale => i128::from(bill.amount),
+                    InvoiceKind::Purchase => -i128::from(bill.amount),
+                })
+                .sum();
+            let remainder = i128::from(net_opening.unwrap_or_default()) - signed_bills;
+            let opening = match i64::try_from(remainder) {
+                Ok(0) => None,
+                Ok(amount) if amount != i64::MIN => Some(amount),
+                _ => {
+                    plan.issues.push(format!(
+                        "{label}: on-account opening amount is outside the supported range"
+                    ));
+                    None
+                }
+            };
             let credit_days = direct_text(node, "BILLCREDITPERIOD")
                 .filter(|value| !value.is_empty())
                 .and_then(|value| {
@@ -4187,7 +4213,8 @@ impl Store {
                         },
                     )?;
                 }
-            } else if let Some(amount) = account.opening {
+            }
+            if let Some(amount) = account.opening {
                 let date = plan
                     .opening_date
                     .as_deref()
@@ -4198,6 +4225,7 @@ impl Store {
                     ledger_id,
                     date,
                     amount,
+                    !account.opening_bills.is_empty(),
                 )?;
             }
         }
@@ -4848,6 +4876,7 @@ impl Store {
             groups: plan.groups.len(),
             ledgers: plan.accounts.len(),
             opening_bills: plan.opening_bill_count(),
+            opening_on_account: plan.opening_on_account_count(),
             vouchers: plan.transactions.len(),
             invoices: plan.invoices.len(),
             settlements: plan.settlement_count(),
@@ -4864,6 +4893,118 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_import_keeps_signed_on_account_amounts_and_named_bills() {
+        for (group, side) in [("Sundry Debtors", 1_i64), ("Sundry Creditors", -1)] {
+            for net in [150, 60, 0, -25] {
+                let mut store = Store::memory().unwrap();
+                let company = store.create_company("Opening balance migration").unwrap();
+                let bank = store
+                    .create_ledger(company, "Bank", Category::Asset)
+                    .unwrap();
+                let xml = format!(
+                    r#"<ENVELOPE><BODY><DATA><MESSAGE>
+                    <LEDGER NAME="Party"><PARENT>{group}</PARENT><ISBILLWISEON>Yes</ISBILLWISEON>
+                      <OPENINGBALANCE>{}</OPENINGBALANCE>
+                      <BILLALLOCATIONS.LIST><NAME>OLD-BILL</NAME><BILLDATE>20251215</BILLDATE>
+                        <ISADVANCE>No</ISADVANCE><OPENINGBALANCE>{}</OPENINGBALANCE>
+                        <BILLCREDITPERIOD>15 Days</BILLCREDITPERIOD>
+                      </BILLALLOCATIONS.LIST>
+                    </LEDGER>
+                </MESSAGE></DATA></BODY></ENVELOPE>"#,
+                    -side * net,
+                    -side * 100
+                );
+                let opening = "2026-01-01";
+                let plan = store
+                    .preview_xml_import_with_opening_date(company, xml.as_bytes(), Some(opening))
+                    .unwrap();
+                assert!(plan.can_apply(), "{:?}", plan.issues());
+                assert_eq!(
+                    (
+                        plan.opening_count(),
+                        plan.opening_bill_count(),
+                        plan.opening_on_account_count()
+                    ),
+                    (0, 1, 1)
+                );
+                let counts = store.apply_xml_import(&plan).unwrap();
+                assert_eq!((counts.opening_bills, counts.opening_on_account), (1, 1));
+                let bill = &store.outstanding_invoices(company, opening).unwrap()[0];
+                let party = bill.party_ledger_id;
+                assert_eq!(bill.outstanding, 10000);
+                assert_eq!(bill.due_date.as_deref(), Some("2025-12-30"));
+                let residual = side * (net - 100) * 100;
+                let balance = store.opening_balance(company, party).unwrap().unwrap();
+                assert_eq!((balance.amount, balance.on_account), (residual, true));
+                assert!(store
+                    .set_opening_balance(company, party, opening, 1000)
+                    .is_err());
+                assert!(store
+                    .set_opening_on_account_balance(company, party, "2026-01-02", 1000)
+                    .is_err());
+                let ledger_at = |s: &Store, date| {
+                    s.ledger_register(company, party, None, Some(date))
+                        .unwrap()
+                        .closing_balance
+                };
+                assert_eq!(ledger_at(&store, opening), i128::from(side * net * 100));
+                assert!(store
+                    .party_outstanding(company, "2025-12-31")
+                    .unwrap()
+                    .is_empty());
+
+                let target = BillSettlementTarget {
+                    invoice_id: bill.invoice_id,
+                    split_id: bill.split_id,
+                };
+                store
+                    .settle_bills(
+                        company,
+                        bank,
+                        "2026-01-02",
+                        "SETTLE",
+                        &[BillSettlementAllocation {
+                            target,
+                            amount: 1500,
+                        }],
+                    )
+                    .unwrap();
+                let totals_at =
+                    |s: &Store, date| s.party_outstanding(company, date).unwrap().remove(0);
+                let before = totals_at(&store, "2026-01-03");
+                assert_eq!(before.opening_on_account, i128::from(residual));
+                assert_eq!(before.receivable + before.payable, 8500);
+                assert_eq!(
+                    before.receivable - before.payable + before.opening_on_account,
+                    ledger_at(&store, "2026-01-03")
+                );
+
+                store
+                    .clear_opening_balance(
+                        company,
+                        party,
+                        "2026-01-04",
+                        "CLEAR",
+                        "Clear on account",
+                    )
+                    .unwrap();
+                assert!(store.opening_clear_history(company, party).unwrap()[0].on_account);
+                assert_eq!(
+                    totals_at(&store, "2026-01-03").opening_on_account,
+                    i128::from(residual)
+                );
+                let after = totals_at(&store, "2026-01-04");
+                assert_eq!(after.opening_on_account, 0);
+                assert_eq!(after.receivable + after.payable, 8500);
+                assert_eq!(
+                    after.receivable - after.payable,
+                    ledger_at(&store, "2026-01-04")
+                );
+            }
+        }
+    }
 
     #[test]
     fn opening_bill_and_settlement_terms_use_the_original_bill_date() {

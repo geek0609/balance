@@ -1965,12 +1965,13 @@ impl Store {
                 "overdue_receivable",
                 "overdue_payable",
                 "current_informational_credit_limit",
+                "opening_on_account_debit_minus_credit",
             ]),
         )?;
         contextual_row(
             &mut csv,
             &context,
-            &strings(&["context", "", "", "", "", "", "", "", ""]),
+            &strings(&["context", "", "", "", "", "", "", "", "", ""]),
         )?;
         for entry in rows {
             let terms = self.ledger_terms(company, entry.party_ledger_id)?;
@@ -1990,6 +1991,7 @@ impl Store {
                         .credit_limit
                         .map(|value| money(i128::from(value)))
                         .unwrap_or_default(),
+                    money(entry.opening_on_account),
                 ],
             )?;
         }

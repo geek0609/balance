@@ -79,22 +79,31 @@ pub(crate) fn check_aggregate_opening(
     company: i64,
     ledger: i64,
     date: NaiveDate,
+    on_account: bool,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT v.date FROM opening_bills b JOIN invoices i ON i.id = b.invoice_id
+        "SELECT v.date, rv.date FROM opening_bills b JOIN invoices i ON i.id = b.invoice_id
+         JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = i.company_id
          LEFT JOIN invoice_reversals r ON r.invoice_id = i.id AND r.company_id = i.company_id
-         LEFT JOIN vouchers v ON v.id = r.reversal_voucher_id AND v.company_id = i.company_id
+         LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id AND rv.company_id = i.company_id
          WHERE i.company_id = ?1 AND i.party_ledger_id = ?2",
     )?;
     for row in stmt.query_map(params![company, ledger], |row| {
-        row.get::<_, Option<String>>(0)
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
     })? {
-        let reversal = row?.ok_or_else(|| {
-            Error::Validation("This ledger already uses opening bills. Clear active opening bills before entering an aggregate opening balance.".into())
-        })?;
-        if date < parse_date(&reversal)? {
+        let (opening, reversal) = row?;
+        if let Some(reversal) = reversal {
+            if date < parse_date(&reversal)? {
+                return Err(Error::Validation(
+                    "Opening date cannot precede a clearing entry for this ledger's opening bills"
+                        .into(),
+                ));
+            }
+        } else if !on_account {
+            return Err(Error::Validation("This ledger already uses opening bills. Record an opening balance on account or clear the active bills before entering an aggregate balance.".into()));
+        } else if date != parse_date(&opening)? {
             return Err(Error::Validation(
-                "Opening date cannot precede a clearing entry for this ledger's opening bills"
+                "The on-account balance and active opening bills must use the same opening date"
                     .into(),
             ));
         }
@@ -108,15 +117,23 @@ fn check_opening_bill_date(
     ledger: i64,
     date: NaiveDate,
 ) -> Result<()> {
-    let balance: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2)",
+    let balance: Option<(String, bool)> = conn.query_row(
+        "SELECT date, on_account FROM opening_balances WHERE company_id = ?1 AND ledger_id = ?2",
         params![company, ledger],
-        |row| row.get(0),
-    )?;
-    if balance {
-        return Err(Error::Validation(
-            "This ledger already has an aggregate opening balance. Clear it before entering opening bills.".into(),
-        ));
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    if let Some((opening, on_account)) = balance {
+        if !on_account {
+            return Err(Error::Validation(
+                "This ledger already has an aggregate opening balance. Clear it before entering opening bills.".into(),
+            ));
+        }
+        if date != parse_date(&opening)? {
+            return Err(Error::Validation(
+                "The on-account balance and active opening bills must use the same opening date"
+                    .into(),
+            ));
+        }
     }
     let mut stmt = conn.prepare(
         "SELECT v.date FROM opening_balance_clears c

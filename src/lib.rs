@@ -54,7 +54,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 79;
+const SCHEMA_VERSION: i64 = 80;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -985,6 +985,10 @@ impl Store {
         if version < 79 {
             advances::migrate_source_bill_terms(&tx)?;
             tx.pragma_update(None, "user_version", 79)?;
+        }
+        if version < 80 {
+            opening::migrate_on_account(&tx)?;
+            tx.pragma_update(None, "user_version", 80)?;
         }
         tx.commit()?;
         Ok(Self { conn })

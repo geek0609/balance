@@ -351,7 +351,7 @@ pub struct OutstandingInvoice {
     /// Days after the due date, if one is set. Zero means not overdue yet.
     pub overdue_days: Option<i64>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PartyOutstanding {
     pub party_ledger_id: i64,
     pub party: String,
@@ -359,6 +359,8 @@ pub struct PartyOutstanding {
     pub payable: i128,
     pub overdue_receivable: i128,
     pub overdue_payable: i128,
+    /// Unallocated opening balance, positive for debit and negative for credit.
+    pub opening_on_account: i128,
     pub invoices: usize,
 }
 #[derive(Debug, Clone)]
@@ -3512,6 +3514,7 @@ impl Store {
 
     /// Group as-of open invoices by party without netting receivables and payables.
     pub fn party_outstanding(&self, company: i64, as_of: &str) -> Result<Vec<PartyOutstanding>> {
+        let tx = self.conn.unchecked_transaction()?;
         let mut parties = BTreeMap::<i64, PartyOutstanding>::new();
         let mut seen_invoices = HashSet::new();
         for invoice in self.outstanding_invoices(company, as_of)? {
@@ -3521,11 +3524,7 @@ impl Store {
                     .or_insert_with(|| PartyOutstanding {
                         party_ledger_id: invoice.party_ledger_id,
                         party: invoice.party.clone(),
-                        receivable: 0,
-                        payable: 0,
-                        overdue_receivable: 0,
-                        overdue_payable: 0,
-                        invoices: 0,
+                        ..PartyOutstanding::default()
                     });
             if seen_invoices.insert(invoice.invoice_id) {
                 entry.invoices += 1;
@@ -3546,6 +3545,18 @@ impl Store {
                 }
             }
         }
+        for (id, party, amount) in
+            crate::opening::opening_on_account_as_of(&tx, company, parse_date(as_of)?)?
+        {
+            parties
+                .entry(id)
+                .or_insert(PartyOutstanding {
+                    party_ledger_id: id,
+                    party,
+                    ..PartyOutstanding::default()
+                })
+                .opening_on_account += i128::from(amount);
+        }
         let mut result: Vec<_> = parties.into_values().collect();
         result.sort_by(|a, b| {
             a.party
@@ -3553,6 +3564,7 @@ impl Store {
                 .cmp(&b.party.to_lowercase())
                 .then_with(|| a.party_ledger_id.cmp(&b.party_ledger_id))
         });
+        tx.commit()?;
         Ok(result)
     }
 }

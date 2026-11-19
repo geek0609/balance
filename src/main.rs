@@ -131,6 +131,7 @@ struct App {
     opening_date: String,
     opening_amount: String,
     opening_debit: bool,
+    opening_on_account: bool,
     opening_clear_date: String,
     opening_clear_reference: String,
     opening_clear_reason: String,
@@ -436,6 +437,7 @@ impl App {
             opening_date: String::new(),
             opening_amount: String::new(),
             opening_debit: true,
+            opening_on_account: false,
             opening_clear_date: String::new(),
             opening_clear_reference: String::new(),
             opening_clear_reason: String::new(),
@@ -647,6 +649,7 @@ impl App {
         self.bank_opening_reason.clear();
         self.opening_date.clear();
         self.opening_amount.clear();
+        self.opening_on_account = false;
         self.opening_clear_date.clear();
         self.opening_clear_reference.clear();
         self.opening_clear_reason.clear();
@@ -1118,6 +1121,7 @@ impl App {
         if previous_opening_ledger != self.opening_ledger {
             self.opening_date.clear();
             self.opening_amount.clear();
+            self.opening_on_account = false;
             self.opening_clear_date.clear();
             self.opening_clear_reference.clear();
             self.opening_clear_reason.clear();
@@ -1128,6 +1132,7 @@ impl App {
                     Ok(Some(value)) => {
                         self.opening_date = value.date;
                         self.opening_debit = value.amount > 0;
+                        self.opening_on_account = value.on_account;
                         self.opening_amount = format_amount(value.amount)
                             .trim_start_matches('-')
                             .to_owned();
@@ -1136,6 +1141,7 @@ impl App {
                         self.opening_date.clear();
                         self.opening_amount.clear();
                         self.opening_debit = true;
+                        self.opening_on_account = false;
                         self.message = "No opening balance recorded for this ledger".into();
                     }
                     Err(e) => self.failure(e),
@@ -1158,18 +1164,26 @@ impl App {
                     ui.selectable_value(&mut self.opening_debit, false, "Credit");
                 });
         });
+        ui.checkbox(&mut self.opening_on_account, "On account")
+            .on_hover_text("Enter the amount that is separate from named opening bills. Use the same opening date.");
         if ui.button("Save opening balance").clicked() {
             let result = (|| -> balance::Result<i64> {
                 let ledger = self
                     .opening_ledger
                     .ok_or_else(|| balance::Error::Validation("Select a ledger".into()))?;
                 let amount = parse_amount(&self.opening_amount)?;
-                self.store.set_opening_balance(
-                    company,
-                    ledger,
-                    &self.opening_date,
-                    if self.opening_debit { amount } else { -amount },
-                )
+                let amount = if self.opening_debit { amount } else { -amount };
+                if self.opening_on_account {
+                    self.store.set_opening_on_account_balance(
+                        company,
+                        ledger,
+                        &self.opening_date,
+                        amount,
+                    )
+                } else {
+                    self.store
+                        .set_opening_balance(company, ledger, &self.opening_date, amount)
+                }
             })();
             match result {
                 Ok(id) => self.message = format!("Opening balance saved (voucher {id})"),
@@ -1204,6 +1218,7 @@ impl App {
                                 Ok(voucher) => {
                                     self.opening_date.clear();
                                     self.opening_amount.clear();
+                                    self.opening_on_account = false;
                                     self.opening_clear_date.clear();
                                     self.opening_clear_reference.clear();
                                     self.opening_clear_reason.clear();
@@ -1218,10 +1233,15 @@ impl App {
                         Ok(rows) => {
                             for entry in rows {
                                 ui.label(format!(
-                                    "{} — original voucher #{} · clearing #{} · {}",
+                                    "{} — original voucher #{} · clearing #{}{} · {}",
                                     entry.date,
                                     entry.original_voucher_id,
                                     entry.clearing_voucher_id,
+                                    if entry.on_account {
+                                        " · On account"
+                                    } else {
+                                        ""
+                                    },
                                     entry.reason
                                 ));
                             }
@@ -4691,11 +4711,12 @@ impl App {
         }
         if let Some(plan) = &self.import_preview {
             ui.label(format!(
-                "Preview: {} account groups, {} ledgers, {} opening balances, {} opening bills, {} vouchers, {} invoices, {} settlements, {} advances, {} advance applications; {} units, {} stock groups, {} locations, {} items, {} opening quantities",
+                "Preview: {} account groups, {} ledgers, {} opening balances, {} opening bills, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} advances, {} advance applications; {} units, {} stock groups, {} locations, {} items, {} opening quantities",
                 plan.group_count(),
                 plan.ledger_count(),
                 plan.opening_count(),
                 plan.opening_bill_count(),
+                plan.opening_on_account_count(),
                 plan.voucher_count(),
                 plan.invoice_count(),
                 plan.settlement_count(),
@@ -4736,8 +4757,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} account groups, {} ledgers, {} opening bills, {} vouchers, {} invoices, {} settlements, {} advances, {} advance applications, {} units, {} stock groups, {} locations and {} items",
-                            counts.groups, counts.ledgers, counts.opening_bills, counts.vouchers, counts.invoices, counts.settlements, counts.advances, counts.advance_applications, counts.units, counts.stock_groups, counts.locations, counts.items
+                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} advances, {} advance applications, {} units, {} stock groups, {} locations and {} items",
+                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_on_account, counts.vouchers, counts.invoices, counts.settlements, counts.advances, counts.advance_applications, counts.units, counts.stock_groups, counts.locations, counts.items
                         );
                         self.import_preview = None;
                     }
@@ -4745,7 +4766,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance and retain due dates or whole-day credit periods. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills and applications of named advances on a sales or purchase transaction must add up to the party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices and leave one named advance or on-account amount in the same voucher. Named advances retain a due date or whole-day credit period. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, multiple advances in one receipt or payment, credit terms on on-account amounts and unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills retain due dates or whole-day credit periods. Balance records the difference between named bills and the ledger opening total on account. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills and applications of named advances on a sales or purchase transaction must add up to the party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices and leave one named advance or on-account amount in the same voucher. Named advances retain a due date or whole-day credit period. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, multiple advances in one receipt or payment, credit terms on on-account amounts and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(ui, "Bank clearance");
@@ -5432,7 +5453,7 @@ impl App {
     fn outstanding_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(ui, "Outstanding invoices");
         self.report_export_path_field(ui);
-        ui.label("Age is measured from the invoice date; overdue days are measured from the optional due date. Credit notes and unallocated payments are not included. Past reports use the invoice's current details and due date.");
+        ui.label("Age uses the invoice or original opening bill date. Overdue days use the due date. Past reports use the current bill details.");
         ui.horizontal(|ui| {
             ui.label("As of");
             ui.add(
@@ -5539,7 +5560,7 @@ impl App {
                     money(payable)
                 ));
                 crate::theme::section(ui, "Outstanding by party");
-                ui.small("Receivables and payables are not netted. Overdue totals exclude invoices with no due date. Credit limits are current and informational.");
+                ui.small("Opening amounts on account appear separately from named bills. Overdue totals require a due date. Credit limits are current and informational.");
                 if ui.button("Export party outstanding as CSV").clicked() {
                     match self.store.export_party_outstanding_csv(
                         company,
@@ -5566,6 +5587,7 @@ impl App {
                                     "Overdue receivable",
                                     "Overdue payable",
                                     "Credit limit",
+                                    "Opening on account",
                                 ] {
                                     ui.strong(label);
                                 }
@@ -5588,6 +5610,11 @@ impl App {
                                     ui.label(money(party.overdue_receivable));
                                     ui.label(money(party.overdue_payable));
                                     ui.label(limit);
+                                    ui.label(match party.opening_on_account {
+                                        0 => "—".into(),
+                                        amount if amount > 0 => format!("{} Dr", money(amount)),
+                                        amount => format!("{} Cr", money(-amount)),
+                                    });
                                     ui.end_row();
                                 }
                             });
