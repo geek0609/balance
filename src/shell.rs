@@ -717,14 +717,14 @@ impl App {
             ui.add_space(6.0);
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
             let painter = ui.painter();
-            painter.rect_filled(rect, CornerRadius::same(8), p.accent);
+            painter.rect_filled(rect, CornerRadius::same(theme::CORNER), p.accent);
             // Two balanced bars: a small mark for "Balance".
             let c = rect.center();
             for dy in [-4.0, 4.0] {
                 painter.rect_filled(
                     egui::Rect::from_center_size(c + Vec2::new(0.0, dy), Vec2::new(14.0, 3.0)),
                     CornerRadius::same(2),
-                    Color32::WHITE,
+                    p.on_accent,
                 );
             }
             ui.add_space(4.0);
@@ -733,7 +733,7 @@ impl App {
                 ui.label(
                     RichText::new("Balance")
                         .font(theme::semibold(17.0))
-                        .color(Color32::WHITE),
+                        .color(p.sidebar_text),
                 );
                 ui.label(
                     RichText::new("Accounting & inventory")
@@ -756,10 +756,23 @@ impl App {
         let painter = ui.painter();
         painter.rect_filled(
             rect,
-            CornerRadius::same(10),
-            Color32::from_white_alpha(if hovered { 14 } else { 8 }),
+            CornerRadius::same(theme::CORNER),
+            if hovered {
+                p.sidebar_hover
+            } else {
+                p.sidebar_surface
+            },
         );
-        theme::paint_outline(ui, rect, Color32::from_white_alpha(20), 10);
+        theme::paint_outline(
+            ui,
+            rect,
+            if response.has_focus() {
+                p.sidebar_text
+            } else {
+                p.sidebar_border
+            },
+            theme::CORNER,
+        );
         let avatar = egui::Pos2::new(rect.left() + 26.0, rect.center().y);
         let name = current.as_deref().unwrap_or("Choose a company");
         painter.circle_filled(
@@ -780,7 +793,11 @@ impl App {
                 "＋".into()
             },
             theme::semibold(12.0),
-            Color32::WHITE,
+            if current.is_some() {
+                p.on_accent
+            } else {
+                p.sidebar_text
+            },
         );
         painter.text(
             egui::Pos2::new(rect.left() + 50.0, rect.top() + 15.0),
@@ -794,7 +811,7 @@ impl App {
             Align2::LEFT_CENTER,
             truncate(name, 20),
             theme::semibold(14.0),
-            Color32::WHITE,
+            p.sidebar_text,
         );
         painter.text(
             egui::Pos2::new(rect.right() - 14.0, rect.center().y),
@@ -844,10 +861,23 @@ impl App {
         let painter = ui.painter();
         painter.rect_filled(
             rect,
-            CornerRadius::same(8),
-            Color32::from_white_alpha(if response.hovered() { 12 } else { 6 }),
+            CornerRadius::same(theme::CORNER),
+            if response.hovered() {
+                p.sidebar_hover
+            } else {
+                p.sidebar_surface
+            },
         );
-        theme::paint_outline(ui, rect, Color32::from_white_alpha(18), 8);
+        theme::paint_outline(
+            ui,
+            rect,
+            if response.has_focus() {
+                p.sidebar_text
+            } else {
+                p.sidebar_border
+            },
+            theme::CORNER,
+        );
         painter.text(
             rect.left_center() + Vec2::new(12.0, 0.0),
             Align2::LEFT_CENTER,
@@ -859,7 +889,7 @@ impl App {
             egui::Pos2::new(rect.right() - 30.0, rect.center().y),
             Vec2::new(44.0, 20.0),
         );
-        painter.rect_filled(keys, CornerRadius::same(4), Color32::from_white_alpha(10));
+        painter.rect_filled(keys, CornerRadius::same(theme::CORNER), p.sidebar_bg);
         painter.text(
             keys.center(),
             Align2::CENTER_CENTER,
@@ -878,7 +908,7 @@ impl App {
         ui.painter().hline(
             rect.x_range(),
             rect.top(),
-            Stroke::new(1.0, Color32::from_white_alpha(14)),
+            Stroke::new(1.0, p.sidebar_border),
         );
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -908,7 +938,7 @@ impl App {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::new()
-                    .fill(p.surface)
+                    .fill(p.surface_alt)
                     .inner_margin(Margin::symmetric(16, 5)),
             )
             .show(ctx, |ui| {
@@ -938,7 +968,7 @@ impl App {
         egui::TopBottomPanel::top("page-header")
             .frame(
                 egui::Frame::new()
-                    .fill(p.surface)
+                    .fill(p.surface_alt)
                     .inner_margin(Margin::symmetric(24, 12)),
             )
             .show(ctx, |ui| {
@@ -1024,8 +1054,8 @@ impl App {
         let mut dismiss = false;
         egui::Frame::new()
             .fill(bg)
-            .stroke(Stroke::new(1.0, fg.gamma_multiply(0.35)))
-            .corner_radius(CornerRadius::same(10))
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(CornerRadius::same(theme::CORNER))
             .inner_margin(Margin::symmetric(14, 9))
             .outer_margin(Margin {
                 left: 24,
@@ -1271,15 +1301,9 @@ impl App {
             .frame(
                 egui::Frame::new()
                     .fill(p.surface)
-                    .stroke(Stroke::new(1.0, p.border))
-                    .corner_radius(CornerRadius::same(14))
-                    .inner_margin(Margin::same(10))
-                    .shadow(egui::Shadow {
-                        offset: [0, 16],
-                        blur: 40,
-                        spread: 0,
-                        color: p.shadow,
-                    }),
+                    .stroke(Stroke::new(1.0, p.border_strong))
+                    .corner_radius(CornerRadius::same(theme::CORNER))
+                    .inner_margin(Margin::same(10)),
             )
             .show(ctx, |ui| {
                 ui.set_width(600.0);
@@ -1373,7 +1397,7 @@ impl App {
             Err(error) => {
                 theme::card(ui, |ui| {
                     ui.colored_label(
-                        theme::DANGER,
+                        ui.visuals().error_fg_color,
                         format!("Could not load the dashboard: {error}"),
                     );
                     refresh = ui.button("Try again").clicked();
@@ -1494,7 +1518,6 @@ impl App {
 
         let tiles = [
             (
-                "📈",
                 "Income",
                 money(d.income),
                 "Cumulative income".to_owned(),
@@ -1502,7 +1525,6 @@ impl App {
                 Page::Reports,
             ),
             (
-                "📉",
                 "Expenses",
                 money(d.expenses),
                 "Cumulative expenses".to_owned(),
@@ -1510,7 +1532,6 @@ impl App {
                 Page::Reports,
             ),
             (
-                "💰",
                 "Net profit",
                 money(d.profit),
                 if d.profit >= 0 {
@@ -1526,7 +1547,6 @@ impl App {
                 Page::Reports,
             ),
             (
-                "⏳",
                 "Receivables",
                 money(d.receivable),
                 if d.overdue_count > 0 {
@@ -1547,7 +1567,6 @@ impl App {
                 Page::Outstanding,
             ),
             (
-                "💳",
                 "Payables",
                 money(d.payable),
                 format!("{} open supplier invoices", d.payable_count),
@@ -1555,7 +1574,6 @@ impl App {
                 Page::Outstanding,
             ),
             (
-                "📦",
                 "Low stock",
                 d.low_stock.to_string(),
                 if d.low_stock == 1 {
@@ -1582,12 +1600,12 @@ impl App {
         for row in tiles.chunks(columns) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
-                for (icon, label, value, note, tone, page) in row {
-                    let response = theme::stat_tile(ui, width, icon, label, value, note, *tone)
+                for (label, value, note, tone, page) in row {
+                    let response = theme::stat_tile(ui, width, label, value, note, *tone)
                         .interact(Sense::click())
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if response.hovered() {
-                        theme::paint_outline(ui, response.rect, p.accent.gamma_multiply(0.6), 12);
+                    if response.hovered() || response.has_focus() {
+                        theme::paint_outline(ui, response.rect, p.accent, theme::CORNER);
                     }
                     if response.clicked() {
                         *action = Some(Action::Go(*page));
@@ -1637,9 +1655,17 @@ impl App {
                     .spacing(Vec2::new(14.0, 8.0))
                     .min_col_width(0.0)
                     .show(ui, |ui| {
-                        for heading in ["Date", "Type", "Particulars", "Amount"] {
+                        for heading in ["Date", "Type", "Particulars"] {
                             ui.label(theme::caption(heading, p.text_faint));
                         }
+                        let amount_width = 130.0;
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(amount_width, 20.0),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                ui.label(theme::caption("Amount", p.text_faint));
+                            },
+                        );
                         ui.end_row();
                         for entry in &d.recent {
                             let voucher = &entry.voucher;
@@ -1655,7 +1681,7 @@ impl App {
                             ui.label(truncate(&particulars, 46))
                                 .on_hover_text(format!("Voucher #{}\n{particulars}", voucher.id));
                             ui.allocate_ui_with_layout(
-                                Vec2::new(130.0, 20.0),
+                                Vec2::new(amount_width, 20.0),
                                 Layout::right_to_left(Align::Center),
                                 |ui| {
                                     ui.label(
@@ -1793,7 +1819,7 @@ impl App {
                     let painter = ui.painter();
                     painter.rect_filled(
                         rect,
-                        CornerRadius::same(10),
+                        CornerRadius::same(theme::CORNER),
                         if response.hovered() {
                             p.hover
                         } else {
@@ -1808,7 +1834,7 @@ impl App {
                         } else {
                             p.border
                         },
-                        10,
+                        theme::CORNER,
                     );
                     let avatar = egui::Pos2::new(rect.left() + 28.0, rect.center().y);
                     painter.circle_filled(avatar, 16.0, p.accent);
@@ -1817,7 +1843,7 @@ impl App {
                         Align2::CENTER_CENTER,
                         initials(&company.name),
                         theme::semibold(12.5),
-                        Color32::WHITE,
+                        p.on_accent,
                     );
                     painter.text(
                         egui::Pos2::new(rect.left() + 56.0, rect.center().y),
@@ -1899,17 +1925,12 @@ fn nav_row(
     });
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(rect, CornerRadius::same(8), p.sidebar_active);
-        painter.rect_filled(
-            egui::Rect::from_min_size(rect.left_top() + Vec2::new(0.0, 7.0), Vec2::new(3.0, 18.0)),
-            CornerRadius::same(2),
-            p.accent,
-        );
+        painter.rect_filled(rect, CornerRadius::same(theme::CORNER), p.selection);
     } else if response.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(8), p.sidebar_hover);
+        painter.rect_filled(rect, CornerRadius::same(theme::CORNER), p.sidebar_hover);
     }
     let text = if selected {
-        Color32::WHITE
+        p.on_selection
     } else if dim {
         p.sidebar_muted
     } else {
@@ -1921,7 +1942,7 @@ fn nav_row(
         icon,
         FontId::proportional(14.0),
         if selected {
-            Color32::WHITE
+            p.on_selection
         } else {
             p.sidebar_muted
         },
@@ -1937,6 +1958,9 @@ fn nav_row(
         },
         text,
     );
+    if response.has_focus() {
+        theme::paint_outline(ui, rect, text, theme::CORNER);
+    }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -1945,16 +1969,20 @@ fn palette_row(ui: &mut egui::Ui, p: &Palette, entry: &Entry, selected: bool) ->
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::click());
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(rect, CornerRadius::same(8), p.accent_soft);
+        painter.rect_filled(rect, CornerRadius::same(theme::CORNER), p.selection);
     } else if response.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(8), p.hover);
+        painter.rect_filled(rect, CornerRadius::same(theme::CORNER), p.hover);
     }
     painter.text(
         rect.left_center() + Vec2::new(20.0, 0.0),
         Align2::CENTER_CENTER,
         entry.icon,
         FontId::proportional(15.0),
-        if selected { p.accent } else { p.text_muted },
+        if selected {
+            p.on_selection
+        } else {
+            p.text_muted
+        },
     );
     painter.text(
         rect.left_center() + Vec2::new(40.0, 0.0),
@@ -1965,7 +1993,7 @@ fn palette_row(ui: &mut egui::Ui, p: &Palette, entry: &Entry, selected: bool) ->
         } else {
             FontId::proportional(14.0)
         },
-        p.text,
+        if selected { p.on_selection } else { p.text },
     );
     let mut right = rect.right() - 12.0;
     if !entry.keys.is_empty() {
@@ -1992,7 +2020,11 @@ fn palette_row(ui: &mut egui::Ui, p: &Palette, entry: &Entry, selected: bool) ->
         Align2::RIGHT_CENTER,
         &entry.detail,
         FontId::proportional(12.0),
-        p.text_faint,
+        if selected {
+            p.on_selection
+        } else {
+            p.text_faint
+        },
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -2063,21 +2095,25 @@ mod tests {
                 )
                 .unwrap();
         }
-        let context = egui::Context::default();
-        crate::theme::install(&context);
         let mut app = App::new(store, "demo.db".into());
         app.switch_company(company);
-        let frame = context.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1360.0, 860.0),
-                )),
-                ..Default::default()
-            },
-            |context| app.shell_update(context),
-        );
-        assert!(!frame.shapes.is_empty());
+        for mode in [egui::Theme::Light, egui::Theme::Dark] {
+            let context = egui::Context::default();
+            crate::theme::install(&context);
+            context.set_theme(mode);
+            let frame = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1360.0, 860.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| app.shell_update(context),
+            );
+            assert_eq!(context.theme(), mode);
+            assert!(!frame.shapes.is_empty());
+        }
         let dashboard = app.shell.dashboard.as_ref().unwrap().data.as_ref().unwrap();
         assert_eq!(dashboard.voucher_count, 1);
         assert_eq!(dashboard.recent[0].voucher.date, "2000-01-01");

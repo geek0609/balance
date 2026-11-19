@@ -830,7 +830,7 @@ impl App {
                     Ok(rows) => for row in rows {
                         ui.label(format!("{} UTC — {}, {}, {}, {} | {} | {} | Tax ID: {} | Registration: {} | Financial year: {} | Books: {}", row.changed_at, row.profile.address, row.profile.region, row.profile.postal_code, row.profile.country, row.profile.email, row.profile.phone, row.profile.tax_id, row.profile.registration_type, row.profile.financial_year_start, row.profile.books_start));
                     },
-                    Err(e) => { ui.colored_label(crate::theme::DANGER, e.to_string()); }
+                    Err(e) => { ui.colored_label(ui.visuals().error_fg_color, e.to_string()); }
                 }
             });
             self.period_lock_form(ui, company);
@@ -1007,7 +1007,7 @@ impl App {
                                 }
                             }
                             Err(e) => {
-                                ui.colored_label(crate::theme::DANGER, e.to_string());
+                                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                             }
                         }
                     });
@@ -1185,7 +1185,7 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(crate::theme::DANGER, e.to_string());
+                            ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                         }
                     }
                 });
@@ -1312,7 +1312,7 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(crate::theme::DANGER, e.to_string());
+                            ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                         }
                     }
                 });
@@ -1441,7 +1441,7 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(crate::theme::DANGER, e.to_string());
+                            ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                         }
                     }
                 });
@@ -1581,13 +1581,15 @@ impl App {
             ui.label("Narration");
             ui.text_edit_singleline(&mut self.narration);
         });
-        let submit = ui
-            .button(if self.editing_voucher.is_some() {
+        let submit = theme::primary_button(
+            ui,
+            if self.editing_voucher.is_some() {
                 "Save changes"
             } else {
                 "Post voucher"
-            })
-            .clicked()
+            },
+        )
+        .clicked()
             || (!self.shell.go_to_is_open()
                 && ui.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Enter)));
         if self.editing_voucher.is_some() && ui.button("Cancel edit").clicked() {
@@ -1838,7 +1840,7 @@ impl App {
                                     }
                                 }
                                 Err(e) => {
-                                    ui.colored_label(crate::theme::DANGER, e.to_string());
+                                    ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                                 }
                             }
                         });
@@ -1878,7 +1880,7 @@ impl App {
         let report = match self.store.financial_report(company, from, to) {
             Ok(v) => v,
             Err(e) => {
-                ui.colored_label(crate::theme::DANGER, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                 return;
             }
         };
@@ -1925,7 +1927,7 @@ impl App {
         ));
         if debit != credit {
             ui.colored_label(
-                crate::theme::DANGER,
+                ui.visuals().error_fg_color,
                 "Trial balance is out of balance; review the underlying records.",
             );
         }
@@ -1988,7 +1990,7 @@ impl App {
                 }
             }
             Err(e) => {
-                ui.colored_label(crate::theme::DANGER, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
             }
         }
         ui.separator();
@@ -2061,7 +2063,7 @@ impl App {
         let register = match self.store.ledger_register(company, ledger, from, to) {
             Ok(v) => v,
             Err(e) => {
-                ui.colored_label(crate::theme::DANGER, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                 return;
             }
         };
@@ -2460,7 +2462,7 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(crate::theme::DANGER, e.to_string());
+                            ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                         }
                     }
                 });
@@ -2559,7 +2561,7 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(crate::theme::DANGER, e.to_string());
+                            ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                         }
                     }
                 });
@@ -2632,7 +2634,7 @@ impl App {
                                 );
                                 if expired {
                                     ui.colored_label(
-                                        crate::theme::DANGER,
+                                        ui.visuals().error_fg_color,
                                         format!("{text} — expired as of selected date"),
                                     );
                                 } else {
@@ -2640,7 +2642,7 @@ impl App {
                                 }
                             }
                             Err(e) => {
-                                ui.colored_label(crate::theme::DANGER, e.to_string());
+                                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                             }
                         }
                     }
@@ -2956,7 +2958,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    ui.colored_label(crate::theme::DANGER, e.to_string());
+                    ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                 }
             }
         });
@@ -3040,7 +3042,7 @@ impl App {
                 }
             }
             Err(e) => {
-                ui.colored_label(crate::theme::DANGER, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
             }
         }
         ui.small("See Stock valuation for ageing and cost reports.");
@@ -3064,7 +3066,7 @@ impl App {
                 }
             }
             Err(e) => {
-                ui.colored_label(crate::theme::DANGER, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
             }
         }
         ui.separator();
@@ -3138,7 +3140,7 @@ impl App {
                     ));
                 }
                 Err(e) => {
-                    ui.colored_label(crate::theme::DANGER, e.to_string());
+                    ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                 }
             }
         }
@@ -3447,7 +3449,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        ui.colored_label(crate::theme::DANGER, e.to_string());
+                        ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                     }
                 }
             }
@@ -3728,7 +3730,7 @@ impl App {
             self.clear_invoice_tax_context();
             self.invoice_tax_ledger = None;
         }
-        if ui.button("Save invoice").clicked() {
+        if theme::primary_button(ui, "Save invoice").clicked() {
             let result = (|| -> balance::Result<i64> {
                 let mut lines = Vec::new();
                 for line in &self.invoice_lines {
@@ -4248,7 +4250,7 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(crate::theme::DANGER, e.to_string());
+                            ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                         }
                     }
                     ui.small(format!("Accounting voucher #{}", invoice.voucher_id));
@@ -4338,7 +4340,7 @@ impl App {
                                     }
                                 }
                                 Err(e) => {
-                                    ui.colored_label(crate::theme::DANGER, e.to_string());
+                                    ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                                 }
                             }
                         });
@@ -4524,7 +4526,7 @@ impl App {
                 ui.label("Preview found no issues. Review the limitations below before importing.");
             } else {
                 ui.colored_label(
-                    crate::theme::DANGER,
+                    ui.visuals().error_fg_color,
                     format!("{} issue(s) prevent import:", plan.issues().len()),
                 );
                 for issue in plan.issues().iter().take(100) {
@@ -4598,7 +4600,7 @@ impl App {
         let report = match self.store.bank_report(company, ledger, &self.bank_as_of) {
             Ok(report) => report,
             Err(e) => {
-                ui.colored_label(crate::theme::DANGER, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                 return;
             }
         };
@@ -4622,7 +4624,7 @@ impl App {
             Ok(None) => ui.label(
                 "No statement balance is available for this date; set an opening balance first.",
             ),
-            Err(e) => ui.colored_label(crate::theme::DANGER, e.to_string()),
+            Err(e) => ui.colored_label(ui.visuals().error_fg_color, e.to_string()),
         };
         ui.small("The statement balance uses only imported entries and the entered opening; verify coverage against the bank. It is not independently verified.");
         ui.small("Balances are debit minus credit. Past reports use the current clearance dates; revisions do not reconstruct past states.");
@@ -4738,7 +4740,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        ui.colored_label(crate::theme::DANGER, e.to_string());
+                        ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                     }
                 }
             });
@@ -4846,7 +4848,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    ui.colored_label(crate::theme::DANGER, e.to_string());
+                    ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                 }
             }
         });
@@ -4895,7 +4897,7 @@ impl App {
         if let Some(plan) = &self.bank_csv_preview {
             ui.label(format!("Preview: {} entries", plan.row_count()));
             for issue in plan.issues().iter().take(100) {
-                ui.colored_label(crate::theme::DANGER, issue);
+                ui.colored_label(ui.visuals().error_fg_color, issue);
             }
             if plan.issues().len() > 100 {
                 ui.label("Additional issues are not shown.");
@@ -4936,7 +4938,7 @@ impl App {
         {
             Ok(entries) => entries,
             Err(e) => {
-                ui.colored_label(crate::theme::DANGER, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                 return;
             }
         };
@@ -5083,7 +5085,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        ui.colored_label(crate::theme::DANGER, e.to_string());
+                        ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                     }
                 }
             });
@@ -5228,7 +5230,7 @@ impl App {
                 ));
             }
             Err(e) => {
-                ui.colored_label(crate::theme::DANGER, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
             }
         }
     }
@@ -5396,7 +5398,7 @@ impl App {
                             });
                     }
                     Err(e) => {
-                        ui.colored_label(crate::theme::DANGER, e.to_string());
+                        ui.colored_label(ui.visuals().error_fg_color, e.to_string());
                     }
                 };
                 crate::theme::section(ui, "Age from invoice date");
@@ -5449,7 +5451,7 @@ impl App {
                     });
             }
             Err(e) => {
-                ui.colored_label(crate::theme::DANGER, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
             }
         }
     }
@@ -5537,7 +5539,7 @@ impl App {
                 });
             }
             Err(e) => {
-                ui.colored_label(crate::theme::DANGER, e.to_string());
+                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
             }
         }
     }
@@ -5728,6 +5730,10 @@ fn money(value: i128) -> String {
     )
 }
 impl eframe::App for App {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.shell_update(ctx);
     }

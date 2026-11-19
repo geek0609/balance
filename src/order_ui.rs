@@ -776,15 +776,17 @@ impl App {
         }
         order_line_fields(ui, &mut form.lines, &items);
         let quotation = form.quotation;
-        if ui
-            .button(if revising {
+        if crate::theme::primary_button(
+            ui,
+            if revising {
                 "Save revised quotation"
             } else if quotation {
                 "Save quotation"
             } else {
                 "Save order"
-            })
-            .clicked()
+            },
+        )
+        .clicked()
         {
             let result = form.draft().and_then(|draft| {
                 if let Some(original) = form.revision_of {
