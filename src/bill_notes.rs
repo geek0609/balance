@@ -60,8 +60,9 @@ pub(crate) fn history(
 
 pub(crate) fn is_bill_note(conn: &Connection, company: i64, voucher: i64) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM bill_note_allocations a JOIN vouchers v ON v.id = a.voucher_id
-         WHERE a.voucher_id = ?1 AND v.company_id = ?2)",
+        "SELECT EXISTS(SELECT 1 FROM vouchers v WHERE v.id = ?1 AND v.company_id = ?2
+         AND (EXISTS(SELECT 1 FROM bill_note_allocations a WHERE a.voucher_id = v.id)
+           OR EXISTS(SELECT 1 FROM bill_note_credits c WHERE c.voucher_id = v.id)))",
         params![voucher, company],
         |row| row.get(0),
     )?)

@@ -32,7 +32,10 @@ pub(crate) fn state(
     through: Option<NaiveDate>,
 ) -> Result<AllocationState> {
     let mut stmt = conn.prepare_cached(
-        "SELECT date, amount, released_on FROM invoice_credit_allocations WHERE company_id = ?1 AND invoice_id = ?2",
+        "SELECT date, amount, released_on FROM invoice_credit_allocations WHERE company_id = ?1 AND invoice_id = ?2
+         UNION ALL SELECT a.date, a.amount, a.released_on FROM bill_note_credit_applications a
+           JOIN bill_note_credits c ON c.id = a.credit_id JOIN vouchers v ON v.id = c.voucher_id
+           WHERE v.company_id = ?1 AND a.invoice_id = ?2",
     )?;
     let rows = stmt.query(params![company, invoice])?;
     read_allocation_state(rows, through)

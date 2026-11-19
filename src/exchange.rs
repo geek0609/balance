@@ -157,8 +157,8 @@ struct ImportedInvoice {
     date: String,
     reference: String,
     bills: Vec<BillSplitDraft>,
-    advance_applications: Vec<ImportedAdvanceApplication>,
-    advance_bill_reference: Option<String>,
+    funding_applications: Vec<ImportedFundingApplication>,
+    funded_bill_reference: Option<String>,
     narration: String,
     party: String,
     existing_party_id: Option<i64>,
@@ -170,11 +170,11 @@ struct ImportedInvoice {
     metadata: SourceMetadata,
 }
 #[derive(Debug, Clone)]
-struct ImportedAdvanceApplication {
+struct ImportedFundingApplication {
     reference: String,
     amount: i64,
     terms: BillTerms,
-    existing_advance_id: Option<i64>,
+    expected_source: Option<FundingSource>,
     expected_available: i128,
 }
 
@@ -221,7 +221,14 @@ struct ImportedBillNote {
     lines: Vec<(Line, Option<i64>)>,
     party_index: usize,
     bills: Vec<ImportedBillAllocation>,
+    credits: Vec<ImportedNoteCredit>,
     metadata: SourceMetadata,
+}
+#[derive(Debug, Clone)]
+struct ImportedNoteCredit {
+    reference: String,
+    amount: i64,
+    terms: BillTerms,
 }
 impl ImportedBillNote {
     fn voucher_kind(&self) -> VoucherKind {
@@ -347,6 +354,7 @@ impl ImportPlan {
                 self.bill_notes
                     .iter()
                     .enumerate()
+                    .filter(|(_, note)| !note.bills.is_empty())
                     .map(|(index, row)| (&row.date, row.source_order, BillChange::Note(index))),
             )
             .collect();
@@ -362,8 +370,23 @@ impl ImportPlan {
     pub fn advance_application_count(&self) -> usize {
         self.invoices
             .iter()
-            .map(|row| row.advance_applications.len())
-            .sum()
+            .flat_map(|row| &row.funding_applications)
+            .filter(|application| {
+                matches!(application.expected_source, Some(FundingSource::Advance(_)))
+            })
+            .count()
+    }
+    pub fn credit_application_count(&self) -> usize {
+        self.invoices
+            .iter()
+            .flat_map(|row| &row.funding_applications)
+            .filter(|application| {
+                matches!(application.expected_source, Some(FundingSource::Note(_)))
+            })
+            .count()
+    }
+    pub fn note_credit_count(&self) -> usize {
+        self.bill_notes.iter().map(|row| row.credits.len()).sum()
     }
     pub fn opening_count(&self) -> usize {
         self.accounts
@@ -457,6 +480,8 @@ pub struct ImportCounts {
     pub bill_notes: usize,
     pub advances: usize,
     pub advance_applications: usize,
+    pub note_credits: usize,
+    pub credit_applications: usize,
     pub units: usize,
     pub stock_groups: usize,
     pub locations: usize,
@@ -1597,6 +1622,7 @@ fn parse_imported_bill_note(
     };
     let mut lines = Vec::with_capacity(entries.len());
     let mut allocations = Vec::new();
+    let mut credits = Vec::new();
     let mut party = None;
     for entry in entries {
         invoice_list_fields(
@@ -1650,11 +1676,7 @@ fn parse_imported_bill_note(
                     label,
                     issues,
                 );
-                if normalized(&invoice_field(bill, "BILLTYPE")?) != "agst ref" {
-                    return Err(Error::Validation(
-                        "this note requires allocations against existing bills".into(),
-                    ));
-                }
+                let bill_type = normalized(&invoice_field(bill, "BILLTYPE")?);
                 let bill_reference = invoice_field(bill, "NAME")?;
                 if !seen.insert(normalized(&bill_reference)) {
                     return Err(Error::Validation(
@@ -1667,19 +1689,37 @@ fn parse_imported_bill_note(
                         "bill allocation direction is inconsistent".into(),
                     ));
                 }
-                allocations.push(ImportedBillAllocation {
-                    reference: bill_reference,
-                    amount: bill_amount
-                        .checked_abs()
-                        .ok_or_else(|| Error::Validation("bill amount is too large".into()))?,
-                    existing_target: None,
-                    expected_outstanding: 0,
-                    terms: xml_bill_terms(direct_text(bill, "BILLCREDITPERIOD").as_deref())?,
-                });
+                let amount = bill_amount
+                    .checked_abs()
+                    .ok_or_else(|| Error::Validation("bill amount is too large".into()))?;
+                let terms = xml_bill_terms(direct_text(bill, "BILLCREDITPERIOD").as_deref())?;
+                match bill_type.as_str() {
+                    "agst ref" => allocations.push(ImportedBillAllocation {
+                        reference: bill_reference,
+                        amount,
+                        terms,
+                        existing_target: None,
+                        expected_outstanding: 0,
+                    }),
+                    "new ref" => {
+                        terms.due_date_from(parse_date(&date)?)?;
+                        credits.push(ImportedNoteCredit {
+                            reference: bill_reference,
+                            amount,
+                            terms,
+                        });
+                    }
+                    _ => {
+                        return Err(Error::Validation(
+                            "note needs an existing bill or a new named credit reference".into(),
+                        ))
+                    }
+                }
             }
             if allocations
                 .iter()
                 .map(|bill| i128::from(bill.amount))
+                .chain(credits.iter().map(|credit| i128::from(credit.amount)))
                 .sum::<i128>()
                 != i128::from(amount).abs()
             {
@@ -1732,6 +1772,7 @@ fn parse_imported_bill_note(
         party_index,
         lines,
         bills: allocations,
+        credits,
         metadata,
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
     })
@@ -1931,7 +1972,7 @@ fn parse_imported_invoice(
                 ));
             }
             let mut schedule = Vec::with_capacity(bills.len());
-            let mut advance_applications = Vec::new();
+            let mut funding_applications = Vec::new();
             let mut advance_references = HashSet::new();
             let mut signed_total = 0_i128;
             for bill in bills {
@@ -1962,11 +2003,11 @@ fn parse_imported_invoice(
                                 "Advance reference {reference} occurs more than once"
                             )));
                         }
-                        advance_applications.push(ImportedAdvanceApplication {
+                        funding_applications.push(ImportedFundingApplication {
                             reference,
                             amount,
                             terms,
-                            existing_advance_id: None,
+                            expected_source: None,
                             expected_available: 0,
                         });
                         continue;
@@ -1991,7 +2032,7 @@ fn parse_imported_invoice(
                     "Bill allocations must add up to the full party amount".into(),
                 ));
             }
-            party = Some((ledger, amount, schedule, advance_applications));
+            party = Some((ledger, amount, schedule, funding_applications));
         } else {
             if !bills.is_empty() {
                 return Err(Error::Validation(
@@ -2007,7 +2048,7 @@ fn parse_imported_invoice(
             }
         }
     }
-    let (party_name, party_amount, bills, advance_applications) =
+    let (party_name, party_amount, bills, funding_applications) =
         party.ok_or_else(|| Error::Validation("party ledger is missing".into()))?;
     if header_party.is_some_and(|name| normalized(&name) != normalized(&party_name)) {
         return Err(Error::Validation(
@@ -2351,8 +2392,8 @@ fn parse_imported_invoice(
         date,
         reference,
         bills,
-        advance_applications,
-        advance_bill_reference: None,
+        funding_applications,
+        funded_bill_reference: None,
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
         party: party_name,
         existing_party_id,
@@ -2366,8 +2407,29 @@ fn parse_imported_invoice(
 }
 type ReferenceKey = (String, String, String);
 
-struct NamedAdvance {
-    id: Option<i64>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FundingSource {
+    Advance(Option<i64>),
+    Note(Option<i64>),
+}
+impl FundingSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Advance(_) => "advance",
+            Self::Note(_) => "credit",
+        }
+    }
+
+    fn matches(self, current: Self) -> bool {
+        matches!(
+            (self, current),
+            (Self::Advance(None), Self::Advance(Some(_))) | (Self::Note(None), Self::Note(Some(_)))
+        ) || self == current
+    }
+}
+
+struct NamedFunding {
+    source: FundingSource,
     reference: String,
     date: NaiveDate,
     original_date: NaiveDate,
@@ -2376,26 +2438,36 @@ struct NamedAdvance {
     available: i128,
 }
 
-type NamedAdvances = HashMap<ReferenceKey, Option<NamedAdvance>>;
+type NamedFundingIndex = HashMap<ReferenceKey, Option<NamedFunding>>;
 
-fn add_named_advance(
-    advances: &mut NamedAdvances,
-    kind: InvoiceKind,
-    party: &str,
-    advance: NamedAdvance,
-) {
-    let key = (
+fn funding_key(kind: InvoiceKind, party: &str, reference: &str) -> ReferenceKey {
+    (
         normalized(kind.as_str()),
         normalized(party),
-        normalized(&advance.reference),
-    );
-    advances
-        .entry(key)
-        .and_modify(|row| *row = None)
-        .or_insert(Some(advance));
+        normalized(reference),
+    )
 }
 
-fn read_named_advances(conn: &Connection, company: i64) -> Result<NamedAdvances> {
+fn add_named_funding(
+    advances: &mut NamedFundingIndex,
+    kind: InvoiceKind,
+    party: &str,
+    funding: NamedFunding,
+) -> bool {
+    let key = funding_key(kind, party, &funding.reference);
+    match advances.entry(key) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(funding));
+            true
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.insert(None);
+            false
+        }
+    }
+}
+
+fn read_named_funding(conn: &Connection, company: i64) -> Result<NamedFundingIndex> {
     let mut advances = HashMap::new();
     for row in read_party_advances(conn, company, None)? {
         let date = parse_date(&row.date)?;
@@ -2417,12 +2489,12 @@ fn read_named_advances(conn: &Connection, company: i64) -> Result<NamedAdvances>
         } else {
             (row.reference, None)
         };
-        add_named_advance(
+        add_named_funding(
             &mut advances,
             row.kind,
             &row.party,
-            NamedAdvance {
-                id: Some(row.id),
+            NamedFunding {
+                source: FundingSource::Advance(Some(row.id)),
                 reference,
                 date,
                 original_date,
@@ -2433,39 +2505,59 @@ fn read_named_advances(conn: &Connection, company: i64) -> Result<NamedAdvances>
             },
         );
     }
+    for credit in crate::bill_note_credits::read_credits(conn, company, None, None)? {
+        let date = parse_date(&credit.date)?;
+        let terms = BillTerms {
+            due_date: credit.due_date,
+            credit_days: credit.credit_days,
+        };
+        add_named_funding(
+            &mut advances,
+            credit.kind,
+            &credit.party,
+            NamedFunding {
+                source: FundingSource::Note(Some(credit.id)),
+                reference: credit.reference,
+                date,
+                original_date: date,
+                due_date: terms.due_date_from(date)?,
+                latest_release: credit.latest_release,
+                available: credit.available,
+            },
+        );
+    }
     Ok(advances)
 }
 
-fn named_advance<'a>(
-    advances: &'a mut NamedAdvances,
+fn resolve_named_funding<'a>(
+    advances: &'a mut NamedFundingIndex,
     kind: InvoiceKind,
     party: &str,
     date: NaiveDate,
-    application: &ImportedAdvanceApplication,
-) -> Result<&'a mut NamedAdvance> {
+    application: &ImportedFundingApplication,
+) -> Result<&'a mut NamedFunding> {
     let reference = &application.reference;
-    let key = (
-        normalized(kind.as_str()),
-        normalized(party),
-        normalized(reference),
-    );
+    let key = funding_key(kind, party, reference);
     let advance = advances
         .get_mut(&key)
         .ok_or_else(|| {
             Error::Validation(format!(
-                "Named advance {reference} is unavailable for this party and type"
+                "Named advance or credit {reference} is unavailable for this party and type"
             ))
         })?
         .as_mut()
-        .ok_or_else(|| Error::Validation(format!("Named advance {reference} is ambiguous")))?;
+        .ok_or_else(|| {
+            Error::Validation(format!("Named advance or credit {reference} is ambiguous"))
+        })?;
+    let label = advance.source.label();
     if &advance.reference != reference {
         return Err(Error::Validation(format!(
-            "Advance reference {reference} differs from the saved spelling"
+            "Reference {reference} differs from the saved {label} spelling"
         )));
     }
     if date < advance.date || advance.latest_release.is_some_and(|release| date < release) {
         return Err(Error::Validation(format!(
-            "Application precedes advance {reference} or its latest release"
+            "Application precedes {label} {reference} or its latest release"
         )));
     }
     if !application
@@ -2473,23 +2565,23 @@ fn named_advance<'a>(
         .matches_due_date(advance.original_date, advance.due_date)?
     {
         return Err(Error::Validation(format!(
-            "Credit terms differ from the saved advance {reference}"
+            "Credit terms differ from the saved {label} {reference}"
         )));
     }
     if i128::from(application.amount) > advance.available {
         return Err(Error::Validation(format!(
-            "Application exceeds the available amount on advance {reference}"
+            "Application exceeds the available amount on {label} {reference}"
         )));
     }
     Ok(advance)
 }
 
-fn preview_advance_applications(
+fn preview_funding_applications(
     conn: &Connection,
     plan: &mut ImportPlan,
     bill_references: &mut HashSet<ReferenceKey>,
 ) -> Result<()> {
-    let mut advances = read_named_advances(conn, plan.company_id)?;
+    let mut advances = read_named_funding(conn, plan.company_id)?;
     if let Some(opening) = plan.opening_date.as_deref() {
         let date = parse_date(opening)?;
         for account in &plan.accounts {
@@ -2499,12 +2591,12 @@ fn preview_advance_applications(
                 .filter(|bill| bill.advance_type.is_some())
             {
                 let original_date = parse_date(&bill.original_date)?;
-                add_named_advance(
+                add_named_funding(
                     &mut advances,
                     bill.kind,
                     &account.name,
-                    NamedAdvance {
-                        id: None,
+                    NamedFunding {
+                        source: FundingSource::Advance(None),
                         reference: bill.reference.clone(),
                         date,
                         original_date,
@@ -2528,12 +2620,12 @@ fn preview_advance_applications(
                     due_date: source_bill.due_date.clone(),
                     credit_days: source_bill.credit_days,
                 };
-                add_named_advance(
+                add_named_funding(
                     &mut advances,
                     settlement.kind,
                     &settlement.party,
-                    NamedAdvance {
-                        id: None,
+                    NamedFunding {
+                        source: FundingSource::Advance(None),
                         reference: reference.into(),
                         date,
                         original_date: date,
@@ -2545,18 +2637,42 @@ fn preview_advance_applications(
             }
         }
     }
+    for note in &plan.bill_notes {
+        let date = parse_date(&note.date)?;
+        for credit in &note.credits {
+            if !add_named_funding(
+                &mut advances,
+                note.kind,
+                &note.lines[note.party_index].0.ledger,
+                NamedFunding {
+                    source: FundingSource::Note(None),
+                    reference: credit.reference.clone(),
+                    date,
+                    original_date: date,
+                    due_date: credit.terms.due_date_from(date)?,
+                    latest_release: None,
+                    available: i128::from(credit.amount),
+                },
+            ) {
+                plan.issues.push(format!(
+                    "Voucher {}: named credit {} is ambiguous for this party and type",
+                    note.reference, credit.reference
+                ));
+            }
+        }
+    }
     for invoice in plan
         .invoices
         .iter_mut()
-        .filter(|invoice| !invoice.advance_applications.is_empty())
+        .filter(|invoice| !invoice.funding_applications.is_empty())
     {
         let date = parse_date(&invoice.date)?;
         let mut funded = 0_i64;
-        for application in &mut invoice.advance_applications {
+        for application in &mut invoice.funding_applications {
             funded = funded
                 .checked_add(application.amount)
                 .ok_or_else(|| Error::Validation("Invoice advance total is too large".into()))?;
-            match named_advance(
+            match resolve_named_funding(
                 &mut advances,
                 invoice.kind,
                 &invoice.party,
@@ -2564,7 +2680,7 @@ fn preview_advance_applications(
                 application,
             ) {
                 Ok(advance) => {
-                    application.existing_advance_id = advance.id;
+                    application.expected_source = Some(advance.source);
                     application.expected_available = advance.available;
                     advance.available -= i128::from(application.amount);
                 }
@@ -2575,7 +2691,15 @@ fn preview_advance_applications(
         }
         // The original advance reference can fund several invoices. Reserve a
         // distinct local bill so the exported unpaid references keep their amounts.
-        let prefix = format!("{} (advance)", invoice.reference);
+        let label =
+            if invoice.funding_applications.iter().any(|application| {
+                matches!(application.expected_source, Some(FundingSource::Note(_)))
+            }) {
+                "credit applied"
+            } else {
+                "advance"
+            };
+        let prefix = format!("{} ({label})", invoice.reference);
         let kind = normalized(invoice.kind.as_str());
         let party = normalized(&invoice.party);
         let mut reference = prefix.clone();
@@ -2590,7 +2714,7 @@ fn preview_advance_applications(
             due_date: None,
             credit_days: None,
         });
-        invoice.advance_bill_reference = Some(reference);
+        invoice.funded_bill_reference = Some(reference);
     }
     Ok(())
 }
@@ -2762,11 +2886,11 @@ fn resolve_imported_bill_allocations(
     Ok(allocations)
 }
 
-fn apply_imported_bill_note(
+fn post_imported_bill_note(
     conn: &Connection,
     company: i64,
     source: &ImportedBillNote,
-) -> Result<()> {
+) -> Result<(i64, i64)> {
     let kind = source.voucher_kind();
     check_new_bill_voucher(conn, company, kind, &source.date, &source.reference)?;
     let mut postings = Vec::with_capacity(source.lines.len());
@@ -2782,14 +2906,6 @@ fn apply_imported_bill_note(
         }
     }
     let party = postings[source.party_index].ledger_id;
-    let allocations = resolve_imported_bill_allocations(
-        conn,
-        company,
-        source.kind,
-        party,
-        &source.date,
-        &source.bills,
-    )?;
     let voucher = insert_voucher_draft(
         conn,
         company,
@@ -2803,6 +2919,39 @@ fn apply_imported_bill_note(
         },
     )?;
     let mut stmt = conn.prepare_cached(
+        "INSERT INTO bill_note_credits(voucher_id, party_ledger_id, reference, amount, due_date, credit_days)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for credit in &source.credits {
+        stmt.execute(params![
+            voucher,
+            party,
+            credit.reference,
+            credit.amount,
+            credit.terms.due_date,
+            credit.terms.credit_days
+        ])?;
+    }
+    save_metadata(conn, company, "voucher", voucher, &source.metadata)?;
+    Ok((voucher, party))
+}
+
+fn attach_note_bill_allocations(
+    conn: &Connection,
+    company: i64,
+    source: &ImportedBillNote,
+    voucher: i64,
+    party: i64,
+) -> Result<()> {
+    let allocations = resolve_imported_bill_allocations(
+        conn,
+        company,
+        source.kind,
+        party,
+        &source.date,
+        &source.bills,
+    )?;
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO bill_note_allocations(voucher_id, invoice_id, split_id, amount) VALUES (?1, ?2, ?3, ?4)",
     )?;
     for allocation in allocations {
@@ -2813,7 +2962,7 @@ fn apply_imported_bill_note(
             allocation.amount
         ])?;
     }
-    save_metadata(conn, company, "voucher", voucher, &source.metadata)
+    Ok(())
 }
 fn find_stock_item(conn: &Connection, company: i64, name: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare("SELECT id, name FROM stock_items WHERE company_id = ?1")?;
@@ -4329,12 +4478,12 @@ impl Store {
                 }
             }
         }
-        let has_advance_applications = plan
+        let has_funding_applications = plan
             .invoices
             .iter()
-            .any(|invoice| !invoice.advance_applications.is_empty());
-        if has_advance_applications {
-            preview_advance_applications(&self.conn, &mut plan, &mut bill_references)?;
+            .any(|invoice| !invoice.funding_applications.is_empty());
+        if has_funding_applications || plan.note_credit_count() > 0 {
+            preview_funding_applications(&self.conn, &mut plan, &mut bill_references)?;
         }
         let bill_changes = plan.bill_changes();
         if !bill_changes.is_empty() {
@@ -4439,7 +4588,7 @@ impl Store {
                     normalized(&invoice.reference),
                 );
                 for bill in &invoice.bills {
-                    if invoice.advance_bill_reference.as_ref() == Some(&bill.reference) {
+                    if invoice.funded_bill_reference.as_ref() == Some(&bill.reference) {
                         continue;
                     }
                     let key = (
@@ -5126,15 +5275,37 @@ impl Store {
                 &settlement.metadata,
             )?;
         }
-        let mut named_advances = if plan
-            .invoices
-            .iter()
-            .any(|invoice| !invoice.advance_applications.is_empty())
+        let mut posted_notes = vec![None; plan.bill_notes.len()];
+        for (index, note) in plan.bill_notes.iter().enumerate() {
+            if !note.credits.is_empty() {
+                posted_notes[index] = Some(post_imported_bill_note(&tx, plan.company_id, note)?);
+            }
+        }
+        let mut named_funding = if plan.note_credit_count() > 0
+            || plan
+                .invoices
+                .iter()
+                .any(|invoice| !invoice.funding_applications.is_empty())
         {
-            read_named_advances(&tx, plan.company_id)?
+            read_named_funding(&tx, plan.company_id)?
         } else {
             HashMap::new()
         };
+        for note in &plan.bill_notes {
+            for credit in &note.credits {
+                let key = funding_key(
+                    note.kind,
+                    &note.lines[note.party_index].0.ledger,
+                    &credit.reference,
+                );
+                if !matches!(named_funding.get(&key), Some(Some(_))) {
+                    return Err(Error::Validation(format!(
+                        "Named credit {} is ambiguous for this party and type",
+                        credit.reference
+                    )));
+                }
+            }
+        }
         for invoice in &plan.invoices {
             let voucher_kind = if invoice.kind == InvoiceKind::Sale {
                 VoucherKind::Sales
@@ -5348,7 +5519,7 @@ impl Store {
                 voucher_id,
                 &invoice.metadata,
             )?;
-            if let Some(reference) = &invoice.advance_bill_reference {
+            if let Some(reference) = &invoice.funded_bill_reference {
                 let split_id = if draft.bill_splits.is_empty() {
                     None
                 } else {
@@ -5356,9 +5527,7 @@ impl Store {
                         crate::bill_splits::read(&tx, invoice_id, None)?
                             .into_iter()
                             .find(|bill| &bill.reference == reference)
-                            .ok_or_else(|| {
-                                Error::Validation("Advance-funded bill is missing".into())
-                            })?
+                            .ok_or_else(|| Error::Validation("Funded bill is missing".into()))?
                             .id,
                     )
                 };
@@ -5367,35 +5536,51 @@ impl Store {
                     invoice_id,
                     split_id,
                 };
-                for application in &invoice.advance_applications {
-                    let advance = named_advance(
-                        &mut named_advances,
+                for application in &invoice.funding_applications {
+                    let advance = resolve_named_funding(
+                        &mut named_funding,
                         invoice.kind,
                         &invoice.party,
                         date,
                         application,
                     )?;
-                    if (application.existing_advance_id.is_some()
-                        && application.existing_advance_id != advance.id)
+                    if !application
+                        .expected_source
+                        .is_some_and(|expected| expected.matches(advance.source))
                         || advance.available != application.expected_available
                     {
                         return Err(Error::Validation(format!(
-                            "Advance {} changed since preview",
+                            "Named {} {} changed since preview",
+                            advance.source.label(),
                             application.reference
                         )));
                     }
-                    let advance_id = advance
-                        .id
-                        .ok_or_else(|| Error::Validation("Named advance was not saved".into()))?;
-                    insert_advance_allocation(
-                        &tx,
-                        plan.company_id,
-                        advance_id,
-                        target,
-                        date,
-                        application.amount,
-                        &invoice.narration,
-                    )?;
+                    match advance.source {
+                        FundingSource::Advance(Some(advance_id)) => insert_advance_allocation(
+                            &tx,
+                            plan.company_id,
+                            advance_id,
+                            target,
+                            date,
+                            application.amount,
+                            &invoice.narration,
+                        )?,
+                        FundingSource::Note(Some(credit_id)) => {
+                            crate::bill_note_credits::insert_application(
+                                &tx,
+                                plan.company_id,
+                                credit_id,
+                                target,
+                                date,
+                                application.amount,
+                            )?
+                        }
+                        _ => {
+                            return Err(Error::Validation(
+                                "Application source was not saved".into(),
+                            ))
+                        }
+                    };
                     advance.available -= i128::from(application.amount);
                 }
             }
@@ -5404,7 +5589,12 @@ impl Store {
             let index = match change {
                 BillChange::Settlement(index) => index,
                 BillChange::Note(index) => {
-                    apply_imported_bill_note(&tx, plan.company_id, &plan.bill_notes[index])?;
+                    let note = &plan.bill_notes[index];
+                    let (voucher, party) = match posted_notes[index] {
+                        Some(saved) => saved,
+                        None => post_imported_bill_note(&tx, plan.company_id, note)?,
+                    };
+                    attach_note_bill_allocations(&tx, plan.company_id, note, voucher, party)?;
                     continue;
                 }
             };
@@ -5459,6 +5649,8 @@ impl Store {
             bill_notes: plan.bill_note_count(),
             advances: plan.advance_count(),
             advance_applications: plan.advance_application_count(),
+            note_credits: plan.note_credit_count(),
+            credit_applications: plan.credit_application_count(),
             units: plan.units.len(),
             stock_groups: plan.stock_groups.len(),
             locations: plan.locations.len(),
@@ -5470,6 +5662,290 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_note_credits_fund_later_bills_without_cash_and_support_release() {
+        for (kind, invoice_kind, note_kind, party_category, trade_category, sign) in [
+            (
+                InvoiceKind::Sale,
+                "Sales",
+                "Credit note",
+                Category::Asset,
+                Category::Income,
+                1_i64,
+            ),
+            (
+                InvoiceKind::Purchase,
+                "Purchase",
+                "Debit note",
+                Category::Liability,
+                Category::Expense,
+                -1,
+            ),
+        ] {
+            let mut store = Store::memory().unwrap();
+            let company = store.create_company("Credit migration").unwrap();
+            let party = store
+                .create_ledger(company, "Party", party_category)
+                .unwrap();
+            let bank = store
+                .create_ledger(company, "Bank", Category::Asset)
+                .unwrap();
+            store
+                .create_ledger(company, "Trade", trade_category)
+                .unwrap();
+            let bill = |reference, mode, signed_amount, terms| {
+                format!(
+                "<BILLALLOCATIONS.LIST><NAME>{reference}</NAME><BILLTYPE>{mode}</BILLTYPE><AMOUNT>{signed_amount}</AMOUNT>{terms}</BILLALLOCATIONS.LIST>"
+            )
+            };
+            let voucher = |date, kind, reference, signed_amount: i64, bills| {
+                format!(
+                    r#"
+                <VOUCHER><DATE>{date}</DATE><VOUCHERTYPENAME>{kind}</VOUCHERTYPENAME><VOUCHERNUMBER>{reference}</VOUCHERNUMBER>
+                 <ISINVOICE>Yes</ISINVOICE><PARTYLEDGERNAME>Party</PARTYLEDGERNAME>
+                 <LEDGERENTRIES.LIST><LEDGERNAME>Party</LEDGERNAME><AMOUNT>{signed_amount}</AMOUNT>{bills}</LEDGERENTRIES.LIST>
+                 <LEDGERENTRIES.LIST><LEDGERNAME>Trade</LEDGERNAME><AMOUNT>{trade}</AMOUNT></LEDGERENTRIES.LIST>
+                </VOUCHER>"#,
+                    trade = -signed_amount
+                )
+            };
+            let envelope = |body: &str| {
+                format!("<ENVELOPE><BODY><DATA><MESSAGE>{body}</MESSAGE></DATA></BODY></ENVELOPE>")
+            };
+            let original = voucher(
+                "20260101",
+                invoice_kind,
+                "ORIGINAL",
+                -sign * 50,
+                bill("ORIGINAL", "New Ref", -sign * 50, ""),
+            );
+            let terms = "<BILLCREDITPERIOD>30 Days</BILLCREDITPERIOD>";
+            let note = voucher(
+                "20260102",
+                note_kind,
+                "NOTE",
+                sign * 60,
+                bill("ORIGINAL", "Agst Ref", sign * 20, "")
+                    + &bill("CREDIT-A", "New Ref", sign * 30, terms)
+                    + &bill("CREDIT-B", "New Ref", sign * 10, ""),
+            );
+            let later = voucher(
+                "20260104",
+                invoice_kind,
+                "LATER",
+                -sign * 45,
+                bill("UNPAID", "New Ref", -sign * 15, "")
+                    + &bill("CREDIT-A", "Agst Ref", -sign * 20, terms)
+                    + &bill("CREDIT-B", "Agst Ref", -sign * 10, ""),
+            );
+            let last = |amount| {
+                voucher(
+                    "20260106",
+                    invoice_kind,
+                    "FINAL",
+                    -sign * amount,
+                    bill("CREDIT-A", "Agst Ref", -sign * amount, terms),
+                )
+            };
+            let masters = envelope(&format!("{original}{note}"));
+            for (invalid, issue) in [
+                (
+                    format!("{}{later}", last(11)),
+                    "exceeds the available amount on credit",
+                ),
+                (later.replace("20260104", "20260101"), "precedes credit"),
+                (later.replace("30 Days", "31 Days"), "Credit terms differ"),
+                (
+                    format!(
+                        "{later}{}",
+                        note.replace("<VOUCHERNUMBER>NOTE<", "<VOUCHERNUMBER>NOTE-2<")
+                    ),
+                    "named credit CREDIT-A is ambiguous",
+                ),
+            ] {
+                let vouchers = envelope(&invalid);
+                let plan = store
+                    .preview_xml_import_batch(
+                        company,
+                        &[masters.as_bytes(), vouchers.as_bytes()],
+                        None,
+                    )
+                    .unwrap();
+                assert!(
+                    plan.issues().iter().any(|found| found.contains(issue)),
+                    "{:?}",
+                    plan.issues()
+                );
+                assert!(store.apply_xml_import(&plan).is_err());
+            }
+            let vouchers = envelope(&format!("{later}{}", last(10)));
+            let plan = store
+                .preview_xml_import_batch(company, &[vouchers.as_bytes(), masters.as_bytes()], None)
+                .unwrap();
+            assert!(plan.can_apply(), "{:?}", plan.issues());
+            let counts = store.apply_xml_import(&plan).unwrap();
+            assert_eq!(
+                (
+                    counts.invoices,
+                    counts.bill_notes,
+                    counts.note_credits,
+                    counts.credit_applications,
+                    counts.advance_applications
+                ),
+                (3, 1, 2, 3, 0)
+            );
+            assert_eq!(store.vouchers(company).unwrap().len(), 4);
+            let credits = store.bill_note_credits(company, None).unwrap();
+            assert_eq!(credits.len(), 2);
+            assert!(credits.iter().all(|row| row.kind == kind
+                && row.available == 0
+                && row.voucher_id == credits[0].voucher_id));
+            assert_eq!(credits[0].credit_days, Some(30));
+            assert!(store.is_bill_note(company, credits[0].voucher_id).unwrap());
+            let ledger = |s: &Store, id, date| {
+                s.ledger_register(company, id, None, Some(date))
+                    .unwrap()
+                    .closing_balance
+            };
+            let reconcile = |store: &Store, date, open, credit| {
+                let owed = store
+                    .outstanding_invoices(company, date)
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.outstanding)
+                    .sum::<i128>();
+                let available = store
+                    .bill_note_credits(company, Some(date))
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.available)
+                    .sum::<i128>();
+                assert_eq!((owed, available), (open, credit));
+                assert_eq!(
+                    ledger(store, party, date),
+                    (owed - available) * i128::from(sign)
+                );
+                assert_eq!(ledger(store, bank, date), 0);
+            };
+            reconcile(&store, "2026-01-02", 3000, 4000);
+            reconcile(&store, "2026-01-04", 4500, 1000);
+            reconcile(&store, "2026-01-06", 4500, 0);
+            let credit_a = credits[0].id;
+            let note_id = credits[0].voucher_id;
+            let history = store
+                .bill_note_credit_applications(company, credit_a)
+                .unwrap();
+            assert_eq!(
+                history
+                    .iter()
+                    .map(|row| (row.invoice_reference.as_str(), row.amount))
+                    .collect::<Vec<_>>(),
+                [("LATER", 2000), ("FINAL", 1000)]
+            );
+            assert!(store
+                .reverse_voucher(company, note_id, "2026-01-07", "REV", "Wrong note")
+                .is_err());
+            assert!(store
+                .release_bill_note_credit(company, history[0].id, "2026-01-03", "Too early")
+                .is_err());
+            store
+                .release_bill_note_credit(
+                    company,
+                    history[0].id,
+                    "2026-01-08",
+                    "Release migrated application",
+                )
+                .unwrap();
+            reconcile(&store, "2026-01-08", 6500, 2000);
+            let unpaid = store
+                .outstanding_invoices(company, "2026-01-08")
+                .unwrap()
+                .into_iter()
+                .find(|row| row.bill_reference == "UNPAID")
+                .unwrap();
+            let target = BillSettlementTarget {
+                invoice_id: unpaid.invoice_id,
+                split_id: unpaid.split_id,
+            };
+            let application = store
+                .apply_bill_note_credit(company, credit_a, target, "2026-01-09", 1500)
+                .unwrap();
+            reconcile(&store, "2026-01-09", 5000, 500);
+            assert_eq!(store.vouchers(company).unwrap().len(), 4);
+            store
+                .release_bill_note_credit(
+                    company,
+                    application,
+                    "2026-01-10",
+                    "Release manual application",
+                )
+                .unwrap();
+            store
+                .release_bill_note_credit(
+                    company,
+                    history[1].id,
+                    "2026-01-10",
+                    "Release last application",
+                )
+                .unwrap();
+            let credit_b_use = store
+                .bill_note_credit_applications(company, credits[1].id)
+                .unwrap()[0]
+                .id;
+            store
+                .release_bill_note_credit(
+                    company,
+                    credit_b_use,
+                    "2026-01-11",
+                    "Release second credit",
+                )
+                .unwrap();
+            assert!(store
+                .reverse_voucher(company, note_id, "2026-01-10", "REV", "Too early")
+                .is_err());
+            store
+                .reverse_voucher(
+                    company,
+                    note_id,
+                    "2026-01-12",
+                    "REV",
+                    "Reverse note after releases",
+                )
+                .unwrap();
+            reconcile(&store, "2026-01-12", 10500, 0);
+            reconcile(&store, "2026-01-04", 4500, 1000);
+            let standalone = voucher(
+                "20260113",
+                note_kind,
+                "CREDIT-ONLY",
+                sign * 25,
+                bill("CREDIT-C", "New Ref", sign * 25, ""),
+            );
+            let plan = store
+                .preview_xml_import(company, envelope(&standalone).as_bytes())
+                .unwrap();
+            assert!(plan.can_apply(), "{:?}", plan.issues());
+            assert_eq!(store.apply_xml_import(&plan).unwrap().note_credits, 1);
+            reconcile(&store, "2026-01-13", 10500, 2500);
+            let separate = voucher(
+                "20260114",
+                invoice_kind,
+                "SEPARATE",
+                -sign * 25,
+                bill("CREDIT-C", "Agst Ref", -sign * 25, ""),
+            );
+            let plan = store
+                .preview_xml_import(company, envelope(&separate).as_bytes())
+                .unwrap();
+            assert!(plan.can_apply(), "{:?}", plan.issues());
+            assert_eq!(
+                store.apply_xml_import(&plan).unwrap().credit_applications,
+                1
+            );
+            reconcile(&store, "2026-01-14", 10500, 0);
+        }
+    }
 
     #[test]
     fn voucher_keys_survive_import_and_block_duplicate_records() {
@@ -5644,8 +6120,8 @@ mod tests {
             };
             for (invalid, issue) in [
                 (
-                    note.replacen("Agst Ref", "New Ref", 1),
-                    "requires allocations against existing bills",
+                    note.replacen("Agst Ref", "On Account", 1),
+                    "note needs an existing bill or a new named credit reference",
                 ),
                 (
                     note.replace("<NAME>B</NAME>", "<NAME>A</NAME>"),
@@ -7545,8 +8021,8 @@ mod tests {
                 due_date: None,
                 credit_days: None,
             }],
-            advance_applications: Vec::new(),
-            advance_bill_reference: None,
+            funding_applications: Vec::new(),
+            funded_bill_reference: None,
             narration: String::new(),
             party: "Customer".into(),
             existing_party_id: Some(customer),

@@ -54,6 +54,7 @@ impl Store {
                 "Linked or already reversed vouchers cannot be reversed here".into(),
             ));
         }
+        crate::bill_note_credits::check_reversal(&tx, company, original, date)?;
         let date = date.format("%Y-%m-%d").to_string();
         let reversed = counter_postings(&tx, company, original, &date)?;
         tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, VoucherKind::Journal.as_str(), reference, date, format!("Reversal of voucher {original}: {reason}")])?;

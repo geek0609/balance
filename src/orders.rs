@@ -1167,7 +1167,9 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP TABLE bill_note_allocations;
+                "DROP TABLE bill_note_credit_applications;
+                 DROP TABLE bill_note_credits;
+                 DROP TABLE bill_note_allocations;
                  DROP TABLE bill_split_note_credits;
                  DROP TABLE bill_split_credit_allocations;
                  DROP INDEX credit_notes_with_invoice;
@@ -1348,7 +1350,9 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP TABLE bill_note_allocations;
+                "DROP TABLE bill_note_credit_applications;
+                 DROP TABLE bill_note_credits;
+                 DROP TABLE bill_note_allocations;
                  DROP TABLE bill_split_note_credits;
                  DROP TABLE bill_split_credit_allocations;
                  DROP INDEX credit_notes_with_invoice;

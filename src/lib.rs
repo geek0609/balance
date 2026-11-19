@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod actual_cost;
 pub mod advances;
 pub mod banking;
+pub mod bill_note_credits;
 pub mod bill_notes;
 pub mod bill_splits;
 pub mod budgets;
@@ -56,7 +57,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 85;
+const SCHEMA_VERSION: i64 = 86;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -458,6 +459,8 @@ impl Store {
             "advance_vouchers",
             "settlement_discounts",
             "bill_note_allocations",
+            "bill_note_credits",
+            "bill_note_credit_applications",
             "party_advances",
             "advance_allocations",
             "bills_of_materials",
@@ -1014,6 +1017,10 @@ impl Store {
         if version < 85 {
             exchange::migrate_voucher_keys(&tx)?;
             tx.pragma_update(None, "user_version", 85)?;
+        }
+        if version < 86 {
+            bill_note_credits::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 86)?;
         }
         tx.commit()?;
         Ok(Self { conn })
