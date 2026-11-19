@@ -72,6 +72,17 @@ pub(crate) fn counter_postings(
     original: i64,
     date: &str,
 ) -> Result<Vec<Posting>> {
+    let reversed = checked_counter_postings(conn, company, original, date)?;
+    crate::opening::check_no_control_postings(conn, company, &reversed)?;
+    Ok(reversed)
+}
+
+pub(crate) fn checked_counter_postings(
+    conn: &Connection,
+    company: i64,
+    original: i64,
+    date: &str,
+) -> Result<Vec<Posting>> {
     let mut stmt =
         conn.prepare("SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
     let postings = stmt
@@ -97,7 +108,6 @@ pub(crate) fn counter_postings(
         .collect::<Result<Vec<_>>>()?;
     validate_voucher(date, &reversed)?;
     check_ledgers(conn, company, &reversed)?;
-    crate::opening::check_no_control_postings(conn, company, &reversed)?;
     Ok(reversed)
 }
 

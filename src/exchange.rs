@@ -43,17 +43,18 @@ struct Account {
     category: Category,
     profile: LedgerProfile,
     opening: Option<i64>,
-    opening_bills: Vec<ImportedOpeningBill>,
+    opening_references: Vec<ImportedOpeningReference>,
     credit_days: Option<u32>,
     metadata: SourceMetadata,
 }
 #[derive(Debug, Clone)]
-struct ImportedOpeningBill {
+struct ImportedOpeningReference {
     kind: InvoiceKind,
     reference: String,
     original_date: String,
     terms: BillTerms,
     amount: i64,
+    advance_type: Option<&'static str>,
 }
 #[derive(Debug, Clone)]
 struct Unit {
@@ -245,7 +246,7 @@ impl ImportPlan {
         let openings = self
             .accounts
             .iter()
-            .any(|row| row.opening.is_some() || !row.opening_bills.is_empty())
+            .any(|row| row.opening.is_some() || !row.opening_references.is_empty())
             || self
                 .items
                 .iter()
@@ -300,16 +301,27 @@ impl ImportPlan {
     pub fn opening_count(&self) -> usize {
         self.accounts
             .iter()
-            .filter(|a| a.opening.is_some() && a.opening_bills.is_empty())
+            .filter(|a| a.opening.is_some() && a.opening_references.is_empty())
             .count()
     }
     pub fn opening_bill_count(&self) -> usize {
-        self.accounts.iter().map(|a| a.opening_bills.len()).sum()
+        self.accounts
+            .iter()
+            .flat_map(|a| &a.opening_references)
+            .filter(|bill| bill.advance_type.is_none())
+            .count()
+    }
+    pub fn opening_advance_count(&self) -> usize {
+        self.accounts
+            .iter()
+            .flat_map(|a| &a.opening_references)
+            .filter(|bill| bill.advance_type.is_some())
+            .count()
     }
     pub fn opening_on_account_count(&self) -> usize {
         self.accounts
             .iter()
-            .filter(|a| a.opening.is_some() && !a.opening_bills.is_empty())
+            .filter(|a| a.opening.is_some() && !a.opening_references.is_empty())
             .count()
     }
     pub fn unit_count(&self) -> usize {
@@ -369,6 +381,7 @@ pub struct ImportCounts {
     pub groups: usize,
     pub ledgers: usize,
     pub opening_bills: usize,
+    pub opening_advances: usize,
     pub opening_on_account: usize,
     pub vouchers: usize,
     pub invoices: usize,
@@ -994,18 +1007,19 @@ fn invoice_list_fields(
         ));
     }
 }
-fn xml_opening_bill(
+fn xml_opening_reference(
     node: Node<'_, '_>,
     kind: InvoiceKind,
     opening_date: NaiveDate,
-) -> Result<ImportedOpeningBill> {
+) -> Result<ImportedOpeningReference> {
     let reference = invoice_field(node, "NAME")?;
-    let is_advance = direct_text(node, "ISADVANCE").unwrap_or_default();
-    if !is_advance.is_empty() && !is_advance.eq_ignore_ascii_case("no") {
-        return Err(Error::Validation(
-            "Only non-advance named opening bills are supported".into(),
-        ));
-    }
+    let advance_flag =
+        match normalized(&direct_text(node, "ISADVANCE").unwrap_or_default()).as_str() {
+            "" => None,
+            "yes" => Some(true),
+            "no" => Some(false),
+            _ => return Err(Error::Validation("Invalid opening advance flag".into())),
+        };
     let original_date = xml_date(&invoice_field(node, "BILLDATE")?)?;
     let original = parse_date(&original_date)?;
     if original > opening_date {
@@ -1013,13 +1027,17 @@ fn xml_opening_bill(
             "Bill date follows the opening date".into(),
         ));
     }
-    if direct_text(node, "BILLTYPE")
-        .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("New Ref"))
-    {
-        return Err(Error::Validation(
-            "Opening bill must have a new reference".into(),
-        ));
-    }
+    let bill_type = normalized(&direct_text(node, "BILLTYPE").unwrap_or_default());
+    let advance_type = match (bill_type.as_str(), advance_flag) {
+        ("", Some(true)) | ("advance", None | Some(true)) => Some("Advance"),
+        ("new ref", Some(true)) => Some("New Ref"),
+        ("" | "new ref", _) => None,
+        _ => {
+            return Err(Error::Validation(
+                "Invalid type or advance flag for an opening reference".into(),
+            ))
+        }
+    };
     let amount_field = |field| -> Result<Option<i64>> {
         direct_text(node, field)
             .filter(|value| !value.is_empty())
@@ -1044,9 +1062,9 @@ fn xml_opening_bill(
         InvoiceKind::Sale => signed_amount > 0,
         InvoiceKind::Purchase => signed_amount < 0,
     };
-    if !matching_side {
+    if signed_amount == 0 || matching_side == advance_type.is_some() {
         return Err(Error::Validation(
-            "Opening bill amount has the wrong debit or credit side".into(),
+            "Opening reference has a zero amount or the wrong debit or credit side".into(),
         ));
     }
     let amount = signed_amount
@@ -1062,23 +1080,24 @@ fn xml_opening_bill(
             "Opening bill due date precedes its original date".into(),
         ));
     }
-    Ok(ImportedOpeningBill {
+    Ok(ImportedOpeningReference {
         kind,
         reference,
         original_date,
         terms,
         amount,
+        advance_type,
     })
 }
 
-fn opening_bills(
+fn opening_references(
     node: Node<'_, '_>,
     ledger_amount: Option<i64>,
     category: Category,
     opening_date: Option<&str>,
     label: &str,
     issues: &mut Vec<String>,
-) -> Vec<ImportedOpeningBill> {
+) -> Vec<ImportedOpeningReference> {
     let nodes: Vec<_> = node
         .children()
         .filter(|child| {
@@ -1131,7 +1150,7 @@ fn opening_bills(
             label,
             issues,
         );
-        match xml_opening_bill(node, kind, date) {
+        match xml_opening_reference(node, kind, date) {
             Ok(bill) if references.insert(normalized(&bill.reference)) => bills.push(bill),
             Ok(bill) => issues.push(format!(
                 "{label}: duplicate opening bill reference {}",
@@ -2039,6 +2058,7 @@ struct NamedAdvance {
     id: Option<i64>,
     reference: String,
     date: NaiveDate,
+    original_date: NaiveDate,
     due_date: Option<NaiveDate>,
     latest_release: Option<NaiveDate>,
     available: i128,
@@ -2067,6 +2087,12 @@ fn read_named_advances(conn: &Connection, company: i64) -> Result<NamedAdvances>
     let mut advances = HashMap::new();
     for row in read_party_advances(conn, company, None)? {
         let date = parse_date(&row.date)?;
+        let original_date = row
+            .opening_original_date
+            .as_deref()
+            .map(parse_date)
+            .transpose()?
+            .unwrap_or(date);
         let (reference, due_date) = if let Some(source) = row.source_bill {
             let Some(reference) = source.named_reference().map(str::to_owned) else {
                 continue;
@@ -2075,7 +2101,7 @@ fn read_named_advances(conn: &Connection, company: i64) -> Result<NamedAdvances>
                 due_date: source.due_date,
                 credit_days: source.credit_days,
             };
-            (reference, terms.due_date_from(date)?)
+            (reference, terms.due_date_from(original_date)?)
         } else {
             (row.reference, None)
         };
@@ -2087,6 +2113,7 @@ fn read_named_advances(conn: &Connection, company: i64) -> Result<NamedAdvances>
                 id: Some(row.id),
                 reference,
                 date,
+                original_date,
                 due_date,
                 latest_release: advance_allocation_state(conn, company, row.id, None)?
                     .latest_release,
@@ -2131,7 +2158,7 @@ fn named_advance<'a>(
     }
     if !application
         .terms
-        .matches_due_date(advance.date, advance.due_date)?
+        .matches_due_date(advance.original_date, advance.due_date)?
     {
         return Err(Error::Validation(format!(
             "Credit terms differ from the saved advance {reference}"
@@ -2151,6 +2178,32 @@ fn preview_advance_applications(
     bill_references: &mut HashSet<ReferenceKey>,
 ) -> Result<()> {
     let mut advances = read_named_advances(conn, plan.company_id)?;
+    if let Some(opening) = plan.opening_date.as_deref() {
+        let date = parse_date(opening)?;
+        for account in &plan.accounts {
+            for bill in account
+                .opening_references
+                .iter()
+                .filter(|bill| bill.advance_type.is_some())
+            {
+                let original_date = parse_date(&bill.original_date)?;
+                add_named_advance(
+                    &mut advances,
+                    bill.kind,
+                    &account.name,
+                    NamedAdvance {
+                        id: None,
+                        reference: bill.reference.clone(),
+                        date,
+                        original_date,
+                        due_date: bill.terms.due_date_from(original_date)?,
+                        latest_release: None,
+                        available: i128::from(bill.amount),
+                    },
+                );
+            }
+        }
+    }
     for settlement in &plan.settlements {
         if let Some(ImportedAdvance {
             amount,
@@ -2171,6 +2224,7 @@ fn preview_advance_applications(
                         id: None,
                         reference: reference.into(),
                         date,
+                        original_date: date,
                         due_date: terms.due_date_from(date)?,
                         latest_release: None,
                         available: (*amount).into(),
@@ -2689,7 +2743,7 @@ impl Store {
                     "Ledger {name}: name is reserved for opening balances"
                 ));
             }
-            let opening_bills = opening_bills(
+            let opening_references = opening_references(
                 node,
                 net_opening,
                 category,
@@ -2697,11 +2751,14 @@ impl Store {
                 &label,
                 &mut plan.issues,
             );
-            let signed_bills: i128 = opening_bills
+            let signed_bills: i128 = opening_references
                 .iter()
-                .map(|bill| match bill.kind {
-                    InvoiceKind::Sale => i128::from(bill.amount),
-                    InvoiceKind::Purchase => -i128::from(bill.amount),
+                .map(|bill| {
+                    let amount = i128::from(bill.amount);
+                    match (bill.kind, bill.advance_type.is_some()) {
+                        (InvoiceKind::Sale, false) | (InvoiceKind::Purchase, true) => amount,
+                        _ => -amount,
+                    }
                 })
                 .sum();
             let remainder = i128::from(net_opening.unwrap_or_default()) - signed_bills;
@@ -2738,7 +2795,7 @@ impl Store {
                 category,
                 profile,
                 opening,
-                opening_bills,
+                opening_references,
                 credit_days,
                 metadata,
             });
@@ -3399,7 +3456,11 @@ impl Store {
         }
         let mut pending_settlements = Vec::new();
         for account in &plan.accounts {
-            for bill in &account.opening_bills {
+            for bill in account
+                .opening_references
+                .iter()
+                .filter(|bill| bill.advance_type.is_none())
+            {
                 let key = (
                     normalized(bill.kind.as_str()),
                     normalized(&account.name),
@@ -3886,7 +3947,11 @@ impl Store {
             if let Some(opening_date) = plan.opening_date.as_deref() {
                 let opening_date = parse_date(opening_date)?;
                 for account in &plan.accounts {
-                    for bill in &account.opening_bills {
+                    for bill in account
+                        .opening_references
+                        .iter()
+                        .filter(|bill| bill.advance_type.is_none())
+                    {
                         let original_date = parse_date(&bill.original_date)?;
                         let key = (
                             normalized(bill.kind.as_str()),
@@ -4192,12 +4257,36 @@ impl Store {
                     params![plan.company_id, ledger_id, days],
                 )?;
             }
-            if !account.opening_bills.is_empty() {
+            if !account.opening_references.is_empty() {
                 let date = plan
                     .opening_date
                     .as_deref()
                     .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
-                for bill in &account.opening_bills {
+                for bill in &account.opening_references {
+                    if let Some(kind) = bill.advance_type {
+                        let control = crate::opening::ensure_control(&tx, plan.company_id)?;
+                        crate::advances::insert_opening_party_advance(
+                            &tx,
+                            plan.company_id,
+                            &AdvanceDraft {
+                                kind: bill.kind,
+                                party_ledger_id: ledger_id,
+                                bank_ledger_id: control,
+                                date: date.into(),
+                                reference: bill.reference.clone(),
+                                amount: bill.amount,
+                                narration: "Opening advance".into(),
+                            },
+                            &AdvanceSourceBill {
+                                kind: kind.into(),
+                                reference: Some(bill.reference.clone()),
+                                due_date: bill.terms.due_date.clone(),
+                                credit_days: bill.terms.credit_days,
+                            },
+                            parse_date(&bill.original_date)?,
+                        )?;
+                        continue;
+                    }
                     crate::opening_bills::insert_opening_bill(
                         &tx,
                         plan.company_id,
@@ -4225,7 +4314,7 @@ impl Store {
                     ledger_id,
                     date,
                     amount,
-                    !account.opening_bills.is_empty(),
+                    !account.opening_references.is_empty(),
                 )?;
             }
         }
@@ -4876,6 +4965,7 @@ impl Store {
             groups: plan.groups.len(),
             ledgers: plan.accounts.len(),
             opening_bills: plan.opening_bill_count(),
+            opening_advances: plan.opening_advance_count(),
             opening_on_account: plan.opening_on_account_count(),
             vouchers: plan.transactions.len(),
             invoices: plan.invoices.len(),
@@ -4893,6 +4983,186 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_advances_fund_later_invoices_without_cash_movement() {
+        for (kind, group, side, source_type) in [
+            ("Sales", "Sundry Debtors", -1_i64, "Advance"),
+            ("Purchase", "Sundry Creditors", 1_i64, "New Ref"),
+        ] {
+            let mut store = Store::memory().unwrap();
+            let company = store.create_company("Opening advance migration").unwrap();
+            let bank = store
+                .create_ledger(company, "Bank", Category::Asset)
+                .unwrap();
+            store
+                .create_ledger(
+                    company,
+                    "Trade",
+                    if side < 0 {
+                        Category::Income
+                    } else {
+                        Category::Expense
+                    },
+                )
+                .unwrap();
+            let masters = format!(
+                r#"<ENVELOPE><BODY><DATA><MESSAGE>
+                <LEDGER NAME="Party"><PARENT>{group}</PARENT><ISBILLWISEON>Yes</ISBILLWISEON>
+                  <OPENINGBALANCE>{}</OPENINGBALANCE>
+                  <BILLALLOCATIONS.LIST><NAME>OLD-BILL</NAME><BILLDATE>20251215</BILLDATE>
+                    <OPENINGBALANCE>{}</OPENINGBALANCE>
+                  </BILLALLOCATIONS.LIST>
+                  <BILLALLOCATIONS.LIST><NAME>DEPOSIT</NAME><BILLDATE>20251201</BILLDATE>
+                    <ISADVANCE>Yes</ISADVANCE><BILLTYPE>{source_type}</BILLTYPE><OPENINGBALANCE>{}</OPENINGBALANCE>
+                    <BILLCREDITPERIOD>30 Days</BILLCREDITPERIOD>
+                  </BILLALLOCATIONS.LIST>
+                </LEDGER>
+            </MESSAGE></DATA></BODY></ENVELOPE>"#,
+                side * 70,
+                side * 90,
+                -side * 50
+            );
+            let invoice = format!(
+                r#"<ENVELOPE><BODY><DATA><MESSAGE><VOUCHER>
+                <DATE>20260105</DATE><VOUCHERTYPENAME>{kind}</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>INV-NEW</VOUCHERNUMBER><ISINVOICE>Yes</ISINVOICE>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Party</LEDGERNAME><ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+                  <AMOUNT>{}</AMOUNT>
+                  <BILLALLOCATIONS.LIST><NAME>DEPOSIT</NAME><BILLTYPE>Agst Ref</BILLTYPE>
+                    <AMOUNT>{}</AMOUNT><BILLCREDITPERIOD>31-Dec-2025</BILLCREDITPERIOD>
+                  </BILLALLOCATIONS.LIST>
+                  <BILLALLOCATIONS.LIST><NAME>REMAINDER</NAME><BILLTYPE>New Ref</BILLTYPE><AMOUNT>{}</AMOUNT></BILLALLOCATIONS.LIST>
+                </LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Trade</LEDGERNAME><AMOUNT>{}</AMOUNT></LEDGERENTRIES.LIST>
+            </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#,
+                side * 45,
+                side * 30,
+                side * 15,
+                -side * 45
+            );
+            let opening = Some("2026-01-01");
+            let blocked = store
+                .preview_xml_import_batch(
+                    company,
+                    &[
+                        masters.as_bytes(),
+                        invoice.replace("20260105", "20251231").as_bytes(),
+                    ],
+                    opening,
+                )
+                .unwrap();
+            assert!(
+                blocked
+                    .issues()
+                    .iter()
+                    .any(|issue| issue.contains("precedes advance")),
+                "{:?}",
+                blocked.issues()
+            );
+            assert!(store.apply_xml_import(&blocked).is_err());
+            assert!(store.vouchers(company).unwrap().is_empty());
+
+            if side > 0 {
+                let plan = store
+                    .preview_xml_import_with_opening_date(company, masters.as_bytes(), opening)
+                    .unwrap();
+                assert!(plan.can_apply(), "{:?}", plan.issues());
+                let counts = store.apply_xml_import(&plan).unwrap();
+                assert_eq!(
+                    (
+                        counts.opening_bills,
+                        counts.opening_advances,
+                        counts.opening_on_account
+                    ),
+                    (1, 1, 1)
+                );
+            }
+            let plan = if side > 0 {
+                store.preview_xml_import(company, invoice.as_bytes())
+            } else {
+                store.preview_xml_import_batch(
+                    company,
+                    &[masters.as_bytes(), invoice.as_bytes()],
+                    opening,
+                )
+            }
+            .unwrap();
+            assert!(plan.can_apply(), "{:?}", plan.issues());
+            let counts = store.apply_xml_import(&plan).unwrap();
+            if side < 0 {
+                assert_eq!(
+                    (
+                        counts.opening_bills,
+                        counts.opening_advances,
+                        counts.opening_on_account
+                    ),
+                    (1, 1, 1)
+                );
+            }
+            assert_eq!(counts.advance_applications, 1);
+            let advance = store.party_advances(company, None).unwrap().remove(0);
+            assert_eq!(advance.opening_original_date.as_deref(), Some("2025-12-01"));
+            assert_eq!(advance.source_bill.as_ref().unwrap().kind, source_type);
+            assert_eq!((advance.applied, advance.available), (3000, 2000));
+            assert!(store
+                .party_advances(company, Some("2025-12-31"))
+                .unwrap()
+                .is_empty());
+            let party = advance.party_ledger_id;
+            let sign = -i128::from(side);
+            let balance = |s: &Store, ledger| {
+                s.ledger_register(company, ledger, None, None)
+                    .unwrap()
+                    .closing_balance
+            };
+            assert_eq!(balance(&store, party), sign * 11500);
+            assert_eq!(balance(&store, bank), 0);
+            let party_report = store
+                .party_outstanding(company, "2026-01-05")
+                .unwrap()
+                .remove(0);
+            assert_eq!(party_report.opening_on_account, sign * 3000);
+            assert_eq!(party_report.receivable + party_report.payable, 10500);
+            let original = store
+                .vouchers(company)
+                .unwrap()
+                .into_iter()
+                .find(|voucher| voucher.id == advance.voucher_id)
+                .unwrap();
+            assert_eq!(original.kind, VoucherKind::Journal);
+            assert!(store
+                .reverse_party_advance(company, advance.id, "2026-01-10", "REV", "Correction")
+                .is_err());
+            let allocation = store
+                .advance_allocations(company, advance.id, None)
+                .unwrap()
+                .remove(0);
+            store
+                .release_advance_allocation(company, allocation.id, "2026-01-07", "Correction")
+                .unwrap();
+            let reversal = store
+                .reverse_party_advance(company, advance.id, "2026-01-10", "REV", "Correction")
+                .unwrap();
+            let reverse_voucher = store
+                .vouchers(company)
+                .unwrap()
+                .into_iter()
+                .find(|voucher| voucher.id == reversal)
+                .unwrap();
+            assert_eq!(reverse_voucher.kind, VoucherKind::Journal);
+            assert_eq!(balance(&store, party), sign * 16500);
+            assert_eq!(balance(&store, bank), 0);
+            assert_eq!(
+                store.party_advances(company, Some("2026-01-09")).unwrap()[0].available,
+                5000
+            );
+            assert_eq!(
+                store.party_advances(company, Some("2026-01-10")).unwrap()[0].available,
+                0
+            );
+        }
+    }
 
     #[test]
     fn opening_import_keeps_signed_on_account_amounts_and_named_bills() {

@@ -259,10 +259,17 @@ impl App {
     }
 
     fn advance_details(&mut self, ui: &mut egui::Ui, company: i64, advance: &PartyAdvance) {
-        ui.label(format!(
-            "Advance {} | Voucher {} | Cash or bank: {}",
-            advance.id, advance.voucher_id, advance.bank
-        ));
+        if let Some(original) = &advance.opening_original_date {
+            ui.label(format!(
+                "Opening advance {} | Voucher {} | Original date {original}",
+                advance.id, advance.voucher_id
+            ));
+        } else {
+            ui.label(format!(
+                "Advance {} | Voucher {} | Cash or bank: {}",
+                advance.id, advance.voucher_id, advance.bank
+            ));
+        }
         if let Some(bill) = &advance.source_bill {
             ui.label(match &bill.reference {
                 Some(reference) => format!("Imported bill {} | {reference}", bill.kind),

@@ -59,6 +59,7 @@ pub struct PartyAdvance {
     pub narration: String,
     pub amount: i64,
     pub includes_settlements: bool,
+    pub opening_original_date: Option<String>,
     pub applied: i128,
     pub available: i128,
     pub source_bill: Option<AdvanceSourceBill>,
@@ -134,6 +135,18 @@ pub(crate) fn migrate_source_bill_terms(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_opening_advances(conn: &Connection) -> Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('party_advances') WHERE name = 'opening_original_date')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        conn.execute_batch("ALTER TABLE party_advances ADD COLUMN opening_original_date TEXT;")?;
+    }
+    Ok(())
+}
+
 pub(crate) fn insert_party_advance(
     conn: &Connection,
     company: i64,
@@ -141,7 +154,35 @@ pub(crate) fn insert_party_advance(
     source_bill: Option<&AdvanceSourceBill>,
     settled_amount: i64,
 ) -> Result<(i64, i64)> {
-    let date = parse_date(&draft.date)?.format("%Y-%m-%d").to_string();
+    insert_advance(conn, company, draft, source_bill, settled_amount, None)
+}
+
+pub(crate) fn insert_opening_party_advance(
+    conn: &Connection,
+    company: i64,
+    draft: &AdvanceDraft,
+    source_bill: &AdvanceSourceBill,
+    original_date: NaiveDate,
+) -> Result<(i64, i64)> {
+    insert_advance(
+        conn,
+        company,
+        draft,
+        Some(source_bill),
+        0,
+        Some(original_date),
+    )
+}
+
+fn insert_advance(
+    conn: &Connection,
+    company: i64,
+    draft: &AdvanceDraft,
+    source_bill: Option<&AdvanceSourceBill>,
+    settled_amount: i64,
+    opening_original_date: Option<NaiveDate>,
+) -> Result<(i64, i64)> {
+    let date = parse_date(&draft.date)?;
     let reference = required(&draft.reference, "Advance reference")?;
     if draft.amount <= 0 {
         return Err(Error::Validation("Enter a positive advance amount".into()));
@@ -154,7 +195,13 @@ pub(crate) fn insert_party_advance(
             "The party ledger must be an asset or liability".into(),
         ));
     }
-    if ledger_category(conn, company, draft.bank_ledger_id)? != Category::Asset {
+    if let Some(original) = opening_original_date {
+        if original > date
+            || crate::opening::control_id(conn, company)? != Some(draft.bank_ledger_id)
+        {
+            return Err(Error::Validation("The opening advance needs an original date on or before its opening date and the opening difference ledger".into()));
+        }
+    } else if ledger_category(conn, company, draft.bank_ledger_id)? != Category::Asset {
         return Err(Error::Validation(
             "The cash or bank ledger must be an asset".into(),
         ));
@@ -180,16 +227,22 @@ pub(crate) fn insert_party_advance(
         .checked_add(settled_amount)
         .filter(|_| settled_amount >= 0)
         .ok_or_else(|| Error::Validation("Invalid receipt or payment total".into()))?;
-    let (voucher_kind, cash) = match draft.kind {
+    let (mut voucher_kind, counterpart) = match draft.kind {
         InvoiceKind::Sale => (VoucherKind::Receipt, total),
         InvoiceKind::Purchase => (VoucherKind::Payment, -total),
     };
+    if opening_original_date.is_some() {
+        voucher_kind = VoucherKind::Journal;
+    }
     conn.execute(
         "INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![company, voucher_kind.as_str(), reference, date, draft.narration.trim()],
+        params![company, voucher_kind.as_str(), reference, date.to_string(), draft.narration.trim()],
     )?;
     let voucher = conn.last_insert_rowid();
-    for (ledger, amount) in [(draft.bank_ledger_id, cash), (draft.party_ledger_id, -cash)] {
+    for (ledger, amount) in [
+        (draft.bank_ledger_id, counterpart),
+        (draft.party_ledger_id, -counterpart),
+    ] {
         conn.execute(
             "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
             params![voucher, ledger, amount],
@@ -197,8 +250,8 @@ pub(crate) fn insert_party_advance(
     }
     conn.execute(
         "INSERT INTO party_advances(company_id, kind, party_ledger_id, bank_ledger_id, voucher_id, amount, reference_key,
-                                    source_bill_type, source_bill_reference, source_bill_due_date, source_bill_credit_days)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                    source_bill_type, source_bill_reference, source_bill_due_date, source_bill_credit_days, opening_original_date)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             company,
             draft.kind.as_str(),
@@ -211,6 +264,7 @@ pub(crate) fn insert_party_advance(
             source_bill.and_then(|bill| bill.reference.as_deref()),
             source_bill.and_then(|bill| bill.due_date.as_deref()),
             source_bill.and_then(|bill| bill.credit_days),
+            opening_original_date.map(|date| date.to_string()),
         ],
     )?;
     Ok((conn.last_insert_rowid(), voucher))
@@ -240,13 +294,13 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (original, original_date, kind, prior): (i64, String, String, Option<i64>) = tx
+        let (original, original_date, kind, prior, opening): (i64, String, String, Option<i64>, bool) = tx
             .query_row(
-                "SELECT v.id, v.date, a.kind, a.reversal_voucher_id FROM party_advances a
+                "SELECT v.id, v.date, a.kind, a.reversal_voucher_id, a.opening_original_date IS NOT NULL FROM party_advances a
              JOIN vouchers v ON v.id = a.voucher_id AND v.company_id = a.company_id
              WHERE a.company_id = ?1 AND a.id = ?2",
                 params![company, advance],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?
             .ok_or_else(|| Error::Validation("Advance not found in this company".into()))?;
@@ -268,12 +322,20 @@ impl Store {
             return Ok(voucher);
         }
         check_advance_reversal(&tx, company, advance, date)?;
-        let kind = match InvoiceKind::parse(&kind)? {
-            InvoiceKind::Sale => VoucherKind::Payment,
-            InvoiceKind::Purchase => VoucherKind::Receipt,
+        let kind = if opening {
+            VoucherKind::Journal
+        } else {
+            match InvoiceKind::parse(&kind)? {
+                InvoiceKind::Sale => VoucherKind::Payment,
+                InvoiceKind::Purchase => VoucherKind::Receipt,
+            }
         };
         let date = date.format("%Y-%m-%d").to_string();
-        let postings = counter_postings(&tx, company, original, &date)?;
+        let postings = if opening {
+            crate::reversals::checked_counter_postings(&tx, company, original, &date)?
+        } else {
+            counter_postings(&tx, company, original, &date)?
+        };
         tx.execute(
             "INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![company, kind.as_str(), reference, date, format!("Advance {advance} reversal: {reason}")],
@@ -330,7 +392,7 @@ pub(crate) fn read_party_advances(
     let mut stmt = conn.prepare(
             "SELECT a.id, a.kind, a.party_ledger_id, party.name, bank.name, v.id, v.date, v.reference,
                     v.narration, a.amount, rv.id, rv.date, rv.reference, a.reversal_reason,
-                    a.source_bill_type, a.source_bill_reference, a.source_bill_due_date, a.source_bill_credit_days,
+                    a.source_bill_type, a.source_bill_reference, a.source_bill_due_date, a.source_bill_credit_days, a.opening_original_date,
                     EXISTS(SELECT 1 FROM invoice_settlements s WHERE s.voucher_id = a.voucher_id AND s.company_id = a.company_id)
              FROM party_advances a JOIN vouchers v ON v.id = a.voucher_id AND v.company_id = a.company_id
              JOIN ledgers party ON party.id = a.party_ledger_id AND party.company_id = a.company_id
@@ -397,7 +459,8 @@ pub(crate) fn read_party_advances(
                 reference: row.get(7)?,
                 narration: row.get(8)?,
                 amount,
-                includes_settlements: row.get(18)?,
+                opening_original_date: row.get(18)?,
+                includes_settlements: row.get(19)?,
                 applied,
                 available,
                 source_bill,
