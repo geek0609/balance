@@ -315,6 +315,21 @@ impl Store {
                 reversal_sources.insert(row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
             }
         }
+        let discounted_settlements = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT s.voucher_id, s.bank_ledger_id, i.party_ledger_id
+                 FROM invoice_settlements s JOIN invoices i ON i.id = s.invoice_id
+                 WHERE s.company_id = ?1 AND EXISTS(
+                     SELECT 1 FROM settlement_discounts d WHERE d.voucher_id = s.voucher_id)",
+            )?;
+            let rows = stmt.query_map([company], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
+        };
         let mut report = CashFlowReport {
             opening: 0,
             closing: 0,
@@ -375,6 +390,17 @@ impl Store {
             if let Some(&Some(class)) = override_rule {
                 add(Some(class), None, cash, "Voucher classification");
                 continue;
+            }
+            let original = reversal_sources
+                .get(&voucher.id)
+                .copied()
+                .unwrap_or(voucher.id);
+            if let Some(&(bank, party)) = discounted_settlements.get(&original) {
+                if rules.get(&bank) == Some(&CashRole::Cash) && counterparts.contains_key(&party) {
+                    // The discount changes bill relief without adding a cash movement.
+                    counterparts.clear();
+                    counterparts.insert(party, -cash);
+                }
             }
             counterparts.retain(|_, amount| *amount != 0);
             if counterparts

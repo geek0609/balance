@@ -14,6 +14,7 @@ use crate::inventory::{
     InvoiceDiscount, InvoiceDraft, InvoiceEntryMode, InvoiceKind, InvoiceLine, StockInvoicePosting,
 };
 use crate::opening_bills::OpeningBillDraft;
+use crate::settlement_discounts::SettlementDiscount;
 use crate::{
     insert_voucher_draft, parse_amount, parse_date, Category, Error, Posting, Result, Store,
     VoucherDraft, VoucherKind,
@@ -193,6 +194,7 @@ struct ImportedSettlement {
     existing_bank_id: Option<i64>,
     existing_party_id: Option<i64>,
     bills: ImportedBillUse,
+    discounts: Vec<ImportedInvoiceAdjustment>,
     metadata: SourceMetadata,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1249,13 +1251,10 @@ fn parse_imported_settlement(
             "multiple ledger entry representations".into(),
         ));
     }
-    if entries.len() != 2 {
-        return Err(Error::Validation(
-            "settlement requires exactly two ledger entries".into(),
-        ));
-    }
     let mut party: Option<(String, Option<i64>, i64, ImportedBillUse)> = None;
     let mut bank: Option<(String, Option<i64>, i64)> = None;
+    let mut discounts = Vec::new();
+    let mut entry_ledgers = HashSet::new();
     for entry in entries {
         invoice_list_fields(
             entry,
@@ -1271,6 +1270,11 @@ fn parse_imported_settlement(
             issues,
         );
         let ledger = invoice_field(entry, "LEDGERNAME")?;
+        if !entry_ledgers.insert(normalized(&ledger)) {
+            return Err(Error::Validation(
+                "a settlement ledger occurs more than once".into(),
+            ));
+        }
         let (existing_id, category) = ledgers
             .get(&normalized(&ledger))
             .ok_or_else(|| Error::Validation(format!("ledger {ledger} is unavailable")))?;
@@ -1290,12 +1294,22 @@ fn parse_imported_settlement(
             })
             .collect();
         if bills.is_empty() {
-            if bank.is_some() || *category != Category::Asset {
-                return Err(Error::Validation(
-                    "settlement needs one cash or bank asset ledger".into(),
-                ));
+            match category {
+                Category::Asset if bank.is_none() => bank = Some((ledger, *existing_id, amount)),
+                Category::Income | Category::Expense => {
+                    if (amount > 0) != (kind == InvoiceKind::Sale) {
+                        return Err(Error::Validation("discount direction differs from the cash posting".into()));
+                    }
+                    discounts.push(ImportedInvoiceAdjustment {
+                        ledger,
+                        existing_ledger_id: *existing_id,
+                        amount: amount.checked_abs().ok_or_else(|| Error::Validation("discount amount is too large".into()))?,
+                    });
+                }
+                _ => return Err(Error::Validation(
+                    "settlement needs one cash or bank asset ledger and income or expense discount ledgers".into(),
+                )),
             }
-            bank = Some((ledger, *existing_id, amount));
         } else {
             if party.is_some() || !matches!(category, Category::Asset | Category::Liability) {
                 return Err(Error::Validation(
@@ -1401,12 +1415,23 @@ fn parse_imported_settlement(
         party.ok_or_else(|| Error::Validation("bill allocations are missing".into()))?;
     let (bank, existing_bank_id, bank_amount) =
         bank.ok_or_else(|| Error::Validation("cash or bank ledger is missing".into()))?;
-    if normalized(&party) == normalized(&bank)
-        || i128::from(party_amount) + i128::from(bank_amount) != 0
+    let discounted = discounts.iter().map(|d| i128::from(d.amount)).sum::<i128>();
+    let settled = bills
+        .invoices
+        .iter()
+        .map(|bill| i128::from(bill.amount))
+        .sum::<i128>();
+    if discounted > settled {
+        return Err(Error::Validation(
+            "discounts exceed the amount allocated to bills".into(),
+        ));
+    }
+    if i128::from(party_amount).abs() != i128::from(bank_amount).abs() + discounted
         || (bank_amount > 0) != (kind == InvoiceKind::Sale)
+        || (party_amount > 0) == (bank_amount > 0)
     {
         return Err(Error::Validation(
-            "party and bank amounts or directions are inconsistent".into(),
+            "party, cash and discount amounts or directions are inconsistent".into(),
         ));
     }
     if direct_text(node, "PARTYLEDGERNAME")
@@ -1426,6 +1451,7 @@ fn parse_imported_settlement(
         existing_bank_id,
         existing_party_id,
         bills,
+        discounts,
         metadata,
     })
 }
@@ -4528,6 +4554,32 @@ impl Store {
             }
             Ok((bank_id, party_id))
         };
+        let settlement_discounts =
+            |settlement: &ImportedSettlement| -> Result<Vec<SettlementDiscount>> {
+                settlement
+                    .discounts
+                    .iter()
+                    .map(|discount| {
+                        let ledger_id = find_ledger(&tx, plan.company_id, &discount.ledger)?
+                            .ok_or_else(|| {
+                                Error::Validation(format!("Ledger {} is missing", discount.ledger))
+                            })?;
+                        if discount
+                            .existing_ledger_id
+                            .is_some_and(|expected| expected != ledger_id)
+                        {
+                            return Err(Error::Validation(format!(
+                                "Ledger {} changed since preview",
+                                discount.ledger
+                            )));
+                        }
+                        Ok(SettlementDiscount {
+                            ledger_id,
+                            amount: discount.amount,
+                        })
+                    })
+                    .collect()
+            };
         let mut advance_vouchers = HashMap::new();
         for (index, settlement) in plan.settlements.iter().enumerate() {
             if settlement.bills.advances.is_empty() {
@@ -4569,6 +4621,7 @@ impl Store {
                             Error::Validation("Settlement total is too large".into())
                         })
                     })?,
+                &settlement_discounts(settlement)?,
             )?;
             advance_vouchers.insert(index, (bank_id, party_id, voucher_id));
             save_metadata(
@@ -4962,6 +5015,7 @@ impl Store {
                 &allocations,
                 &settlement.narration,
                 advance_voucher,
+                &settlement_discounts(settlement)?,
             )?;
             if advance_voucher.is_none() {
                 save_metadata(
@@ -5655,7 +5709,109 @@ mod tests {
     }
 
     #[test]
-    fn mixed_receipt_keeps_one_cash_posting_and_reverses_both_parts() {
+    fn native_and_imported_supplier_discounts_post_the_same_amounts() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Supplier settlement").unwrap();
+        let supplier = store
+            .create_ledger(company, "Supplier", Category::Liability)
+            .unwrap();
+        let bank = store
+            .create_ledger(company, "Bank", Category::Asset)
+            .unwrap();
+        let discount = store
+            .create_ledger(company, "Discount received", Category::Income)
+            .unwrap();
+        store
+            .create_ledger(company, "Purchases", Category::Expense)
+            .unwrap();
+        let plan = store.preview_xml_import(company, br#"<ENVELOPE><BODY><DATA><MESSAGE><VOUCHER>
+            <DATE>20260101</DATE><VOUCHERTYPENAME>Purchase</VOUCHERTYPENAME><VOUCHERNUMBER>INV-1</VOUCHERNUMBER>
+            <ISINVOICE>Yes</ISINVOICE>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Supplier</LEDGERNAME><ISPARTYLEDGER>Yes</ISPARTYLEDGER><AMOUNT>100</AMOUNT>
+                <BILLALLOCATIONS.LIST><NAME>BILL-1</NAME><BILLTYPE>New Ref</BILLTYPE><AMOUNT>100</AMOUNT></BILLALLOCATIONS.LIST>
+            </LEDGERENTRIES.LIST>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Purchases</LEDGERNAME><AMOUNT>-100</AMOUNT></LEDGERENTRIES.LIST>
+        </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#).unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        store.apply_xml_import(&plan).unwrap();
+        let bill = &store.outstanding_invoices(company, "2026-01-01").unwrap()[0];
+        let allocations = [BillSettlementAllocation {
+            target: BillSettlementTarget {
+                invoice_id: bill.invoice_id,
+                split_id: bill.split_id,
+            },
+            amount: 6000,
+        }];
+        let rejected = [SettlementDiscount {
+            ledger_id: discount,
+            amount: 6000,
+        }];
+        assert!(store
+            .settle_bills_with_discounts(
+                company,
+                bank,
+                "2026-01-02",
+                "P-1",
+                &allocations,
+                &[],
+                &rejected
+            )
+            .is_err());
+        assert_eq!(store.vouchers(company).unwrap().len(), 1);
+        let discounts = [SettlementDiscount {
+            ledger_id: discount,
+            amount: 500,
+        }];
+        let (voucher, _) = store
+            .settle_bills_with_discounts(
+                company,
+                bank,
+                "2026-01-02",
+                "P-1",
+                &allocations,
+                &[],
+                &discounts,
+            )
+            .unwrap();
+        let check = |store: &Store, date| {
+            let balance = |ledger| {
+                store
+                    .ledger_register(company, ledger, None, Some(date))
+                    .unwrap()
+                    .closing_balance
+            };
+            assert_eq!(
+                (balance(supplier), balance(bank), balance(discount)),
+                (-4000, -5500, -500)
+            );
+            let bills = store.outstanding_invoices(company, date).unwrap();
+            assert_eq!(bills[0].outstanding, 4000);
+        };
+        check(&store, "2026-01-02");
+        store
+            .reverse_settlement(
+                company,
+                voucher,
+                "2026-01-03",
+                "P-1-R",
+                "Reverse test payment",
+            )
+            .unwrap();
+        let plan = store.preview_xml_import(company, br#"<ENVELOPE><BODY><DATA><MESSAGE><VOUCHER>
+            <DATE>20260104</DATE><VOUCHERTYPENAME>Payment</VOUCHERTYPENAME><VOUCHERNUMBER>P-2</VOUCHERNUMBER>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Supplier</LEDGERNAME><AMOUNT>-60</AMOUNT>
+                <BILLALLOCATIONS.LIST><NAME>BILL-1</NAME><BILLTYPE>Agst Ref</BILLTYPE><AMOUNT>-60</AMOUNT></BILLALLOCATIONS.LIST>
+            </LEDGERENTRIES.LIST>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>55</AMOUNT></LEDGERENTRIES.LIST>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Discount received</LEDGERNAME><AMOUNT>5</AMOUNT></LEDGERENTRIES.LIST>
+        </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#).unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        assert_eq!(store.apply_xml_import(&plan).unwrap().settlements, 1);
+        check(&store, "2026-01-04");
+    }
+
+    #[test]
+    fn discounted_receipt_with_advances_reconciles_and_reverses_as_one_voucher() {
         let mut store = Store::memory().unwrap();
         let company = store.create_company("Migration").unwrap();
         let customer = store
@@ -5663,6 +5819,12 @@ mod tests {
             .unwrap();
         let bank = store
             .create_ledger(company, "Bank", Category::Asset)
+            .unwrap();
+        let discount = store
+            .create_ledger(company, "Discount allowed", Category::Expense)
+            .unwrap();
+        let allowance = store
+            .create_ledger(company, "Early payment allowance", Category::Income)
             .unwrap();
         store
             .create_ledger(company, "Sales", Category::Income)
@@ -5705,7 +5867,9 @@ mod tests {
                 <DATE>20260110</DATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
                 <VOUCHERNUMBER>RC-01</VOUCHERNUMBER><GUID>mixed-receipt-example</GUID>
                 <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME><AMOUNT>90</AMOUNT>{allocations}{deposit}</LEDGERENTRIES.LIST>
-                <LEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-90</AMOUNT></LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Discount allowed</LEDGERNAME><AMOUNT>-3</AMOUNT></LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-85</AMOUNT></LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Early payment allowance</LEDGERNAME><AMOUNT>-2</AMOUNT></LEDGERENTRIES.LIST>
             </VOUCHER>{first}</MESSAGE></DATA></BODY></ENVELOPE>"#
             )
         };
@@ -5717,6 +5881,18 @@ mod tests {
             (
                 xml(&(bill("RC-DEPOSIT", "Advance", 20) + &bill("RC-DEPOSIT", "New Ref", 10))),
                 "named advance reference occurs more than once",
+            ),
+            (
+                xml(&deposit).replace("<AMOUNT>-3</AMOUNT>", "<AMOUNT>3</AMOUNT>"),
+                "discount direction",
+            ),
+            (
+                xml(&deposit).replace("<AMOUNT>-3</AMOUNT>", "<AMOUNT>-4</AMOUNT>"),
+                "amounts or directions are inconsistent",
+            ),
+            (
+                xml(&deposit).replace("<AMOUNT>-3</AMOUNT>", "<AMOUNT>-70</AMOUNT>"),
+                "discounts exceed",
             ),
         ] {
             let plan = store
@@ -5750,8 +5926,10 @@ mod tests {
                 .unwrap()
                 .closing_balance
         };
-        assert_eq!(ledger(&store, bank), 9000);
+        assert_eq!(ledger(&store, bank), 8500);
         assert_eq!(ledger(&store, customer), 3000);
+        assert_eq!(ledger(&store, discount), 300);
+        assert_eq!(ledger(&store, allowance), 200);
         let rows = store.outstanding_invoices(company, "2026-01-15").unwrap();
         assert_eq!(
             rows.iter()
@@ -5789,16 +5967,20 @@ mod tests {
             .save_cash_ledger_rule(company, bank, CashRole::Cash, "Test bank classification")
             .unwrap();
         store
-            .save_cash_voucher_rule(
+            .save_cash_ledger_rule(
                 company,
-                settlement.voucher_id,
-                Some(CashClass::Operating),
-                "Test receipt classification",
+                customer,
+                CashRole::Counterpart(CashClass::Operating),
+                "Test customer classification",
             )
             .unwrap();
         assert_eq!(
             (settlement.amount, advance.amount, advance.available),
             (6000, 2000, 0)
+        );
+        assert_eq!(
+            (settlement.voucher_cash, settlement.voucher_discount),
+            (8500, 500)
         );
         assert!(advance.includes_settlements);
         let partial_reversal = store.conn.execute(
@@ -5820,7 +6002,7 @@ mod tests {
         assert!(store
             .reverse_party_advance(company, held.id, "2026-01-20", "REV", "Test reversal")
             .is_err());
-        assert_eq!(ledger(&store, bank), 9000);
+        assert_eq!(ledger(&store, bank), 8500);
         let extra = store
             .apply_party_advance_to_bill(
                 company,
@@ -5861,12 +6043,14 @@ mod tests {
         assert_eq!(store.vouchers(company).unwrap().len(), 4);
         assert_eq!(ledger(&store, bank), 0);
         assert_eq!(ledger(&store, customer), 12000);
+        assert_eq!(ledger(&store, discount), 0);
+        assert_eq!(ledger(&store, allowance), 0);
         let cash = store.cash_flow_report(company, None, None).unwrap();
         assert_eq!(cash.entries.len(), 2);
         let operating = cash.totals[&CashClass::Operating];
         assert_eq!(
             (cash.closing, operating.inflows, operating.outflows),
-            (0, 9000, 9000)
+            (0, 8500, 8500)
         );
         assert_eq!(
             store

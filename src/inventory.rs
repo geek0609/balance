@@ -285,6 +285,8 @@ pub struct Settlement {
     pub date: String,
     pub reference: String,
     pub amount: i64,
+    pub voucher_cash: i64,
+    pub voucher_discount: i64,
     pub bank_ledger: String,
     pub reversal_voucher_id: Option<i64>,
     pub reversal_date: Option<String>,
@@ -1369,6 +1371,7 @@ pub(crate) fn insert_settlement_on_connection(
     allocations: &[BillSettlementAllocation],
     narration: &str,
     advance_voucher: Option<i64>,
+    discounts: &[crate::settlement_discounts::SettlementDiscount],
 ) -> Result<(i64, Vec<i64>)> {
     let parsed_date = parse_date(date)?;
     let date = parsed_date.format("%Y-%m-%d").to_string();
@@ -1516,19 +1519,16 @@ pub(crate) fn insert_settlement_on_connection(
             "Advance for this settlement is missing".into(),
         ));
     }
-    let total = i64::try_from(total + advance.map_or(0, i128::from))
-        .map_err(|_| Error::Validation("Settlement total is too large".into()))?;
-    let direction = if kind == InvoiceKind::Sale { 1 } else { -1 };
-    let postings = [
-        Posting {
-            ledger_id: bank_ledger_id,
-            amount: direction * total,
-        },
-        Posting {
-            ledger_id: party,
-            amount: -direction * total,
-        },
-    ];
+    let postings = crate::settlement_discounts::postings(
+        conn,
+        company_id,
+        kind,
+        bank_ledger_id,
+        party,
+        total,
+        advance.unwrap_or(0),
+        discounts,
+    )?;
     validate_voucher(&date, &postings)?;
     check_ledgers(conn, company_id, &postings)?;
     crate::opening::check_no_control_postings(conn, company_id, &postings)?;
@@ -1545,12 +1545,20 @@ pub(crate) fn insert_settlement_on_connection(
                 "Advance voucher does not match the settlement".into(),
             ));
         }
-        check_settlement_postings(conn, voucher, bank_ledger_id, party, direction * total)?;
+        check_settlement_postings(conn, voucher, &postings)?;
+        let mut discounts = discounts.to_vec();
+        discounts.sort_unstable_by_key(|discount| discount.ledger_id);
+        if discounts != crate::settlement_discounts::read(conn, voucher)? {
+            return Err(Error::Validation(
+                "Advance voucher discounts do not match the settlement".into(),
+            ));
+        }
         voucher
     } else {
         conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, voucher_kind.as_str(), reference, date, narration.trim()])?;
         let voucher = conn.last_insert_rowid();
         write_postings(conn, voucher, &postings)?;
+        crate::settlement_discounts::save(conn, voucher, discounts)?;
         voucher
     };
     let mut ids = Vec::with_capacity(groups.len());
@@ -1605,22 +1613,14 @@ fn settlement_advance_total(
     }
 }
 
-fn check_settlement_postings(
-    conn: &Connection,
-    voucher: i64,
-    bank: i64,
-    party: i64,
-    cash: i64,
-) -> Result<()> {
-    let counts: (i64, i64, i64) = conn.query_row(
-        "SELECT COUNT(*),
-                COUNT(CASE WHEN ledger_id = ?2 AND amount = ?4 THEN 1 END),
-                COUNT(CASE WHEN ledger_id = ?3 AND amount = -?4 THEN 1 END)
-         FROM postings WHERE voucher_id = ?1",
-        params![voucher, bank, party, cash],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+fn check_settlement_postings(conn: &Connection, voucher: i64, postings: &[Posting]) -> Result<()> {
+    let mut expected: Vec<_> = postings.iter().map(|p| (p.ledger_id, p.amount)).collect();
+    expected.sort_unstable();
+    let mut stmt = conn.prepare_cached(
+        "SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1 ORDER BY ledger_id, amount",
     )?;
-    if counts != (2, 1, 1) {
+    let rows = stmt.query_map([voucher], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    if rows.collect::<rusqlite::Result<Vec<(i64, i64)>>>()? != expected {
         return Err(Error::Validation(
             "Settlement postings do not match its allocations".into(),
         ));
@@ -1694,18 +1694,14 @@ pub(crate) fn reverse_settlement_on_connection(
         common.ok_or_else(|| Error::Validation("Settlement has no allocations".into()))?;
     let advance =
         settlement_advance_total(conn, company_id, settlement_voucher, kind, party, bank)?;
-    if let Some(amount) = advance {
+    if advance.is_some() {
         crate::advances::check_advance_voucher_reversal(
             conn,
             company_id,
             settlement_voucher,
             reversal_date,
         )?;
-        total += i128::from(amount);
     }
-    let total = i64::try_from(total)
-        .map_err(|_| Error::Validation("Settlement total is too large".into()))?;
-    let direction = if kind == InvoiceKind::Sale { 1 } else { -1 };
     let expected_kind = if kind == InvoiceKind::Sale {
         VoucherKind::Receipt
     } else {
@@ -1716,7 +1712,18 @@ pub(crate) fn reverse_settlement_on_connection(
             "Settlement voucher type is inconsistent".into(),
         ));
     }
-    check_settlement_postings(conn, settlement_voucher, bank, party, direction * total)?;
+    let discounts = crate::settlement_discounts::read(conn, settlement_voucher)?;
+    let expected_postings = crate::settlement_discounts::postings(
+        conn,
+        company_id,
+        kind,
+        bank,
+        party,
+        total,
+        advance.unwrap_or(0),
+        &discounts,
+    )?;
+    check_settlement_postings(conn, settlement_voucher, &expected_postings)?;
     let postings = crate::reversals::counter_postings(conn, company_id, settlement_voucher, &date)?;
     conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, expected_kind.as_str(), reference, date, format!("Reversal of settlement voucher {settlement_voucher}: {reason}")])?;
     let reversal_voucher = conn.last_insert_rowid();
@@ -3292,6 +3299,7 @@ impl Store {
             reference,
             allocations,
             parts,
+            &[],
         )
     }
 
@@ -3304,6 +3312,28 @@ impl Store {
         reference: &str,
         allocations: &[BillSettlementAllocation],
         advances: &[crate::advances::AdvancePartDraft],
+    ) -> Result<(i64, Vec<i64>)> {
+        self.settle_bills_with_discounts(
+            company_id,
+            bank_ledger_id,
+            date,
+            reference,
+            allocations,
+            advances,
+            &[],
+        )
+    }
+
+    /// Settle bills for their allocated amount while posting the net cash and discounts separately.
+    pub fn settle_bills_with_discounts(
+        &mut self,
+        company_id: i64,
+        bank_ledger_id: i64,
+        date: &str,
+        reference: &str,
+        allocations: &[BillSettlementAllocation],
+        advances: &[crate::advances::AdvancePartDraft],
+        discounts: &[crate::settlement_discounts::SettlementDiscount],
     ) -> Result<(i64, Vec<i64>)> {
         let sources: Vec<_> = advances
             .iter()
@@ -3321,6 +3351,7 @@ impl Store {
             reference,
             allocations,
             &parts,
+            discounts,
         )
     }
 
@@ -3332,6 +3363,7 @@ impl Store {
         reference: &str,
         allocations: &[BillSettlementAllocation],
         parts: &[(i64, Option<&crate::advances::AdvanceSourceBill>)],
+        discounts: &[crate::settlement_discounts::SettlementDiscount],
     ) -> Result<(i64, Vec<i64>)> {
         let tx = self
             .conn
@@ -3377,6 +3409,7 @@ impl Store {
                 },
                 parts,
                 settled,
+                discounts,
             )?;
             Some(voucher)
         } else {
@@ -3391,6 +3424,7 @@ impl Store {
             allocations,
             "Invoice settlement",
             advance_voucher,
+            discounts,
         )?;
         tx.commit()?;
         Ok(result)
@@ -3420,7 +3454,17 @@ impl Store {
         Ok(voucher)
     }
     pub fn invoice_settlements(&self, company_id: i64, invoice_id: i64) -> Result<Vec<Settlement>> {
-        let mut stmt = self.conn.prepare("SELECT s.id, s.voucher_id, v.date, v.reference, s.amount, l.name, r.reversal_voucher_id, rv.date, r.reason FROM invoice_settlements s JOIN vouchers v ON v.id = s.voucher_id JOIN ledgers l ON l.id = s.bank_ledger_id AND l.company_id = s.company_id LEFT JOIN settlement_reversals r ON r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id WHERE s.company_id = ?1 AND s.invoice_id = ?2 ORDER BY v.date, s.id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.voucher_id, v.date, v.reference, s.amount, l.name,
+                    r.reversal_voucher_id, rv.date, r.reason,
+                    (SELECT ABS(p.amount) FROM postings p WHERE p.voucher_id = s.voucher_id AND p.ledger_id = s.bank_ledger_id),
+                    COALESCE((SELECT SUM(d.amount) FROM settlement_discounts d WHERE d.voucher_id = s.voucher_id), 0)
+             FROM invoice_settlements s JOIN vouchers v ON v.id = s.voucher_id
+             JOIN ledgers l ON l.id = s.bank_ledger_id AND l.company_id = s.company_id
+             LEFT JOIN settlement_reversals r ON r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id
+             LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
+             WHERE s.company_id = ?1 AND s.invoice_id = ?2 ORDER BY v.date, s.id",
+        )?;
         let mut rows = stmt
             .query_map(params![company_id, invoice_id], |r| {
                 Ok(Settlement {
@@ -3433,6 +3477,8 @@ impl Store {
                     reversal_voucher_id: r.get(6)?,
                     reversal_date: r.get(7)?,
                     reversal_reason: r.get(8)?,
+                    voucher_cash: r.get(9)?,
+                    voucher_discount: r.get(10)?,
                     bill_allocations: Vec::new(),
                 })
             })?

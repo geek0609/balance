@@ -12,6 +12,7 @@ use balance::inventory::{
 };
 use balance::pricing::PriceList;
 use balance::reorder::ReorderRule;
+use balance::settlement_discounts::SettlementDiscount;
 use balance::tax_profiles::TaxCalculation;
 use balance::taxes::InvoiceTaxLine;
 use balance::terms::LedgerTerms;
@@ -280,6 +281,7 @@ struct App {
     settlement_amount: String,
     settlement_on_account: String,
     settlement_advances: Vec<advance_ui::AdvancePartForm>,
+    settlement_discounts: Vec<SettlementDiscountForm>,
     settlement_extra: Vec<SettlementLineForm>,
     reversal_target: Option<i64>,
     reversal_date: String,
@@ -298,6 +300,11 @@ struct InvoiceReversalForm {
 }
 struct SettlementLineForm {
     target: Option<BillSettlementTarget>,
+    amount: String,
+}
+#[derive(Default)]
+struct SettlementDiscountForm {
+    ledger: Option<i64>,
     amount: String,
 }
 #[derive(Default)]
@@ -587,6 +594,7 @@ impl App {
             settlement_amount: String::new(),
             settlement_on_account: String::new(),
             settlement_advances: Vec::new(),
+            settlement_discounts: Vec::new(),
             settlement_extra: Vec::new(),
             reversal_target: None,
             reversal_date: String::new(),
@@ -732,6 +740,7 @@ impl App {
         self.settlement_amount.clear();
         self.settlement_on_account.clear();
         self.settlement_advances.clear();
+        self.settlement_discounts.clear();
         self.settlement_extra.clear();
         self.reversal_target = None;
         self.reversal_date.clear();
@@ -4081,7 +4090,7 @@ impl App {
         ui.small("Invoice balances include all saved settlements and reversals. Use Outstanding for a specific date.");
         if let Some(voucher) = self.reversal_target {
             crate::theme::section(ui, format!("Reverse settlement voucher {voucher}"));
-            ui.label("This reverses every bill allocation and advance on the receipt or payment. Release any active applications first.");
+            ui.label("This reverses the cash, discounts, bill allocations and advances on the voucher. Release any active applications first.");
             ui.horizontal(|ui| {
                 ui.label("Date");
                 ui.add(egui::TextEdit::singleline(&mut self.reversal_date).hint_text("YYYY-MM-DD"));
@@ -4177,6 +4186,41 @@ impl App {
                     );
                 });
                 advance_ui::advance_part_fields(ui, &mut self.settlement_advances);
+                if !self.settlement_discounts.is_empty() {
+                    let accounts: Vec<_> = ledgers
+                        .iter()
+                        .filter(|ledger| {
+                            matches!(ledger.category, Category::Income | Category::Expense)
+                        })
+                        .cloned()
+                        .collect();
+                    let mut remove = None;
+                    for (index, line) in self.settlement_discounts.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            pick_account(
+                                ui,
+                                ("settlement-discount", index),
+                                "Discount ledger",
+                                &accounts,
+                                &mut line.ledger,
+                                false,
+                            );
+                            ui.label("Amount");
+                            ui.text_edit_singleline(&mut line.amount);
+                            if ui.button("Remove").clicked() {
+                                remove = Some(index);
+                            }
+                        });
+                    }
+                    if let Some(index) = remove {
+                        self.settlement_discounts.remove(index);
+                    }
+                    ui.small("Enter the amount applied to each bill before discounts.");
+                }
+                if ui.button("Add settlement discount").clicked() {
+                    self.settlement_discounts
+                        .push(SettlementDiscountForm::default());
+                }
                 if ui.button("Save receipt / payment").clicked() {
                     let result = (|| -> balance::Result<i64> {
                         let mut allocations = vec![BillSettlementAllocation {
@@ -4200,32 +4244,53 @@ impl App {
                         } else {
                             parse_amount(&self.settlement_on_account)?
                         };
+                        if on_account < 0 {
+                            return Err(balance::Error::Validation(
+                                "Amount kept on account cannot be negative".into(),
+                            ));
+                        }
+                        let discounts = self
+                            .settlement_discounts
+                            .iter()
+                            .map(|line| {
+                                Ok(SettlementDiscount {
+                                    ledger_id: line.ledger.ok_or_else(|| {
+                                        balance::Error::Validation(
+                                            "Select a ledger for every discount".into(),
+                                        )
+                                    })?,
+                                    amount: parse_amount(&line.amount)?,
+                                })
+                            })
+                            .collect::<balance::Result<Vec<_>>>()?;
                         let bank = self.settlement_bank.ok_or_else(|| {
                             balance::Error::Validation("Select a cash or bank ledger".into())
                         })?;
-                        let (voucher, _) = if self.settlement_advances.is_empty() {
-                            self.store.settle_bills_with_advance(
-                                company,
-                                bank,
-                                &self.settlement_date,
-                                &self.settlement_reference,
-                                &allocations,
-                                on_account,
-                            )?
-                        } else {
-                            let advances = advance_ui::advance_part_drafts(
-                                &self.settlement_advances,
-                                on_account,
-                            )?;
-                            self.store.settle_bills_with_advance_parts(
-                                company,
-                                bank,
-                                &self.settlement_date,
-                                &self.settlement_reference,
-                                &allocations,
-                                &advances,
-                            )?
-                        };
+                        let (voucher, _) =
+                            if self.settlement_advances.is_empty() && discounts.is_empty() {
+                                self.store.settle_bills_with_advance(
+                                    company,
+                                    bank,
+                                    &self.settlement_date,
+                                    &self.settlement_reference,
+                                    &allocations,
+                                    on_account,
+                                )?
+                            } else {
+                                let advances = advance_ui::advance_part_drafts(
+                                    &self.settlement_advances,
+                                    on_account,
+                                )?;
+                                self.store.settle_bills_with_discounts(
+                                    company,
+                                    bank,
+                                    &self.settlement_date,
+                                    &self.settlement_reference,
+                                    &allocations,
+                                    &advances,
+                                    &discounts,
+                                )?
+                            };
                         Ok(voucher)
                     })();
                     match result {
@@ -4236,6 +4301,7 @@ impl App {
                             self.settlement_amount.clear();
                             self.settlement_on_account.clear();
                             self.settlement_advances.clear();
+                            self.settlement_discounts.clear();
                             self.settlement_extra.clear();
                         }
                         Err(e) => self.failure(e),
@@ -4254,7 +4320,7 @@ impl App {
                 ui.small("Editing or copying an invoice replaces the current invoice form. A copy retains prices, tax and allocations for review; enter a new date and reference before saving.");
                 for invoice in invoices {
                     ui.strong(format!(
-                        "{}  {}  {}  {}  Total {}  Cash {}  Advances {}  Notes {}  Outstanding {}",
+                        "{}  {}  {}  {}  Total {}  Settled {}  Advances {}  Notes {}  Outstanding {}",
                         invoice.date,
                         invoice.document_type(),
                         reference_with_bill(&invoice.reference, &invoice.bill_reference),
@@ -4270,7 +4336,7 @@ impl App {
                     }
                     for bill in &invoice.bill_splits {
                         ui.label(format!(
-                            "Bill {} · {} · Due {} · Cash settled {} · Advances {} · Credits {} · Outstanding {}",
+                            "Bill {} · {} · Due {} · Settled {} · Advances {} · Credits {} · Outstanding {}",
                             bill.reference,
                             format_amount(bill.amount),
                             bill.due_date.as_deref().unwrap_or("—"),
@@ -4431,6 +4497,13 @@ impl App {
                                         self.reversal_target = Some(payment.voucher_id);
                                     }
                                 });
+                                if payment.voucher_discount > 0 {
+                                    ui.small(format!(
+                                        "Voucher cash {} · Discounts {}",
+                                        money(i128::from(payment.voucher_cash)),
+                                        money(i128::from(payment.voucher_discount))
+                                    ));
+                                }
                                 for (reference, amount) in payment.bill_allocations {
                                     ui.small(format!(
                                         "Bill {reference} · {}",
@@ -5423,7 +5496,7 @@ impl App {
                             "Due",
                             "Original total",
                             "Reversed on",
-                            "Cash settled",
+                            "Settled",
                             "Advances",
                             "Credits",
                             "Outstanding",
@@ -5518,7 +5591,7 @@ impl App {
                         "Due date",
                         "Reference / bill",
                         "Total",
-                        "Cash settled",
+                        "Settled",
                         "Advances",
                         "Credits",
                         "Outstanding",

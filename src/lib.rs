@@ -41,6 +41,7 @@ pub mod recurring;
 pub mod reorder;
 pub mod report_export;
 pub mod reversals;
+pub mod settlement_discounts;
 pub mod stock_allocation;
 pub mod stock_counts;
 pub mod stock_notes;
@@ -54,7 +55,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 82;
+const SCHEMA_VERSION: i64 = 83;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -454,6 +455,7 @@ impl Store {
             "standard_stock_costs",
             "stock_receipt_costs",
             "advance_vouchers",
+            "settlement_discounts",
             "party_advances",
             "advance_allocations",
             "bills_of_materials",
@@ -998,6 +1000,10 @@ impl Store {
         if version < 82 {
             advances::migrate_advance_vouchers(&tx)?;
             tx.pragma_update(None, "user_version", 82)?;
+        }
+        if version < 83 {
+            settlement_discounts::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 83)?;
         }
         tx.commit()?;
         Ok(Self { conn })

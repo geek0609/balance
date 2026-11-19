@@ -1,7 +1,10 @@
 //! On-account receipts and payments for customers and suppliers.
-use crate::inventory::{invoice_total, ledger_category, BillSettlementTarget, InvoiceKind};
+use crate::inventory::{
+    invoice_total, ledger_category, write_postings, BillSettlementTarget, InvoiceKind,
+};
 use crate::reversals::{counter_postings, write_counter_postings};
-use crate::{parse_date, required, Category, Error, Result, Store, VoucherKind};
+use crate::settlement_discounts::{self, SettlementDiscount};
+use crate::{parse_date, required, Category, Error, Posting, Result, Store, VoucherKind};
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::HashSet;
@@ -287,6 +290,7 @@ pub(crate) fn insert_party_advance(
         draft,
         &[(draft.amount, source_bill)],
         settled_amount,
+        &[],
     )?;
     Ok((ids[0], voucher))
 }
@@ -297,8 +301,9 @@ pub(crate) fn insert_party_advance_parts(
     draft: &AdvanceDraft,
     parts: &[(i64, Option<&AdvanceSourceBill>)],
     settled_amount: i64,
+    discounts: &[SettlementDiscount],
 ) -> Result<(Vec<i64>, i64)> {
-    insert_advance_voucher(conn, company, draft, parts, settled_amount, None)
+    insert_advance_voucher(conn, company, draft, parts, settled_amount, None, discounts)
 }
 
 pub(crate) fn insert_opening_party_advance(
@@ -315,6 +320,7 @@ pub(crate) fn insert_opening_party_advance(
         &[(draft.amount, Some(source_bill))],
         0,
         Some(original_date),
+        &[],
     )?;
     Ok((ids[0], voucher))
 }
@@ -326,6 +332,7 @@ fn insert_advance_voucher(
     parts: &[(i64, Option<&AdvanceSourceBill>)],
     settled_amount: i64,
     opening_original_date: Option<NaiveDate>,
+    discounts: &[SettlementDiscount],
 ) -> Result<(Vec<i64>, i64)> {
     let date = parse_date(&draft.date)?;
     let reference = required(&draft.reference, "Advance reference")?;
@@ -387,32 +394,50 @@ fn insert_advance_voucher(
             "An advance with this party, type and reference already exists".into(),
         ));
     }
-    let total = draft
-        .amount
-        .checked_add(settled_amount)
-        .filter(|_| settled_amount >= 0)
-        .ok_or_else(|| Error::Validation("Invalid receipt or payment total".into()))?;
-    let (mut voucher_kind, counterpart) = match draft.kind {
-        InvoiceKind::Sale => (VoucherKind::Receipt, total),
-        InvoiceKind::Purchase => (VoucherKind::Payment, -total),
+    let (voucher_kind, postings) = if opening_original_date.is_some() {
+        let counterpart = if draft.kind == InvoiceKind::Sale {
+            draft.amount
+        } else {
+            -draft.amount
+        };
+        (
+            VoucherKind::Journal,
+            vec![
+                Posting {
+                    ledger_id: draft.bank_ledger_id,
+                    amount: counterpart,
+                },
+                Posting {
+                    ledger_id: draft.party_ledger_id,
+                    amount: -counterpart,
+                },
+            ],
+        )
+    } else {
+        let kind = if draft.kind == InvoiceKind::Sale {
+            VoucherKind::Receipt
+        } else {
+            VoucherKind::Payment
+        };
+        let postings = settlement_discounts::postings(
+            conn,
+            company,
+            draft.kind,
+            draft.bank_ledger_id,
+            draft.party_ledger_id,
+            i128::from(settled_amount),
+            draft.amount,
+            discounts,
+        )?;
+        (kind, postings)
     };
-    if opening_original_date.is_some() {
-        voucher_kind = VoucherKind::Journal;
-    }
     conn.execute(
         "INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![company, voucher_kind.as_str(), reference, date.to_string(), draft.narration.trim()],
     )?;
     let voucher = conn.last_insert_rowid();
-    for (ledger, amount) in [
-        (draft.bank_ledger_id, counterpart),
-        (draft.party_ledger_id, -counterpart),
-    ] {
-        conn.execute(
-            "INSERT INTO postings(voucher_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-            params![voucher, ledger, amount],
-        )?;
-    }
+    write_postings(conn, voucher, &postings)?;
+    settlement_discounts::save(conn, voucher, discounts)?;
     conn.execute(
         "INSERT INTO advance_vouchers(voucher_id, company_id, kind, party_ledger_id, bank_ledger_id,
                                       reference_key, opening_original_date)
@@ -466,7 +491,7 @@ impl Store {
             .zip(&sources)
             .map(|(part, source)| (part.amount, Some(source)))
             .collect();
-        let (ids, _) = insert_party_advance_parts(&tx, company, draft, &allocations, 0)?;
+        let (ids, _) = insert_party_advance_parts(&tx, company, draft, &allocations, 0, &[])?;
         tx.commit()?;
         Ok(ids)
     }
