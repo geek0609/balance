@@ -3,7 +3,7 @@
 use balance::banking::{parse_signed_amount, BankEntry, StatementPlan};
 use balance::company::CompanyProfile;
 use balance::contacts::LedgerProfile;
-use balance::exchange::ImportPlan;
+use balance::exchange::{ImportPlan, MAX_XML_IMPORT_BYTES};
 use balance::inventory::{
     discounted_line_amount, format_quantity, parse_quantity, InvoiceAdjustment, InvoiceAllocation,
     InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine, SettlementAllocation, StockBatch,
@@ -171,6 +171,7 @@ struct App {
     bank_opening_amount: String,
     bank_opening_reason: String,
     import_path: String,
+    import_second_path: String,
     import_opening_date: String,
     backup_path: String,
     restore_source: String,
@@ -445,6 +446,7 @@ impl App {
             bank_opening_amount: String::new(),
             bank_opening_reason: String::new(),
             import_path: String::new(),
+            import_second_path: String::new(),
             import_opening_date: String::new(),
             backup_path: String::new(),
             restore_source: String::new(),
@@ -4451,16 +4453,21 @@ impl App {
 
     fn import_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(ui, "Import accounting XML");
-        ui.label("Preview a file before importing. Only supported, complete records can be imported; no changes are made if any issue is found.");
-        ui.horizontal(|ui| {
-            ui.label("File path");
-            if ui
-                .add(egui::TextEdit::singleline(&mut self.import_path).desired_width(420.0))
-                .changed()
-            {
-                self.import_preview = None;
-            }
-        });
+        ui.label("Preview one XML file or separate masters and transactions exports together. Include each record only once across both files.");
+        for (label, path) in [
+            ("First XML file", &mut self.import_path),
+            ("Second XML file (optional)", &mut self.import_second_path),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                if ui
+                    .add(egui::TextEdit::singleline(path).desired_width(420.0))
+                    .changed()
+                {
+                    self.import_preview = None;
+                }
+            });
+        }
         ui.horizontal(|ui| {
             ui.label("Opening date (if included)");
             if ui
@@ -4473,27 +4480,46 @@ impl App {
                 self.import_preview = None;
             }
         });
-        if ui.button("Preview file").clicked() {
+        if ui.button("Preview XML").clicked() {
             self.import_preview = None;
             let result = (|| -> balance::Result<ImportPlan> {
-                let path = std::path::Path::new(self.import_path.trim());
-                let metadata = std::fs::metadata(path)
-                    .map_err(|e| balance::Error::Validation(format!("Cannot read file: {e}")))?;
-                if !metadata.is_file() || metadata.len() > 50 * 1024 * 1024 {
-                    return Err(balance::Error::Validation(
-                        "Choose a file no larger than 50 MiB".into(),
-                    ));
-                }
                 use std::io::Read;
-                let file = std::fs::File::open(path)
-                    .map_err(|e| balance::Error::Validation(format!("Cannot read file: {e}")))?;
-                let mut bytes = Vec::new();
-                file.take(50 * 1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| balance::Error::Validation(format!("Cannot read file: {e}")))?;
-                self.store.preview_xml_import_with_opening_date(
+                let mut remaining = MAX_XML_IMPORT_BYTES;
+                let mut files = Vec::new();
+                for path in [&self.import_path, &self.import_second_path]
+                    .map(|path| path.trim())
+                    .into_iter()
+                    .filter(|path| !path.is_empty())
+                {
+                    let read_error =
+                        |e| balance::Error::Validation(format!("Cannot read XML file {path}: {e}"));
+                    let metadata = std::fs::metadata(path).map_err(read_error)?;
+                    if !metadata.is_file() {
+                        return Err(balance::Error::Validation(format!(
+                            "Choose a regular XML file: {path}"
+                        )));
+                    }
+                    let size_error = || {
+                        balance::Error::Validation(
+                            "The XML files exceed the combined 50 MiB import limit".into(),
+                        )
+                    };
+                    if metadata.len() > remaining as u64 {
+                        return Err(size_error());
+                    }
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(path)
+                        .map_err(read_error)?
+                        .take(remaining as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(read_error)?;
+                    remaining = remaining.checked_sub(bytes.len()).ok_or_else(size_error)?;
+                    files.push(bytes);
+                }
+                let inputs = files.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                self.store.preview_xml_import_batch(
                     company,
-                    &bytes,
+                    &inputs,
                     Some(&self.import_opening_date),
                 )
             })();

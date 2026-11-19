@@ -21,7 +21,9 @@ use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 
-const MAX_BYTES: usize = 50 * 1024 * 1024;
+/// Maximum combined input size for a single XML import preview.
+pub const MAX_XML_IMPORT_BYTES: usize = 50 * 1024 * 1024;
+const MAX_XML_NODES: u32 = 1_000_000;
 
 #[derive(Debug, Clone)]
 struct Group {
@@ -649,11 +651,6 @@ fn profile_list_values(
     values
 }
 fn decode(bytes: &[u8]) -> Result<String> {
-    if bytes.len() > MAX_BYTES {
-        return Err(Error::Validation(
-            "The XML file exceeds the 50 MiB import limit".into(),
-        ));
-    }
     if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
         if bytes.len() % 2 != 0 {
             return Err(Error::Validation("Invalid UTF-16 XML".into()));
@@ -1927,18 +1924,55 @@ impl Store {
         bytes: &[u8],
         opening_date: Option<&str>,
     ) -> Result<ImportPlan> {
+        self.preview_xml_import_batch(company_id, &[bytes], opening_date)
+    }
+
+    /// Resolve masters and transactions across independent XML documents in one plan.
+    pub fn preview_xml_import_batch(
+        &self,
+        company_id: i64,
+        files: &[&[u8]],
+        opening_date: Option<&str>,
+    ) -> Result<ImportPlan> {
         if !self.companies()?.iter().any(|c| c.id == company_id) {
             return Err(Error::Validation("Select an existing company".into()));
         }
-        let text = decode(bytes)?;
-        let doc = Document::parse_with_options(
-            &text,
-            ParsingOptions {
-                nodes_limit: 1_000_000,
-                ..ParsingOptions::default()
-            },
-        )
-        .map_err(|e| Error::Validation(format!("Cannot read XML: {e}")))?;
+        if files.is_empty() {
+            return Err(Error::Validation("Select at least one XML file".into()));
+        }
+        if files
+            .iter()
+            .try_fold(MAX_XML_IMPORT_BYTES, |remaining, file| {
+                remaining.checked_sub(file.len())
+            })
+            .is_none()
+        {
+            return Err(Error::Validation(
+                "The XML files exceed the combined 50 MiB import limit".into(),
+            ));
+        }
+        let mut texts = Vec::with_capacity(files.len());
+        for (index, file) in files.iter().enumerate() {
+            let text = decode(file).map_err(|e| {
+                Error::Validation(format!("Cannot read XML file {}: {e}", index + 1))
+            })?;
+            texts.push(text);
+        }
+        let mut remaining_nodes = MAX_XML_NODES;
+        let mut documents = Vec::with_capacity(texts.len());
+        for (index, text) in texts.iter().enumerate() {
+            let document = Document::parse_with_options(
+                text,
+                ParsingOptions {
+                    nodes_limit: remaining_nodes,
+                    ..ParsingOptions::default()
+                },
+            )
+            .map_err(|e| Error::Validation(format!("Cannot read XML file {}: {e}", index + 1)))?;
+            remaining_nodes -= document.descendants().len() as u32;
+            documents.push(document);
+        }
+        let nodes = || documents.iter().flat_map(Document::descendants);
         let mut plan = ImportPlan {
             company_id,
             opening_date: opening_date
@@ -1980,7 +2014,7 @@ impl Store {
                 }
             }
         }
-        for node in doc.descendants().filter(|n| {
+        for node in nodes().filter(|n| {
             n.is_element()
                 && n.parent().is_some_and(|p| {
                     p.is_element()
@@ -2018,9 +2052,8 @@ impl Store {
         }
         let mut pending_groups = Vec::<(String, String, SourceMetadata)>::new();
         let mut seen_input_groups = HashSet::<String>::new();
-        for node in doc
-            .descendants()
-            .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("GROUP"))
+        for node in
+            nodes().filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("GROUP"))
         {
             let Some(name) = object_name(node) else {
                 plan.issues
@@ -2120,7 +2153,7 @@ impl Store {
                     .push(format!("Ledger {} is ambiguous", ledger.name));
             }
         }
-        for node in doc.descendants().filter(|n| {
+        for node in nodes().filter(|n| {
             n.is_element()
                 && local_name(*n).eq_ignore_ascii_case("LEDGER")
                 && !n
@@ -2276,9 +2309,8 @@ impl Store {
             }
         }
         let mut seen_units = HashSet::new();
-        for node in doc
-            .descendants()
-            .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("UNIT"))
+        for node in
+            nodes().filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("UNIT"))
         {
             let Some(symbol) = object_name(node) else {
                 plan.issues.push("A unit has no unambiguous symbol".into());
@@ -2360,9 +2392,8 @@ impl Store {
         }
         let mut input_stock_groups = HashSet::new();
         let mut pending_stock_groups = Vec::<(String, String, SourceMetadata)>::new();
-        for node in doc
-            .descendants()
-            .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("STOCKGROUP"))
+        for node in
+            nodes().filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("STOCKGROUP"))
         {
             let Some(name) = object_name(node) else {
                 plan.issues
@@ -2459,7 +2490,7 @@ impl Store {
         }
         let mut input_locations = HashSet::new();
         let mut pending_locations = Vec::new();
-        for node in doc.descendants().filter(|n| {
+        for node in nodes().filter(|n| {
             n.is_element()
                 && local_name(*n).eq_ignore_ascii_case("GODOWN")
                 && !n.ancestors().any(|a| {
@@ -2558,9 +2589,8 @@ impl Store {
                     .push(format!("Stock item {} is ambiguous", item.name));
             }
         }
-        for node in doc
-            .descendants()
-            .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("STOCKITEM"))
+        for node in
+            nodes().filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("STOCKITEM"))
         {
             let Some(name) = object_name(node) else {
                 plan.issues
@@ -2942,9 +2972,8 @@ impl Store {
                 )
             })
             .collect();
-        for node in doc
-            .descendants()
-            .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("VOUCHER"))
+        for node in
+            nodes().filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("VOUCHER"))
         {
             let label = format!(
                 "Voucher {}",
@@ -3401,7 +3430,7 @@ impl Store {
                 }
             }
         }
-        for node in doc.descendants().filter(|n| {
+        for node in nodes().filter(|n| {
             n.is_element()
                 && ["VOUCHERTYPE", "STOCKCATEGORY"]
                     .iter()
@@ -4169,6 +4198,81 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn separate_master_and_transaction_exports_share_one_import() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let masters = br#"<?xml version="1.0"?>
+            <ENVELOPE><BODY><DATA><MESSAGE>
+                <LEDGER NAME="Trial Bank"><PARENT>Bank Accounts</PARENT>
+                    <OPENINGBALANCE>-100.00</OPENINGBALANCE></LEDGER>
+                <LEDGER NAME="Trial Earnings"><PARENT>Indirect Incomes</PARENT></LEDGER>
+            </MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let vouchers = r#"<?xml version="1.0" encoding="UTF-16"?>
+            <ENVELOPE><BODY><DATA><MESSAGE>
+                <VOUCHER>
+                    <VOUCHERTYPENAME>Journal</VOUCHERTYPENAME>
+                    <DATE>20260102</DATE><VOUCHERNUMBER>J-01</VOUCHERNUMBER>
+                    <ALLLEDGERENTRIES.LIST><LEDGERNAME>Trial Bank</LEDGERNAME>
+                        <AMOUNT>-64.25</AMOUNT></ALLLEDGERENTRIES.LIST>
+                    <ALLLEDGERENTRIES.LIST><LEDGERNAME>Trial Earnings</LEDGERNAME>
+                        <AMOUNT>64.25</AMOUNT></ALLLEDGERENTRIES.LIST>
+                </VOUCHER>
+            </MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let utf16 = |xml: &str| {
+            let mut bytes = vec![0xff, 0xfe];
+            bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes
+        };
+        let good = utf16(vouchers);
+        let unbalanced = utf16(&vouchers.replacen("-64.25", "-64.24", 1));
+
+        assert!(!store
+            .preview_xml_import(company, &good)
+            .unwrap()
+            .can_apply());
+        let malformed = store
+            .preview_xml_import_batch(company, &[masters, b"<broken"], Some("2026-01-01"))
+            .unwrap_err();
+        assert!(malformed.to_string().contains("XML file 2"));
+
+        let blocked = store
+            .preview_xml_import_batch(company, &[masters, &unbalanced], Some("2026-01-01"))
+            .unwrap();
+        assert_eq!(blocked.ledger_count(), 2);
+        assert!(blocked
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("postings must balance")));
+        assert!(store.apply_xml_import(&blocked).is_err());
+        assert!(store.vouchers(company).unwrap().is_empty());
+        assert!(!store
+            .ledgers(company)
+            .unwrap()
+            .iter()
+            .any(|ledger| ledger.name == "Trial Bank"));
+
+        let preview = store
+            .preview_xml_import_batch(company, &[masters, &good], Some("2026-01-01"))
+            .unwrap();
+        assert!(preview.can_apply(), "{:?}", preview.issues());
+        let counts = store.apply_xml_import(&preview).unwrap();
+        assert_eq!(counts.ledgers, 2);
+        assert_eq!(counts.vouchers, 1);
+        let bank = store
+            .ledgers(company)
+            .unwrap()
+            .into_iter()
+            .find(|ledger| ledger.name == "Trial Bank")
+            .unwrap();
+        let activity = store
+            .ledger_register(company, bank.id, Some("2026-01-02"), Some("2026-01-02"))
+            .unwrap();
+        assert_eq!(activity.opening_balance, 10000);
+        assert_eq!(activity.entries[0].reference, "J-01");
+        assert_eq!(activity.closing_balance, 16425);
+    }
 
     #[test]
     fn import_checks_final_daily_stock_balances_before_committing() {
