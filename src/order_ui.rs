@@ -287,6 +287,10 @@ impl OrderScreen {
         self.amendment.is_some()
     }
 
+    pub(super) fn revising_quotation(&self) -> bool {
+        self.form.revision_of.is_some()
+    }
+
     pub(super) fn select(&mut self, order: i64) {
         self.selected = Some(order);
         self.close_reason.clear();
@@ -865,11 +869,28 @@ impl App {
         if !quote.notes.is_empty() {
             ui.label(&quote.notes);
         }
-        if let Some(original) = &quote.revises {
-            ui.label(format!("Revises quotation {original}"));
-        }
-        if let Some(replacement) = &quote.revised_by {
-            ui.label(format!("Replaced by quotation {replacement}"));
+        for (label, reference) in [
+            ("Revises", &quote.revises),
+            ("Replaced by", &quote.revised_by),
+        ] {
+            if let Some(related) = quotes.iter().find(|other| {
+                other.kind == quote.kind
+                    && other.party_ledger_id == quote.party_ledger_id
+                    && reference.as_ref() == Some(&other.reference)
+            }) {
+                if ui
+                    .link(format!("{label} quotation {}", related.reference))
+                    .clicked()
+                {
+                    *form = QuotationForm {
+                        selected: Some(related.id),
+                        order_reference: related.reference.clone(),
+                        expected_on: related.expected_on.clone().unwrap_or_default(),
+                        ..QuotationForm::default()
+                    };
+                    return Ok(());
+                }
+            }
         }
         let items = self.store.stock_items(company)?;
         let lines = self.store.quotation_lines(company, quote.id)?;

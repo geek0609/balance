@@ -548,6 +548,12 @@ impl Store {
             escape(&quote.date),
             quote.status(),
         );
+        if let Some(reference) = &quote.revises {
+            let _ = write!(html, "<br>Revises quotation {}", escape(reference));
+        }
+        if let Some(reference) = &quote.revised_by {
+            let _ = write!(html, "<br>Replaced by quotation {}", escape(reference));
+        }
         if let Some(date) = &quote.valid_through {
             let _ = write!(html, "<br>Valid through: {}", escape(date));
         }
