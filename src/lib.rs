@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod actual_cost;
 pub mod advances;
 pub mod banking;
+pub mod bill_notes;
 pub mod bill_splits;
 pub mod budgets;
 pub mod cash_flow;
@@ -55,7 +56,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 83;
+const SCHEMA_VERSION: i64 = 84;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -456,6 +457,7 @@ impl Store {
             "stock_receipt_costs",
             "advance_vouchers",
             "settlement_discounts",
+            "bill_note_allocations",
             "party_advances",
             "advance_allocations",
             "bills_of_materials",
@@ -1005,6 +1007,10 @@ impl Store {
             settlement_discounts::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 83)?;
         }
+        if version < 84 {
+            bill_notes::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 84)?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
@@ -1286,6 +1292,7 @@ impl Store {
         )?;
         if invoice_backed
             || invoice_credits::is_linked_voucher(&tx, company_id, voucher_id)?
+            || bill_notes::is_bill_note(&tx, company_id, voucher_id)?
             || recurring::contains_voucher(&tx, company_id, voucher_id)?
         {
             return Err(Error::Validation(

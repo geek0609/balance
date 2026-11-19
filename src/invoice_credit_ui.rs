@@ -98,9 +98,26 @@ impl App {
         {
             return;
         }
-        egui::CollapsingHeader::new(format!("Partial {label}s"))
+        let heading = match invoice.kind {
+            InvoiceKind::Sale => "Credit notes",
+            InvoiceKind::Purchase => "Debit notes",
+        };
+        egui::CollapsingHeader::new(heading)
             .id_salt(("invoice-credits", invoice.id))
             .show(ui, |ui| {
+                match self.store.bill_note_allocations(company, invoice.id) {
+                    Ok(allocations) => {
+                        for allocation in allocations {
+                            ui.label(format!("{} · {} · Bill {} · {} · Voucher {}",
+                                allocation.date, allocation.reference, allocation.bill_reference,
+                                money(i128::from(allocation.amount)), allocation.voucher_id));
+                            if let Some(date) = allocation.reversal_date {
+                                ui.small(format!("Reversed on {date}"));
+                            }
+                        }
+                    }
+                    Err(error) => self.failure(error),
+                }
                 let notes = match self.store.invoice_credit_notes(company, invoice.id) {
                     Ok(notes) => notes,
                     Err(e) => {

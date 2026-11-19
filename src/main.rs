@@ -1775,7 +1775,7 @@ impl App {
                     self.voucher_reversal_target = None;
                 }
             });
-            ui.small("The original remains in the books. The new entry reverses its postings on the chosen date; it does not change invoice, stock or settlement records.");
+            ui.small("The counter-entry offsets the original postings and restores any linked bill balances from the reversal date.");
         }
         match self.store.vouchers(company) {
             Ok(vouchers) => {
@@ -1792,6 +1792,7 @@ impl App {
                         }
                     };
                     let protected = invoice_backed || reversal.is_some();
+                    let bill_note = self.store.is_bill_note(company, voucher.id).unwrap_or(true);
                     let foreign = self
                         .store
                         .is_foreign_voucher(company, voucher.id)
@@ -1811,7 +1812,7 @@ impl App {
                         }
                         if ui
                             .add_enabled(
-                                !protected && !foreign && !recurring,
+                                !protected && !bill_note && !foreign && !recurring,
                                 egui::Button::new("Edit"),
                             )
                             .clicked()
@@ -1849,6 +1850,8 @@ impl App {
                             ui.small("Foreign amounts are in Currencies.");
                         } else if recurring {
                             ui.small("Monthly journal. Use a reversal to correct it.");
+                        } else if bill_note {
+                            ui.small("Bill-linked note. Use a reversal to correct it.");
                         } else if protected {
                             ui.small("Linked or reversed postings cannot be edited here.");
                         }
@@ -4805,7 +4808,7 @@ impl App {
         }
         if let Some(plan) = &self.import_preview {
             ui.label(format!(
-                "Preview: {} account groups, {} ledgers, {} opening balances, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} advances, {} advance applications; {} units, {} stock groups, {} locations, {} items, {} opening quantities",
+                "Preview: {} account groups, {} ledgers, {} opening balances, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} bill-linked notes, {} advances, {} advance applications; {} units, {} stock groups, {} locations, {} items, {} opening quantities",
                 plan.group_count(),
                 plan.ledger_count(),
                 plan.opening_count(),
@@ -4815,6 +4818,7 @@ impl App {
                 plan.voucher_count(),
                 plan.invoice_count(),
                 plan.settlement_count(),
+                plan.bill_note_count(),
                 plan.advance_count(),
                 plan.advance_application_count(),
                 plan.unit_count(),
@@ -4852,8 +4856,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} advances, {} advance applications, {} units, {} stock groups, {} locations and {} items",
-                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.settlements, counts.advances, counts.advance_applications, counts.units, counts.stock_groups, counts.locations, counts.items
+                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} units, {} stock groups, {} locations and {} items",
+                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.units, counts.stock_groups, counts.locations, counts.items
                         );
                         self.import_preview = None;
                     }

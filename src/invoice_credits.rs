@@ -132,6 +132,23 @@ pub(crate) fn state(
             result.latest_active_date = result.latest_active_date.max(Some(date));
         }
     }
+    for allocation in crate::bill_notes::history(conn, company, invoice)? {
+        result.has_history = true;
+        let date = parse_date(&allocation.date)?;
+        let reversal = allocation
+            .reversal_date
+            .as_deref()
+            .map(parse_date)
+            .transpose()?;
+        result.latest_reversal = result.latest_reversal.max(reversal);
+        if as_of.is_none_or(|end| date <= end)
+            && reversal.is_none_or(|day| as_of.is_some_and(|end| day > end))
+        {
+            result.total += i128::from(allocation.amount);
+            result.applied += i128::from(allocation.amount);
+            result.latest_active_date = result.latest_active_date.max(Some(date));
+        }
+    }
     let incoming = crate::invoice_credit_allocations::state(conn, company, invoice, as_of)?;
     result.applied += incoming.applied;
     result.latest_reversal = result.latest_reversal.max(incoming.latest_release);

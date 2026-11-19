@@ -208,6 +208,12 @@ pub(crate) fn read(conn: &Connection, invoice: i64, as_of: Option<&str>) -> Resu
              JOIN vouchers v ON v.id = n.voucher_id
              LEFT JOIN vouchers rv ON rv.id = n.reversal_voucher_id
              WHERE s.split_id = b.id AND (?2 IS NULL OR v.date <= ?2)
+               AND (rv.id IS NULL OR (?2 IS NOT NULL AND rv.date > ?2))), 0),
+           COALESCE((SELECT SUM(a.amount) FROM bill_note_allocations a
+             JOIN vouchers v ON v.id = a.voucher_id
+             LEFT JOIN voucher_reversals r ON r.original_voucher_id = v.id AND r.company_id = v.company_id
+             LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
+             WHERE a.split_id = b.id AND (?2 IS NULL OR v.date <= ?2)
                AND (rv.id IS NULL OR (?2 IS NOT NULL AND rv.date > ?2))), 0)
          FROM invoice_bill_splits b WHERE b.invoice_id = ?1 ORDER BY b.id",
     )?;
@@ -221,7 +227,9 @@ pub(crate) fn read(conn: &Connection, invoice: i64, as_of: Option<&str>) -> Resu
                 credit_days: row.get(4)?,
                 settled: i128::from(row.get::<_, i64>(5)?),
                 advance_applied: i128::from(row.get::<_, i64>(6)?),
-                credited: i128::from(row.get::<_, i64>(7)?) + i128::from(row.get::<_, i64>(8)?),
+                credited: i128::from(row.get::<_, i64>(7)?)
+                    + i128::from(row.get::<_, i64>(8)?)
+                    + i128::from(row.get::<_, i64>(9)?),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
