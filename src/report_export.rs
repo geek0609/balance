@@ -1174,6 +1174,67 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_quotation_register_csv(
+        &self,
+        company: i64,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let snapshot = self.conn.unchecked_transaction()?;
+        let context = [self.report_company_name(company)?];
+        let mut csv = writer();
+        let columns = [
+            "row_type",
+            "quotation_id",
+            "kind",
+            "reference",
+            "party",
+            "date",
+            "expected_on",
+            "valid_through",
+            "status",
+            "subtotal",
+            "order_id",
+            "revises",
+            "revised_by",
+            "close_reason",
+        ];
+        contextual_row(&mut csv, &strings(&["company"]), &strings(&columns))?;
+        let mut metadata = vec![String::new(); columns.len()];
+        metadata[0] = "context".into();
+        contextual_row(&mut csv, &context, &metadata)?;
+        for quote in self.quotations(company)? {
+            let mut subtotal = 0_i128;
+            for line in self.quotation_lines(company, quote.id)? {
+                subtotal += i128::from(crate::inventory::line_amount(
+                    line.quantity,
+                    line.unit_price,
+                )?);
+            }
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "quotation".into(),
+                    quote.id.to_string(),
+                    quote.kind.as_str().into(),
+                    text_cell(&quote.reference),
+                    text_cell(&quote.party),
+                    quote.date.clone(),
+                    quote.expected_on.clone().unwrap_or_default(),
+                    quote.valid_through.clone().unwrap_or_default(),
+                    quote.status().into(),
+                    money(subtotal),
+                    quote.order_id.map(|id| id.to_string()).unwrap_or_default(),
+                    text_cell(quote.revises.as_deref().unwrap_or_default()),
+                    text_cell(quote.revised_by.as_deref().unwrap_or_default()),
+                    text_cell(quote.close_reason.as_deref().unwrap_or_default()),
+                ],
+            )?;
+        }
+        snapshot.commit()?;
+        save(csv, destination)
+    }
+
     pub fn export_replenishment_csv(
         &self,
         company: i64,

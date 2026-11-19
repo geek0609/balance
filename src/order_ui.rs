@@ -820,6 +820,12 @@ impl App {
     }
 
     fn quotation_register(&mut self, ui: &mut egui::Ui, company: i64) -> Result<()> {
+        self.report_export_path_field(ui);
+        if ui.button("Export quotation register as CSV").clicked() {
+            self.store
+                .export_quotation_register_csv(company, self.report_export_path.trim())?;
+            self.message = "Quotation register exported".into();
+        }
         let quotes = self.store.quotations(company)?;
         if quotes.is_empty() {
             ui.label("No quotations saved.");
