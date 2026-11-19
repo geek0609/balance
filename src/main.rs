@@ -279,6 +279,7 @@ struct App {
     settlement_reference: String,
     settlement_amount: String,
     settlement_on_account: String,
+    settlement_advances: Vec<advance_ui::AdvancePartForm>,
     settlement_extra: Vec<SettlementLineForm>,
     reversal_target: Option<i64>,
     reversal_date: String,
@@ -585,6 +586,7 @@ impl App {
             settlement_reference: String::new(),
             settlement_amount: String::new(),
             settlement_on_account: String::new(),
+            settlement_advances: Vec::new(),
             settlement_extra: Vec::new(),
             reversal_target: None,
             reversal_date: String::new(),
@@ -729,6 +731,7 @@ impl App {
         self.settlement_reference.clear();
         self.settlement_amount.clear();
         self.settlement_on_account.clear();
+        self.settlement_advances.clear();
         self.settlement_extra.clear();
         self.reversal_target = None;
         self.reversal_date.clear();
@@ -4078,7 +4081,7 @@ impl App {
         ui.small("Invoice balances include all saved settlements and reversals. Use Outstanding for a specific date.");
         if let Some(voucher) = self.reversal_target {
             crate::theme::section(ui, format!("Reverse settlement voucher {voucher}"));
-            ui.label("This reverses the entire receipt or payment, including its bill allocations and any amount kept on account.");
+            ui.label("This reverses every bill allocation and advance on the receipt or payment. Release any active applications first.");
             ui.horizontal(|ui| {
                 ui.label("Date");
                 ui.add(egui::TextEdit::singleline(&mut self.reversal_date).hint_text("YYYY-MM-DD"));
@@ -4173,6 +4176,7 @@ impl App {
                             .hint_text("Optional"),
                     );
                 });
+                advance_ui::advance_part_fields(ui, &mut self.settlement_advances);
                 if ui.button("Save receipt / payment").clicked() {
                     let result = (|| -> balance::Result<i64> {
                         let mut allocations = vec![BillSettlementAllocation {
@@ -4196,16 +4200,32 @@ impl App {
                         } else {
                             parse_amount(&self.settlement_on_account)?
                         };
-                        let (voucher, _) = self.store.settle_bills_with_advance(
-                            company,
-                            self.settlement_bank.ok_or_else(|| {
-                                balance::Error::Validation("Select a cash or bank ledger".into())
-                            })?,
-                            &self.settlement_date,
-                            &self.settlement_reference,
-                            &allocations,
-                            on_account,
-                        )?;
+                        let bank = self.settlement_bank.ok_or_else(|| {
+                            balance::Error::Validation("Select a cash or bank ledger".into())
+                        })?;
+                        let (voucher, _) = if self.settlement_advances.is_empty() {
+                            self.store.settle_bills_with_advance(
+                                company,
+                                bank,
+                                &self.settlement_date,
+                                &self.settlement_reference,
+                                &allocations,
+                                on_account,
+                            )?
+                        } else {
+                            let advances = advance_ui::advance_part_drafts(
+                                &self.settlement_advances,
+                                on_account,
+                            )?;
+                            self.store.settle_bills_with_advance_parts(
+                                company,
+                                bank,
+                                &self.settlement_date,
+                                &self.settlement_reference,
+                                &allocations,
+                                &advances,
+                            )?
+                        };
                         Ok(voucher)
                     })();
                     match result {
@@ -4215,6 +4235,7 @@ impl App {
                             self.settlement_reference.clear();
                             self.settlement_amount.clear();
                             self.settlement_on_account.clear();
+                            self.settlement_advances.clear();
                             self.settlement_extra.clear();
                         }
                         Err(e) => self.failure(e),
@@ -4767,7 +4788,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills retain due dates or whole-day credit periods. Named opening advances retain their original dates and can fund later invoices. Balance records the difference between the named opening entries and the ledger opening total on account. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills and applications of named advances on a sales or purchase transaction must add up to the party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices and leave one named advance or on-account amount in the same voucher. Named advances retain a due date or whole-day credit period. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, multiple advances in one receipt or payment, credit terms on on-account amounts and unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills retain due dates or whole-day credit periods. Named opening advances retain their original dates and can fund later invoices. Balance records the difference between the named opening entries and the ledger opening total on account. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills and applications of named advances on a sales or purchase transaction must add up to the party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. A voucher can contain bill settlements, named advances and on-account amounts. Named advances retain a due date or whole-day credit period. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, credit terms on on-account amounts and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(ui, "Bank clearance");

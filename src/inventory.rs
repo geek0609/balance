@@ -1506,7 +1506,9 @@ pub(crate) fn insert_settlement_on_connection(
         VoucherKind::Payment
     };
     let advance = advance_voucher
-        .map(|voucher| settlement_advance(conn, company_id, voucher, kind, party, bank_ledger_id))
+        .map(|voucher| {
+            settlement_advance_total(conn, company_id, voucher, kind, party, bank_ledger_id)
+        })
         .transpose()?
         .flatten();
     if advance_voucher.is_some() && advance.is_none() {
@@ -1514,7 +1516,7 @@ pub(crate) fn insert_settlement_on_connection(
             "Advance for this settlement is missing".into(),
         ));
     }
-    let total = i64::try_from(total + advance.map_or(0, |(_, amount)| i128::from(amount)))
+    let total = i64::try_from(total + advance.map_or(0, i128::from))
         .map_err(|_| Error::Validation("Settlement total is too large".into()))?;
     let direction = if kind == InvoiceKind::Sale { 1 } else { -1 };
     let postings = [
@@ -1569,32 +1571,36 @@ pub(crate) fn insert_settlement_on_connection(
     Ok((voucher_id, ids))
 }
 
-fn settlement_advance(
+fn settlement_advance_total(
     conn: &Connection,
     company: i64,
     voucher: i64,
     kind: InvoiceKind,
     party: i64,
     bank: i64,
-) -> Result<Option<(i64, i64)>> {
-    let row: Option<(i64, i64, String, i64, i64, bool)> = conn.query_row(
-        "SELECT id, amount, kind, party_ledger_id, bank_ledger_id, reversal_voucher_id IS NOT NULL
-         FROM party_advances WHERE company_id = ?1 AND voucher_id = ?2",
-        params![company, voucher],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-    ).optional()?;
+) -> Result<Option<i64>> {
+    let row: Option<(Option<i64>, String, i64, i64, bool)> = conn
+        .query_row(
+            "SELECT (SELECT SUM(a.amount) FROM party_advances a WHERE a.voucher_id = h.voucher_id),
+                h.kind, h.party_ledger_id, h.bank_ledger_id,
+                h.reversal_voucher_id IS NOT NULL OR h.opening_original_date IS NOT NULL
+         FROM advance_vouchers h WHERE h.company_id = ?1 AND h.voucher_id = ?2",
+            params![company, voucher],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
     match row {
         None => Ok(None),
-        Some((id, amount, stored_kind, stored_party, stored_bank, reversed))
-            if !reversed
+        Some((Some(amount), stored_kind, stored_party, stored_bank, false))
+            if amount > 0
                 && stored_kind == kind.as_str()
                 && stored_party == party
                 && stored_bank == bank =>
         {
-            Ok(Some((id, amount)))
+            Ok(Some(amount))
         }
         Some(_) => Err(Error::Validation(
-            "Settlement and advance are inconsistent".into(),
+            "Settlement and advances are inconsistent".into(),
         )),
     }
 }
@@ -1686,9 +1692,15 @@ pub(crate) fn reverse_settlement_on_connection(
     }
     let (bank, party, kind) =
         common.ok_or_else(|| Error::Validation("Settlement has no allocations".into()))?;
-    let advance = settlement_advance(conn, company_id, settlement_voucher, kind, party, bank)?;
-    if let Some((id, amount)) = advance {
-        crate::advances::check_advance_reversal(conn, company_id, id, reversal_date)?;
+    let advance =
+        settlement_advance_total(conn, company_id, settlement_voucher, kind, party, bank)?;
+    if let Some(amount) = advance {
+        crate::advances::check_advance_voucher_reversal(
+            conn,
+            company_id,
+            settlement_voucher,
+            reversal_date,
+        )?;
         total += i128::from(amount);
     }
     let total = i64::try_from(total)
@@ -1716,11 +1728,11 @@ pub(crate) fn reverse_settlement_on_connection(
         &postings,
     )?;
     conn.execute("INSERT INTO settlement_reversals(company_id, settlement_voucher_id, reversal_voucher_id, reason) VALUES (?1, ?2, ?3, ?4)", params![company_id, settlement_voucher, reversal_voucher, reason])?;
-    if let Some((id, _)) = advance {
+    if advance.is_some() {
         conn.execute(
-            "UPDATE party_advances SET reversal_voucher_id = ?1, reversal_reason = ?2
-             WHERE company_id = ?3 AND id = ?4",
-            params![reversal_voucher, reason, company_id, id],
+            "UPDATE advance_vouchers SET reversal_voucher_id = ?1, reversal_reason = ?2
+             WHERE company_id = ?3 AND voucher_id = ?4",
+            params![reversal_voucher, reason, company_id, settlement_voucher],
         )?;
     }
     Ok(reversal_voucher)
@@ -2956,7 +2968,7 @@ impl Store {
             return Ok(true);
         }
         Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM party_advances WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_accruals WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_payments WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM opening_balances WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?1 AND (original_voucher_id = ?2 OR clearing_voucher_id = ?2))",
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM invoice_reversals WHERE company_id = ?1 AND reversal_voucher_id = ?2 UNION ALL SELECT 1 FROM advance_vouchers WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_accruals WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM payroll_payments WHERE company_id = ?1 AND ?2 IN (voucher_id, reversal_voucher_id) UNION ALL SELECT 1 FROM opening_balances WHERE company_id = ?1 AND voucher_id = ?2 UNION ALL SELECT 1 FROM opening_balance_clears WHERE company_id = ?1 AND (original_voucher_id = ?2 OR clearing_voucher_id = ?2))",
             params![company_id, voucher_id],
             |r| r.get(0),
         )?)
@@ -3271,10 +3283,67 @@ impl Store {
                 "Amount kept on account cannot be negative".into(),
             ));
         }
+        let single = [(advance, None)];
+        let parts = if advance > 0 { &single[..] } else { &[] };
+        self.settle_bills_with_parts(
+            company_id,
+            bank_ledger_id,
+            date,
+            reference,
+            allocations,
+            parts,
+        )
+    }
+
+    /// Save bill settlements and several advance amounts on one cash voucher.
+    pub fn settle_bills_with_advance_parts(
+        &mut self,
+        company_id: i64,
+        bank_ledger_id: i64,
+        date: &str,
+        reference: &str,
+        allocations: &[BillSettlementAllocation],
+        advances: &[crate::advances::AdvancePartDraft],
+    ) -> Result<(i64, Vec<i64>)> {
+        let sources: Vec<_> = advances
+            .iter()
+            .map(crate::advances::AdvancePartDraft::source_bill)
+            .collect();
+        let parts: Vec<_> = advances
+            .iter()
+            .zip(&sources)
+            .map(|(advance, source)| (advance.amount, Some(source)))
+            .collect();
+        self.settle_bills_with_parts(
+            company_id,
+            bank_ledger_id,
+            date,
+            reference,
+            allocations,
+            &parts,
+        )
+    }
+
+    fn settle_bills_with_parts(
+        &mut self,
+        company_id: i64,
+        bank_ledger_id: i64,
+        date: &str,
+        reference: &str,
+        allocations: &[BillSettlementAllocation],
+        parts: &[(i64, Option<&crate::advances::AdvanceSourceBill>)],
+    ) -> Result<(i64, Vec<i64>)> {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let advance_voucher = if advance > 0 {
+        let advance_voucher = if !parts.is_empty() {
+            let advance = i64::try_from(
+                parts
+                    .iter()
+                    .map(|(amount, _)| i128::from(*amount))
+                    .sum::<i128>(),
+            )
+            .map_err(|_| Error::Validation("Advance total is too large".into()))?;
             let first = allocations
                 .first()
                 .ok_or_else(|| Error::Validation("Select at least one invoice".into()))?;
@@ -3294,7 +3363,7 @@ impl Store {
                 .sum::<i128>();
             let settled = i64::try_from(settled)
                 .map_err(|_| Error::Validation("Settlement amount is too large".into()))?;
-            let (_, voucher) = crate::advances::insert_party_advance(
+            let (_, voucher) = crate::advances::insert_party_advance_parts(
                 &tx,
                 company_id,
                 &crate::advances::AdvanceDraft {
@@ -3306,7 +3375,7 @@ impl Store {
                     amount: advance,
                     narration: "Invoice settlement and advance".into(),
                 },
-                None,
+                parts,
                 settled,
             )?;
             Some(voucher)

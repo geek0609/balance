@@ -1,7 +1,7 @@
 use super::{
     money, outstanding_bill_choices, pick_account, pick_settlement_bill, reference_with_bill, App,
 };
-use balance::advances::{AdvanceDraft, PartyAdvance};
+use balance::advances::{AdvanceDraft, AdvancePartDraft, PartyAdvance};
 use balance::inventory::{BillSettlementTarget, InvoiceKind};
 use balance::{parse_amount, Category, Error, Result};
 use eframe::egui;
@@ -14,6 +14,7 @@ struct AdvanceEntry {
     reference: String,
     amount: String,
     narration: String,
+    parts: Vec<AdvancePartForm>,
 }
 impl Default for AdvanceEntry {
     fn default() -> Self {
@@ -25,11 +26,12 @@ impl Default for AdvanceEntry {
             reference: String::new(),
             amount: String::new(),
             narration: String::new(),
+            parts: Vec::new(),
         }
     }
 }
 impl AdvanceEntry {
-    fn draft(&self) -> Result<AdvanceDraft> {
+    fn draft(&self, amount: i64) -> Result<AdvanceDraft> {
         Ok(AdvanceDraft {
             kind: self.kind,
             party_ledger_id: self
@@ -40,10 +42,65 @@ impl AdvanceEntry {
                 .ok_or_else(|| Error::Validation("Select the cash or bank ledger".into()))?,
             date: self.date.clone(),
             reference: self.reference.clone(),
-            amount: parse_amount(&self.amount)?,
+            amount,
             narration: self.narration.clone(),
         })
     }
+}
+
+#[derive(Default)]
+pub(super) struct AdvancePartForm {
+    reference: String,
+    amount: String,
+}
+
+pub(super) fn advance_part_fields(ui: &mut egui::Ui, parts: &mut Vec<AdvancePartForm>) {
+    let mut remove = None;
+    for (index, part) in parts.iter_mut().enumerate() {
+        ui.push_id(("advance-reference", index), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Advance reference");
+                ui.text_edit_singleline(&mut part.reference);
+                ui.label("Amount");
+                ui.text_edit_singleline(&mut part.amount);
+                if ui.button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove {
+        parts.remove(index);
+    }
+    if ui.button("Add advance reference").clicked() {
+        parts.push(AdvancePartForm::default());
+    }
+}
+
+pub(super) fn advance_part_drafts(
+    parts: &[AdvancePartForm],
+    on_account: i64,
+) -> Result<Vec<AdvancePartDraft>> {
+    let mut drafts = Vec::with_capacity(parts.len() + 1);
+    for part in parts {
+        let reference = part.reference.trim();
+        if reference.is_empty() {
+            return Err(Error::Validation(
+                "Enter a reference for each named advance".into(),
+            ));
+        }
+        drafts.push(AdvancePartDraft {
+            reference: reference.into(),
+            amount: parse_amount(&part.amount)?,
+        });
+    }
+    if on_account > 0 {
+        drafts.push(AdvancePartDraft {
+            reference: String::new(),
+            amount: on_account,
+        });
+    }
+    Ok(drafts)
 }
 
 #[derive(Default)]
@@ -163,6 +220,14 @@ impl App {
             } else {
                 ""
             };
+            let reference = advance
+                .source_bill
+                .as_ref()
+                .and_then(|bill| bill.reference.as_deref())
+                .map_or_else(
+                    || advance.reference.clone(),
+                    |name| reference_with_bill(&advance.reference, name),
+                );
             if ui
                 .selectable_label(
                     current,
@@ -171,7 +236,7 @@ impl App {
                         advance.date,
                         kind_label(advance.kind),
                         advance.party,
-                        advance.reference,
+                        reference,
                         money(advance.amount.into())
                     ),
                 )
@@ -229,11 +294,16 @@ impl App {
             &mut form.bank,
             false,
         );
+        let amount_label = if form.parts.is_empty() {
+            "Amount"
+        } else {
+            "On-account amount (optional)"
+        };
         egui::Grid::new("advance-voucher-fields").show(ui, |ui| {
             for (label, field) in [
                 ("Date (YYYY-MM-DD)", &mut form.date),
                 ("Reference", &mut form.reference),
-                ("Amount", &mut form.amount),
+                (amount_label, &mut form.amount),
                 ("Narration", &mut form.narration),
             ] {
                 ui.label(label);
@@ -241,15 +311,39 @@ impl App {
                 ui.end_row();
             }
         });
+        advance_part_fields(ui, &mut form.parts);
         if ui.button("Post advance").clicked() {
-            match form
-                .draft()
-                .and_then(|draft| self.store.post_party_advance(company, &draft))
-            {
+            let result = (|| -> Result<i64> {
+                if form.parts.is_empty() {
+                    let draft = form.draft(parse_amount(&form.amount)?)?;
+                    return self.store.post_party_advance(company, &draft);
+                }
+                let on_account = if form.amount.trim().is_empty() {
+                    0
+                } else {
+                    parse_amount(&form.amount)?
+                };
+                let parts = advance_part_drafts(&form.parts, on_account)?;
+                let total = i64::try_from(
+                    parts
+                        .iter()
+                        .map(|part| i128::from(part.amount))
+                        .sum::<i128>(),
+                )
+                .map_err(|_| Error::Validation("Advance total is too large".into()))?;
+                let ids = self.store.post_party_advance_with_parts(
+                    company,
+                    &form.draft(total)?,
+                    &parts,
+                )?;
+                Ok(ids[0])
+            })();
+            match result {
                 Ok(id) => {
                     form.reference.clear();
                     form.amount.clear();
                     form.narration.clear();
+                    form.parts.clear();
                     self.advance_screen.select(Some(id));
                     self.message = format!("Advance {id} posted");
                 }
@@ -272,8 +366,8 @@ impl App {
         }
         if let Some(bill) = &advance.source_bill {
             ui.label(match &bill.reference {
-                Some(reference) => format!("Imported bill {} | {reference}", bill.kind),
-                None => format!("Imported bill {}", bill.kind),
+                Some(reference) => format!("{} | {reference}", bill.kind),
+                None => bill.kind.clone(),
             });
             if let Some(date) = &bill.due_date {
                 ui.label(format!("Due date {date}"));
@@ -307,7 +401,7 @@ impl App {
                 .id_salt(advance.id)
                 .show(ui, |ui| self.advance_allocation_form(ui, company, advance));
         }
-        let reverse_label = if advance.includes_settlements {
+        let reverse_label = if advance.includes_settlements || advance.shares_voucher {
             "Reverse whole receipt / payment"
         } else {
             "Reverse advance"
@@ -323,8 +417,8 @@ impl App {
         let Some(form) = &mut self.advance_screen.reversal else {
             return;
         };
-        if advance.includes_settlements {
-            ui.label("This reverses the bill allocations and the amount kept on account.");
+        if advance.includes_settlements || advance.shares_voucher {
+            ui.label("This reverses every allocation on the receipt or payment. Release any active applications first.");
         }
         egui::Grid::new(("reverse-advance", advance.id)).show(ui, |ui| {
             for (label, field) in [

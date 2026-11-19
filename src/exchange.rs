@@ -1,8 +1,8 @@
 //! Import of a limited accounting XML interchange format.
 //! Unsupported or ambiguous data is reported before any database writes.
 use crate::advances::{
-    advance_allocation_state, insert_advance_allocation, insert_party_advance, read_party_advances,
-    AdvanceDraft, AdvanceSourceBill,
+    advance_allocation_state, insert_advance_allocation, insert_party_advance_parts,
+    read_party_advances, AdvanceDraft, AdvanceSourceBill,
 };
 use crate::bill_splits::BillSplitDraft;
 use crate::contacts::{insert_new_profile, LedgerProfile};
@@ -175,7 +175,7 @@ struct ImportedBillAllocation {
 #[derive(Debug, Clone)]
 struct ImportedBillUse {
     invoices: Vec<ImportedBillAllocation>,
-    advance: Option<ImportedAdvance>,
+    advances: Vec<ImportedAdvance>,
 }
 #[derive(Debug, Clone)]
 struct ImportedAdvance {
@@ -289,8 +289,8 @@ impl ImportPlan {
     pub fn advance_count(&self) -> usize {
         self.settlements
             .iter()
-            .filter(|row| row.bills.advance.is_some())
-            .count()
+            .map(|row| row.bills.advances.len())
+            .sum()
     }
     pub fn advance_application_count(&self) -> usize {
         self.invoices
@@ -1303,7 +1303,8 @@ fn parse_imported_settlement(
                 ));
             }
             let mut allocations = Vec::new();
-            let mut advance = None;
+            let mut advances = Vec::new();
+            let mut advance_references = HashSet::new();
             let mut seen = HashSet::new();
             for bill in bills {
                 invoice_list_fields(
@@ -1324,11 +1325,6 @@ fn parse_imported_settlement(
                     .ok_or_else(|| Error::Validation("bill amount is too large".into()))?;
                 let credit = direct_text(bill, "BILLCREDITPERIOD").filter(|v| !v.is_empty());
                 if matches!(bill_type.as_str(), "advance" | "new ref" | "on account") {
-                    if advance.is_some() {
-                        return Err(Error::Validation(
-                            "only one advance or on-account allocation per receipt or payment is supported".into(),
-                        ));
-                    }
                     let source = match bill_type.as_str() {
                         "advance" => "Advance",
                         "new ref" => "New Ref",
@@ -1340,6 +1336,15 @@ fn parse_imported_settlement(
                             "a named advance needs a bill reference".into(),
                         ));
                     }
+                    if source != "On Account"
+                        && reference
+                            .as_deref()
+                            .is_some_and(|name| !advance_references.insert(normalized(name)))
+                    {
+                        return Err(Error::Validation(
+                            "A named advance reference occurs more than once".into(),
+                        ));
+                    }
                     let terms = xml_bill_terms(credit.as_deref())?;
                     if source == "On Account" && terms.is_specified() {
                         return Err(Error::Validation(
@@ -1347,7 +1352,7 @@ fn parse_imported_settlement(
                         ));
                     }
                     terms.due_date_from(parse_date(&date)?)?;
-                    advance = Some(ImportedAdvance {
+                    advances.push(ImportedAdvance {
                         amount: value,
                         source_bill: AdvanceSourceBill {
                             kind: source.into(),
@@ -1379,7 +1384,7 @@ fn parse_imported_settlement(
                 .iter()
                 .map(|v| i128::from(v.amount))
                 .sum::<i128>()
-                + advance.as_ref().map_or(0, |v| i128::from(v.amount));
+                + advances.iter().map(|v| i128::from(v.amount)).sum::<i128>();
             if sum != i128::from(amount).abs() {
                 return Err(Error::Validation(
                     "bill allocations do not equal the party amount".into(),
@@ -1387,7 +1392,7 @@ fn parse_imported_settlement(
             }
             let bills = ImportedBillUse {
                 invoices: allocations,
-                advance,
+                advances,
             };
             party = Some((ledger, *existing_id, amount, bills));
         }
@@ -2205,10 +2210,10 @@ fn preview_advance_applications(
         }
     }
     for settlement in &plan.settlements {
-        if let Some(ImportedAdvance {
+        for ImportedAdvance {
             amount,
             source_bill,
-        }) = &settlement.bills.advance
+        } in &settlement.bills.advances
         {
             if let Some(reference) = source_bill.named_reference() {
                 let date = parse_date(&settlement.date)?;
@@ -3787,7 +3792,7 @@ impl Store {
                             "{label}: a voucher with the same type, date and number already exists"
                         ));
                         }
-                        if settlement.bills.advance.is_some()
+                        if !settlement.bills.advances.is_empty()
                             && !advance_references.insert((
                                 normalized(settlement.kind.as_str()),
                                 normalized(&settlement.party),
@@ -4525,15 +4530,24 @@ impl Store {
         };
         let mut advance_vouchers = HashMap::new();
         for (index, settlement) in plan.settlements.iter().enumerate() {
-            let Some(ImportedAdvance {
-                amount,
-                source_bill,
-            }) = &settlement.bills.advance
-            else {
+            if settlement.bills.advances.is_empty() {
                 continue;
-            };
+            }
             let (bank_id, party_id) = settlement_ledgers(settlement)?;
-            let (_, voucher_id) = insert_party_advance(
+            let parts = settlement
+                .bills
+                .advances
+                .iter()
+                .map(|advance| (advance.amount, Some(&advance.source_bill)))
+                .collect::<Vec<_>>();
+            let amount = i64::try_from(
+                parts
+                    .iter()
+                    .map(|(amount, _)| i128::from(*amount))
+                    .sum::<i128>(),
+            )
+            .map_err(|_| Error::Validation("Advance total is too large".into()))?;
+            let (_, voucher_id) = insert_party_advance_parts(
                 &tx,
                 plan.company_id,
                 &AdvanceDraft {
@@ -4542,10 +4556,10 @@ impl Store {
                     bank_ledger_id: bank_id,
                     date: settlement.date.clone(),
                     reference: settlement.reference.clone(),
-                    amount: *amount,
+                    amount,
                     narration: settlement.narration.clone(),
                 },
-                Some(source_bill),
+                &parts,
                 settlement
                     .bills
                     .invoices
@@ -5683,7 +5697,7 @@ mod tests {
             &bill("RC-DEPOSIT", "Agst Ref", -20),
         );
         let allocations = bill("A", "Agst Ref", 25) + &bill("B", "Agst Ref", 35);
-        let deposit = bill("RC-DEPOSIT", "Advance", 30);
+        let deposit = bill("RC-DEPOSIT", "Advance", 20) + &bill("HOLD", "New Ref", 10);
         let xml = |deposit: &str| {
             format!(
                 r#"<ENVELOPE><BODY><DATA><MESSAGE>
@@ -5701,8 +5715,8 @@ mod tests {
                 "do not equal the party",
             ),
             (
-                xml(&(bill("RC-DEPOSIT", "Advance", 20) + &bill("", "On Account", 10))),
-                "only one advance",
+                xml(&(bill("RC-DEPOSIT", "Advance", 20) + &bill("RC-DEPOSIT", "New Ref", 10))),
+                "named advance reference occurs more than once",
             ),
         ] {
             let plan = store
@@ -5728,7 +5742,7 @@ mod tests {
                 counts.advances,
                 counts.advance_applications
             ),
-            (2, 1, 1, 1)
+            (2, 1, 2, 1)
         );
         assert_eq!(store.vouchers(company).unwrap().len(), 3);
         let ledger = |s: &Store, ledger| {
@@ -5749,8 +5763,27 @@ mod tests {
             .invoice_settlements(company, rows[0].invoice_id)
             .unwrap()
             .remove(0);
-        let advance = store.party_advances(company, None).unwrap().remove(0);
+        let advances = store.party_advances(company, None).unwrap();
+        let find = |name: &str| {
+            advances
+                .iter()
+                .find(|advance| {
+                    advance
+                        .source_bill
+                        .as_ref()
+                        .and_then(AdvanceSourceBill::named_reference)
+                        == Some(name)
+                })
+                .unwrap()
+        };
+        let advance = find("RC-DEPOSIT");
+        let held = find("HOLD");
+        assert!(advances
+            .iter()
+            .all(|advance| advance.shares_voucher && advance.includes_settlements));
         assert_eq!(settlement.voucher_id, advance.voucher_id);
+        assert_eq!(settlement.voucher_id, held.voucher_id);
+        assert_eq!((held.amount, held.available), (1000, 1000));
         use crate::cash_flow::{CashClass, CashRole};
         store
             .save_cash_ledger_rule(company, bank, CashRole::Cash, "Test bank classification")
@@ -5765,12 +5798,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             (settlement.amount, advance.amount, advance.available),
-            (6000, 3000, 1000)
+            (6000, 2000, 0)
         );
         assert!(advance.includes_settlements);
         let partial_reversal = store.conn.execute(
-            "UPDATE party_advances SET reversal_voucher_id = ?1, reversal_reason = 'Test partial reversal' WHERE id = ?2",
-            params![settlement.voucher_id, advance.id],
+            "UPDATE advance_vouchers SET reversal_voucher_id = ?1, reversal_reason = 'Test partial reversal' WHERE voucher_id = ?2",
+            params![settlement.voucher_id, advance.voucher_id],
         ).unwrap_err();
         assert!(partial_reversal
             .to_string()
@@ -5785,14 +5818,33 @@ mod tests {
             )
             .is_err());
         assert!(store
-            .reverse_party_advance(company, advance.id, "2026-01-20", "REV", "Test reversal")
+            .reverse_party_advance(company, held.id, "2026-01-20", "REV", "Test reversal")
             .is_err());
         assert_eq!(ledger(&store, bank), 9000);
+        let extra = store
+            .apply_party_advance_to_bill(
+                company,
+                held.id,
+                BillSettlementTarget {
+                    invoice_id: rows[0].invoice_id,
+                    split_id: rows[0].split_id,
+                },
+                "2026-01-16",
+                400,
+                "Apply separately",
+            )
+            .unwrap();
         let history = store
             .advance_allocations(company, advance.id, None)
             .unwrap();
         store
             .release_advance_allocation(company, history[0].id, "2026-01-18", "Test release")
+            .unwrap();
+        assert!(store
+            .reverse_party_advance(company, advance.id, "2026-01-20", "REV", "Test reversal")
+            .is_err());
+        store
+            .release_advance_allocation(company, extra, "2026-01-19", "Test release")
             .unwrap();
         assert!(store
             .reverse_settlement(
@@ -5823,14 +5875,10 @@ mod tests {
                 .reversal_voucher_id,
             Some(reversed)
         );
-        let reversed_advance = store.party_advances(company, None).unwrap().remove(0);
-        assert_eq!(
-            (
-                reversed_advance.available,
-                reversed_advance.reversal.unwrap().voucher_id
-            ),
-            (0, reversed)
-        );
+        let reversed_advances = store.party_advances(company, None).unwrap();
+        assert_eq!(reversed_advances.len(), 2);
+        assert!(reversed_advances.iter().all(|row| row.available == 0
+            && row.reversal.as_ref().map(|r| r.voucher_id) == Some(reversed)));
         for (date, amounts) in [
             ("2026-01-19", vec![1500, 2500, 2000]),
             ("2026-01-20", vec![4000, 6000, 2000]),
@@ -5864,8 +5912,19 @@ mod tests {
             )
             .is_err());
         assert_eq!(store.vouchers(company).unwrap().len(), 4);
+        use crate::advances::AdvancePartDraft;
+        let parts = [
+            AdvancePartDraft {
+                reference: "PHASE-ONE".into(),
+                amount: 200,
+            },
+            AdvancePartDraft {
+                reference: "PHASE-TWO".into(),
+                amount: 300,
+            },
+        ];
         let (native, _) = store
-            .settle_bills_with_advance(
+            .settle_bills_with_advance_parts(
                 company,
                 bank,
                 "2026-01-21",
@@ -5874,12 +5933,17 @@ mod tests {
                     target,
                     amount: 1500,
                 }],
-                500,
+                &parts,
             )
             .unwrap();
         assert_eq!(ledger(&store, bank), 2000);
+        let native_parts = store.party_advances(company, None).unwrap();
         assert_eq!(
-            store.party_advances(company, None).unwrap()[0].available,
+            native_parts
+                .iter()
+                .filter(|row| row.voucher_id == native)
+                .map(|row| row.available)
+                .sum::<i128>(),
             500
         );
         store
@@ -5887,6 +5951,54 @@ mod tests {
             .unwrap();
         assert_eq!(ledger(&store, bank), 0);
         assert_eq!(store.vouchers(company).unwrap().len(), 6);
+
+        let draft = AdvanceDraft {
+            kind: InvoiceKind::Sale,
+            party_ledger_id: customer,
+            bank_ledger_id: bank,
+            date: "2026-01-23".into(),
+            reference: "STANDALONE".into(),
+            amount: 500,
+            narration: "Named advances only".into(),
+        };
+        assert!(store
+            .post_party_advance_with_parts(
+                company,
+                &draft,
+                &[
+                    parts[0].clone(),
+                    AdvancePartDraft {
+                        reference: "phase-one".into(),
+                        amount: 300
+                    },
+                ]
+            )
+            .is_err());
+        assert_eq!(store.vouchers(company).unwrap().len(), 6);
+        let ids = store
+            .post_party_advance_with_parts(company, &draft, &parts)
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ledger(&store, bank), 500);
+        let reversal = store
+            .reverse_party_advance(
+                company,
+                ids[0],
+                "2026-01-24",
+                "ONLY-ADV-REV",
+                "Test reversal",
+            )
+            .unwrap();
+        let saved = store
+            .party_advances(company, None)
+            .unwrap()
+            .into_iter()
+            .filter(|row| ids.contains(&row.id))
+            .collect::<Vec<_>>();
+        assert!(saved.iter().all(|row| row.available == 0
+            && row.reversal.as_ref().map(|r| r.voucher_id) == Some(reversal)));
+        assert_eq!(ledger(&store, bank), 0);
+        assert_eq!(store.vouchers(company).unwrap().len(), 8);
     }
 
     #[test]
