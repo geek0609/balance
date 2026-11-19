@@ -80,6 +80,27 @@ pub(crate) fn migrate_source_bill(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_combined_reversal_guard(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS combined_advance_reversal
+         BEFORE UPDATE OF reversal_voucher_id ON party_advances
+         WHEN NEW.reversal_voucher_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM invoice_settlements
+               WHERE company_id = NEW.company_id AND voucher_id = NEW.voucher_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM settlement_reversals
+               WHERE company_id = NEW.company_id AND settlement_voucher_id = NEW.voucher_id
+                   AND reversal_voucher_id = NEW.reversal_voucher_id
+           )
+         BEGIN
+             SELECT RAISE(ABORT, 'Reverse the entire combined receipt or payment');
+         END;",
+    )?;
+    Ok(())
+}
+
 pub(crate) fn insert_party_advance(
     conn: &Connection,
     company: i64,

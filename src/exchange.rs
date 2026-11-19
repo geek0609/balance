@@ -5107,6 +5107,13 @@ mod tests {
             (6000, 3000, 1000)
         );
         assert!(advance.includes_settlements);
+        let partial_reversal = store.conn.execute(
+            "UPDATE party_advances SET reversal_voucher_id = ?1, reversal_reason = 'Test partial reversal' WHERE id = ?2",
+            params![settlement.voucher_id, advance.id],
+        ).unwrap_err();
+        assert!(partial_reversal
+            .to_string()
+            .contains("Reverse the entire combined receipt or payment"));
         assert!(store
             .reverse_settlement(
                 company,
