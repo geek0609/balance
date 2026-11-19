@@ -252,6 +252,7 @@ mod tests {
         let mut store = Store::from_connection(store.conn).unwrap();
         assert_eq!(store.negative_stock_blocked_from(company).unwrap(), None);
         let mut draft = InvoiceDraft {
+            external_reference: Default::default(),
             kind: InvoiceKind::Purchase,
             entry_mode: crate::inventory::InvoiceEntryMode::Invoice,
             date: "2026-02-01".into(),

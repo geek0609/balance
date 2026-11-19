@@ -58,7 +58,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 88;
+const SCHEMA_VERSION: i64 = 89;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -1035,6 +1035,10 @@ impl Store {
         if version < 88 {
             invoice_returns::migrate_voucher_links(&tx)?;
             tx.pragma_update(None, "user_version", 88)?;
+        }
+        if version < 89 {
+            inventory::migrate_external_invoice_references(&tx)?;
+            tx.pragma_update(None, "user_version", 89)?;
         }
         tx.commit()?;
         Ok(Self { conn })

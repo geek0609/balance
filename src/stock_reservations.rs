@@ -585,6 +585,7 @@ mod tests {
         line: &StockNoteLineDraft,
     ) -> InvoiceDraft {
         InvoiceDraft {
+            external_reference: Default::default(),
             kind,
             entry_mode: crate::inventory::InvoiceEntryMode::Invoice,
             date: DATE.into(),

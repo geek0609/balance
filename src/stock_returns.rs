@@ -507,6 +507,7 @@ mod tests {
         );
 
         let mut invoice = InvoiceDraft {
+            external_reference: Default::default(),
             kind: InvoiceKind::Sale,
             entry_mode: crate::inventory::InvoiceEntryMode::Invoice,
             date: "2026-01-02".into(),

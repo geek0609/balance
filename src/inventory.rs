@@ -213,6 +213,28 @@ pub struct InvoiceAdjustmentDetail {
     pub amount: i64,
     pub description: String,
 }
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InvoiceExternalReference {
+    pub number: Option<String>,
+    pub date: Option<String>,
+}
+
+pub(crate) fn migrate_external_invoice_references(conn: &Connection) -> Result<()> {
+    for table in ["invoices", "invoice_revisions"] {
+        for column in ["external_reference", "external_reference_date"] {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                params![table, column],
+                |row| row.get(0),
+            )?;
+            if !present {
+                conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct InvoiceDraft {
     pub kind: InvoiceKind,
@@ -221,6 +243,7 @@ pub struct InvoiceDraft {
     pub due_date: Option<String>,
     pub credit_days: Option<u32>,
     pub reference: String,
+    pub external_reference: InvoiceExternalReference,
     /// Optional reference for settling the bill. Defaults to the invoice reference.
     pub bill_reference: Option<String>,
     pub bill_splits: Vec<BillSplitDraft>,
@@ -244,6 +267,7 @@ pub struct InvoiceSummary {
     pub due_date: Option<String>,
     pub credit_days: Option<u32>,
     pub reference: String,
+    pub external_reference: InvoiceExternalReference,
     pub bill_reference: String,
     pub bill_splits: Vec<BillSplit>,
     pub party: String,
@@ -319,6 +343,7 @@ pub struct InvoiceRevision {
     pub kind: InvoiceKind,
     pub entry_mode: InvoiceEntryMode,
     pub reference: String,
+    pub external_reference: InvoiceExternalReference,
     pub bill_reference: String,
     pub bill_splits: Vec<BillSplitDraft>,
     pub narration: String,
@@ -473,6 +498,7 @@ struct PreparedInvoice {
     due_date: Option<String>,
     credit_days: Option<u32>,
     reference: String,
+    external_reference: InvoiceExternalReference,
     bill_reference: Option<String>,
     bill_splits: Vec<BillSplitDraft>,
     postings: Vec<Posting>,
@@ -487,6 +513,22 @@ fn prepare_invoice(
 ) -> Result<PreparedInvoice> {
     let invoice_date = parse_date(&draft.date)?;
     let date = invoice_date.format("%Y-%m-%d").to_string();
+    let external_reference = InvoiceExternalReference {
+        number: draft
+            .external_reference
+            .number
+            .as_deref()
+            .map(str::trim)
+            .filter(|number| !number.is_empty())
+            .map(str::to_owned),
+        date: draft
+            .external_reference
+            .date
+            .as_deref()
+            .map(parse_date)
+            .transpose()?
+            .map(|date| date.format("%Y-%m-%d").to_string()),
+    };
     if draft.credit_days.is_some() && draft.due_date.is_some() {
         return Err(Error::Validation(
             "Enter either a due date or a credit period, not both".into(),
@@ -728,6 +770,7 @@ fn prepare_invoice(
         due_date,
         credit_days: draft.credit_days,
         reference,
+        external_reference,
         bill_reference,
         bill_splits,
         postings,
@@ -1047,8 +1090,9 @@ fn insert_invoice(
     write_invoice_postings(conn, voucher_id, draft, postings)?;
     conn.execute(
         "INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id,
-             tax_ledger_id, tax_amount, due_date, credit_days, bill_reference, entry_mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             tax_ledger_id, tax_amount, due_date, credit_days, bill_reference, entry_mode,
+             external_reference, external_reference_date)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             company_id,
             voucher_id,
@@ -1061,6 +1105,8 @@ fn insert_invoice(
             prepared.credit_days,
             prepared.bill_reference,
             draft.entry_mode.as_str(),
+            prepared.external_reference.number,
+            prepared.external_reference.date,
         ],
     )?;
     let invoice_id = conn.last_insert_rowid();
@@ -2697,14 +2743,16 @@ impl Store {
     pub fn invoice_draft(&self, company_id: i64, invoice_id: i64) -> Result<InvoiceDraft> {
         crate::opening_bills::ensure_trade_invoice(&self.conn, company_id, invoice_id)?;
         let (kind, date, reference, narration, party_ledger_id, trade_ledger_id,
-            tax_ledger_id, tax_amount, due_date, credit_days, bill_reference, entry_mode) = self.conn.query_row(
+            tax_ledger_id, tax_amount, due_date, credit_days, bill_reference, entry_mode, external_reference) = self.conn.query_row(
             "SELECT i.kind, v.date, v.reference, v.narration, i.party_ledger_id, i.trade_ledger_id,
-                    i.tax_ledger_id, i.tax_amount, i.due_date, i.credit_days, i.bill_reference, i.entry_mode
+                    i.tax_ledger_id, i.tax_amount, i.due_date, i.credit_days, i.bill_reference, i.entry_mode,
+                    i.external_reference, i.external_reference_date
              FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
              WHERE i.id = ?1 AND i.company_id = ?2",
             params![invoice_id, company_id],
             |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
-                    r.get(6)?, r.get(7)?, r.get(8)?, r.get::<_, Option<u32>>(9)?, r.get(10)?, r.get::<_, String>(11)?)),
+                    r.get(6)?, r.get(7)?, r.get(8)?, r.get::<_, Option<u32>>(9)?, r.get(10)?, r.get::<_, String>(11)?,
+                    InvoiceExternalReference { number: r.get(12)?, date: r.get(13)? })),
         ).map_err(|error| match error {
             rusqlite::Error::QueryReturnedNoRows => {
                 Error::Validation("Invoice not found in the selected company".into())
@@ -2785,6 +2833,7 @@ impl Store {
             },
             credit_days,
             reference,
+            external_reference,
             bill_reference,
             bill_splits: crate::bill_splits::read(&self.conn, invoice_id, None)?
                 .into_iter()
@@ -2885,9 +2934,11 @@ impl Store {
         )?;
         tx.execute(
             "INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id,
-                 trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days, bill_reference, entry_mode)
+                 trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days, bill_reference, entry_mode,
+                 external_reference, external_reference_date)
              SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id,
-                    tax_amount, due_date, credit_days, bill_reference, entry_mode
+                    tax_amount, due_date, credit_days, bill_reference, entry_mode,
+                    external_reference, external_reference_date
              FROM invoices WHERE id = ?2 AND company_id = ?3",
             params![voucher_revision, invoice_id, company_id],
         )?;
@@ -2912,8 +2963,8 @@ impl Store {
         tx.execute(
             "UPDATE invoices SET kind = ?1, party_ledger_id = ?2, trade_ledger_id = ?3,
                  tax_ledger_id = ?4, tax_amount = ?5, due_date = ?6, credit_days = ?7,
-                 bill_reference = ?8, entry_mode = ?9
-             WHERE id = ?10 AND company_id = ?11",
+                 bill_reference = ?8, entry_mode = ?9, external_reference = ?10, external_reference_date = ?11
+             WHERE id = ?12 AND company_id = ?13",
             params![
                 draft.kind.as_str(),
                 draft.party_ledger_id,
@@ -2924,6 +2975,8 @@ impl Store {
                 prepared.credit_days,
                 prepared.bill_reference,
                 draft.entry_mode.as_str(),
+                prepared.external_reference.number,
+                prepared.external_reference.date,
                 invoice_id,
                 company_id
             ],
@@ -2990,7 +3043,8 @@ impl Store {
     ) -> Result<Vec<InvoiceRevision>> {
         let mut stmt = self.conn.prepare(
             "SELECT r.id, r.changed_at, r.kind, v.date, v.reference, v.narration, p.name, t.name,
-                    x.name, r.tax_amount, r.due_date, r.credit_days, COALESCE(r.bill_reference, v.reference), r.entry_mode
+                    x.name, r.tax_amount, r.due_date, r.credit_days, COALESCE(r.bill_reference, v.reference), r.entry_mode,
+                    r.external_reference, r.external_reference_date
              FROM invoice_revisions r JOIN voucher_revisions v ON v.id = r.voucher_revision_id
              JOIN ledgers p ON p.id = r.party_ledger_id JOIN ledgers t ON t.id = r.trade_ledger_id
              LEFT JOIN ledgers x ON x.id = r.tax_ledger_id
@@ -3013,6 +3067,10 @@ impl Store {
                     r.get::<_, Option<u32>>(11)?,
                     r.get::<_, String>(12)?,
                     r.get::<_, String>(13)?,
+                    InvoiceExternalReference {
+                        number: r.get(14)?,
+                        date: r.get(15)?,
+                    },
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3032,6 +3090,7 @@ impl Store {
             credit_days,
             bill_reference,
             entry_mode,
+            external_reference,
         ) in rows
         {
             let mut items = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name, l.id FROM invoice_revision_lines l JOIN invoice_revisions r ON r.id = l.revision_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, r.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.revision_id = ?1 ORDER BY l.id")?;
@@ -3070,6 +3129,7 @@ impl Store {
                 kind: InvoiceKind::parse(&kind)?,
                 entry_mode: InvoiceEntryMode::parse(&entry_mode)?,
                 reference,
+                external_reference,
                 bill_reference,
                 bill_splits: crate::bill_splits::revisions(&self.conn, id)?,
                 narration,
@@ -3088,7 +3148,8 @@ impl Store {
     pub fn invoices(&self, company_id: i64) -> Result<Vec<InvoiceSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.voucher_id, i.kind, v.date, v.reference, l.name, i.tax_amount, i.due_date,
-                    i.credit_days, i.party_ledger_id, x.name, COALESCE(i.bill_reference, v.reference), i.entry_mode
+                    i.credit_days, i.party_ledger_id, x.name, COALESCE(i.bill_reference, v.reference), i.entry_mode,
+                    i.external_reference, i.external_reference_date
              FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id
              LEFT JOIN ledgers x ON x.id = i.tax_ledger_id WHERE i.company_id = ?1 ORDER BY v.date DESC, i.id DESC",
         )?;
@@ -3107,6 +3168,10 @@ impl Store {
                 r.get::<_, Option<String>>(10)?,
                 r.get::<_, String>(11)?,
                 r.get::<_, String>(12)?,
+                InvoiceExternalReference {
+                    number: r.get(13)?,
+                    date: r.get(14)?,
+                },
             ))
         })?;
         let mut result = Vec::new();
@@ -3125,6 +3190,7 @@ impl Store {
                 primary_tax_name,
                 bill_reference,
                 entry_mode,
+                external_reference,
             ) = row?;
             let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name, l.id FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, i.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
             let line_amounts = amounts.query_map([id], |r| {
@@ -3194,6 +3260,7 @@ impl Store {
                 due_date,
                 credit_days,
                 reference,
+                external_reference,
                 bill_reference,
                 bill_splits: crate::bill_splits::read(&self.conn, id, None)?,
                 party,

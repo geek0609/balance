@@ -57,6 +57,16 @@ impl Store {
                     && !invoice.reference.to_lowercase().contains(&search)
                     && !invoice.bill_reference.to_lowercase().contains(&search)
                     && !invoice
+                        .external_reference
+                        .number
+                        .as_ref()
+                        .is_some_and(|number| number.to_lowercase().contains(&search))
+                    && !invoice
+                        .external_reference
+                        .date
+                        .as_ref()
+                        .is_some_and(|date| date.contains(&search))
+                    && !invoice
                         .bill_splits
                         .iter()
                         .any(|bill| bill.reference.to_lowercase().contains(&search))

@@ -12,7 +12,8 @@ use crate::inventory::{
     discounted_line_amount, find_stock_batch, insert_direct_invoice,
     insert_settlement_on_connection, insert_stock_adjustment, parse_quantity,
     BillSettlementAllocation, BillSettlementTarget, InvoiceAdjustment, InvoiceAllocation,
-    InvoiceDiscount, InvoiceDraft, InvoiceEntryMode, InvoiceKind, InvoiceLine, StockInvoicePosting,
+    InvoiceDiscount, InvoiceDraft, InvoiceEntryMode, InvoiceExternalReference, InvoiceKind,
+    InvoiceLine, StockInvoicePosting,
 };
 use crate::opening_bills::OpeningBillDraft;
 use crate::settlement_discounts::SettlementDiscount;
@@ -157,6 +158,7 @@ struct ImportedInvoice {
     entry_mode: InvoiceEntryMode,
     date: String,
     reference: String,
+    external_reference: InvoiceExternalReference,
     bills: Vec<BillSplitDraft>,
     funding_applications: Vec<ImportedFundingApplication>,
     funded_bill_reference: Option<String>,
@@ -242,6 +244,42 @@ struct OriginalReturnInvoice {
     reference: String,
     date: Option<String>,
     existing_id: Option<i64>,
+}
+
+#[derive(Clone)]
+struct StockInvoiceOrigin {
+    voucher_number: String,
+    voucher_date: String,
+    external_reference: InvoiceExternalReference,
+    existing_id: Option<i64>,
+}
+
+impl StockInvoiceOrigin {
+    // Include case variants in ambiguity checks, then require exact source spelling.
+    fn matching_spelling(&self, original: &OriginalReturnInvoice) -> Option<bool> {
+        let key = normalized(&original.reference);
+        [
+            (
+                Some(self.voucher_number.as_str()),
+                Some(self.voucher_date.as_str()),
+            ),
+            (
+                self.external_reference.number.as_deref(),
+                self.external_reference.date.as_deref(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(number, date)| {
+            let number = number?;
+            (normalized(number) == key
+                && original
+                    .date
+                    .as_deref()
+                    .is_none_or(|value| Some(value) == date))
+            .then_some(number == original.reference)
+        })
+        .max()
+    }
 }
 #[derive(Debug, Clone)]
 struct ImportedNoteCredit {
@@ -1310,19 +1348,25 @@ const RETURN_DATE_FIELDS: [&str; 4] = [
     "ORIGINALINVOICEDATE",
     "ORIGINALINVDATE",
 ];
+const INVOICE_REFERENCE_FIELDS: [&str; 2] = ["REFERENCE", "REF"];
+const INVOICE_REFERENCE_DATE_FIELDS: [&str; 2] = ["REFERENCEDATE", "REFDATE"];
 
-fn original_return_invoice(node: Node<'_, '_>) -> Result<Option<OriginalReturnInvoice>> {
-    let mut references = RETURN_REFERENCE_FIELDS
+fn invoice_document_reference(
+    node: Node<'_, '_>,
+    number_fields: &[&str],
+    date_fields: &[&str],
+) -> Result<InvoiceExternalReference> {
+    let mut references = number_fields
         .iter()
         .filter_map(|field| direct_text(node, field))
         .filter(|value| !value.is_empty());
-    let reference = references.next();
-    if references.any(|value| Some(&value) != reference.as_ref()) {
+    let number = references.next();
+    if references.any(|value| Some(&value) != number.as_ref()) {
         return Err(Error::Validation(
-            "Conflicting original invoice references".into(),
+            "Conflicting invoice reference numbers".into(),
         ));
     }
-    let mut dates = RETURN_DATE_FIELDS
+    let mut dates = date_fields
         .iter()
         .filter_map(|field| direct_text(node, field))
         .filter(|value| !value.is_empty())
@@ -1331,16 +1375,22 @@ fn original_return_invoice(node: Node<'_, '_>) -> Result<Option<OriginalReturnIn
     for value in dates {
         if Some(value?) != date {
             return Err(Error::Validation(
-                "Conflicting original invoice dates".into(),
+                "Conflicting invoice reference dates".into(),
             ));
         }
     }
-    if reference.is_none() && date.is_some() {
+    Ok(InvoiceExternalReference { number, date })
+}
+
+fn original_return_invoice(node: Node<'_, '_>) -> Result<Option<OriginalReturnInvoice>> {
+    let InvoiceExternalReference { number, date } =
+        invoice_document_reference(node, &RETURN_REFERENCE_FIELDS, &RETURN_DATE_FIELDS)?;
+    if number.is_none() && date.is_some() {
         return Err(Error::Validation(
             "Original invoice date requires its reference".into(),
         ));
     }
-    Ok(reference.map(|reference| OriginalReturnInvoice {
+    Ok(number.map(|reference| OriginalReturnInvoice {
         reference,
         date,
         existing_id: None,
@@ -1946,6 +1996,10 @@ fn parse_imported_invoice(
             "DATE",
             "VOUCHERTYPENAME",
             "VOUCHERNUMBER",
+            "REFERENCE",
+            "REF",
+            "REFERENCEDATE",
+            "REFDATE",
             "NARRATION",
             "PARTYLEDGERNAME",
             "PERSISTEDVIEW",
@@ -2274,6 +2328,11 @@ fn parse_imported_invoice(
         entry_mode,
         date,
         reference,
+        external_reference: invoice_document_reference(
+            node,
+            &INVOICE_REFERENCE_FIELDS,
+            &INVOICE_REFERENCE_DATE_FIELDS,
+        )?,
         bills,
         funding_applications,
         funded_bill_reference: None,
@@ -2638,6 +2697,23 @@ fn funding_key(kind: InvoiceKind, party: &str, reference: &str) -> ReferenceKey 
         normalized(party),
         normalized(reference),
     )
+}
+
+fn index_stock_origin(
+    origins: &mut HashMap<ReferenceKey, Vec<StockInvoiceOrigin>>,
+    key: ReferenceKey,
+    origin: StockInvoiceOrigin,
+) {
+    if let Some(number) = &origin.external_reference.number {
+        let number_key = normalized(number);
+        if number_key != key.2 {
+            origins
+                .entry((key.0.clone(), key.1.clone(), number_key))
+                .or_default()
+                .push(origin.clone());
+        }
+    }
+    origins.entry(key).or_default().push(origin);
 }
 
 fn add_named_funding(
@@ -3243,47 +3319,49 @@ fn resolve_return_invoice(
 ) -> Result<i64> {
     let invoice = if let Some(original) = &source.original_invoice {
         let mut stmt = conn.prepare_cached(
-            "SELECT i.id, v.reference, v.date FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
-             WHERE i.company_id = ?1 AND i.party_ledger_id = ?2 AND i.kind = ?3",
+            "SELECT i.id, v.reference, v.date, i.external_reference, i.external_reference_date
+             FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
+             WHERE i.company_id = ?1 AND i.party_ledger_id = ?2 AND i.kind = ?3
+               AND EXISTS(SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id)
+               AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)",
         )?;
         let mut candidates = Vec::new();
         for row in stmt.query_map(params![company, party, source.kind.as_str()], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok(StockInvoiceOrigin {
+                existing_id: Some(row.get(0)?),
+                voucher_number: row.get(1)?,
+                voucher_date: row.get(2)?,
+                external_reference: InvoiceExternalReference {
+                    number: row.get(3)?,
+                    date: row.get(4)?,
+                },
+            })
         })? {
-            let (id, reference, date) = row?;
-            if normalized(&reference) == normalized(&original.reference)
-                && original
-                    .date
-                    .as_ref()
-                    .is_none_or(|expected| expected == &date)
-            {
-                candidates.push((id, reference, date));
+            let candidate = row?;
+            if let Some(exact) = candidate.matching_spelling(original) {
+                candidates.push((candidate, exact));
             }
         }
-        let [(invoice, reference, date)] = candidates.as_slice() else {
+        let [(candidate, exact)] = candidates.as_slice() else {
             return Err(Error::Validation(
                 "Original invoice is missing or ambiguous".into(),
             ));
         };
-        if reference != &original.reference
+        if !exact
             || original
                 .existing_id
-                .is_some_and(|expected| expected != *invoice)
+                .is_some_and(|expected| Some(expected) != candidate.existing_id)
         {
             return Err(Error::Validation(
                 "Original invoice changed since preview".into(),
             ));
         }
-        if parse_date(date)? > parse_date(&source.date)? {
+        if parse_date(&candidate.voucher_date)? > parse_date(&source.date)? {
             return Err(Error::Validation(
                 "Return cannot precede the original invoice".into(),
             ));
         }
-        *invoice
+        candidate.existing_id.expect("saved invoice has an ID")
     } else {
         bills
             .first()
@@ -5065,7 +5143,7 @@ impl Store {
             }
             let mut invoice_balances = HashMap::<ReferenceKey, PreviewBill>::new();
             let mut payment_references = HashMap::<ReferenceKey, HashSet<String>>::new();
-            let mut stock_origins = HashMap::<ReferenceKey, Vec<OriginalReturnInvoice>>::new();
+            let mut stock_origins = HashMap::<ReferenceKey, Vec<StockInvoiceOrigin>>::new();
             for invoice in self.invoices(company_id)? {
                 let mut latest_reversal = crate::advances::invoice_allocation_state(
                     &self.conn, company_id, invoice.id, None,
@@ -5081,10 +5159,13 @@ impl Store {
                     normalized(&invoice.reference),
                 );
                 if !invoice.lines.is_empty() && invoice.reversal.is_none() {
-                    stock_origins.entry(invoice_key.clone()).or_default().push(
-                        OriginalReturnInvoice {
-                            reference: invoice.reference.clone(),
-                            date: Some(invoice.date.clone()),
+                    index_stock_origin(
+                        &mut stock_origins,
+                        invoice_key.clone(),
+                        StockInvoiceOrigin {
+                            voucher_number: invoice.reference.clone(),
+                            voucher_date: invoice.date.clone(),
+                            external_reference: invoice.external_reference,
                             existing_id: Some(invoice.id),
                         },
                     );
@@ -5164,10 +5245,13 @@ impl Store {
                     normalized(&invoice.reference),
                 );
                 if !invoice.lines.is_empty() {
-                    stock_origins.entry(invoice_key.clone()).or_default().push(
-                        OriginalReturnInvoice {
-                            reference: invoice.reference.clone(),
-                            date: Some(invoice.date.clone()),
+                    index_stock_origin(
+                        &mut stock_origins,
+                        invoice_key.clone(),
+                        StockInvoiceOrigin {
+                            voucher_number: invoice.reference.clone(),
+                            voucher_date: invoice.date.clone(),
+                            external_reference: invoice.external_reference.clone(),
                             existing_id: None,
                         },
                     );
@@ -5277,26 +5361,30 @@ impl Store {
                         let party = &row.lines[row.party_index].0.ledger;
                         let origin_key = if let Some(original) = &mut row.original_invoice {
                             let key = funding_key(row.kind, party, &original.reference);
-                            let mut candidates = stock_origins
-                                .get(&key)
-                                .into_iter()
-                                .flatten()
-                                .filter(|candidate| {
-                                    original
-                                        .date
-                                        .as_ref()
-                                        .is_none_or(|date| Some(date) == candidate.date.as_ref())
-                                });
+                            let mut candidates =
+                                stock_origins.get(&key).into_iter().flatten().filter_map(
+                                    |candidate| {
+                                        candidate
+                                            .matching_spelling(original)
+                                            .map(|exact| (candidate, exact))
+                                    },
+                                );
                             match (candidates.next(), candidates.next()) {
-                                    (Some(candidate), None) if candidate.reference == original.reference => {
-                                        if candidate.date.as_ref().is_some_and(|date| date > &row.date) {
-                                            plan.issues.push(format!("Voucher {}: return precedes its original invoice", row.reference));
-                                        }
-                                        original.existing_id = candidate.existing_id;
+                                (Some((candidate, true)), None) => {
+                                    if candidate.voucher_date > row.date {
+                                        plan.issues.push(format!(
+                                            "Voucher {}: return precedes its original invoice",
+                                            row.reference
+                                        ));
                                     }
-                                    _ => plan.issues.push(format!("Voucher {}: original stock invoice {} is unavailable or ambiguous", row.reference, original.reference)),
+                                    original.existing_id = candidate.existing_id;
+                                    Some(funding_key(row.kind, party, &candidate.voucher_number))
                                 }
-                            Some(key)
+                                _ => {
+                                    plan.issues.push(format!("Voucher {}: original stock invoice {} is unavailable or ambiguous", row.reference, original.reference));
+                                    None
+                                }
+                            }
                         } else {
                             None
                         };
@@ -6109,6 +6197,7 @@ impl Store {
                     None
                 },
                 reference: invoice.reference.clone(),
+                external_reference: invoice.external_reference.clone(),
                 bill_reference: (invoice.bills.len() == 1)
                     .then(|| invoice.bills[0].reference.clone()),
                 bill_splits: if invoice.bills.len() > 1 {
@@ -6431,6 +6520,8 @@ mod tests {
                 "<VOUCHER><DATE>{date}</DATE><VOUCHERTYPENAME>{kind}</VOUCHERTYPENAME><VOUCHERNUMBER>{reference}</VOUCHERNUMBER><PARTYLEDGERNAME>Party</PARTYLEDGERNAME><ISINVOICE>{mode}</ISINVOICE>{contents}</VOUCHER>"
             )
             };
+            let external =
+                "<REFERENCE>EXTERNAL-17</REFERENCE><REFERENCEDATE>20260331</REFERENCEDATE>";
             let invoice = voucher(
                 "20260402",
                 invoice_kind,
@@ -6441,15 +6532,19 @@ mod tests {
                     -sign * 44,
                     bill("FIRST", "New Ref", -sign * 15) + &bill("SECOND", "New Ref", -sign * 29),
                 ) + &stock("ALLINVENTORYENTRIES.LIST", 2, 10, sign)
-                    + &lines("Charge", sign * 4, String::new()),
+                    + &lines("Charge", sign * 4, String::new())
+                    + external,
             );
+            let external_origin =
+                "<ORIGINALINVNO>EXTERNAL-17</ORIGINALINVNO><ORIGINALINVDATE>20260331</ORIGINALINVDATE>";
             let note = |rate| {
                 let contents = lines(
                     "Party",
                     sign * (rate * 2 + 2),
                     bill("FIRST", "Agst Ref", sign * 5)
                         + &bill("SECOND", "Agst Ref", sign * (rate * 2 - 3)),
-                ) + &lines("Charge", -sign * 2, String::new());
+                ) + &lines("Charge", -sign * 2, String::new())
+                    + external_origin;
                 if sign == 1 {
                     voucher(
                         "20260403",
@@ -6492,6 +6587,77 @@ mod tests {
                     xml(&(note(rate) + &invoice))
                 }
             };
+            let wrong_date = input(10).replace(
+                "<ORIGINALINVDATE>20260331</ORIGINALINVDATE>",
+                "<ORIGINALINVDATE>20260402</ORIGINALINVDATE>",
+            );
+            assert!(store
+                .preview_xml_import(company, wrong_date.as_bytes())
+                .unwrap()
+                .issues()
+                .iter()
+                .any(|issue| issue.contains("original stock invoice EXTERNAL-17 is unavailable")));
+            let premature = input(10).replace("<DATE>20260403</DATE>", "<DATE>20260401</DATE>");
+            assert!(store
+                .preview_xml_import(company, premature.as_bytes())
+                .unwrap()
+                .issues()
+                .iter()
+                .any(|issue| issue.contains("return precedes its original invoice")));
+            let second_invoice = invoice
+                .replace(">INV<", ">INV-SECOND<")
+                .replace(">FIRST<", ">OTHER-FIRST<")
+                .replace(">SECOND<", ">OTHER-SECOND<")
+                .replace(">20260331<", ">20260330<");
+            let ambiguous_note =
+                note(10).replace("<ORIGINALINVDATE>20260331</ORIGINALINVDATE>", "");
+            let mut ambiguous = ambiguous_note + &second_invoice;
+            if !standalone {
+                ambiguous.push_str(&invoice);
+            }
+            assert!(store
+                .preview_xml_import(company, xml(&ambiguous).as_bytes())
+                .unwrap()
+                .issues()
+                .iter()
+                .any(|issue| issue
+                    .contains("original stock invoice EXTERNAL-17 is unavailable or ambiguous")));
+            let mut different_invoice = note(10).replace(
+                "<ORIGINALINVDATE>20260331</ORIGINALINVDATE>",
+                "<ORIGINALINVDATE>20260330</ORIGINALINVDATE>",
+            ) + &second_invoice;
+            if !standalone {
+                different_invoice.push_str(&invoice);
+            }
+            assert!(store
+                .preview_xml_import(company, xml(&different_invoice).as_bytes())
+                .unwrap()
+                .issues()
+                .iter()
+                .any(|issue| issue
+                    .contains("belongs to a different invoice than the returned stock")));
+            if standalone {
+                let saved = store
+                    .invoice_register(company, None, None, None, None, "external-17")
+                    .unwrap()
+                    .remove(0);
+                let original = store.invoice_draft(company, saved.id).unwrap();
+                assert_eq!(original.external_reference, saved.external_reference);
+                let mut revised = original.clone();
+                revised.external_reference.number = Some("SUPPLIER-EDIT".into());
+                let stale = store
+                    .preview_xml_import(company, input(10).as_bytes())
+                    .unwrap();
+                assert!(stale.can_apply(), "{:?}", stale.issues());
+                store.update_invoice(company, saved.id, &revised).unwrap();
+                assert!(store.apply_xml_import(&stale).is_err());
+                assert_eq!(store.vouchers(company).unwrap().len(), 1);
+                assert_eq!(
+                    store.invoice_revisions(company, saved.id).unwrap()[0].external_reference,
+                    original.external_reference
+                );
+                store.update_invoice(company, saved.id, &original).unwrap();
+            }
             let wrong_location = input(10).replacen(
                 "<GODOWNNAME>West</GODOWNNAME><BATCHNAME>A</BATCHNAME>",
                 "<GODOWNNAME>East</GODOWNNAME><BATCHNAME>A</BATCHNAME>",
@@ -6516,6 +6682,16 @@ mod tests {
             assert!(plan.can_apply(), "{:?}", plan.issues());
             assert_eq!(store.apply_xml_import(&plan).unwrap().bill_notes, 1);
             let invoice = store.invoices(company).unwrap().remove(0);
+            assert_eq!(invoice.reference, "INV");
+            assert_eq!(invoice.date, "2026-04-02");
+            assert_eq!(
+                invoice.external_reference.number.as_deref(),
+                Some("EXTERNAL-17")
+            );
+            assert_eq!(
+                invoice.external_reference.date.as_deref(),
+                Some("2026-03-31")
+            );
             let saved = store
                 .invoice_credit_notes(company, invoice.id)
                 .unwrap()
@@ -6626,7 +6802,7 @@ mod tests {
             let origin = if sign == 1 {
                 "<REFERENCE>INV</REFERENCE><REFERENCEDATE>20260402</REFERENCEDATE>"
             } else {
-                "<ORIGINALINVOICENUMBER>INV</ORIGINALINVOICENUMBER><ORIGINALINVOICEDATE>2026-04-02</ORIGINALINVOICEDATE>"
+                external_origin
             };
             let return_with_credit = voucher(
                 "20260406",
@@ -6637,14 +6813,15 @@ mod tests {
             );
             let wrong_day = return_with_credit
                 .replace("20260402", "20260401")
-                .replace("2026-04-02", "2026-04-01");
+                .replace("20260331", "20260402");
             let invalid = store
                 .preview_xml_import(company, xml(&wrong_day).as_bytes())
                 .unwrap();
             assert!(invalid
                 .issues()
                 .iter()
-                .any(|issue| issue.contains("original stock invoice INV is unavailable")));
+                .any(|issue| issue.contains("original stock invoice")
+                    && issue.contains("is unavailable")));
             let later = voucher(
                 "20260407",
                 invoice_kind,
@@ -9595,6 +9772,7 @@ mod tests {
             entry_mode: InvoiceEntryMode::Invoice,
             date: date.into(),
             reference: "SELL-01".into(),
+            external_reference: Default::default(),
             bills: vec![BillSplitDraft {
                 reference: "SELL-01".into(),
                 amount: 3000,

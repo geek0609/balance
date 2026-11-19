@@ -8,7 +8,8 @@ use balance::exchange::{ImportPlan, MAX_XML_IMPORT_BYTES};
 use balance::inventory::{
     discounted_line_amount, format_quantity, parse_quantity, BillSettlementAllocation,
     BillSettlementTarget, InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft,
-    InvoiceEntryMode, InvoiceKind, InvoiceLine, StockBatch, StockItem, StockLocation,
+    InvoiceEntryMode, InvoiceExternalReference, InvoiceKind, InvoiceLine, StockBatch, StockItem,
+    StockLocation,
 };
 use balance::pricing::PriceList;
 use balance::reorder::ReorderRule;
@@ -242,6 +243,8 @@ struct App {
     invoice_due_date: String,
     invoice_credit_days: String,
     invoice_reference: String,
+    invoice_external_number: String,
+    invoice_external_date: String,
     invoice_bill_reference: String,
     invoice_bill_splits: Vec<BillSplitForm>,
     invoice_narration: String,
@@ -556,6 +559,8 @@ impl App {
             invoice_due_date: String::new(),
             invoice_credit_days: String::new(),
             invoice_reference: String::new(),
+            invoice_external_number: String::new(),
+            invoice_external_date: String::new(),
             invoice_bill_reference: String::new(),
             invoice_bill_splits: Vec::new(),
             invoice_narration: String::new(),
@@ -729,6 +734,8 @@ impl App {
         self.currency_screen = CurrencyScreen::default();
         self.cash_flow_screen = CashFlowScreen::default();
         self.invoice_reference.clear();
+        self.invoice_external_number.clear();
+        self.invoice_external_date.clear();
         self.invoice_bill_reference.clear();
         self.invoice_bill_splits.clear();
         self.invoice_narration.clear();
@@ -3257,6 +3264,8 @@ impl App {
         self.invoice_trade = None;
         self.invoice_date.clear();
         self.invoice_reference.clear();
+        self.invoice_external_number.clear();
+        self.invoice_external_date.clear();
         self.invoice_bill_reference.clear();
         self.invoice_bill_splits.clear();
         self.invoice_narration.clear();
@@ -3297,6 +3306,13 @@ impl App {
         } else {
             String::new()
         };
+        if edit.is_some() {
+            self.invoice_external_number = draft.external_reference.number.unwrap_or_default();
+            self.invoice_external_date = draft.external_reference.date.unwrap_or_default();
+        } else {
+            self.invoice_external_number.clear();
+            self.invoice_external_date.clear();
+        }
         self.invoice_bill_reference = if edit.is_some() {
             draft.bill_reference.unwrap_or_default()
         } else {
@@ -3516,6 +3532,20 @@ impl App {
             }
             ui.label("Reference");
             ui.text_edit_singleline(&mut self.invoice_reference);
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(if self.invoice_kind == InvoiceKind::Purchase {
+                "Supplier invoice number"
+            } else {
+                "External invoice number"
+            });
+            ui.text_edit_singleline(&mut self.invoice_external_number);
+            ui.label("External invoice date");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.invoice_external_date)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(100.0),
+            );
         });
         ui.horizontal(|ui| {
             egui::ComboBox::from_label("Entry mode")
@@ -3921,6 +3951,8 @@ impl App {
             self.invoice_party = None;
             self.invoice_trade = None;
             self.invoice_reference.clear();
+            self.invoice_external_number.clear();
+            self.invoice_external_date.clear();
             self.invoice_bill_reference.clear();
             self.invoice_bill_splits.clear();
             self.invoice_narration.clear();
@@ -4028,6 +4060,12 @@ impl App {
                         )
                     },
                     reference: self.invoice_reference.clone(),
+                    external_reference: InvoiceExternalReference {
+                        number: (!self.invoice_external_number.trim().is_empty())
+                            .then(|| self.invoice_external_number.trim().to_owned()),
+                        date: (!self.invoice_external_date.trim().is_empty())
+                            .then(|| self.invoice_external_date.trim().to_owned()),
+                    },
                     bill_reference: (!self.invoice_bill_reference.trim().is_empty())
                         .then(|| self.invoice_bill_reference.trim().to_owned()),
                     bill_splits: self
@@ -4081,6 +4119,8 @@ impl App {
                 Ok(id) => {
                     self.message = format!("Invoice {id} saved");
                     self.invoice_reference.clear();
+                    self.invoice_external_number.clear();
+                    self.invoice_external_date.clear();
                     self.invoice_bill_reference.clear();
                     self.invoice_bill_splits.clear();
                     self.invoice_narration.clear();
@@ -4348,6 +4388,9 @@ impl App {
                     if let Some(bill) = &invoice.opening_bill {
                         ui.label(format!("Original bill date {}", bill.original_date));
                     }
+                    if let Some(reference) = external_invoice_label(&invoice.external_reference) {
+                        ui.label(format!("External invoice {reference}"));
+                    }
                     for bill in &invoice.bill_splits {
                         ui.label(format!(
                             "Bill {} · {} · Due {} · Settled {} · Advances {} · Credits {} · Outstanding {}",
@@ -4551,6 +4594,11 @@ impl App {
                                             ),
                                             revision.party
                                         ));
+                                        if let Some(reference) =
+                                            external_invoice_label(&revision.external_reference)
+                                        {
+                                            ui.label(format!("External invoice {reference}"));
+                                        }
                                         ui.label(format!("Trade ledger: {}", revision.trade));
                                         if let Some(calculated) = &revision.tax_calculation {
                                             ui.small(format!(
@@ -5471,7 +5519,7 @@ impl App {
             true,
         );
         ui.horizontal(|ui| {
-            ui.label("Search party, invoice or bill reference, or invoice ID");
+            ui.label("Search party, reference, or invoice ID");
             ui.text_edit_singleline(&mut self.invoice_register_search);
         });
         let from = (!self.invoice_register_from.trim().is_empty())
@@ -5512,6 +5560,7 @@ impl App {
                             "Invoice",
                             "Party",
                             "Reference / bill",
+                            "External invoice",
                             "Due",
                             "Original total",
                             "Reversed on",
@@ -5536,6 +5585,10 @@ impl App {
                                 &invoice.reference,
                                 &invoice.bill_reference,
                             ));
+                            ui.label(
+                                external_invoice_label(&invoice.external_reference)
+                                    .unwrap_or_default(),
+                            );
                             ui.label(invoice.due_date.as_deref().unwrap_or("—"));
                             ui.label(money(invoice.total));
                             ui.label(
@@ -6062,6 +6115,14 @@ fn reference_with_bill(reference: &str, bill_reference: &str) -> String {
         reference.to_owned()
     } else {
         format!("{reference} · Bill {bill_reference}")
+    }
+}
+
+fn external_invoice_label(reference: &InvoiceExternalReference) -> Option<String> {
+    match (&reference.number, &reference.date) {
+        (Some(number), Some(date)) => Some(format!("{number} · {date}")),
+        (Some(value), None) | (None, Some(value)) => Some(value.clone()),
+        (None, None) => None,
     }
 }
 

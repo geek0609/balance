@@ -1006,6 +1006,7 @@ mod combined_billing_tests {
             sources.push(store.stock_note_lines(company, note).unwrap()[0].id);
         }
         let mut draft = InvoiceDraft {
+            external_reference: Default::default(),
             kind: InvoiceKind::Sale,
             entry_mode: crate::inventory::InvoiceEntryMode::Invoice,
             date: "2026-04-02".into(),

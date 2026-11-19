@@ -671,6 +671,12 @@ impl Store {
                 escape(&invoice.bill_reference)
             );
         }
+        if let Some(number) = &invoice.external_reference.number {
+            let _ = write!(html, "<br>External invoice number: {}", escape(number));
+        }
+        if let Some(date) = &invoice.external_reference.date {
+            let _ = write!(html, "<br>External invoice date: {}", escape(date));
+        }
         for bill in &invoice.bill_splits {
             let _ = write!(
                 html,

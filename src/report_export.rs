@@ -1118,6 +1118,8 @@ impl Store {
             "bill_reference",
             "entry_mode",
             "split_bill_references",
+            "external_invoice_number",
+            "external_invoice_date",
         ]);
         let mut csv = writer();
         contextual_row(
@@ -1196,6 +1198,8 @@ impl Store {
                             .collect::<Vec<_>>()
                             .join(" | "),
                     ),
+                    text_cell(invoice.external_reference.number.as_deref().unwrap_or("")),
+                    invoice.external_reference.date.unwrap_or_default(),
                 ],
             )?;
         }
