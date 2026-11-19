@@ -1466,7 +1466,15 @@ impl App {
                     hold.reason
                 ));
                 if let Some(date) = &hold.expires_on {
-                    ui.label(format!("Expiry at the end of {date}"));
+                    if hold.expired_quantity > 0 {
+                        ui.label(format!(
+                            "{} {} expired at the end of {date}",
+                            format_quantity(hold.expired_quantity.into()),
+                            hold.unit,
+                        ));
+                    } else {
+                        ui.label(format!("Expiry at the end of {date}"));
+                    }
                 }
                 for event in self
                     .store

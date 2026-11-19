@@ -109,6 +109,7 @@ pub struct StockReservation {
     pub reserved_at: String,
     pub reason: String,
     pub expires_on: Option<String>,
+    pub expired_quantity: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -126,8 +127,14 @@ pub(crate) fn order_reservations(
 ) -> Result<Vec<StockReservation>> {
     let mut stmt = conn.prepare_cached(
         "SELECT r.id, r.item_id, s.name, s.unit, r.location_id, l.name,
-                r.batch_id, b.name, r.quantity, r.remaining, r.reserved_at, r.reason, r.expires_on
+                r.batch_id, b.name, r.quantity, r.remaining, r.reserved_at, r.reason, r.expires_on,
+                CASE WHEN r.expires_on < date('now', 'localtime')
+                     AND (o.closed_at IS NULL OR date(o.closed_at, 'localtime') > r.expires_on)
+                     THEN r.quantity - COALESCE((
+                         SELECT SUM(e.quantity) FROM stock_reservation_releases e WHERE e.reservation_id = r.id
+                     ), 0) ELSE 0 END
          FROM active_stock_reservation_balances r JOIN stock_items s ON s.id = r.item_id
+         JOIN orders o ON o.id = r.order_id
          JOIN stock_locations l ON l.id = r.location_id LEFT JOIN stock_batches b ON b.id = r.batch_id
          WHERE r.company_id = ?1 AND r.order_id = ?2 ORDER BY r.id",
     )?;
@@ -146,6 +153,7 @@ pub(crate) fn order_reservations(
             reserved_at: row.get(10)?,
             reason: row.get(11)?,
             expires_on: row.get(12)?,
+            expired_quantity: row.get(13)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -497,6 +505,9 @@ mod tests {
         store
             .adjust_stock(company, item, &tomorrow, -3000, "Issue after expiry")
             .unwrap();
+        store
+            .release_order_stock(company, order, id, 1000, "Partial release")
+            .unwrap();
         store.conn.execute(
             "UPDATE stock_reservation_expiries SET expires_on = date('now','localtime','-1 day') WHERE reservation_id = ?1",
             [id],
@@ -505,6 +516,11 @@ mod tests {
         let detail = store.order_detail(company, order).unwrap();
         assert_eq!(detail.reservations[0].id, id);
         assert_eq!(detail.reservations[0].remaining, 0);
+        assert_eq!(detail.reservations[0].expired_quantity, 3000);
+        assert_eq!(
+            store.stock_reservation_history(company, order, id).unwrap()[0].quantity,
+            1000
+        );
         assert_eq!(detail.lines[0].unfulfilled(), 5000);
         store
             .reserve_order_stock(
@@ -516,6 +532,13 @@ mod tests {
                 },
             )
             .unwrap();
+        store
+            .close_order(company, order, "Order cancelled")
+            .unwrap();
+        assert_eq!(
+            store.order_detail(company, order).unwrap().reservations[0].expired_quantity,
+            3000
+        );
     }
     use super::*;
     use crate::inventory::{
