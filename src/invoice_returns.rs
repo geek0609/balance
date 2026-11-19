@@ -581,6 +581,11 @@ pub(crate) struct ImportedReturnAllocation {
     pub amount: i64,
 }
 
+pub(crate) struct PreparedImportedReturn {
+    plans: Vec<ReturnPlan>,
+    pub(crate) amounts_match_original: bool,
+}
+
 pub(crate) fn insert_imported_return(
     conn: &Connection,
     company: i64,
@@ -588,11 +593,10 @@ pub(crate) fn insert_imported_return(
     date: NaiveDate,
     reference: &str,
     reason: &str,
-    allocations_from_xml: &[ImportedReturnAllocation],
+    prepared: PreparedImportedReturn,
     bills: &[crate::invoice_credits::NoteBillAllocation],
     adjustments: &[CreditLineDraft],
 ) -> Result<i64> {
-    let planned = plan_imported_return(conn, company, invoice, allocations_from_xml)?;
     post_planned_return(
         conn,
         company,
@@ -600,18 +604,18 @@ pub(crate) fn insert_imported_return(
         date,
         reference,
         reason,
-        planned,
+        prepared.plans,
         adjustments,
         Some(bills),
     )
 }
 
-fn plan_imported_return(
+pub(crate) fn prepare_imported_return(
     conn: &Connection,
     company: i64,
     invoice: i64,
     allocations_from_xml: &[ImportedReturnAllocation],
-) -> Result<Vec<ReturnPlan>> {
+) -> Result<PreparedImportedReturn> {
     let original = allocations(conn, company, invoice)?;
     let mut lines = Vec::with_capacity(allocations_from_xml.len());
     for requested in allocations_from_xml {
@@ -638,15 +642,16 @@ fn plan_imported_return(
             quantity: requested.quantity,
         });
     }
-    let planned = plan(conn, company, invoice, &lines)?;
-    for (stock, requested) in planned.iter().zip(allocations_from_xml) {
-        if stock.net_amount != requested.amount {
-            return Err(Error::Validation(
-                "Return amount differs from the original invoice allocation".into(),
-            ));
-        }
+    let mut plans = plan(conn, company, invoice, &lines)?;
+    let mut amounts_match_original = true;
+    for (stock, requested) in plans.iter_mut().zip(allocations_from_xml) {
+        amounts_match_original &= stock.net_amount == requested.amount;
+        stock.net_amount = requested.amount;
     }
-    Ok(planned)
+    Ok(PreparedImportedReturn {
+        plans,
+        amounts_match_original,
+    })
 }
 
 pub(crate) fn attach_imported_stock_return(
@@ -656,9 +661,8 @@ pub(crate) fn attach_imported_stock_return(
     voucher: i64,
     date: NaiveDate,
     reference: &str,
-    allocations_from_xml: &[ImportedReturnAllocation],
+    prepared: PreparedImportedReturn,
 ) -> Result<()> {
-    let planned = plan_imported_return(conn, company, invoice, allocations_from_xml)?;
     write_return_movements(
         conn,
         company,
@@ -667,7 +671,7 @@ pub(crate) fn attach_imported_stock_return(
         date,
         reference,
         "Imported stock return",
-        planned,
+        prepared.plans,
     )
 }
 

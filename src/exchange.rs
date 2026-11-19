@@ -3312,10 +3312,6 @@ fn apply_stock_return(
     source: &ImportedBillNote,
     voucher: Option<i64>,
 ) -> Result<()> {
-    let kind = source.voucher_kind();
-    if voucher.is_none() {
-        check_new_bill_voucher(conn, company, kind, &source.date, &source.reference)?;
-    }
     let (party, existing) = &source.lines[source.party_index];
     let party_id = import_ledger(conn, company, &party.ledger, *existing)?;
     let bills = resolve_imported_bill_allocations(
@@ -3420,6 +3416,14 @@ fn apply_stock_return(
     } else {
         -1
     };
+    if item_amounts
+        .iter()
+        .any(|(ledger, items)| sign * expected.get(ledger).copied().unwrap_or_default() < *items)
+    {
+        return Err(Error::Validation(
+            "Return ledger postings do not cover the returned item amounts".into(),
+        ));
+    }
     let components = crate::invoice_credits::credit_components(conn, company, invoice)?;
     let mut adjustments = Vec::new();
     for (&ledger, &amount) in &expected {
@@ -3454,6 +3458,14 @@ fn apply_stock_return(
             amount,
         });
     }
+    let prepared = crate::invoice_returns::prepare_imported_return(conn, company, invoice, &stock)?;
+    let voucher = match voucher {
+        Some(voucher) => Some(voucher),
+        None if !prepared.amounts_match_original => {
+            Some(post_imported_bill_note(conn, company, source)?.0)
+        }
+        None => None,
+    };
     if let Some(voucher) = voucher {
         crate::invoice_returns::attach_imported_stock_return(
             conn,
@@ -3462,7 +3474,7 @@ fn apply_stock_return(
             voucher,
             parse_date(&source.date)?,
             &source.reference,
-            &stock,
+            prepared,
         )?;
         return write_note_bill_allocations(conn, voucher, &bills);
     }
@@ -3471,6 +3483,13 @@ fn apply_stock_return(
     } else {
         &source.narration
     };
+    check_new_bill_voucher(
+        conn,
+        company,
+        source.voucher_kind(),
+        &source.date,
+        &source.reference,
+    )?;
     let note = crate::invoice_returns::insert_imported_return(
         conn,
         company,
@@ -3478,7 +3497,7 @@ fn apply_stock_return(
         parse_date(&source.date)?,
         &source.reference,
         reason,
-        &stock,
+        prepared,
         &allocations,
         &adjustments,
     )?;
@@ -6473,15 +6492,20 @@ mod tests {
                     xml(&(note(rate) + &invoice))
                 }
             };
+            let wrong_location = input(10).replacen(
+                "<GODOWNNAME>West</GODOWNNAME><BATCHNAME>A</BATCHNAME>",
+                "<GODOWNNAME>East</GODOWNNAME><BATCHNAME>A</BATCHNAME>",
+                1,
+            );
             let plan = store
-                .preview_xml_import(company, input(8).as_bytes())
+                .preview_xml_import(company, wrong_location.as_bytes())
                 .unwrap();
             assert!(plan.can_apply(), "{:?}", plan.issues());
             assert!(store
                 .apply_xml_import(&plan)
                 .unwrap_err()
                 .to_string()
-                .contains("Return amount differs from the original invoice allocation"));
+                .contains("Returned stock does not match an available allocation"));
             assert_eq!(
                 store.vouchers(company).unwrap().len(),
                 usize::from(standalone)
@@ -6561,8 +6585,13 @@ mod tests {
             let bank = store
                 .create_ledger(company, "Bank", Category::Asset)
                 .unwrap();
-            let named_amount = if sign == 1 { 22 } else { 18 };
-            let applied_amount = 22 - named_amount;
+            let returned_amount = 18;
+            let named_amount = if sign == 1 {
+                returned_amount
+            } else {
+                returned_amount - 4
+            };
+            let applied_amount = returned_amount - named_amount;
             let settlement = invoice
                 .bill_splits
                 .iter()
@@ -6579,7 +6608,7 @@ mod tests {
                         },
                 })
                 .collect::<Vec<_>>();
-            store
+            let (settlement_voucher, _) = store
                 .settle_bills(company, bank, "2026-04-05", "SETTLED", &settlement)
                 .unwrap();
             let due = if applied_amount > 0 {
@@ -6589,11 +6618,11 @@ mod tests {
             };
             let returned_stock = lines(
                 "Party",
-                sign * 22,
+                sign * returned_amount,
                 due + &bill("CARRY", "New Ref", sign * named_amount),
-            ) + &lines("Trade", -sign * 20, String::new())
+            ) + &lines("Trade", -sign * 16, String::new())
                 + &lines("Charge", -sign * 2, String::new())
-                + &stock("ALLINVENTORYENTRIES.LIST", 1, 10, -sign);
+                + &stock("ALLINVENTORYENTRIES.LIST", 1, 8, -sign);
             let origin = if sign == 1 {
                 "<REFERENCE>INV</REFERENCE><REFERENCEDATE>20260402</REFERENCEDATE>"
             } else {
@@ -6645,6 +6674,7 @@ mod tests {
                 .imported_stock_return_lines(company, invoice.id)
                 .unwrap();
             assert_eq!(history.len(), 2);
+            assert!(history.iter().all(|row| row.stock.net_amount == 800));
             assert!(history
                 .iter()
                 .all(|row| row.voucher_id == credit.voucher_id));
@@ -6711,14 +6741,14 @@ mod tests {
                     .iter()
                     .map(|row| row.outstanding)
                     .sum::<i128>(),
-                2200
+                i128::from(returned_amount) * 100
             );
             assert_eq!(
                 store
                     .ledger_register(company, party, None, Some("2026-04-09"))
                     .unwrap()
                     .closing_balance,
-                2200 * i128::from(sign)
+                i128::from(returned_amount * sign) * 100
             );
             for (location, batch) in [(west, a), (east, b)] {
                 assert_eq!(
@@ -6746,6 +6776,59 @@ mod tests {
                     i128::from(5000 - sign * 2000)
                 );
             }
+            store
+                .reverse_settlement(
+                    company,
+                    settlement_voucher,
+                    "2026-04-10",
+                    "UNDO-PAYMENT",
+                    "Restore original bills",
+                )
+                .unwrap();
+            let repriced = note(11).replace("20260403", "20260411").replace(
+                "<VOUCHERNUMBER>RETURN</VOUCHERNUMBER>",
+                "<VOUCHERNUMBER>DIFFERENT-AMOUNT</VOUCHERNUMBER>",
+            );
+            let input = xml(&repriced);
+            let plan = store.preview_xml_import(company, input.as_bytes()).unwrap();
+            assert!(plan.can_apply(), "{:?}", plan.issues());
+            assert_eq!(store.apply_xml_import(&plan).unwrap().bill_notes, 1);
+            let returned = store
+                .imported_stock_return_lines(company, invoice.id)
+                .unwrap();
+            let lines = returned
+                .iter()
+                .filter(|row| row.reference == "DIFFERENT-AMOUNT")
+                .collect::<Vec<_>>();
+            assert_eq!(lines.len(), 2);
+            assert!(lines
+                .iter()
+                .all(|row| row.stock.quantity == 1000 && row.stock.net_amount == 1100));
+            let open = store
+                .outstanding_invoices(company, "2026-04-11")
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.invoice_id == invoice.id)
+                .map(|row| row.outstanding)
+                .sum::<i128>();
+            assert_eq!(open, 2000);
+            store
+                .reverse_voucher(
+                    company,
+                    lines[0].voucher_id,
+                    "2026-04-12",
+                    "UNDO-AMOUNT",
+                    "Reverse different return amount",
+                )
+                .unwrap();
+            let open = store
+                .outstanding_invoices(company, "2026-04-12")
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.invoice_id == invoice.id)
+                .map(|row| row.outstanding)
+                .sum::<i128>();
+            assert_eq!(open, 4400);
         }
     }
 
