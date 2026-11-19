@@ -1,6 +1,6 @@
 //! Carry receivable and payable bills into new books with their original dates.
 
-use crate::inventory::{check_invoice_reference, ledger_category, write_postings, InvoiceKind};
+use crate::inventory::{check_invoice_references, ledger_category, write_postings, InvoiceKind};
 use crate::{
     check_ledgers, opening, parse_date, required, validate_voucher, Category, Error, Posting,
     Result, Store, VoucherKind,
@@ -224,11 +224,12 @@ pub(crate) fn insert_opening_bill(
         ));
     }
     check_opening_bill_date(conn, company, draft.party_ledger_id, opening)?;
-    check_invoice_reference(
+    check_invoice_references(
         conn,
         company,
         draft.kind,
         draft.party_ledger_id,
+        reference,
         reference,
         None,
     )?;

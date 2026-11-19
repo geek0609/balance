@@ -650,6 +650,13 @@ impl Store {
             escape(&invoice.reference),
             escape(&invoice.date)
         );
+        if invoice.bill_reference != invoice.reference {
+            let _ = write!(
+                html,
+                "<br>Bill reference: {}",
+                escape(&invoice.bill_reference)
+            );
+        }
         if let Some(date) = &invoice.due_date {
             let _ = write!(html, "<br>Due: {}", escape(date));
         }

@@ -360,8 +360,8 @@ impl App {
             .iter()
             .find(|invoice| Some(invoice.id) == form.invoice);
         let caption = selected
-            .map(|invoice| invoice.reference.as_str())
-            .unwrap_or("Select invoice");
+            .map(|invoice| crate::reference_with_bill(&invoice.reference, &invoice.bill_reference))
+            .unwrap_or_else(|| "Select invoice".into());
         egui::ComboBox::from_id_salt(("advance-invoice", advance.id))
             .selected_text(caption)
             .show_ui(ui, |ui| {
@@ -372,7 +372,7 @@ impl App {
                         format!(
                             "{} | {} | Due {}",
                             invoice.date,
-                            invoice.reference,
+                            crate::reference_with_bill(&invoice.reference, &invoice.bill_reference),
                             money(invoice.outstanding)
                         ),
                     );

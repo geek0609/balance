@@ -55,6 +55,7 @@ impl Store {
                 || party.is_some_and(|value| value != invoice.party_ledger_id)
                 || (!search.is_empty()
                     && !invoice.reference.to_lowercase().contains(&search)
+                    && !invoice.bill_reference.to_lowercase().contains(&search)
                     && !invoice.party.to_lowercase().contains(&search)
                     && !invoice.id.to_string().contains(&search))
             {

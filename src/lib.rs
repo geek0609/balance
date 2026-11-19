@@ -53,7 +53,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 72;
+const SCHEMA_VERSION: i64 = 73;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -946,6 +946,15 @@ impl Store {
                  ALTER TABLE recurring_journal_lines ADD COLUMN is_party INTEGER NOT NULL DEFAULT 0 CHECK(is_party IN (0, 1));",
             )?;
             tx.pragma_update(None, "user_version", 72)?;
+        }
+        if version < 73 {
+            tx.execute_batch(
+                "ALTER TABLE invoices ADD COLUMN bill_reference TEXT
+                     CHECK(bill_reference IS NULL OR length(trim(bill_reference)) > 0);
+                 ALTER TABLE invoice_revisions ADD COLUMN bill_reference TEXT
+                     CHECK(bill_reference IS NULL OR length(trim(bill_reference)) > 0);",
+            )?;
+            tx.pragma_update(None, "user_version", 73)?;
         }
         tx.commit()?;
         Ok(Self { conn })

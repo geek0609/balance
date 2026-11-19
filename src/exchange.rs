@@ -137,6 +137,7 @@ struct ImportedInvoice {
     date: String,
     credit_days: Option<u32>,
     reference: String,
+    bill_reference: String,
     narration: String,
     party: String,
     existing_party_id: Option<i64>,
@@ -1394,7 +1395,7 @@ fn parse_imported_invoice(
             "multiple ledger entry representations".into(),
         ));
     }
-    let mut party: Option<(String, i64)> = None;
+    let mut party = None;
     let mut credit_days = None;
     let mut adjustments = Vec::new();
     let party_debit = kind == InvoiceKind::Sale;
@@ -1450,12 +1451,12 @@ fn parse_imported_invoice(
                 label,
                 issues,
             );
-            if invoice_field(bill, "NAME")? != reference
-                || !invoice_field(bill, "BILLTYPE")?.eq_ignore_ascii_case("New Ref")
+            let bill_reference = invoice_field(bill, "NAME")?;
+            if !invoice_field(bill, "BILLTYPE")?.eq_ignore_ascii_case("New Ref")
                 || xml_amount(&invoice_field(bill, "AMOUNT")?)? != amount
             {
                 return Err(Error::Validation(
-                    "bill reference does not match the invoice".into(),
+                    "A new bill reference must cover the full party amount".into(),
                 ));
             }
             if let Some(term) = direct_text(bill, "BILLCREDITPERIOD").filter(|v| !v.is_empty()) {
@@ -1467,7 +1468,7 @@ fn parse_imported_invoice(
                     })?;
                 credit_days = Some(days);
             }
-            party = Some((ledger, amount));
+            party = Some((ledger, amount, bill_reference));
         } else {
             if !bills.is_empty() {
                 return Err(Error::Validation(
@@ -1481,7 +1482,7 @@ fn parse_imported_invoice(
             });
         }
     }
-    let (party_name, party_amount) =
+    let (party_name, party_amount, bill_reference) =
         party.ok_or_else(|| Error::Validation("party ledger is missing".into()))?;
     let mut lines = Vec::new();
     let mut trade: Option<String> = None;
@@ -1791,6 +1792,7 @@ fn parse_imported_invoice(
         date,
         credit_days,
         reference,
+        bill_reference,
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
         party: party_name,
         existing_party_id,
@@ -2928,31 +2930,39 @@ impl Store {
             )
         }));
         let mut invoice_references = HashSet::<(String, String, String)>::new();
+        let mut bill_references = HashSet::<(String, String, String)>::new();
         {
-            let mut stmt = self.conn.prepare("SELECT i.kind, l.name, v.reference FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1")?;
+            let mut stmt = self.conn.prepare(
+                "SELECT i.kind, l.name, v.reference, COALESCE(i.bill_reference, v.reference)
+                 FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
+                 JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1",
+            )?;
             for row in stmt.query_map([company_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             })? {
-                let (kind, party, reference) = row?;
-                invoice_references.insert((
-                    normalized(&kind),
-                    normalized(&party),
-                    normalized(&reference),
-                ));
+                let (kind, party, reference, bill_reference) = row?;
+                let kind = normalized(&kind);
+                let party = normalized(&party);
+                invoice_references.insert((kind.clone(), party.clone(), normalized(&reference)));
+                bill_references.insert((kind, party, normalized(&bill_reference)));
             }
         }
         let mut pending_settlements = Vec::new();
         for account in &plan.accounts {
             for bill in &account.opening_bills {
-                if !invoice_references.insert((
+                let key = (
                     normalized(bill.kind.as_str()),
                     normalized(&account.name),
                     normalized(&bill.reference),
-                )) {
+                );
+                let new_document = invoice_references.insert(key.clone());
+                let new_bill = bill_references.insert(key);
+                if !new_document || !new_bill {
                     plan.issues.push(format!(
                         "Ledger {}: opening bill reference {} already exists",
                         account.name, bill.reference
@@ -3017,6 +3027,16 @@ impl Store {
                             normalized(&invoice.reference),
                         )) {
                             plan.issues.push(format!("{label}: an invoice with the same type, party and reference already exists"));
+                        }
+                        if !bill_references.insert((
+                            normalized(invoice.kind.as_str()),
+                            normalized(&invoice.party),
+                            normalized(&invoice.bill_reference),
+                        )) {
+                            plan.issues.push(format!(
+                                "{label}: bill reference {} already exists for this party and type",
+                                invoice.bill_reference
+                            ));
                         }
                         plan.invoices.push(invoice);
                     }
@@ -3242,7 +3262,7 @@ impl Store {
                 let key = (
                     normalized(invoice.kind.as_str()),
                     normalized(&invoice.party),
-                    normalized(&invoice.reference),
+                    normalized(&invoice.bill_reference),
                 );
                 if invoice_balances
                     .insert(
@@ -3250,7 +3270,7 @@ impl Store {
                         (
                             Some(invoice.id),
                             invoice.date,
-                            invoice.reference,
+                            invoice.bill_reference,
                             invoice.outstanding,
                             latest_reversal,
                             invoice.credit_days,
@@ -3260,14 +3280,14 @@ impl Store {
                     .is_some()
                 {
                     plan.issues
-                        .push("Existing invoice references are ambiguous".into());
+                        .push("Existing bill references are ambiguous".into());
                 }
             }
             for invoice in &plan.invoices {
                 let key = (
                     normalized(invoice.kind.as_str()),
                     normalized(&invoice.party),
-                    normalized(&invoice.reference),
+                    normalized(&invoice.bill_reference),
                 );
                 let mut total = 0_i128;
                 for line in &invoice.lines {
@@ -3284,7 +3304,7 @@ impl Store {
                         (
                             None,
                             invoice.date.clone(),
-                            invoice.reference.clone(),
+                            invoice.bill_reference.clone(),
                             total,
                             None,
                             invoice.credit_days,
@@ -3294,7 +3314,7 @@ impl Store {
                     .is_some()
                 {
                     plan.issues
-                        .push("Imported invoice references are ambiguous".into());
+                        .push("Imported bill references are ambiguous".into());
                 }
             }
             if let Some(opening_date) = &plan.opening_date {
@@ -3402,7 +3422,7 @@ impl Store {
                                 }
                                 if *reference != allocation.reference {
                                     plan.issues.push(format!(
-                                        "{label}: bill reference spelling differs from the invoice"
+                                        "{label}: bill reference spelling differs from the saved bill"
                                     ));
                                 }
                                 let date = parse_date(&settlement.date)?;
@@ -3423,7 +3443,7 @@ impl Store {
                                 *outstanding -= i128::from(allocation.amount);
                             } else {
                                 plan.issues.push(format!(
-                                    "{label}: referenced invoice {} is unavailable",
+                                    "{label}: referenced bill {} is unavailable",
                                     allocation.reference
                                 ));
                             }
@@ -3985,6 +4005,7 @@ impl Store {
                 due_date: None,
                 credit_days: invoice.credit_days,
                 reference: invoice.reference.clone(),
+                bill_reference: Some(invoice.bill_reference.clone()),
                 narration: invoice.narration.clone(),
                 party_ledger_id: party_id,
                 trade_ledger_id: trade_id,
@@ -4103,7 +4124,11 @@ impl Store {
             };
             let mut allocations = Vec::new();
             for allocation in source_allocations {
-                let mut stmt = tx.prepare("SELECT i.id, v.reference, i.tax_amount, i.credit_days FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3")?;
+                let mut stmt = tx.prepare(
+                    "SELECT i.id, COALESCE(i.bill_reference, v.reference), i.tax_amount, i.credit_days
+                     FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
+                     WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3",
+                )?;
                 let mut found: Option<(i64, i64, Option<u32>)> = None;
                 for row in stmt.query_map(
                     params![plan.company_id, settlement.kind.as_str(), party_id],
@@ -4120,8 +4145,7 @@ impl Store {
                     if normalized(&reference) == normalized(&allocation.reference) {
                         if found.is_some() || reference != allocation.reference {
                             return Err(Error::Validation(
-                                "Invoice reference changed or became ambiguous since preview"
-                                    .into(),
+                                "Bill reference changed or became ambiguous since preview".into(),
                             ));
                         }
                         found = Some((id, tax, credit_days));
@@ -4129,7 +4153,7 @@ impl Store {
                 }
                 drop(stmt);
                 let (id, tax, credit_days) = found.ok_or_else(|| {
-                    Error::Validation(format!("Invoice {} is missing", allocation.reference))
+                    Error::Validation(format!("Bill {} is missing", allocation.reference))
                 })?;
                 if allocation.credit_days.is_some() && allocation.credit_days != credit_days {
                     return Err(Error::Validation(format!(
@@ -4207,6 +4231,126 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipts_resolve_bill_references_independently_of_document_numbers() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let customer = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        store
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        store
+            .create_ledger(company, "Bank", Category::Asset)
+            .unwrap();
+        let invoice = |reference: &str, bill: &str| {
+            format!(
+                r#"<ENVELOPE><BODY><DATA><MESSAGE>
+                <VOUCHER>
+                    <DATE>20260102</DATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+                    <VOUCHERNUMBER>{reference}</VOUCHERNUMBER><ISINVOICE>Yes</ISINVOICE>
+                    <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>
+                    <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME>
+                        <ISPARTYLEDGER>Yes</ISPARTYLEDGER><AMOUNT>-100.00</AMOUNT>
+                        <BILLALLOCATIONS.LIST><NAME>{bill}</NAME><BILLTYPE>New Ref</BILLTYPE>
+                            <BILLCREDITPERIOD>30 Days</BILLCREDITPERIOD><AMOUNT>-100.00</AMOUNT>
+                        </BILLALLOCATIONS.LIST>
+                    </LEDGERENTRIES.LIST>
+                    <LEDGERENTRIES.LIST><LEDGERNAME>Sales</LEDGERNAME><AMOUNT>100.00</AMOUNT>
+                    </LEDGERENTRIES.LIST>
+                </VOUCHER>
+            </MESSAGE></DATA></BODY></ENVELOPE>"#
+            )
+        };
+        let receipt = |reference: &str, bill: &str, amount: &str| {
+            format!(
+                r#"<ENVELOPE><BODY><DATA><MESSAGE>
+                <VOUCHER>
+                    <DATE>20260105</DATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
+                    <VOUCHERNUMBER>{reference}</VOUCHERNUMBER>
+                    <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME>
+                        <ISPARTYLEDGER>Yes</ISPARTYLEDGER><AMOUNT>{amount}</AMOUNT>
+                        <BILLALLOCATIONS.LIST><NAME>{bill}</NAME><BILLTYPE>Agst Ref</BILLTYPE>
+                            <AMOUNT>{amount}</AMOUNT></BILLALLOCATIONS.LIST>
+                    </LEDGERENTRIES.LIST>
+                    <LEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-{amount}</AMOUNT>
+                    </LEDGERENTRIES.LIST>
+                </VOUCHER>
+            </MESSAGE></DATA></BODY></ENVELOPE>"#
+            )
+        };
+        let sale = invoice("INV-01", "BILL-07");
+        let other = invoice("BILL-07", "INV-01");
+        let paid = receipt("RCPT-01", "BILL-07", "40.00");
+        let plan = store
+            .preview_xml_import_batch(
+                company,
+                &[sale.as_bytes(), other.as_bytes(), paid.as_bytes()],
+                None,
+            )
+            .unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        let counts = store.apply_xml_import(&plan).unwrap();
+        assert_eq!(counts.invoices, 2);
+        assert_eq!(counts.settlements, 1);
+        let outstanding = store.outstanding_invoices(company, "2026-01-05").unwrap();
+        let first = outstanding
+            .iter()
+            .find(|row| row.reference == "INV-01")
+            .unwrap();
+        assert_eq!(first.bill_reference, "BILL-07");
+        assert_eq!(first.due_date.as_deref(), Some("2026-02-01"));
+        assert_eq!(first.outstanding, 6000);
+        let second = outstanding
+            .iter()
+            .find(|row| row.reference == "BILL-07")
+            .unwrap();
+        assert_eq!(second.outstanding, 10000);
+
+        let stale = receipt("RCPT-02", "INV-01", "25.00");
+        let stale = store.preview_xml_import(company, stale.as_bytes()).unwrap();
+        assert!(stale.can_apply(), "{:?}", stale.issues());
+        let mut draft = store.invoice_draft(company, second.invoice_id).unwrap();
+        assert_eq!(draft.bill_reference.as_deref(), Some("INV-01"));
+        draft.bill_reference = Some("BILL-08".into());
+        store
+            .update_invoice(company, second.invoice_id, &draft)
+            .unwrap();
+        assert_eq!(
+            store.invoice_revisions(company, second.invoice_id).unwrap()[0].bill_reference,
+            "INV-01"
+        );
+        assert!(store.apply_xml_import(&stale).is_err());
+
+        let duplicate = invoice("INV-03", "bill-08");
+        let duplicate = store
+            .preview_xml_import(company, duplicate.as_bytes())
+            .unwrap();
+        assert!(!duplicate.can_apply());
+        assert!(duplicate
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("bill reference bill-08 already exists")));
+        let paid = receipt("RCPT-02", "BILL-08", "25.00");
+        let plan = store.preview_xml_import(company, paid.as_bytes()).unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        store.apply_xml_import(&plan).unwrap();
+        let rows = store
+            .invoice_register(company, None, None, None, None, "BILL-08")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reference, "BILL-07");
+        assert_eq!(rows[0].outstanding, 7500);
+        assert_eq!(
+            store
+                .ledger_register(company, customer, None, None)
+                .unwrap()
+                .closing_balance,
+            13500
+        );
+    }
 
     #[test]
     fn ordinary_voucher_party_lines_survive_import_edits_and_reversal() {
@@ -4428,6 +4572,7 @@ mod tests {
             date: date.into(),
             credit_days: None,
             reference: "SELL-01".into(),
+            bill_reference: "SELL-01".into(),
             narration: String::new(),
             party: "Customer".into(),
             existing_party_id: Some(customer),
@@ -4457,6 +4602,7 @@ mod tests {
         let mut purchase = sale.clone();
         purchase.kind = InvoiceKind::Purchase;
         purchase.reference = "BUY-01".into();
+        purchase.bill_reference = "BUY-01".into();
         purchase.party = "Supplier".into();
         purchase.existing_party_id = Some(supplier);
         purchase.trade = "Purchases".into();

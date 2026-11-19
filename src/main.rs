@@ -237,6 +237,7 @@ struct App {
     invoice_due_date: String,
     invoice_credit_days: String,
     invoice_reference: String,
+    invoice_bill_reference: String,
     invoice_narration: String,
     invoice_party: Option<i64>,
     invoice_trade: Option<i64>,
@@ -514,6 +515,7 @@ impl App {
             invoice_due_date: String::new(),
             invoice_credit_days: String::new(),
             invoice_reference: String::new(),
+            invoice_bill_reference: String::new(),
             invoice_narration: String::new(),
             invoice_party: None,
             invoice_trade: None,
@@ -680,6 +682,7 @@ impl App {
         self.currency_screen = CurrencyScreen::default();
         self.cash_flow_screen = CashFlowScreen::default();
         self.invoice_reference.clear();
+        self.invoice_bill_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
         self.invoice_credit_days.clear();
@@ -3174,6 +3177,7 @@ impl App {
         self.invoice_trade = None;
         self.invoice_date.clear();
         self.invoice_reference.clear();
+        self.invoice_bill_reference.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
         self.invoice_credit_days.clear();
@@ -3208,6 +3212,11 @@ impl App {
             .unwrap_or_default();
         self.invoice_reference = if edit.is_some() {
             draft.reference
+        } else {
+            String::new()
+        };
+        self.invoice_bill_reference = if edit.is_some() {
+            draft.bill_reference.unwrap_or_default()
         } else {
             String::new()
         };
@@ -3365,6 +3374,13 @@ impl App {
             );
             ui.label("Reference");
             ui.text_edit_singleline(&mut self.invoice_reference);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Bill reference");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.invoice_bill_reference)
+                    .hint_text("Defaults to invoice reference"),
+            );
         });
         let lists = match self.store.price_lists(company) {
             Ok(lists) => lists,
@@ -3732,6 +3748,7 @@ impl App {
             self.invoice_party = None;
             self.invoice_trade = None;
             self.invoice_reference.clear();
+            self.invoice_bill_reference.clear();
             self.invoice_narration.clear();
             self.invoice_due_date.clear();
             self.invoice_credit_days.clear();
@@ -3836,6 +3853,8 @@ impl App {
                         )
                     },
                     reference: self.invoice_reference.clone(),
+                    bill_reference: (!self.invoice_bill_reference.trim().is_empty())
+                        .then(|| self.invoice_bill_reference.trim().to_owned()),
                     narration: self.invoice_narration.clone(),
                     party_ledger_id: self.invoice_party.ok_or_else(|| {
                         balance::Error::Validation("Select a party ledger".into())
@@ -3882,6 +3901,7 @@ impl App {
                 Ok(id) => {
                     self.message = format!("Invoice {id} saved");
                     self.invoice_reference.clear();
+                    self.invoice_bill_reference.clear();
                     self.invoice_narration.clear();
                     self.invoice_due_date.clear();
                     self.invoice_credit_days.clear();
@@ -3947,7 +3967,7 @@ impl App {
                         format!(
                             "{} {} — outstanding {}",
                             invoice.document_type(),
-                            invoice.reference,
+                            reference_with_bill(&invoice.reference, &invoice.bill_reference),
                             money(invoice.outstanding)
                         )
                     })
@@ -3963,7 +3983,10 @@ impl App {
                                     format!(
                                         "{} {} — {} ({})",
                                         invoice.document_type(),
-                                        invoice.reference,
+                                        reference_with_bill(
+                                            &invoice.reference,
+                                            &invoice.bill_reference
+                                        ),
                                         invoice.party,
                                         money(invoice.outstanding)
                                     ),
@@ -4000,7 +4023,10 @@ impl App {
                                 format!(
                                     "{} {} — {} ({})",
                                     invoice.document_type(),
-                                    invoice.reference,
+                                    reference_with_bill(
+                                        &invoice.reference,
+                                        &invoice.bill_reference
+                                    ),
                                     invoice.party,
                                     money(invoice.outstanding)
                                 )
@@ -4017,7 +4043,10 @@ impl App {
                                             format!(
                                                 "{} {} — {} ({})",
                                                 invoice.document_type(),
-                                                invoice.reference,
+                                                reference_with_bill(
+                                                    &invoice.reference,
+                                                    &invoice.bill_reference
+                                                ),
                                                 invoice.party,
                                                 money(invoice.outstanding)
                                             ),
@@ -4097,7 +4126,7 @@ impl App {
                         "{}  {}  {}  {}  Total {}  Cash {}  Advances {}  Notes {}  Outstanding {}",
                         invoice.date,
                         invoice.document_type(),
-                        invoice.reference,
+                        reference_with_bill(&invoice.reference, &invoice.bill_reference),
                         invoice.party,
                         money(invoice.total),
                         money(invoice.settled),
@@ -4280,7 +4309,10 @@ impl App {
                                             revision.changed_at,
                                             revision.date,
                                             revision.kind.as_str(),
-                                            revision.reference,
+                                            reference_with_bill(
+                                                &revision.reference,
+                                                &revision.bill_reference
+                                            ),
                                             revision.party
                                         ));
                                         ui.label(format!("Trade ledger: {}", revision.trade));
@@ -4589,7 +4621,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. Invoices require one matching new bill reference and one accounting allocation per item; additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed bill allocations, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. Invoices require one new bill reference for the full party amount. Item invoices require one accounting allocation per item. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed bill allocations, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(ui, "Bank clearance");
@@ -5180,7 +5212,7 @@ impl App {
             true,
         );
         ui.horizontal(|ui| {
-            ui.label("Search party, reference or invoice ID");
+            ui.label("Search party, invoice or bill reference, or invoice ID");
             ui.text_edit_singleline(&mut self.invoice_register_search);
         });
         let from = (!self.invoice_register_from.trim().is_empty())
@@ -5220,7 +5252,7 @@ impl App {
                             "Type",
                             "Invoice",
                             "Party",
-                            "Reference",
+                            "Reference / bill",
                             "Due",
                             "Original total",
                             "Reversed on",
@@ -5241,7 +5273,10 @@ impl App {
                             ui.label(invoice.document_type());
                             ui.label(invoice.id.to_string());
                             ui.label(&invoice.party);
-                            ui.label(&invoice.reference);
+                            ui.label(reference_with_bill(
+                                &invoice.reference,
+                                &invoice.bill_reference,
+                            ));
                             ui.label(invoice.due_date.as_deref().unwrap_or("—"));
                             ui.label(money(invoice.total));
                             ui.label(
@@ -5314,7 +5349,7 @@ impl App {
                         "Party",
                         "Date",
                         "Due date",
-                        "Reference",
+                        "Reference / bill",
                         "Total",
                         "Cash settled",
                         "Advances",
@@ -5359,7 +5394,7 @@ impl App {
                         ui.label(row.party);
                         ui.label(row.date);
                         ui.label(row.due_date.as_deref().unwrap_or("—"));
-                        ui.label(row.reference);
+                        ui.label(reference_with_bill(&row.reference, &row.bill_reference));
                         ui.label(money(row.total));
                         ui.label(money(row.settled));
                         ui.label(money(row.advance_applied));
@@ -5756,6 +5791,14 @@ fn discount_description(discount: &InvoiceDiscount, amount: i64) -> String {
         InvoiceDiscount::Percent(rate) => format!("discount {}% ({})", rate, format_amount(amount)),
     }
 }
+fn reference_with_bill(reference: &str, bill_reference: &str) -> String {
+    if reference == bill_reference {
+        reference.to_owned()
+    } else {
+        format!("{reference} · Bill {bill_reference}")
+    }
+}
+
 fn money(value: i128) -> String {
     let n = value.unsigned_abs();
     format!(

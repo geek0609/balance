@@ -1167,7 +1167,9 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "ALTER TABLE postings DROP COLUMN is_party;
+                "ALTER TABLE invoices DROP COLUMN bill_reference;
+                 ALTER TABLE invoice_revisions DROP COLUMN bill_reference;
+                 ALTER TABLE postings DROP COLUMN is_party;
                  ALTER TABLE revision_postings DROP COLUMN is_party;
                  ALTER TABLE recurring_journal_lines DROP COLUMN is_party;
                  DROP TABLE quotation_revisions;
@@ -1333,7 +1335,9 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "ALTER TABLE postings DROP COLUMN is_party;
+                "ALTER TABLE invoices DROP COLUMN bill_reference;
+                 ALTER TABLE invoice_revisions DROP COLUMN bill_reference;
+                 ALTER TABLE postings DROP COLUMN is_party;
                  ALTER TABLE revision_postings DROP COLUMN is_party;
                  ALTER TABLE recurring_journal_lines DROP COLUMN is_party;
                  DROP TABLE quotation_revisions;

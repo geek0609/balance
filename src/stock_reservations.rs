@@ -588,6 +588,7 @@ mod tests {
             kind,
             date: DATE.into(),
             reference: "INV-01".into(),
+            bill_reference: None,
             narration: String::new(),
             due_date: None,
             credit_days: None,

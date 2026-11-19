@@ -523,6 +523,7 @@ mod tests {
                 due_date: None,
                 credit_days: None,
                 reference: "INV-01".into(),
+                bill_reference: None,
                 narration: String::new(),
                 party_ledger_id: party,
                 trade_ledger_id: trade,

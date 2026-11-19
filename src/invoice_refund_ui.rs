@@ -176,7 +176,7 @@ impl App {
             let label = |bill: &InvoiceSummary| {
                 format!(
                     "{} · {} · Due {}",
-                    bill.reference,
+                    crate::reference_with_bill(&bill.reference, &bill.bill_reference),
                     bill.date,
                     money(bill.outstanding)
                 )

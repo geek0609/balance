@@ -219,7 +219,9 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "ALTER TABLE postings DROP COLUMN is_party;
+                "ALTER TABLE invoices DROP COLUMN bill_reference;
+                 ALTER TABLE invoice_revisions DROP COLUMN bill_reference;
+                 ALTER TABLE postings DROP COLUMN is_party;
                  ALTER TABLE revision_postings DROP COLUMN is_party;
                  ALTER TABLE recurring_journal_lines DROP COLUMN is_party;
                  DROP TABLE quotation_revisions;
@@ -236,6 +238,7 @@ mod tests {
             kind: InvoiceKind::Purchase,
             date: "2026-02-01".into(),
             reference: "BUY-01".into(),
+            bill_reference: None,
             narration: String::new(),
             due_date: None,
             credit_days: None,
