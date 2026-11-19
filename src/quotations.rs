@@ -71,6 +71,8 @@ pub struct Quotation {
 }
 
 impl Quotation {
+    pub const STATUSES: [&'static str; 4] = ["Open", "Converted", "Revised", "Closed"];
+
     pub fn status(&self) -> &'static str {
         if self.order_id.is_some() {
             "Converted"

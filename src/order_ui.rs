@@ -4,6 +4,7 @@ use super::{
 };
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind, StockItem};
 use balance::orders::{OrderAmendmentDraft, OrderDetail, OrderDraft, OrderLine, OrderStatus};
+use balance::quotations::Quotation;
 use balance::stock_allocation::{StockAllocationDraft, StockAllocationPlan};
 use balance::stock_notes::note_label;
 use balance::stock_reservations::StockReservationDraft;
@@ -224,6 +225,13 @@ struct QuotationForm {
 }
 
 #[derive(Default)]
+struct QuotationFilter {
+    search: String,
+    kind: Option<InvoiceKind>,
+    status: Option<&'static str>,
+}
+
+#[derive(Default)]
 struct LineClosureForm {
     item: Option<i64>,
     date: String,
@@ -286,6 +294,7 @@ pub(super) struct OrderScreen {
     schedule_kind: Option<InvoiceKind>,
     schedule_through: String,
     quotation: QuotationForm,
+    quotation_filter: QuotationFilter,
 }
 
 impl OrderScreen {
@@ -821,7 +830,10 @@ impl App {
 
     fn quotation_register(&mut self, ui: &mut egui::Ui, company: i64) -> Result<()> {
         self.report_export_path_field(ui);
-        if ui.button("Export quotation register as CSV").clicked() {
+        if ui
+            .button("Export complete quotation register as CSV")
+            .clicked()
+        {
             self.store
                 .export_quotation_register_csv(company, self.report_export_path.trim())?;
             self.message = "Quotation register exported".into();
@@ -831,9 +843,44 @@ impl App {
             ui.label("No quotations saved.");
             return Ok(());
         }
+        let filter = &mut self.order_screen.quotation_filter;
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut filter.search).hint_text("Reference or party"));
+            egui::ComboBox::from_id_salt("quotation-kind-filter")
+                .selected_text(filter.kind.map(InvoiceKind::as_str).unwrap_or("All types"))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut filter.kind, None, "All types");
+                    for kind in InvoiceKind::ALL {
+                        ui.selectable_value(&mut filter.kind, Some(kind), kind.as_str());
+                    }
+                });
+            egui::ComboBox::from_id_salt("quotation-status-filter")
+                .selected_text(filter.status.unwrap_or("All statuses"))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut filter.status, None, "All statuses");
+                    for status in Quotation::STATUSES {
+                        ui.selectable_value(&mut filter.status, Some(status), status);
+                    }
+                });
+        });
+        let search = filter.search.trim().to_lowercase();
+        let matching: Vec<_> = quotes
+            .iter()
+            .filter(|quote| {
+                filter.kind.is_none_or(|kind| kind == quote.kind)
+                    && filter.status.is_none_or(|status| status == quote.status())
+                    && (search.is_empty()
+                        || quote.reference.to_lowercase().contains(&search)
+                        || quote.party.to_lowercase().contains(&search))
+            })
+            .collect();
+        if matching.is_empty() {
+            ui.label("No matching quotations.");
+            return Ok(());
+        }
         let form = &mut self.order_screen.quotation;
         let mut selected = form.selected;
-        let picked = quotes.iter().find(|quote| Some(quote.id) == selected);
+        let picked = matching.iter().find(|quote| Some(quote.id) == selected);
         egui::ComboBox::from_label("Quotation")
             .selected_text(
                 picked
@@ -841,7 +888,7 @@ impl App {
                     .unwrap_or("Select quotation"),
             )
             .show_ui(ui, |ui| {
-                for quote in &quotes {
+                for quote in &matching {
                     ui.selectable_value(
                         &mut selected,
                         Some(quote.id),
@@ -855,7 +902,10 @@ impl App {
                     );
                 }
             });
-        let Some(quote) = quotes.iter().find(|quote| Some(quote.id) == selected) else {
+        let Some(quote) = matching
+            .into_iter()
+            .find(|quote| Some(quote.id) == selected)
+        else {
             return Ok(());
         };
         if form.selected != selected {
@@ -894,6 +944,7 @@ impl App {
                     .link(format!("{label} quotation {}", related.reference))
                     .clicked()
                 {
+                    *filter = QuotationFilter::default();
                     *form = QuotationForm {
                         selected: Some(related.id),
                         order_reference: related.reference.clone(),
