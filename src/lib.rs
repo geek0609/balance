@@ -53,7 +53,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 70;
+const SCHEMA_VERSION: i64 = 71;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -474,6 +474,7 @@ impl Store {
             "recurring_journal_occurrences",
             "quotations",
             "quotation_lines",
+            "quotation_revisions",
             "stock_notes",
             "stock_note_lines",
             "stock_note_invoices",
@@ -921,6 +922,10 @@ impl Store {
         if version < 70 {
             stock_reservations::migrate_expiry(&tx)?;
             tx.pragma_update(None, "user_version", 70)?;
+        }
+        if version < 71 {
+            quotations::migrate_revisions(&tx)?;
+            tx.pragma_update(None, "user_version", 71)?;
         }
         tx.commit()?;
         Ok(Self { conn })

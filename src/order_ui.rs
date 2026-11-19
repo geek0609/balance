@@ -70,6 +70,8 @@ struct CreateOrderForm {
     valid_through: String,
     party: Option<i64>,
     price_list: Option<i64>,
+    revision_of: Option<i64>,
+    revision_reason: String,
     reference: String,
     notes: String,
     lines: Vec<LineForm>,
@@ -85,6 +87,8 @@ impl Default for CreateOrderForm {
             valid_through: String::new(),
             party: None,
             price_list: None,
+            revision_of: None,
+            revision_reason: String::new(),
             reference: String::new(),
             notes: String::new(),
             lines: vec![LineForm::default()],
@@ -313,7 +317,7 @@ impl App {
             .body_returned
             .unwrap_or(false);
         egui::CollapsingHeader::new("Create order or quotation")
-            .open(prepared.then_some(true))
+            .open((prepared || self.order_screen.form.revision_of.is_some()).then_some(true))
             .show(ui, |ui| self.create_order_form(ui, company));
         egui::CollapsingHeader::new("Quotations").show(ui, |ui| {
             if let Err(error) = self.quotation_register(ui, company) {
@@ -689,15 +693,22 @@ impl App {
             }
         };
         let form = &mut self.order_screen.form;
-        ui.checkbox(&mut form.quotation, "Save as quotation");
-        egui::ComboBox::from_id_salt("order-kind")
-            .selected_text(form.kind.as_str())
-            .show_ui(ui, |ui| {
-                for kind in InvoiceKind::ALL {
-                    ui.selectable_value(&mut form.kind, kind, kind.as_str());
-                }
-            });
-        pick_account(ui, "order-party", "Party", &ledgers, &mut form.party, false);
+        let revising = form.revision_of.is_some();
+        if revising && ui.button("Cancel quotation revision").clicked() {
+            *form = CreateOrderForm::default();
+            return;
+        }
+        ui.add_enabled_ui(!revising, |ui| {
+            ui.checkbox(&mut form.quotation, "Save as quotation");
+            egui::ComboBox::from_id_salt("order-kind")
+                .selected_text(form.kind.as_str())
+                .show_ui(ui, |ui| {
+                    for kind in InvoiceKind::ALL {
+                        ui.selectable_value(&mut form.kind, kind, kind.as_str());
+                    }
+                });
+            pick_account(ui, "order-party", "Party", &ledgers, &mut form.party, false);
+        });
         egui::Grid::new("order-fields").show(ui, |ui| {
             let date_label = if form.quotation {
                 "Quotation date (YYYY-MM-DD)"
@@ -717,6 +728,11 @@ impl App {
             if form.quotation {
                 ui.label("Valid through (optional)");
                 ui.add(egui::TextEdit::singleline(&mut form.valid_through).hint_text("YYYY-MM-DD"));
+                ui.end_row();
+            }
+            if revising {
+                ui.label("Revision reason");
+                ui.text_edit_singleline(&mut form.revision_reason);
                 ui.end_row();
             }
         });
@@ -742,7 +758,9 @@ impl App {
         order_line_fields(ui, &mut form.lines, &items);
         let quotation = form.quotation;
         if ui
-            .button(if quotation {
+            .button(if revising {
+                "Save revised quotation"
+            } else if quotation {
                 "Save quotation"
             } else {
                 "Save order"
@@ -750,7 +768,16 @@ impl App {
             .clicked()
         {
             let result = form.draft().and_then(|draft| {
-                if quotation {
+                if let Some(original) = form.revision_of {
+                    let expiry = form.valid_through.trim();
+                    self.store.revise_quotation(
+                        company,
+                        original,
+                        &draft,
+                        (!expiry.is_empty()).then_some(expiry),
+                        &form.revision_reason,
+                    )
+                } else if quotation {
                     let expiry = form.valid_through.trim();
                     self.store.create_quotation(
                         company,
@@ -838,6 +865,12 @@ impl App {
         if !quote.notes.is_empty() {
             ui.label(&quote.notes);
         }
+        if let Some(original) = &quote.revises {
+            ui.label(format!("Revises quotation {original}"));
+        }
+        if let Some(replacement) = &quote.revised_by {
+            ui.label(format!("Replaced by quotation {replacement}"));
+        }
         let items = self.store.stock_items(company)?;
         let lines = self.store.quotation_lines(company, quote.id)?;
         egui::Grid::new("quotation-lines")
@@ -847,7 +880,7 @@ impl App {
                     ui.strong(heading);
                 }
                 ui.end_row();
-                for line in lines {
+                for line in &lines {
                     let item = items.iter().find(|item| item.id == line.item_id);
                     ui.label(
                         item.map(|item| item.name.as_str())
@@ -889,6 +922,34 @@ impl App {
                 ui.label(reason);
             }
             return Ok(());
+        }
+        if ui
+            .add_enabled(
+                !self.order_screen.form.has_content(),
+                egui::Button::new("Prepare revised quotation"),
+            )
+            .clicked()
+        {
+            self.order_screen.form = CreateOrderForm {
+                quotation: true,
+                kind: quote.kind,
+                party: Some(quote.party_ledger_id),
+                date: quote.date.clone(),
+                expected_on: quote.expected_on.clone().unwrap_or_default(),
+                valid_through: quote.valid_through.clone().unwrap_or_default(),
+                notes: quote.notes.clone(),
+                revision_of: Some(quote.id),
+                lines: lines
+                    .iter()
+                    .map(|line| LineForm {
+                        item: Some(line.item_id),
+                        quantity: format_quantity(line.quantity.into()),
+                        price: format_amount(line.unit_price),
+                    })
+                    .collect(),
+                ..CreateOrderForm::default()
+            };
+            self.message = "Edit the replacement quotation in the draft form above".into();
         }
 
         egui::Grid::new("quotation-conversion").show(ui, |ui| {
