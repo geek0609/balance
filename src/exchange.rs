@@ -52,7 +52,7 @@ struct ImportedOpeningBill {
     kind: InvoiceKind,
     reference: String,
     original_date: String,
-    credit_days: Option<u32>,
+    terms: BillTerms,
     amount: i64,
 }
 #[derive(Debug, Clone)]
@@ -169,7 +169,7 @@ struct ImportedBillAllocation {
     amount: i64,
     existing_target: Option<BillSettlementTarget>,
     expected_outstanding: i128,
-    credit_days: Option<u32>,
+    terms: BillTerms,
 }
 #[derive(Debug, Clone)]
 struct ImportedBillUse {
@@ -914,18 +914,31 @@ impl BillTerms {
     }
 
     fn due_date_from(&self, date: NaiveDate) -> Result<Option<NaiveDate>> {
-        if let Some(due_date) = &self.due_date {
-            return parse_date(due_date).map(Some);
-        }
-        self.credit_days
-            .map(|days| {
-                date.checked_add_days(chrono::Days::new(u64::from(days)))
-                    .ok_or_else(|| {
-                        Error::Validation("Credit period produces an invalid due date".into())
-                    })
-            })
-            .transpose()
+        bill_due_date(date, self.due_date.as_deref(), self.credit_days)
     }
+
+    fn matches_due_date(&self, original: NaiveDate, due: Option<NaiveDate>) -> Result<bool> {
+        Ok(!self.is_specified() || self.due_date_from(original)? == due)
+    }
+}
+
+fn bill_due_date(
+    original: NaiveDate,
+    due_date: Option<&str>,
+    credit_days: Option<u32>,
+) -> Result<Option<NaiveDate>> {
+    if let Some(date) = due_date {
+        return parse_date(date).map(Some);
+    }
+    credit_days
+        .map(|days| {
+            original
+                .checked_add_days(chrono::Days::new(u64::from(days)))
+                .ok_or_else(|| {
+                    Error::Validation("Credit period produces an invalid due date".into())
+                })
+        })
+        .transpose()
 }
 
 fn xml_bill_terms(value: Option<&str>) -> Result<BillTerms> {
@@ -1026,25 +1039,21 @@ fn xml_opening_bill(
     let amount = signed_amount
         .checked_abs()
         .ok_or_else(|| Error::Validation("Opening bill amount is too large".into()))?;
-    let credit_days = direct_text(node, "BILLCREDITPERIOD")
-        .filter(|value| !value.is_empty())
-        .as_deref()
-        .map(xml_credit_days)
-        .transpose()?;
-    if credit_days.is_some_and(|days| {
-        original
-            .checked_add_days(chrono::Days::new(u64::from(days)))
-            .is_none()
-    }) {
+    let credit = direct_text(node, "BILLCREDITPERIOD").filter(|value| !value.is_empty());
+    let terms = xml_bill_terms(credit.as_deref())?;
+    if terms
+        .due_date_from(original)?
+        .is_some_and(|due| due < original)
+    {
         return Err(Error::Validation(
-            "Opening bill credit period exceeds the supported date range".into(),
+            "Opening bill due date precedes its original date".into(),
         ));
     }
     Ok(ImportedOpeningBill {
         kind,
         reference,
         original_date,
-        credit_days,
+        terms,
         amount,
     })
 }
@@ -1336,7 +1345,7 @@ fn parse_imported_settlement(
                     amount: value,
                     existing_target: None,
                     expected_outstanding: 0,
-                    credit_days: credit.map(|v| xml_credit_days(&v)).transpose()?,
+                    terms: xml_bill_terms(credit.as_deref())?,
                 });
             }
             let sum = allocations
@@ -2112,8 +2121,9 @@ fn named_advance<'a>(
             "Application precedes advance {reference} or its latest release"
         )));
     }
-    if application.terms.is_specified()
-        && application.terms.due_date_from(advance.date)? != advance.due_date
+    if !application
+        .terms
+        .matches_due_date(advance.date, advance.due_date)?
     {
         return Err(Error::Validation(format!(
             "Credit terms differ from the saved advance {reference}"
@@ -3716,11 +3726,12 @@ impl Store {
             struct PreviewBill {
                 target: Option<BillSettlementTarget>,
                 invoice_key: ReferenceKey,
-                invoice_date: String,
+                invoice_date: NaiveDate,
+                original_date: NaiveDate,
+                due_date: Option<NaiveDate>,
                 reference: String,
                 outstanding: i128,
                 latest_reversal: Option<NaiveDate>,
-                credit_days: Option<u32>,
             }
             let mut invoice_balances = HashMap::<ReferenceKey, PreviewBill>::new();
             let mut payment_references = HashMap::<ReferenceKey, HashSet<String>>::new();
@@ -3747,12 +3758,19 @@ impl Store {
                             Some(latest_reversal.map_or(date, |old: NaiveDate| old.max(date)));
                     }
                 }
+                let invoice_date = parse_date(&invoice.date)?;
+                let original_date = invoice
+                    .opening_bill
+                    .as_ref()
+                    .map(|bill| parse_date(&bill.original_date))
+                    .transpose()?
+                    .unwrap_or(invoice_date);
                 let entries = if invoice.bill_splits.is_empty() {
                     vec![(
                         None,
                         invoice.bill_reference,
                         invoice.outstanding,
-                        invoice.credit_days,
+                        invoice.due_date,
                     )]
                 } else {
                     invoice
@@ -3764,11 +3782,11 @@ impl Store {
                             } else {
                                 bill.outstanding()
                             };
-                            (Some(bill.id), bill.reference, remaining, bill.credit_days)
+                            (Some(bill.id), bill.reference, remaining, bill.due_date)
                         })
                         .collect()
                 };
-                for (split_id, reference, outstanding, credit_days) in entries {
+                for (split_id, reference, outstanding, due_date) in entries {
                     let key = (
                         invoice_key.0.clone(),
                         invoice_key.1.clone(),
@@ -3783,11 +3801,12 @@ impl Store {
                                     split_id,
                                 }),
                                 invoice_key: invoice_key.clone(),
-                                invoice_date: invoice.date.clone(),
+                                invoice_date,
+                                original_date,
+                                due_date: due_date.as_deref().map(parse_date).transpose()?,
                                 reference,
                                 outstanding,
                                 latest_reversal,
-                                credit_days,
                             },
                         )
                         .is_some()
@@ -3798,6 +3817,7 @@ impl Store {
                 }
             }
             for invoice in &plan.invoices {
+                let invoice_date = parse_date(&invoice.date)?;
                 let invoice_key = (
                     normalized(invoice.kind.as_str()),
                     normalized(&invoice.party),
@@ -3818,11 +3838,16 @@ impl Store {
                             PreviewBill {
                                 target: None,
                                 invoice_key: invoice_key.clone(),
-                                invoice_date: invoice.date.clone(),
+                                invoice_date,
+                                original_date: invoice_date,
+                                due_date: bill_due_date(
+                                    invoice_date,
+                                    bill.due_date.as_deref(),
+                                    bill.credit_days,
+                                )?,
                                 reference: bill.reference.clone(),
                                 outstanding: i128::from(bill.amount),
                                 latest_reversal: None,
-                                credit_days: bill.credit_days,
                             },
                         )
                         .is_some()
@@ -3832,9 +3857,11 @@ impl Store {
                     }
                 }
             }
-            if let Some(opening_date) = &plan.opening_date {
+            if let Some(opening_date) = plan.opening_date.as_deref() {
+                let opening_date = parse_date(opening_date)?;
                 for account in &plan.accounts {
                     for bill in &account.opening_bills {
+                        let original_date = parse_date(&bill.original_date)?;
                         let key = (
                             normalized(bill.kind.as_str()),
                             normalized(&account.name),
@@ -3846,11 +3873,12 @@ impl Store {
                                 PreviewBill {
                                     target: None,
                                     invoice_key: key,
-                                    invoice_date: opening_date.clone(),
+                                    invoice_date: opening_date,
+                                    original_date,
+                                    due_date: bill.terms.due_date_from(original_date)?,
                                     reference: bill.reference.clone(),
                                     outstanding: i128::from(bill.amount),
                                     latest_reversal: None,
-                                    credit_days: bill.credit_days,
                                 },
                             )
                             .is_some()
@@ -3878,11 +3906,13 @@ impl Store {
                         ));
                         continue;
                     };
-                    if allocation.credit_days.is_some()
-                        && allocation.credit_days != bill.credit_days
+                    if !allocation
+                        .terms
+                        .matches_due_date(bill.original_date, bill.due_date)?
                     {
                         plan.issues.push(format!(
-                            "{label}: bill credit period differs from the saved bill"
+                            "{label}: credit terms differ from the saved bill {}",
+                            bill.reference
                         ));
                     }
                     if referenced_invoices.insert(bill.invoice_key.clone())
@@ -3901,7 +3931,7 @@ impl Store {
                         ));
                     }
                     let date = parse_date(&settlement.date)?;
-                    if date < parse_date(&bill.invoice_date)?
+                    if date < bill.invoice_date
                         || bill.latest_reversal.is_some_and(|value| date < value)
                     {
                         plan.issues.push(format!("{label}: settlement precedes the invoice, a reversal or an advance release"));
@@ -4151,8 +4181,8 @@ impl Store {
                             reference: bill.reference.clone(),
                             original_date: bill.original_date.clone(),
                             opening_date: date.to_owned(),
-                            due_date: None,
-                            credit_days: bill.credit_days,
+                            due_date: bill.terms.due_date.clone(),
+                            credit_days: bill.terms.credit_days,
                             amount: bill.amount,
                         },
                     )?;
@@ -4707,9 +4737,11 @@ impl Store {
             for allocation in &settlement.bills.invoices {
                 let mut stmt = tx.prepare(
                     "SELECT i.id, b.id, COALESCE(b.reference, i.bill_reference, v.reference), i.tax_amount,
-                            CASE WHEN b.id IS NULL THEN i.credit_days ELSE b.credit_days END
+                            CASE WHEN b.id IS NULL THEN i.due_date ELSE b.due_date END,
+                            COALESCE(o.original_date, v.date)
                      FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
                      LEFT JOIN invoice_bill_splits b ON b.invoice_id = i.id
+                     LEFT JOIN opening_bills o ON o.invoice_id = i.id
                      WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3",
                 )?;
                 let mut found = None;
@@ -4723,22 +4755,23 @@ impl Store {
                             },
                             r.get::<_, String>(2)?,
                             r.get::<_, i64>(3)?,
-                            r.get::<_, Option<u32>>(4)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, String>(5)?,
                         ))
                     },
                 )? {
-                    let (target, reference, tax, credit_days) = row?;
+                    let (target, reference, tax, due_date, original_date) = row?;
                     if normalized(&reference) == normalized(&allocation.reference) {
                         if found.is_some() || reference != allocation.reference {
                             return Err(Error::Validation(
                                 "Bill reference changed or became ambiguous since preview".into(),
                             ));
                         }
-                        found = Some((target, tax, credit_days));
+                        found = Some((target, tax, due_date, original_date));
                     }
                 }
                 drop(stmt);
-                let (target, tax, credit_days) = found.ok_or_else(|| {
+                let (target, tax, due_date, original_date) = found.ok_or_else(|| {
                     Error::Validation(format!("Bill {} is missing", allocation.reference))
                 })?;
                 let changed = || {
@@ -4747,10 +4780,12 @@ impl Store {
                         allocation.reference
                     ))
                 };
-                if allocation.credit_days.is_some() && allocation.credit_days != credit_days
-                    || allocation
-                        .existing_target
-                        .is_some_and(|expected| expected != target)
+                if !allocation.terms.matches_due_date(
+                    parse_date(&original_date)?,
+                    due_date.as_deref().map(parse_date).transpose()?,
+                )? || allocation
+                    .existing_target
+                    .is_some_and(|expected| expected != target)
                 {
                     return Err(changed());
                 }
@@ -4829,6 +4864,123 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_bill_and_settlement_terms_use_the_original_bill_date() {
+        let masters = r#"<ENVELOPE><BODY><DATA><MESSAGE>
+          <LEDGER NAME="Customer"><PARENT>Sundry Debtors</PARENT><ISBILLWISEON>Yes</ISBILLWISEON>
+            <OPENINGBALANCE>-100.00</OPENINGBALANCE>
+            <BILLALLOCATIONS.LIST><NAME>DEC-01</NAME><BILLDATE>20251201</BILLDATE>
+              <BILLTYPE>New Ref</BILLTYPE><AMOUNT>-40.00</AMOUNT>
+              <BILLCREDITPERIOD>31-Jan-2026</BILLCREDITPERIOD>
+            </BILLALLOCATIONS.LIST>
+            <BILLALLOCATIONS.LIST><NAME>DEC-10</NAME><BILLDATE>20251210</BILLDATE>
+              <BILLTYPE>New Ref</BILLTYPE><AMOUNT>-60.00</AMOUNT>
+              <BILLCREDITPERIOD>30 Days</BILLCREDITPERIOD>
+            </BILLALLOCATIONS.LIST>
+          </LEDGER>
+        </MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let receipt = r#"<ENVELOPE><BODY><DATA><MESSAGE><VOUCHER>
+          <DATE>20260105</DATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>RC-OPEN</VOUCHERNUMBER>
+          <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME><AMOUNT>35.00</AMOUNT>
+            <BILLALLOCATIONS.LIST><NAME>DEC-01</NAME><BILLTYPE>Agst Ref</BILLTYPE><AMOUNT>15.00</AMOUNT>
+              <BILLCREDITPERIOD>61 Days</BILLCREDITPERIOD>
+            </BILLALLOCATIONS.LIST>
+            <BILLALLOCATIONS.LIST><NAME>DEC-10</NAME><BILLTYPE>Agst Ref</BILLTYPE><AMOUNT>20.00</AMOUNT>
+              <BILLCREDITPERIOD>20260109</BILLCREDITPERIOD>
+            </BILLALLOCATIONS.LIST>
+          </LEDGERENTRIES.LIST>
+          <LEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-35.00</AMOUNT></LEDGERENTRIES.LIST>
+        </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let opening = Some("2026-01-01");
+        for separate in [false, true] {
+            let mut store = Store::memory().unwrap();
+            let company = store.create_company("Opening bill migration").unwrap();
+            let bank = store
+                .create_ledger(company, "Bank", Category::Asset)
+                .unwrap();
+            let wrong_due = masters.replace("31-Jan-2026", "30-Nov-2025");
+            let invalid = store
+                .preview_xml_import_with_opening_date(company, wrong_due.as_bytes(), opening)
+                .unwrap();
+            assert!(
+                invalid
+                    .issues()
+                    .iter()
+                    .any(|issue| issue.contains("due date precedes")),
+                "{:?}",
+                invalid.issues()
+            );
+            assert!(store.apply_xml_import(&invalid).is_err());
+
+            if separate {
+                let plan = store
+                    .preview_xml_import_with_opening_date(company, masters.as_bytes(), opening)
+                    .unwrap();
+                assert!(plan.can_apply(), "{:?}", plan.issues());
+                assert_eq!(store.apply_xml_import(&plan).unwrap().opening_bills, 2);
+            }
+            let before_receipt = store.vouchers(company).unwrap().len();
+            let preview = |store: &Store, transactions: &str| {
+                if separate {
+                    store.preview_xml_import(company, transactions.as_bytes())
+                } else {
+                    store.preview_xml_import_batch(
+                        company,
+                        &[masters.as_bytes(), transactions.as_bytes()],
+                        opening,
+                    )
+                }
+            };
+            let conflict = preview(&store, &receipt.replace("61 Days", "62 Days")).unwrap();
+            assert!(
+                conflict
+                    .issues()
+                    .iter()
+                    .any(|issue| issue.contains("credit terms differ from the saved bill DEC-01")),
+                "{:?}",
+                conflict.issues()
+            );
+            assert!(store.apply_xml_import(&conflict).is_err());
+            assert_eq!(store.vouchers(company).unwrap().len(), before_receipt);
+
+            let plan = preview(&store, receipt).unwrap();
+            assert!(plan.can_apply(), "{:?}", plan.issues());
+            let counts = store.apply_xml_import(&plan).unwrap();
+            assert_eq!(
+                (counts.opening_bills, counts.settlements),
+                (if separate { 0 } else { 2 }, 1)
+            );
+            let rows = store.outstanding_invoices(company, "2026-02-01").unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| (
+                        row.bill_reference.as_str(),
+                        row.due_date.as_deref(),
+                        row.outstanding,
+                        row.overdue_days
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    ("DEC-01", Some("2026-01-31"), 2500, Some(1)),
+                    ("DEC-10", Some("2026-01-09"), 4000, Some(23))
+                ]
+            );
+            let closing = |ledger| {
+                store
+                    .ledger_register(company, ledger, None, None)
+                    .unwrap()
+                    .closing_balance
+            };
+            assert_eq!(closing(rows[0].party_ledger_id), 6500);
+            assert_eq!(closing(bank), 3500);
+            let before = store.outstanding_invoices(company, "2026-01-04").unwrap();
+            assert_eq!(
+                before.iter().map(|row| row.outstanding).sum::<i128>(),
+                10000
+            );
+        }
+    }
 
     #[test]
     fn named_advances_reconcile_on_fully_and_partially_funded_imported_invoices() {
@@ -5354,8 +5506,10 @@ mod tests {
         let receipt = br#"<ENVELOPE><BODY><DATA><MESSAGE><VOUCHER>
             <DATE>20260108</DATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>RC-01</VOUCHERNUMBER>
             <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME><AMOUNT>40.00</AMOUNT>
-                <BILLALLOCATIONS.LIST><NAME>FIRST</NAME><BILLTYPE>Agst Ref</BILLTYPE><AMOUNT>15.00</AMOUNT></BILLALLOCATIONS.LIST>
-                <BILLALLOCATIONS.LIST><NAME>SECOND</NAME><BILLTYPE>Agst Ref</BILLTYPE><AMOUNT>25.00</AMOUNT></BILLALLOCATIONS.LIST>
+                <BILLALLOCATIONS.LIST><NAME>FIRST</NAME><BILLTYPE>Agst Ref</BILLTYPE><AMOUNT>15.00</AMOUNT>
+                    <BILLCREDITPERIOD>20260111</BILLCREDITPERIOD></BILLALLOCATIONS.LIST>
+                <BILLALLOCATIONS.LIST><NAME>SECOND</NAME><BILLTYPE>Agst Ref</BILLTYPE><AMOUNT>25.00</AMOUNT>
+                    <BILLCREDITPERIOD>30 Days</BILLCREDITPERIOD></BILLALLOCATIONS.LIST>
             </LEDGERENTRIES.LIST>
             <LEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-40.00</AMOUNT></LEDGERENTRIES.LIST>
         </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#;
