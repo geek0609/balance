@@ -2,7 +2,7 @@
 use crate::inventory::{
     check_quantity_precision, check_stock_batch, check_stock_location, stock_available_to_reserve,
 };
-use crate::{required, Error, Result, Store};
+use crate::{parse_date, required, Error, Result, Store};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::HashMap;
 
@@ -39,6 +39,43 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_expiry(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE stock_reservation_expiries(
+            reservation_id INTEGER PRIMARY KEY REFERENCES stock_reservations(id),
+            expires_on TEXT NOT NULL
+        );
+        CREATE VIEW active_stock_reservation_balances AS
+            SELECT r.id, r.order_line_id, r.order_id, r.company_id, r.item_id, r.location_id,
+                   r.batch_id, r.quantity, r.reserved_at, r.reason, e.expires_on,
+                   CASE WHEN e.expires_on < date('now', 'localtime') THEN 0 ELSE r.remaining END AS remaining
+            FROM stock_reservation_balances r
+            LEFT JOIN stock_reservation_expiries e ON e.reservation_id = r.id;",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn record_expiry(
+    conn: &Connection,
+    reservation: i64,
+    expires_on: Option<&str>,
+) -> Result<()> {
+    if let Some(expires_on) = expires_on {
+        let date = parse_date(expires_on)?;
+        let today: String = conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))?;
+        if date < parse_date(&today)? || chrono::Datelike::year(&date) > 9999 {
+            return Err(Error::Validation(
+                "Expiry must be today or later, with a four-digit year".into(),
+            ));
+        }
+        conn.execute(
+            "INSERT INTO stock_reservation_expiries(reservation_id, expires_on) VALUES (?1, ?2)",
+            params![reservation, date.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
 pub struct StockReservationDraft {
     pub item_id: i64,
     pub location_id: i64,
@@ -61,6 +98,7 @@ pub struct StockReservation {
     pub remaining: i64,
     pub reserved_at: String,
     pub reason: String,
+    pub expires_on: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,8 +116,8 @@ pub(crate) fn order_reservations(
 ) -> Result<Vec<StockReservation>> {
     let mut stmt = conn.prepare_cached(
         "SELECT r.id, r.item_id, s.name, s.unit, r.location_id, l.name,
-                r.batch_id, b.name, r.quantity, r.remaining, r.reserved_at, r.reason
-         FROM stock_reservation_balances r JOIN stock_items s ON s.id = r.item_id
+                r.batch_id, b.name, r.quantity, r.remaining, r.reserved_at, r.reason, r.expires_on
+         FROM active_stock_reservation_balances r JOIN stock_items s ON s.id = r.item_id
          JOIN stock_locations l ON l.id = r.location_id LEFT JOIN stock_batches b ON b.id = r.batch_id
          WHERE r.company_id = ?1 AND r.order_id = ?2 ORDER BY r.id",
     )?;
@@ -97,6 +135,7 @@ pub(crate) fn order_reservations(
             remaining: row.get(9)?,
             reserved_at: row.get(10)?,
             reason: row.get(11)?,
+            expires_on: row.get(12)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -104,7 +143,7 @@ pub(crate) fn order_reservations(
 
 pub(crate) fn reserved_by_item(conn: &Connection, company: i64) -> Result<HashMap<i64, i128>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT item_id, remaining FROM stock_reservation_balances WHERE company_id = ?1",
+        "SELECT item_id, remaining FROM active_stock_reservation_balances WHERE company_id = ?1",
     )?;
     let mut quantities = HashMap::<_, i128>::new();
     let rows = stmt.query_map([company], |r| {
@@ -125,7 +164,7 @@ pub(crate) fn reserved_in_bucket(
     batch: Option<i64>,
 ) -> Result<i128> {
     let mut stmt = conn.prepare_cached(
-        "SELECT remaining FROM stock_reservation_balances
+        "SELECT remaining FROM active_stock_reservation_balances
          WHERE company_id = ?1 AND item_id = ?2 AND location_id = ?3 AND batch_id IS ?4
            AND remaining > 0",
     )?;
@@ -161,7 +200,7 @@ pub(crate) fn check_order_coverage(conn: &Connection, order: i64) -> Result<()> 
     let over_reserved: bool = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM order_line_availability p
-            JOIN stock_reservation_balances r ON r.order_line_id = p.id AND r.remaining > 0
+            JOIN active_stock_reservation_balances r ON r.order_line_id = p.id AND r.remaining > 0
             WHERE p.order_id = ?1
             GROUP BY p.id
             HAVING SUM(r.remaining) > p.quantity - p.fulfilled - p.preclosed
@@ -204,7 +243,7 @@ pub(crate) fn consume_reservations(
     reference: &str,
 ) -> Result<()> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, remaining FROM stock_reservation_balances
+        "SELECT id, remaining FROM active_stock_reservation_balances
          WHERE order_id = ?1 AND item_id = ?2 AND location_id = ?3
            AND batch_id IS ?4 AND remaining > 0 ORDER BY id",
     )?;
@@ -246,7 +285,7 @@ pub(crate) fn insert_reservation(
              WHERE o.company_id = ?1 AND o.id = ?2 AND p.item_id = ?3
                AND o.kind = 'Sale' AND o.closed_at IS NULL
                AND p.quantity - p.fulfilled - p.preclosed - COALESCE((
-                   SELECT SUM(r.remaining) FROM stock_reservation_balances r WHERE r.order_line_id = p.id
+                   SELECT SUM(r.remaining) FROM active_stock_reservation_balances r WHERE r.order_line_id = p.id
                ), 0) >= ?6",
             params![company, order, draft.item_id, draft.location_id, draft.batch_id, draft.quantity, reason],
         )?;
@@ -265,10 +304,21 @@ impl Store {
         order: i64,
         draft: &StockReservationDraft,
     ) -> Result<i64> {
+        self.reserve_order_stock_until(company, order, draft, None)
+    }
+
+    pub fn reserve_order_stock_until(
+        &mut self,
+        company: i64,
+        order: i64,
+        draft: &StockReservationDraft,
+        expires_on: Option<&str>,
+    ) -> Result<i64> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let reservation = insert_reservation(&tx, company, order, draft)?;
+        record_expiry(&tx, reservation, expires_on)?;
         check_stock_coverage(
             &tx,
             company,
@@ -294,7 +344,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (item, remaining): (i64, i64) = tx
             .query_row(
-                "SELECT item_id, remaining FROM stock_reservation_balances
+                "SELECT item_id, remaining FROM active_stock_reservation_balances
                  WHERE company_id = ?1 AND order_id = ?2 AND id = ?3",
                 params![company, order, reservation],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -321,7 +371,7 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(
             "SELECT e.quantity, e.released_at, e.fulfilled, e.reason
              FROM stock_reservation_releases e
-             JOIN stock_reservation_balances r ON r.id = e.reservation_id
+             JOIN active_stock_reservation_balances r ON r.id = e.reservation_id
              WHERE r.company_id = ?1 AND r.order_id = ?2 AND r.id = ?3
              ORDER BY e.id",
         )?;
@@ -339,6 +389,65 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expiry_releases_remaining_stock_and_keeps_the_hold() {
+        let mut store = crate::Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let party = store
+            .create_ledger(company, "Customer", crate::Category::Asset)
+            .unwrap();
+        let item = store.create_stock_item(company, "Part", "Each").unwrap();
+        let location = store.stock_locations(company).unwrap()[0].id;
+        store
+            .adjust_stock(company, item, "2026-01-01", 5000, "Opening")
+            .unwrap();
+        let order = store
+            .create_order(
+                company,
+                &crate::orders::OrderDraft {
+                    kind: crate::inventory::InvoiceKind::Sale,
+                    party_ledger_id: party,
+                    reference: "SO-01".into(),
+                    date: "2026-01-01".into(),
+                    expected_on: None,
+                    notes: String::new(),
+                    lines: vec![crate::orders::OrderLine {
+                        item_id: item,
+                        quantity: 5000,
+                        unit_price: 100,
+                    }],
+                },
+            )
+            .unwrap();
+        let draft = super::StockReservationDraft {
+            item_id: item,
+            location_id: location,
+            batch_id: None,
+            quantity: 4000,
+            reason: "Hold".into(),
+        };
+        assert!(store
+            .reserve_order_stock_until(company, order, &draft, Some("2000-01-01"))
+            .is_err());
+        let today: String = store
+            .conn
+            .query_row("SELECT date('now','localtime')", [], |r| r.get(0))
+            .unwrap();
+        let id = store
+            .reserve_order_stock_until(company, order, &draft, Some(&today))
+            .unwrap();
+        assert_eq!(store.order_availability(company).unwrap()[0].reserved, 4000);
+        store.conn.execute(
+            "UPDATE stock_reservation_expiries SET expires_on = date('now','localtime','-1 day') WHERE reservation_id = ?1",
+            [id],
+        ).unwrap();
+        assert_eq!(store.order_availability(company).unwrap()[0].reserved, 0);
+        let detail = store.order_detail(company, order).unwrap();
+        assert_eq!(detail.reservations[0].id, id);
+        assert_eq!(detail.reservations[0].remaining, 0);
+        assert_eq!(detail.lines[0].unfulfilled(), 5000);
+        store.reserve_order_stock(company, order, &draft).unwrap();
+    }
     use super::*;
     use crate::inventory::{
         InvoiceAllocation, InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine,

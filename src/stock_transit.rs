@@ -437,7 +437,9 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP VIEW warehouse_stock_movements;
+                "DROP VIEW active_stock_reservation_balances;
+                 DROP TABLE stock_reservation_expiries;
+                 DROP VIEW warehouse_stock_movements;
              DROP TABLE negative_stock_policy_changes;
              DROP VIEW stock_transfer_location_movements;
              DROP TABLE stock_transfer_arrivals;

@@ -235,6 +235,7 @@ struct StockReservationForm {
     batch: Option<i64>,
     quantity: String,
     reason: String,
+    expires_on: String,
 }
 
 #[derive(Default)]
@@ -252,6 +253,7 @@ struct StockAllocationForm {
     maximum: String,
     expected_through: String,
     reason: String,
+    expires_on: String,
     plan: Option<StockAllocationPlan>,
 }
 
@@ -1315,6 +1317,11 @@ impl App {
             .horizontal_wrapped(|ui| {
                 ui.label("Reservation reason");
                 ui.text_edit_singleline(&mut form.reason);
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.expires_on)
+                        .hint_text("Expiry YYYY-MM-DD (optional)")
+                        .desired_width(165.0),
+                );
                 ui.add_enabled(
                     !form.reason.trim().is_empty(),
                     egui::Button::new("Apply reservations"),
@@ -1323,9 +1330,12 @@ impl App {
             })
             .inner;
         if apply {
-            let count = self
-                .store
-                .apply_stock_allocation(company, plan, &form.reason)?;
+            let count = self.store.apply_stock_allocation_until(
+                company,
+                plan,
+                &form.reason,
+                (!form.expires_on.trim().is_empty()).then_some(form.expires_on.as_str()),
+            )?;
             form.plan = None;
             form.reason.clear();
             self.message = format!("Stock reserved on {count} order lines");
@@ -1403,6 +1413,11 @@ impl App {
                 ui.add(
                     egui::TextEdit::singleline(&mut form.reason).hint_text("Reason for reserving"),
                 );
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.expires_on)
+                        .hint_text("Expiry YYYY-MM-DD (optional)")
+                        .desired_width(165.0),
+                );
                 let save = ui.add_enabled(
                     form.item.is_some() && form.location.is_some(),
                     egui::Button::new("Reserve stock"),
@@ -1410,7 +1425,7 @@ impl App {
                 if let (true, Some(item_id), Some(location_id)) =
                     (save.clicked(), form.item, form.location)
                 {
-                    self.store.reserve_order_stock(
+                    self.store.reserve_order_stock_until(
                         company,
                         order.id,
                         &StockReservationDraft {
@@ -1420,6 +1435,7 @@ impl App {
                             quantity: parse_quantity(&form.quantity)?,
                             reason: form.reason.clone(),
                         },
+                        (!form.expires_on.trim().is_empty()).then_some(form.expires_on.as_str()),
                     )?;
                     *form = StockReservationForm::default();
                     self.message = "Stock reserved for this order".into();
@@ -1446,6 +1462,9 @@ impl App {
                     hold.unit,
                     hold.reason
                 ));
+                if let Some(date) = &hold.expires_on {
+                    ui.label(format!("Expiry at the end of {date}"));
+                }
                 for event in self
                     .store
                     .stock_reservation_history(company, order.id, hold.id)?

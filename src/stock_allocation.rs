@@ -4,7 +4,8 @@ use crate::inventory::{
 };
 use crate::orders::remaining_quantity;
 use crate::stock_reservations::{
-    check_stock_coverage, insert_reservation, reserved_in_bucket, StockReservationDraft,
+    check_stock_coverage, insert_reservation, record_expiry, reserved_in_bucket,
+    StockReservationDraft,
 };
 use crate::{parse_date, required, Error, Result, Store};
 use chrono::NaiveDate;
@@ -87,7 +88,7 @@ fn preview(
     let mut stmt = conn.prepare(
         "SELECT o.id, o.reference, l.name, o.date, o.expected_on,
                 p.quantity, p.fulfilled, p.preclosed, COALESCE((
-                    SELECT SUM(r.remaining) FROM stock_reservation_balances r WHERE r.order_line_id = p.id
+                    SELECT SUM(r.remaining) FROM active_stock_reservation_balances r WHERE r.order_line_id = p.id
                 ), 0)
          FROM order_line_availability p JOIN orders o ON o.id = p.order_id
          JOIN ledgers l ON l.company_id = o.company_id AND l.id = o.party_ledger_id
@@ -162,6 +163,16 @@ impl Store {
         plan: &StockAllocationPlan,
         reason: &str,
     ) -> Result<usize> {
+        self.apply_stock_allocation_until(company, plan, reason, None)
+    }
+
+    pub fn apply_stock_allocation_until(
+        &mut self,
+        company: i64,
+        plan: &StockAllocationPlan,
+        reason: &str,
+        expires_on: Option<&str>,
+    ) -> Result<usize> {
         let reason = required(reason, "Allocation reason")?;
         if company != plan.company || plan.allocations.is_empty() {
             return Err(Error::Validation(
@@ -186,7 +197,8 @@ impl Store {
         };
         for row in &current.allocations {
             reservation.quantity = row.quantity;
-            insert_reservation(&tx, company, row.order_id, &reservation)?;
+            let id = insert_reservation(&tx, company, row.order_id, &reservation)?;
+            record_expiry(&tx, id, expires_on)?;
         }
         check_stock_coverage(
             &tx,
