@@ -4674,13 +4674,21 @@ impl App {
         }
         if let Some(plan) = &self.import_preview {
             ui.label(format!(
-                "Preview: {} account groups, {} ledgers, {} opening balances, {} opening bills, {} vouchers, {} invoices, {} settlements, {} advances; {} units, {} stock groups, {} locations, {} items, {} opening quantities",
+                "Preview: {} account groups, {} ledgers, {} opening balances, {} opening bills, {} vouchers, {} invoices, {} settlements, {} advances, {} advance applications; {} units, {} stock groups, {} locations, {} items, {} opening quantities",
                 plan.group_count(),
                 plan.ledger_count(),
                 plan.opening_count(),
                 plan.opening_bill_count(),
-                plan.voucher_count(), plan.invoice_count(), plan.settlement_count(), plan.advance_count()
-                , plan.unit_count(), plan.stock_group_count(), plan.location_count(), plan.item_count(), plan.stock_opening_count()
+                plan.voucher_count(),
+                plan.invoice_count(),
+                plan.settlement_count(),
+                plan.advance_count(),
+                plan.advance_application_count(),
+                plan.unit_count(),
+                plan.stock_group_count(),
+                plan.location_count(),
+                plan.item_count(),
+                plan.stock_opening_count()
             ));
             let (valued_openings, value) = plan.opening_stock_value();
             if valued_openings > 0 {
@@ -4711,8 +4719,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} account groups, {} ledgers, {} opening bills, {} vouchers, {} invoices, {} settlements, {} advances, {} units, {} stock groups, {} locations and {} items",
-                            counts.groups, counts.ledgers, counts.opening_bills, counts.vouchers, counts.invoices, counts.settlements, counts.advances, counts.units, counts.stock_groups, counts.locations, counts.items
+                            "Imported {} account groups, {} ledgers, {} opening bills, {} vouchers, {} invoices, {} settlements, {} advances, {} advance applications, {} units, {} stock groups, {} locations and {} items",
+                            counts.groups, counts.ledgers, counts.opening_bills, counts.vouchers, counts.invoices, counts.settlements, counts.advances, counts.advance_applications, counts.units, counts.stock_groups, counts.locations, counts.items
                         );
                         self.import_preview = None;
                     }
@@ -4720,7 +4728,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills on an imported invoice or sales or purchase voucher must add up to the party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed bill allocations, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills and applications of named advances on a sales or purchase transaction must add up to the party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed allocations in receipts or payments, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(ui, "Bank clearance");

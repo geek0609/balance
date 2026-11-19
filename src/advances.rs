@@ -220,8 +220,16 @@ impl Store {
 
     /// Show all advances and their reversals, or advance activity through a date.
     pub fn party_advances(&self, company: i64, through: Option<&str>) -> Result<Vec<PartyAdvance>> {
-        let through = through.map(parse_date).transpose()?;
-        let mut stmt = self.conn.prepare(
+        read_party_advances(&self.conn, company, through.map(parse_date).transpose()?)
+    }
+}
+
+pub(crate) fn read_party_advances(
+    conn: &Connection,
+    company: i64,
+    through: Option<NaiveDate>,
+) -> Result<Vec<PartyAdvance>> {
+    let mut stmt = conn.prepare(
             "SELECT a.id, a.kind, a.party_ledger_id, party.name, bank.name, v.id, v.date, v.reference,
                     v.narration, a.amount, rv.id, rv.date, rv.reference, a.reversal_reason,
                     a.source_bill_type, a.source_bill_reference
@@ -231,75 +239,72 @@ impl Store {
              LEFT JOIN vouchers rv ON rv.id = a.reversal_voucher_id AND rv.company_id = a.company_id
              WHERE a.company_id = ?1",
         )?;
-        let mut rows = stmt.query([company])?;
-        let mut advances = Vec::new();
-        while let Some(row) = rows.next()? {
-            let date: String = row.get(6)?;
-            let original_date = parse_date(&date)?;
-            if through.is_some_and(|limit| original_date > limit) {
-                continue;
-            }
-            let reversal = if let Some(voucher_id) = row.get(10)? {
-                let date: String = row.get(11)?;
-                let parsed = parse_date(&date)?;
-                if through.is_none_or(|limit| parsed <= limit) {
-                    Some(AdvanceReversal {
-                        voucher_id,
-                        date,
-                        reference: row.get(12)?,
-                        reason: row.get(13)?,
-                    })
-                } else {
-                    None
-                }
+    let mut rows = stmt.query([company])?;
+    let mut advances = Vec::new();
+    while let Some(row) = rows.next()? {
+        let date: String = row.get(6)?;
+        let original_date = parse_date(&date)?;
+        if through.is_some_and(|limit| original_date > limit) {
+            continue;
+        }
+        let reversal = if let Some(voucher_id) = row.get(10)? {
+            let date: String = row.get(11)?;
+            let parsed = parse_date(&date)?;
+            if through.is_none_or(|limit| parsed <= limit) {
+                Some(AdvanceReversal {
+                    voucher_id,
+                    date,
+                    reference: row.get(12)?,
+                    reason: row.get(13)?,
+                })
             } else {
                 None
-            };
-            let id = row.get(0)?;
-            let amount = row.get::<_, i64>(9)?;
-            let applied =
-                allocation_state(&self.conn, company, AllocationTarget::Advance(id), through)?
-                    .applied;
-            let available = if reversal.is_some() {
-                0
-            } else {
-                i128::from(amount) - applied
-            };
-            if available < 0 {
-                return Err(Error::Validation(
-                    "Allocations exceed the advance amount".into(),
-                ));
             }
-            let source_bill = match row.get::<_, Option<String>>(14)? {
-                Some(kind) => Some(AdvanceSourceBill {
-                    kind,
-                    reference: row.get(15)?,
-                }),
-                None => None,
-            };
-            advances.push((
-                original_date,
-                PartyAdvance {
-                    id,
-                    kind: InvoiceKind::parse(&row.get::<_, String>(1)?)?,
-                    party_ledger_id: row.get(2)?,
-                    party: row.get(3)?,
-                    bank: row.get(4)?,
-                    voucher_id: row.get(5)?,
-                    date,
-                    reference: row.get(7)?,
-                    narration: row.get(8)?,
-                    amount,
-                    applied,
-                    available,
-                    source_bill,
-                    reversal,
-                },
+        } else {
+            None
+        };
+        let id = row.get(0)?;
+        let amount = row.get::<_, i64>(9)?;
+        let applied = advance_allocation_state(conn, company, id, through)?.applied;
+        let available = if reversal.is_some() {
+            0
+        } else {
+            i128::from(amount) - applied
+        };
+        if available < 0 {
+            return Err(Error::Validation(
+                "Allocations exceed the advance amount".into(),
             ));
         }
-        advances.sort_by(|(a, row_a), (b, row_b)| b.cmp(a).then_with(|| row_b.id.cmp(&row_a.id)));
-        Ok(advances.into_iter().map(|(_, advance)| advance).collect())
+        let source_bill = match row.get::<_, Option<String>>(14)? {
+            Some(kind) => Some(AdvanceSourceBill {
+                kind,
+                reference: row.get(15)?,
+            }),
+            None => None,
+        };
+        advances.push((
+            original_date,
+            PartyAdvance {
+                id,
+                kind: InvoiceKind::parse(&row.get::<_, String>(1)?)?,
+                party_ledger_id: row.get(2)?,
+                party: row.get(3)?,
+                bank: row.get(4)?,
+                voucher_id: row.get(5)?,
+                date,
+                reference: row.get(7)?,
+                narration: row.get(8)?,
+                amount,
+                applied,
+                available,
+                source_bill,
+                reversal,
+            },
+        ));
     }
+    advances.sort_by(|(a, row_a), (b, row_b)| b.cmp(a).then_with(|| row_b.id.cmp(&row_a.id)));
+    Ok(advances.into_iter().map(|(_, advance)| advance).collect())
 }
 
 pub(crate) fn migrate_allocations(conn: &Connection) -> Result<()> {
@@ -393,6 +398,15 @@ pub(crate) fn read_allocation_state(
     Ok(state)
 }
 
+pub(crate) fn advance_allocation_state(
+    conn: &Connection,
+    company: i64,
+    advance: i64,
+    through: Option<NaiveDate>,
+) -> Result<AllocationState> {
+    allocation_state(conn, company, AllocationTarget::Advance(advance), through)
+}
+
 pub(crate) fn invoice_allocation_state(
     conn: &Connection,
     company: i64,
@@ -409,6 +423,129 @@ pub(crate) fn check_open_date(conn: &Connection, company: i64, date: NaiveDate) 
         ));
     }
     Ok(())
+}
+
+pub(crate) fn insert_advance_allocation(
+    conn: &Connection,
+    company: i64,
+    advance: i64,
+    target: BillSettlementTarget,
+    date: NaiveDate,
+    amount: i64,
+    narration: &str,
+) -> Result<i64> {
+    let invoice = target.invoice_id;
+    if amount <= 0 {
+        return Err(Error::Validation(
+            "Enter a positive allocation amount".into(),
+        ));
+    }
+    check_open_date(conn, company, date)?;
+    let (kind, party, advance_date, advance_amount, reversed): (String, i64, String, i64, bool) = conn.query_row(
+            "SELECT a.kind, a.party_ledger_id, v.date, a.amount, a.reversal_voucher_id IS NOT NULL
+             FROM party_advances a JOIN vouchers v ON v.id = a.voucher_id AND v.company_id = a.company_id
+             WHERE a.company_id = ?1 AND a.id = ?2",
+            params![company, advance], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional()?.ok_or_else(|| Error::Validation("Advance not found in this company".into()))?;
+    if reversed {
+        return Err(Error::Validation(
+            "A reversed advance cannot be applied".into(),
+        ));
+    }
+    let (invoice_kind, invoice_party, invoice_date, tax): (String, i64, String, i64) = conn
+        .query_row(
+            "SELECT i.kind, i.party_ledger_id, v.date, i.tax_amount FROM invoices i
+             JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = i.company_id
+             WHERE i.company_id = ?1 AND i.id = ?2",
+            params![company, invoice],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::Validation("Invoice not found in this company".into()))?;
+    if party != invoice_party || kind != invoice_kind {
+        return Err(Error::Validation(
+            "Advance and invoice must have the same party and type".into(),
+        ));
+    }
+    if date < parse_date(&invoice_date)? || date < parse_date(&advance_date)? {
+        return Err(Error::Validation(
+            "Allocation date cannot precede the advance or invoice date".into(),
+        ));
+    }
+    if crate::invoice_reversals::for_invoice(conn, company, invoice)?.is_some() {
+        return Err(Error::Validation(
+            "A reversed invoice cannot accept an advance".into(),
+        ));
+    }
+    let bill = crate::bill_splits::target(conn, target)?;
+    let advance_state = advance_allocation_state(conn, company, advance, None)?;
+    let invoice_state = invoice_allocation_state(conn, company, invoice, None)?;
+    let credits = crate::invoice_credits::state(conn, company, invoice, None)?;
+    if advance_state
+        .latest_release
+        .max(invoice_state.latest_release)
+        .max(credits.latest_reversal)
+        .is_some_and(|released| date < released)
+    {
+        return Err(Error::Validation(
+            "Allocation date cannot precede an advance release or note reversal".into(),
+        ));
+    }
+    if i128::from(amount) > i128::from(advance_amount) - advance_state.applied {
+        return Err(Error::Validation(
+            "Allocation exceeds the available advance amount".into(),
+        ));
+    }
+    let mut paid = 0_i128;
+    {
+        let mut stmt = conn.prepare(
+                "SELECT s.amount, rv.date FROM invoice_settlements s
+                 LEFT JOIN settlement_reversals r ON r.settlement_voucher_id = s.voucher_id AND r.company_id = s.company_id
+                 LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
+                 WHERE s.company_id = ?1 AND s.invoice_id = ?2",
+            )?;
+        let mut rows = stmt.query(params![company, invoice])?;
+        while let Some(row) = rows.next()? {
+            if let Some(reversed_on) = row.get::<_, Option<String>>(1)? {
+                if date < parse_date(&reversed_on)? {
+                    return Err(Error::Validation(
+                        "Allocation date cannot precede a settlement reversal".into(),
+                    ));
+                }
+            } else {
+                paid += i128::from(row.get::<_, i64>(0)?);
+            }
+        }
+    }
+    if i128::from(amount)
+        > invoice_total(conn, invoice, tax)? - paid - invoice_state.applied - credits.applied
+    {
+        return Err(Error::Validation(
+            "Allocation exceeds the outstanding invoice amount".into(),
+        ));
+    }
+    if let Some(bill) = &bill {
+        if i128::from(amount) > bill.outstanding() {
+            return Err(Error::Validation(format!(
+                "Allocation exceeds the outstanding amount for bill {}",
+                bill.reference
+            )));
+        }
+    }
+    conn.execute(
+            "INSERT INTO advance_allocations(company_id, advance_id, invoice_id, date, amount, narration)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![company, advance, invoice, date.format("%Y-%m-%d").to_string(), amount, narration.trim()],
+        )?;
+    let id = conn.last_insert_rowid();
+    if let Some(bill) = bill {
+        conn.execute(
+            "INSERT INTO bill_split_advances(allocation_id, split_id, invoice_id)
+                 VALUES (?1, ?2, ?3)",
+            params![id, bill.id, invoice],
+        )?;
+    }
+    Ok(id)
 }
 
 impl Store {
@@ -445,122 +582,11 @@ impl Store {
         amount: i64,
         narration: &str,
     ) -> Result<i64> {
-        let invoice = target.invoice_id;
         let date = parse_date(date)?;
-        if amount <= 0 {
-            return Err(Error::Validation(
-                "Enter a positive allocation amount".into(),
-            ));
-        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_open_date(&tx, company, date)?;
-        let (kind, party, advance_date, advance_amount, reversed): (String, i64, String, i64, bool) = tx.query_row(
-            "SELECT a.kind, a.party_ledger_id, v.date, a.amount, a.reversal_voucher_id IS NOT NULL
-             FROM party_advances a JOIN vouchers v ON v.id = a.voucher_id AND v.company_id = a.company_id
-             WHERE a.company_id = ?1 AND a.id = ?2",
-            params![company, advance], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        ).optional()?.ok_or_else(|| Error::Validation("Advance not found in this company".into()))?;
-        if reversed {
-            return Err(Error::Validation(
-                "A reversed advance cannot be applied".into(),
-            ));
-        }
-        let (invoice_kind, invoice_party, invoice_date, tax): (String, i64, String, i64) = tx
-            .query_row(
-                "SELECT i.kind, i.party_ledger_id, v.date, i.tax_amount FROM invoices i
-             JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = i.company_id
-             WHERE i.company_id = ?1 AND i.id = ?2",
-                params![company, invoice],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?
-            .ok_or_else(|| Error::Validation("Invoice not found in this company".into()))?;
-        if party != invoice_party || kind != invoice_kind {
-            return Err(Error::Validation(
-                "Advance and invoice must have the same party and type".into(),
-            ));
-        }
-        if date < parse_date(&invoice_date)? || date < parse_date(&advance_date)? {
-            return Err(Error::Validation(
-                "Allocation date cannot precede the advance or invoice date".into(),
-            ));
-        }
-        if crate::invoice_reversals::for_invoice(&tx, company, invoice)?.is_some() {
-            return Err(Error::Validation(
-                "A reversed invoice cannot accept an advance".into(),
-            ));
-        }
-        let bill = crate::bill_splits::target(&tx, target)?;
-        let advance_state =
-            allocation_state(&tx, company, AllocationTarget::Advance(advance), None)?;
-        let invoice_state = invoice_allocation_state(&tx, company, invoice, None)?;
-        let credits = crate::invoice_credits::state(&tx, company, invoice, None)?;
-        if advance_state
-            .latest_release
-            .max(invoice_state.latest_release)
-            .max(credits.latest_reversal)
-            .is_some_and(|released| date < released)
-        {
-            return Err(Error::Validation(
-                "Allocation date cannot precede an advance release or note reversal".into(),
-            ));
-        }
-        if i128::from(amount) > i128::from(advance_amount) - advance_state.applied {
-            return Err(Error::Validation(
-                "Allocation exceeds the available advance amount".into(),
-            ));
-        }
-        let mut paid = 0_i128;
-        {
-            let mut stmt = tx.prepare(
-                "SELECT s.amount, rv.date FROM invoice_settlements s
-                 LEFT JOIN settlement_reversals r ON r.settlement_voucher_id = s.voucher_id AND r.company_id = s.company_id
-                 LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
-                 WHERE s.company_id = ?1 AND s.invoice_id = ?2",
-            )?;
-            let mut rows = stmt.query(params![company, invoice])?;
-            while let Some(row) = rows.next()? {
-                if let Some(reversed_on) = row.get::<_, Option<String>>(1)? {
-                    if date < parse_date(&reversed_on)? {
-                        return Err(Error::Validation(
-                            "Allocation date cannot precede a settlement reversal".into(),
-                        ));
-                    }
-                } else {
-                    paid += i128::from(row.get::<_, i64>(0)?);
-                }
-            }
-        }
-        if i128::from(amount)
-            > invoice_total(&tx, invoice, tax)? - paid - invoice_state.applied - credits.applied
-        {
-            return Err(Error::Validation(
-                "Allocation exceeds the outstanding invoice amount".into(),
-            ));
-        }
-        if let Some(bill) = &bill {
-            if i128::from(amount) > bill.outstanding() {
-                return Err(Error::Validation(format!(
-                    "Allocation exceeds the outstanding amount for bill {}",
-                    bill.reference
-                )));
-            }
-        }
-        tx.execute(
-            "INSERT INTO advance_allocations(company_id, advance_id, invoice_id, date, amount, narration)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![company, advance, invoice, date.format("%Y-%m-%d").to_string(), amount, narration.trim()],
-        )?;
-        let id = tx.last_insert_rowid();
-        if let Some(bill) = bill {
-            tx.execute(
-                "INSERT INTO bill_split_advances(allocation_id, split_id, invoice_id)
-                 VALUES (?1, ?2, ?3)",
-                params![id, bill.id, invoice],
-            )?;
-        }
+        let id = insert_advance_allocation(&tx, company, advance, target, date, amount, narration)?;
         tx.commit()?;
         Ok(id)
     }
