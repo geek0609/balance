@@ -40,6 +40,21 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_advances(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX advance_allocations_with_invoice ON advance_allocations(id, invoice_id);
+        CREATE TABLE bill_split_advances(
+            allocation_id INTEGER PRIMARY KEY,
+            split_id INTEGER NOT NULL,
+            invoice_id INTEGER NOT NULL,
+            FOREIGN KEY(allocation_id, invoice_id) REFERENCES advance_allocations(id, invoice_id),
+            FOREIGN KEY(split_id, invoice_id) REFERENCES invoice_bill_splits(id, invoice_id)
+        );
+        CREATE INDEX bill_split_advances_split ON bill_split_advances(split_id);",
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct BillSplitDraft {
     pub reference: String,
@@ -57,6 +72,13 @@ pub struct BillSplit {
     pub due_date: Option<String>,
     pub credit_days: Option<u32>,
     pub settled: i128,
+    pub advance_applied: i128,
+}
+
+impl BillSplit {
+    pub fn outstanding(&self) -> i128 {
+        i128::from(self.amount) - self.settled - self.advance_applied
+    }
 }
 
 pub(crate) fn prepare(
@@ -145,7 +167,11 @@ pub(crate) fn read(conn: &Connection, invoice: i64, as_of: Option<&str>) -> Resu
              LEFT JOIN settlement_reversals r ON r.settlement_voucher_id = s.voucher_id
              LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id
              WHERE a.split_id = b.id AND (?2 IS NULL OR v.date <= ?2)
-               AND (rv.id IS NULL OR (?2 IS NOT NULL AND rv.date > ?2))), 0)
+               AND (rv.id IS NULL OR (?2 IS NOT NULL AND rv.date > ?2))), 0),
+           COALESCE((SELECT SUM(a.amount) FROM bill_split_advances s
+             JOIN advance_allocations a ON a.id = s.allocation_id
+             WHERE s.split_id = b.id AND (?2 IS NULL OR a.date <= ?2)
+               AND (a.released_on IS NULL OR (?2 IS NOT NULL AND a.released_on > ?2))), 0)
          FROM invoice_bill_splits b WHERE b.invoice_id = ?1 ORDER BY b.id",
     )?;
     let rows = stmt
@@ -157,6 +183,7 @@ pub(crate) fn read(conn: &Connection, invoice: i64, as_of: Option<&str>) -> Resu
                 due_date: row.get(3)?,
                 credit_days: row.get(4)?,
                 settled: i128::from(row.get::<_, i64>(5)?),
+                advance_applied: i128::from(row.get::<_, i64>(6)?),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -171,7 +198,7 @@ pub(crate) fn require_unsplit(conn: &Connection, invoice: i64) -> Result<()> {
     )?;
     if exists {
         return Err(Error::Validation(
-            "Credits and advances on a split bill schedule require individual bill allocations"
+            "Credit and debit notes on a split bill schedule require individual bill allocations"
                 .into(),
         ));
     }

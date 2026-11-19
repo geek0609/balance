@@ -1,5 +1,5 @@
 //! On-account receipts and payments for customers and suppliers.
-use crate::inventory::{invoice_total, ledger_category, InvoiceKind};
+use crate::inventory::{invoice_total, ledger_category, BillSettlementTarget, InvoiceKind};
 use crate::reversals::{counter_postings, write_counter_postings};
 use crate::{parse_date, required, Category, Error, Result, Store, VoucherKind};
 use chrono::NaiveDate;
@@ -327,6 +327,7 @@ pub struct AdvanceAllocation {
     pub id: i64,
     pub invoice_id: i64,
     pub invoice_reference: String,
+    pub bill_reference: String,
     pub date: String,
     pub amount: i64,
     pub narration: String,
@@ -421,6 +422,30 @@ impl Store {
         amount: i64,
         narration: &str,
     ) -> Result<i64> {
+        self.apply_party_advance_to_bill(
+            company,
+            advance,
+            BillSettlementTarget {
+                invoice_id: invoice,
+                split_id: None,
+            },
+            date,
+            amount,
+            narration,
+        )
+    }
+
+    /// Apply an advance to a named bill without posting another cash movement.
+    pub fn apply_party_advance_to_bill(
+        &mut self,
+        company: i64,
+        advance: i64,
+        target: BillSettlementTarget,
+        date: &str,
+        amount: i64,
+        narration: &str,
+    ) -> Result<i64> {
+        let invoice = target.invoice_id;
         let date = parse_date(date)?;
         if amount <= 0 {
             return Err(Error::Validation(
@@ -452,7 +477,6 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| Error::Validation("Invoice not found in this company".into()))?;
-        crate::bill_splits::require_unsplit(&tx, invoice)?;
         if party != invoice_party || kind != invoice_kind {
             return Err(Error::Validation(
                 "Advance and invoice must have the same party and type".into(),
@@ -468,6 +492,18 @@ impl Store {
                 "A reversed invoice cannot accept an advance".into(),
             ));
         }
+        let bills = crate::bill_splits::read(&tx, invoice, None)?;
+        let bill = match target.split_id {
+            Some(id) => Some(bills.iter().find(|bill| bill.id == id).ok_or_else(|| {
+                Error::Validation("The selected bill is unavailable on this invoice".into())
+            })?),
+            None if bills.is_empty() => None,
+            None => {
+                return Err(Error::Validation(
+                    "Select the individual bill for this advance".into(),
+                ))
+            }
+        };
         let advance_state =
             allocation_state(&tx, company, AllocationTarget::Advance(advance), None)?;
         let invoice_state = invoice_allocation_state(&tx, company, invoice, None)?;
@@ -515,12 +551,27 @@ impl Store {
                 "Allocation exceeds the outstanding invoice amount".into(),
             ));
         }
+        if let Some(bill) = bill {
+            if i128::from(amount) > bill.outstanding() {
+                return Err(Error::Validation(format!(
+                    "Allocation exceeds the outstanding amount for bill {}",
+                    bill.reference
+                )));
+            }
+        }
         tx.execute(
             "INSERT INTO advance_allocations(company_id, advance_id, invoice_id, date, amount, narration)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![company, advance, invoice, date.format("%Y-%m-%d").to_string(), amount, narration.trim()],
         )?;
         let id = tx.last_insert_rowid();
+        if let Some(bill) = bill {
+            tx.execute(
+                "INSERT INTO bill_split_advances(allocation_id, split_id, invoice_id)
+                 VALUES (?1, ?2, ?3)",
+                params![id, bill.id, invoice],
+            )?;
+        }
         tx.commit()?;
         Ok(id)
     }
@@ -568,9 +619,12 @@ impl Store {
     ) -> Result<Vec<AdvanceAllocation>> {
         let through = through.map(parse_date).transpose()?;
         let mut stmt = self.conn.prepare(
-            "SELECT a.id, a.invoice_id, v.reference, a.date, a.amount, a.narration, a.released_on, a.release_reason
+            "SELECT a.id, a.invoice_id, v.reference, a.date, a.amount, a.narration, a.released_on,
+                    a.release_reason, COALESCE(b.reference, i.bill_reference, v.reference)
              FROM advance_allocations a JOIN invoices i ON i.id = a.invoice_id AND i.company_id = a.company_id
              JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = i.company_id
+             LEFT JOIN bill_split_advances s ON s.allocation_id = a.id AND s.invoice_id = a.invoice_id
+             LEFT JOIN invoice_bill_splits b ON b.id = s.split_id AND b.invoice_id = i.id
              WHERE a.company_id = ?1 AND a.advance_id = ?2 ORDER BY a.date, a.id",
         )?;
         let mut rows = stmt.query(params![company, advance])?;
@@ -592,6 +646,7 @@ impl Store {
                 id: row.get(0)?,
                 invoice_id: row.get(1)?,
                 invoice_reference: row.get(2)?,
+                bill_reference: row.get(8)?,
                 date,
                 amount: row.get(4)?,
                 narration: row.get(5)?,
@@ -600,5 +655,140 @@ impl Store {
             });
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bill_splits::BillSplitDraft;
+    use crate::inventory::{
+        BillSettlementAllocation, InvoiceAdjustment, InvoiceDraft, InvoiceEntryMode,
+    };
+
+    #[test]
+    fn advance_reduces_only_its_split_bill_until_released() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let customer = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        let bank = store
+            .create_ledger(company, "Bank", Category::Asset)
+            .unwrap();
+        let income = store
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        let advance = store
+            .post_party_advance(
+                company,
+                &AdvanceDraft {
+                    kind: InvoiceKind::Sale,
+                    party_ledger_id: customer,
+                    bank_ledger_id: bank,
+                    date: "2026-01-01".into(),
+                    reference: "A-1".into(),
+                    amount: 6000,
+                    narration: String::new(),
+                },
+            )
+            .unwrap();
+        let invoice = store
+            .create_invoice(
+                company,
+                &InvoiceDraft {
+                    kind: InvoiceKind::Sale,
+                    entry_mode: InvoiceEntryMode::Invoice,
+                    date: "2026-01-02".into(),
+                    reference: "I-1".into(),
+                    narration: String::new(),
+                    due_date: None,
+                    credit_days: None,
+                    bill_reference: None,
+                    bill_splits: vec![
+                        BillSplitDraft {
+                            reference: "FIRST".into(),
+                            amount: 4000,
+                            due_date: None,
+                            credit_days: Some(10),
+                        },
+                        BillSplitDraft {
+                            reference: "SECOND".into(),
+                            amount: 6000,
+                            due_date: None,
+                            credit_days: Some(20),
+                        },
+                    ],
+                    party_ledger_id: customer,
+                    trade_ledger_id: income,
+                    tax_ledger_id: None,
+                    tax_amount: 0,
+                    additional_taxes: Vec::new(),
+                    tax_calculation: None,
+                    lines: Vec::new(),
+                    adjustments: vec![InvoiceAdjustment {
+                        ledger_id: income,
+                        amount: 10000,
+                        description: "Service".into(),
+                    }],
+                },
+            )
+            .unwrap();
+        let bills = store.invoices(company).unwrap().remove(0).bill_splits;
+        let target = |index: usize| BillSettlementTarget {
+            invoice_id: invoice,
+            split_id: Some(bills[index].id),
+        };
+        assert!(store
+            .apply_party_advance(company, advance, invoice, "2026-01-04", 3000, "")
+            .is_err());
+        assert!(store
+            .apply_party_advance_to_bill(company, advance, target(0), "2026-01-04", 4500, "")
+            .is_err());
+        let allocation = store
+            .apply_party_advance_to_bill(company, advance, target(0), "2026-01-04", 3000, "")
+            .unwrap();
+        assert!(store
+            .settle_bills(
+                company,
+                bank,
+                "2026-01-05",
+                "OVER",
+                &[BillSettlementAllocation {
+                    target: target(0),
+                    amount: 1001
+                },]
+            )
+            .is_err());
+        store
+            .settle_bills(
+                company,
+                bank,
+                "2026-01-05",
+                "R-1",
+                &[BillSettlementAllocation {
+                    target: target(1),
+                    amount: 2000,
+                }],
+            )
+            .unwrap();
+        store
+            .release_advance_allocation(company, allocation, "2026-01-07", "Apply elsewhere")
+            .unwrap();
+        let balances = |date| {
+            store
+                .outstanding_invoices(company, date)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.outstanding, row.advance_applied))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(balances("2026-01-03"), [(4000, 0), (6000, 0)]);
+        assert_eq!(balances("2026-01-06"), [(1000, 3000), (4000, 0)]);
+        assert_eq!(balances("2026-01-07"), [(4000, 0), (4000, 0)]);
+        let history = store.advance_allocations(company, advance, None).unwrap();
+        assert_eq!(history[0].bill_reference, "FIRST");
+        assert_eq!(history[0].released_on.as_deref(), Some("2026-01-07"));
+        assert_eq!(store.vouchers(company).unwrap().len(), 3);
     }
 }

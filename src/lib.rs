@@ -54,7 +54,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 75;
+const SCHEMA_VERSION: i64 = 76;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -969,6 +969,10 @@ impl Store {
         if version < 75 {
             bill_splits::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 75)?;
+        }
+        if version < 76 {
+            bill_splits::migrate_advances(&tx)?;
+            tx.pragma_update(None, "user_version", 76)?;
         }
         tx.commit()?;
         Ok(Self { conn })

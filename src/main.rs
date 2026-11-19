@@ -4092,40 +4092,7 @@ impl App {
             Ok(invoices) => {
                 crate::theme::section(ui, "Record a receipt or payment");
                 ui.small("Choose outstanding bills of the same party and type.");
-                let mut bill_choices = Vec::new();
-                for invoice in &invoices {
-                    if invoice.outstanding <= 0 {
-                        continue;
-                    }
-                    let mut add = |split_id, bill_reference: &str, amount| {
-                        if amount > 0 {
-                            bill_choices.push((
-                                BillSettlementTarget {
-                                    invoice_id: invoice.id,
-                                    split_id,
-                                },
-                                format!(
-                                    "{} {} - {} ({})",
-                                    invoice.document_type(),
-                                    reference_with_bill(&invoice.reference, bill_reference),
-                                    invoice.party,
-                                    money(amount)
-                                ),
-                            ));
-                        }
-                    };
-                    if invoice.bill_splits.is_empty() {
-                        add(None, &invoice.bill_reference, invoice.outstanding);
-                    } else {
-                        for bill in &invoice.bill_splits {
-                            add(
-                                Some(bill.id),
-                                &bill.reference,
-                                i128::from(bill.amount) - bill.settled,
-                            );
-                        }
-                    }
-                }
+                let bill_choices = outstanding_bill_choices(&invoices);
                 pick_settlement_bill(
                     ui,
                     "settlement-bill",
@@ -4245,11 +4212,13 @@ impl App {
                     }
                     for bill in &invoice.bill_splits {
                         ui.label(format!(
-                            "Bill {} · {} · Due {} · Cash settled {}",
+                            "Bill {} · {} · Due {} · Cash settled {} · Advances {} · Outstanding {}",
                             bill.reference,
                             format_amount(bill.amount),
                             bill.due_date.as_deref().unwrap_or("—"),
-                            money(bill.settled)
+                            money(bill.settled),
+                            money(bill.advance_applied),
+                            money(bill.outstanding())
                         ));
                     }
                     if invoice.opening_bill.is_none()
@@ -5926,6 +5895,42 @@ fn reference_with_bill(reference: &str, bill_reference: &str) -> String {
     } else {
         format!("{reference} · Bill {bill_reference}")
     }
+}
+
+fn outstanding_bill_choices<'a>(
+    invoices: impl IntoIterator<Item = &'a balance::inventory::InvoiceSummary>,
+) -> Vec<(BillSettlementTarget, String)> {
+    let mut choices = Vec::new();
+    for invoice in invoices {
+        if invoice.outstanding <= 0 {
+            continue;
+        }
+        let mut add = |split_id, bill_reference: &str, amount| {
+            if amount > 0 {
+                choices.push((
+                    BillSettlementTarget {
+                        invoice_id: invoice.id,
+                        split_id,
+                    },
+                    format!(
+                        "{} {} - {} ({})",
+                        invoice.document_type(),
+                        reference_with_bill(&invoice.reference, bill_reference),
+                        invoice.party,
+                        money(amount)
+                    ),
+                ));
+            }
+        };
+        if invoice.bill_splits.is_empty() {
+            add(None, &invoice.bill_reference, invoice.outstanding);
+        } else {
+            for bill in &invoice.bill_splits {
+                add(Some(bill.id), &bill.reference, bill.outstanding());
+            }
+        }
+    }
+    choices
 }
 
 fn pick_settlement_bill(

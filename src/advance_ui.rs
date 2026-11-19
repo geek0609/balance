@@ -1,6 +1,8 @@
-use super::{money, pick_account, App};
+use super::{
+    money, outstanding_bill_choices, pick_account, pick_settlement_bill, reference_with_bill, App,
+};
 use balance::advances::{AdvanceDraft, PartyAdvance};
-use balance::inventory::InvoiceKind;
+use balance::inventory::{BillSettlementTarget, InvoiceKind};
 use balance::{parse_amount, Category, Error, Result};
 use eframe::egui;
 
@@ -53,7 +55,7 @@ struct ReversalForm {
 
 #[derive(Default)]
 struct AllocationForm {
-    invoice: Option<i64>,
+    bill: Option<BillSettlementTarget>,
     date: String,
     amount: String,
     narration: String,
@@ -337,48 +339,23 @@ impl App {
 
     fn advance_allocation_form(&mut self, ui: &mut egui::Ui, company: i64, advance: &PartyAdvance) {
         let invoices = match self.store.invoices(company) {
-            Ok(invoices) => invoices
-                .into_iter()
-                .filter(|invoice| {
-                    invoice.party_ledger_id == advance.party_ledger_id
-                        && invoice.kind == advance.kind
-                        && invoice.reversal.is_none()
-                        && invoice.outstanding > 0
-                        && invoice.bill_splits.is_empty()
-                })
-                .collect::<Vec<_>>(),
+            Ok(invoices) => invoices,
             Err(error) => {
                 self.failure(error);
                 return;
             }
         };
-        if invoices.is_empty() {
-            ui.label("No outstanding invoices for this party and type.");
+        let choices = outstanding_bill_choices(invoices.iter().filter(|invoice| {
+            invoice.party_ledger_id == advance.party_ledger_id
+                && invoice.kind == advance.kind
+                && invoice.reversal.is_none()
+        }));
+        if choices.is_empty() {
+            ui.label("No outstanding bills for this party and type.");
             return;
         }
         let form = &mut self.advance_screen.allocation;
-        let selected = invoices
-            .iter()
-            .find(|invoice| Some(invoice.id) == form.invoice);
-        let caption = selected
-            .map(|invoice| crate::reference_with_bill(&invoice.reference, &invoice.bill_reference))
-            .unwrap_or_else(|| "Select invoice".into());
-        egui::ComboBox::from_id_salt(("advance-invoice", advance.id))
-            .selected_text(caption)
-            .show_ui(ui, |ui| {
-                for invoice in &invoices {
-                    ui.selectable_value(
-                        &mut form.invoice,
-                        Some(invoice.id),
-                        format!(
-                            "{} | {} | Due {}",
-                            invoice.date,
-                            crate::reference_with_bill(&invoice.reference, &invoice.bill_reference),
-                            money(invoice.outstanding)
-                        ),
-                    );
-                }
-            });
+        pick_settlement_bill(ui, ("advance-bill", advance.id), &choices, &mut form.bill);
         egui::Grid::new(("apply-advance", advance.id)).show(ui, |ui| {
             for (label, value) in [
                 ("Allocation date (YYYY-MM-DD)", &mut form.date),
@@ -391,18 +368,18 @@ impl App {
             }
         });
         if ui
-            .add_enabled(form.invoice.is_some(), egui::Button::new("Apply advance"))
+            .add_enabled(form.bill.is_some(), egui::Button::new("Apply advance"))
             .clicked()
         {
             let result = (|| {
-                let invoice = form
-                    .invoice
-                    .ok_or_else(|| Error::Validation("Select an invoice".into()))?;
+                let bill = form
+                    .bill
+                    .ok_or_else(|| Error::Validation("Select a bill".into()))?;
                 let amount = parse_amount(&form.amount)?;
-                self.store.apply_party_advance(
+                self.store.apply_party_advance_to_bill(
                     company,
                     advance.id,
-                    invoice,
+                    bill,
                     &form.date,
                     amount,
                     &form.narration,
@@ -449,7 +426,7 @@ impl App {
                     ui.label(format!(
                         "{} | Invoice {} ({}) | {}",
                         row.date,
-                        row.invoice_reference,
+                        reference_with_bill(&row.invoice_reference, &row.bill_reference),
                         row.invoice_id,
                         money(row.amount.into())
                     ));
@@ -485,7 +462,7 @@ impl App {
         if allocation != form.allocation {
             return;
         }
-        ui.label("Release the full allocation. The invoice balance and available advance will increase from the release date.");
+        ui.label("Release the full allocation. The bill balance and available advance will increase from the release date.");
         ui.horizontal_wrapped(|ui| {
             ui.label("Date");
             ui.add(egui::TextEdit::singleline(&mut form.date).hint_text("YYYY-MM-DD"));

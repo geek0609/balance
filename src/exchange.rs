@@ -3423,7 +3423,7 @@ impl Store {
                             let remaining = if invoice.reversal.is_some() {
                                 0
                             } else {
-                                i128::from(bill.amount) - bill.settled
+                                bill.outstanding()
                             };
                             (Some(bill.id), bill.reference, remaining, bill.credit_days)
                         })
@@ -4379,7 +4379,7 @@ impl Store {
                         .into_iter()
                         .find(|bill| bill.id == split_id)
                         .ok_or_else(changed)?;
-                    i128::from(bill.amount) - bill.settled
+                    bill.outstanding()
                 } else {
                     let advances =
                         crate::advances::invoice_allocation_state(&tx, plan.company_id, id, None)?;

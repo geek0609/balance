@@ -1418,7 +1418,7 @@ pub(crate) fn insert_settlement_on_connection(
             let bill = bills.iter().find(|bill| bill.id == *id).ok_or_else(|| {
                 Error::Validation("The selected bill is unavailable on this invoice".into())
             })?;
-            if i128::from(*amount) > i128::from(bill.amount) - bill.settled {
+            if i128::from(*amount) > bill.outstanding() {
                 return Err(Error::Validation(format!(
                     "The allocation exceeds the outstanding amount for bill {}",
                     bill.reference
@@ -3284,6 +3284,7 @@ impl Store {
                     invoice.due_date,
                     invoice.total,
                     settled,
+                    advance_applied,
                 )]
             } else {
                 let bills = crate::bill_splits::read(&self.conn, invoice.id, Some(&end_text))?;
@@ -3293,7 +3294,8 @@ impl Store {
                         .map(|bill| i128::from(bill.amount))
                         .sum::<i128>()
                         != invoice.total
-                    || advance_applied != 0
+                    || bills.iter().map(|bill| bill.advance_applied).sum::<i128>()
+                        != advance_applied
                     || credited != 0
                 {
                     return Err(Error::Validation(
@@ -3309,11 +3311,12 @@ impl Store {
                             bill.due_date,
                             i128::from(bill.amount),
                             bill.settled,
+                            bill.advance_applied,
                         )
                     })
                     .collect()
             };
-            for (split_id, bill_reference, due_date, total, settled) in bills {
+            for (split_id, bill_reference, due_date, total, settled, advance_applied) in bills {
                 let outstanding = total - settled - advance_applied - credited;
                 if outstanding < 0 {
                     return Err(Error::Validation(
