@@ -62,7 +62,8 @@ fn allocation_state(
     through: Option<NaiveDate>,
 ) -> Result<AllocationState> {
     let mut stmt = conn.prepare_cached(
-        "SELECT date, amount, released_on FROM bill_note_credit_applications WHERE credit_id = ?1",
+        "SELECT date, amount, released_on FROM bill_note_credit_applications WHERE credit_id = ?1
+         UNION ALL SELECT date, amount, reversal_date FROM bill_note_refund_history WHERE credit_id = ?1",
     )?;
     let rows = stmt.query([credit])?;
     read_allocation_state(rows, through)
@@ -186,12 +187,14 @@ pub(crate) fn check_reversal(
     let conflict: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM bill_note_credit_applications a JOIN bill_note_credits c ON c.id = a.credit_id
          JOIN vouchers v ON v.id = c.voucher_id WHERE c.voucher_id = ?1 AND v.company_id = ?2
-         AND (a.released_on IS NULL OR a.released_on > ?3))",
+         AND (a.released_on IS NULL OR a.released_on > ?3)
+         UNION ALL SELECT 1 FROM bill_note_refund_history f JOIN bill_note_credits c ON c.id = f.credit_id
+         WHERE c.voucher_id = ?1 AND f.company_id = ?2 AND (f.reversal_date IS NULL OR f.reversal_date > ?3))",
         params![voucher, company, date.to_string()], |row| row.get(0),
     )?;
     if conflict {
         return Err(Error::Validation(
-            "Release all applications on the note before reversing it".into(),
+            "Release all applications and reverse any refunds before reversing the note".into(),
         ));
     }
     Ok(())

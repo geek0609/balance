@@ -401,7 +401,9 @@ impl App {
                 .id_salt(advance.id)
                 .show(ui, |ui| self.advance_allocation_form(ui, company, advance));
         }
-        let reverse_label = if advance.includes_settlements || advance.shares_voucher {
+        let combined =
+            advance.includes_settlements || advance.includes_refunds || advance.shares_voucher;
+        let reverse_label = if combined {
             "Reverse whole receipt / payment"
         } else {
             "Reverse advance"
@@ -417,7 +419,7 @@ impl App {
         let Some(form) = &mut self.advance_screen.reversal else {
             return;
         };
-        if advance.includes_settlements || advance.shares_voucher {
+        if combined {
             ui.label("This reverses every allocation on the receipt or payment. Release any active applications first.");
         }
         egui::Grid::new(("reverse-advance", advance.id)).show(ui, |ui| {

@@ -28,10 +28,10 @@ pub(crate) fn postings(
     bank: i64,
     party: i64,
     settled: i128,
-    advance: i64,
+    other_amount: i128,
     discounts: &[SettlementDiscount],
 ) -> Result<Vec<Posting>> {
-    let total = i64::try_from(settled + i128::from(advance))
+    let total = i64::try_from(settled + other_amount)
         .map_err(|_| Error::Validation("Receipt or payment total is too large".into()))?;
     let mut ledgers = HashSet::from([bank, party]);
     let mut discounted = 0_i128;

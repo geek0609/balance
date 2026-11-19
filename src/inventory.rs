@@ -1372,6 +1372,7 @@ pub(crate) fn insert_settlement_on_connection(
     narration: &str,
     advance_voucher: Option<i64>,
     discounts: &[crate::settlement_discounts::SettlementDiscount],
+    refund_total: i64,
 ) -> Result<(i64, Vec<i64>)> {
     let parsed_date = parse_date(date)?;
     let date = parsed_date.format("%Y-%m-%d").to_string();
@@ -1526,7 +1527,7 @@ pub(crate) fn insert_settlement_on_connection(
         bank_ledger_id,
         party,
         total,
-        advance.unwrap_or(0),
+        i128::from(advance.unwrap_or(0)) + i128::from(refund_total),
         discounts,
     )?;
     validate_voucher(&date, &postings)?;
@@ -1713,6 +1714,7 @@ pub(crate) fn reverse_settlement_on_connection(
         ));
     }
     let discounts = crate::settlement_discounts::read(conn, settlement_voucher)?;
+    let refunds = crate::bill_note_refunds::total_for_voucher(conn, settlement_voucher)?;
     let expected_postings = crate::settlement_discounts::postings(
         conn,
         company_id,
@@ -1720,7 +1722,7 @@ pub(crate) fn reverse_settlement_on_connection(
         bank,
         party,
         total,
-        advance.unwrap_or(0),
+        i128::from(advance.unwrap_or(0)) + i128::from(refunds),
         &discounts,
     )?;
     check_settlement_postings(conn, settlement_voucher, &expected_postings)?;
@@ -3410,6 +3412,7 @@ impl Store {
                 parts,
                 settled,
                 discounts,
+                0,
             )?;
             Some(voucher)
         } else {
@@ -3425,6 +3428,7 @@ impl Store {
             "Invoice settlement",
             advance_voucher,
             discounts,
+            0,
         )?;
         tx.commit()?;
         Ok(result)

@@ -88,6 +88,7 @@ pub struct PartyAdvance {
     pub narration: String,
     pub amount: i64,
     pub includes_settlements: bool,
+    pub includes_refunds: bool,
     pub shares_voucher: bool,
     pub opening_original_date: Option<String>,
     pub applied: i128,
@@ -291,6 +292,7 @@ pub(crate) fn insert_party_advance(
         &[(draft.amount, source_bill)],
         settled_amount,
         &[],
+        0,
     )?;
     Ok((ids[0], voucher))
 }
@@ -302,8 +304,18 @@ pub(crate) fn insert_party_advance_parts(
     parts: &[(i64, Option<&AdvanceSourceBill>)],
     settled_amount: i64,
     discounts: &[SettlementDiscount],
+    refund_total: i64,
 ) -> Result<(Vec<i64>, i64)> {
-    insert_advance_voucher(conn, company, draft, parts, settled_amount, None, discounts)
+    insert_advance_voucher(
+        conn,
+        company,
+        draft,
+        parts,
+        settled_amount,
+        None,
+        discounts,
+        refund_total,
+    )
 }
 
 pub(crate) fn insert_opening_party_advance(
@@ -321,6 +333,7 @@ pub(crate) fn insert_opening_party_advance(
         0,
         Some(original_date),
         &[],
+        0,
     )?;
     Ok((ids[0], voucher))
 }
@@ -333,6 +346,7 @@ fn insert_advance_voucher(
     settled_amount: i64,
     opening_original_date: Option<NaiveDate>,
     discounts: &[SettlementDiscount],
+    refund_total: i64,
 ) -> Result<(Vec<i64>, i64)> {
     let date = parse_date(&draft.date)?;
     let reference = required(&draft.reference, "Advance reference")?;
@@ -426,7 +440,7 @@ fn insert_advance_voucher(
             draft.bank_ledger_id,
             draft.party_ledger_id,
             i128::from(settled_amount),
-            draft.amount,
+            i128::from(draft.amount) + i128::from(refund_total),
             discounts,
         )?;
         (kind, postings)
@@ -491,7 +505,7 @@ impl Store {
             .zip(&sources)
             .map(|(part, source)| (part.amount, Some(source)))
             .collect();
-        let (ids, _) = insert_party_advance_parts(&tx, company, draft, &allocations, 0, &[])?;
+        let (ids, _) = insert_party_advance_parts(&tx, company, draft, &allocations, 0, &[], 0)?;
         tx.commit()?;
         Ok(ids)
     }
@@ -617,7 +631,8 @@ pub(crate) fn read_party_advances(
                     v.narration, a.amount, rv.id, rv.date, rv.reference, h.reversal_reason,
                     a.source_bill_type, a.source_bill_reference, a.source_bill_due_date, a.source_bill_credit_days, h.opening_original_date,
                     EXISTS(SELECT 1 FROM invoice_settlements s WHERE s.voucher_id = a.voucher_id AND s.company_id = h.company_id),
-                    EXISTS(SELECT 1 FROM party_advances sibling WHERE sibling.voucher_id = a.voucher_id AND sibling.id != a.id)
+                    EXISTS(SELECT 1 FROM party_advances sibling WHERE sibling.voucher_id = a.voucher_id AND sibling.id != a.id),
+                    EXISTS(SELECT 1 FROM bill_note_refunds f WHERE f.voucher_id = a.voucher_id)
              FROM party_advances a JOIN advance_vouchers h ON h.voucher_id = a.voucher_id
              JOIN vouchers v ON v.id = h.voucher_id AND v.company_id = h.company_id
              JOIN ledgers party ON party.id = h.party_ledger_id AND party.company_id = h.company_id
@@ -687,6 +702,7 @@ pub(crate) fn read_party_advances(
                 opening_original_date: row.get(18)?,
                 includes_settlements: row.get(19)?,
                 shares_voucher: row.get(20)?,
+                includes_refunds: row.get(21)?,
                 applied,
                 available,
                 source_bill,

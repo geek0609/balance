@@ -10,6 +10,7 @@ pub mod actual_cost;
 pub mod advances;
 pub mod banking;
 pub mod bill_note_credits;
+pub mod bill_note_refunds;
 pub mod bill_notes;
 pub mod bill_splits;
 pub mod budgets;
@@ -57,7 +58,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 86;
+const SCHEMA_VERSION: i64 = 87;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -461,6 +462,7 @@ impl Store {
             "bill_note_allocations",
             "bill_note_credits",
             "bill_note_credit_applications",
+            "bill_note_refunds",
             "party_advances",
             "advance_allocations",
             "bills_of_materials",
@@ -539,6 +541,9 @@ impl Store {
         store
             .conn
             .prepare("SELECT item_id, location_id, batch_id, date, quantity FROM warehouse_stock_movements LIMIT 0")?;
+        store
+            .conn
+            .prepare("SELECT credit_id, voucher_id, amount, reversal_date FROM bill_note_refund_history LIMIT 0")?;
         Ok(())
     }
     fn from_connection(mut conn: Connection) -> Result<Self> {
@@ -1022,6 +1027,10 @@ impl Store {
             bill_note_credits::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 86)?;
         }
+        if version < 87 {
+            bill_note_refunds::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 87)?;
+        }
         tx.commit()?;
         Ok(Self { conn })
     }
@@ -1304,6 +1313,7 @@ impl Store {
         if invoice_backed
             || invoice_credits::is_linked_voucher(&tx, company_id, voucher_id)?
             || bill_notes::is_bill_note(&tx, company_id, voucher_id)?
+            || bill_note_refunds::is_linked(&tx, company_id, voucher_id)?
             || recurring::contains_voucher(&tx, company_id, voucher_id)?
         {
             return Err(Error::Validation(
@@ -1695,6 +1705,29 @@ fn validate_voucher(date: &str, postings: &[Posting]) -> Result<NaiveDate> {
     }
     Ok(date)
 }
+pub(crate) fn check_new_bill_voucher(
+    conn: &Connection,
+    company: i64,
+    kind: VoucherKind,
+    date: &str,
+    reference: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT reference FROM vouchers WHERE company_id = ?1 AND kind = ?2 AND date = ?3",
+    )?;
+    let key = reference.trim().to_lowercase();
+    for old in stmt.query_map(params![company, kind.as_str(), date], |row| {
+        row.get::<_, String>(0)
+    })? {
+        if old?.trim().to_lowercase() == key {
+            return Err(Error::Validation(format!(
+                "Voucher {reference} already exists"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn insert_voucher_draft(
     conn: &Connection,
     company_id: i64,

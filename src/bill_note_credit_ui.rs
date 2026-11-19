@@ -1,5 +1,8 @@
-use super::{money, outstanding_bill_choices, pick_settlement_bill, App, BillSettlementTarget};
-use balance::{parse_amount, Error, Result};
+use super::{
+    money, outstanding_bill_choices, pick_account, pick_settlement_bill, App, BillSettlementTarget,
+};
+use balance::bill_note_refunds::NoteRefundAllocation;
+use balance::{parse_amount, Category, Error, Result};
 use eframe::egui;
 
 pub(super) enum NoteCreditAction {
@@ -15,6 +18,13 @@ pub(super) enum NoteCreditAction {
         application: i64,
         date: String,
         reason: String,
+    },
+    Refund {
+        credit: i64,
+        bank: Option<i64>,
+        date: String,
+        reference: String,
+        amount: String,
     },
 }
 
@@ -57,15 +67,51 @@ impl App {
                 }
                 if let Some(reversed) = &credit.reversal_date {
                     ui.small(format!("Reversed on {reversed}"));
-                } else if credit.available > 0 && ui.button("Apply to a bill").clicked() {
-                    action = Some(NoteCreditAction::Apply {
-                        credit: credit.id,
-                        party: credit.party_ledger_id,
-                        kind: credit.kind,
-                        bill: None,
-                        date: through.into(),
-                        amount: String::new(),
+                } else if credit.available > 0 {
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply to a bill").clicked() {
+                            action = Some(NoteCreditAction::Apply {
+                                credit: credit.id,
+                                party: credit.party_ledger_id,
+                                kind: credit.kind,
+                                bill: None,
+                                date: through.into(),
+                                amount: String::new(),
+                            });
+                        }
+                        if ui.button("Refund credit").clicked() {
+                            action = Some(NoteCreditAction::Refund {
+                                credit: credit.id,
+                                bank: None,
+                                date: through.into(),
+                                reference: String::new(),
+                                amount: String::new(),
+                            });
+                        }
                     });
+                }
+                match self.store.bill_note_refunds(company, credit.id) {
+                    Ok(refunds) => {
+                        for refund in refunds
+                            .into_iter()
+                            .filter(|refund| refund.date.as_str() <= through)
+                        {
+                            ui.small(format!(
+                                "{} · Refund {} (#{}), {} via {}",
+                                refund.date,
+                                refund.reference,
+                                refund.voucher_id,
+                                money(i128::from(refund.amount)),
+                                refund.bank
+                            ));
+                            if let Some(date) = refund.reversal_date {
+                                ui.small(format!("Reversed on {date}"));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+                    }
                 }
                 match self.store.bill_note_credit_applications(company, credit.id) {
                     Ok(rows) => {
@@ -160,6 +206,57 @@ impl App {
                                 .release_bill_note_credit(company, *application, date, reason)
                                 .map(|()| "Credit released"),
                         );
+                    }
+                });
+            }
+            NoteCreditAction::Refund {
+                credit,
+                bank,
+                date,
+                reference,
+                amount,
+            } => {
+                match self.store.ledgers(company) {
+                    Ok(mut ledgers) => {
+                        ledgers.retain(|ledger| ledger.category == Category::Asset);
+                        pick_account(
+                            ui,
+                            "named-credit-refund-bank",
+                            "Cash or bank",
+                            &ledgers,
+                            bank,
+                            false,
+                        );
+                    }
+                    Err(error) => {
+                        ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Refund date");
+                    ui.text_edit_singleline(date);
+                    ui.label("Reference");
+                    ui.text_edit_singleline(reference);
+                    ui.label("Amount");
+                    ui.text_edit_singleline(amount);
+                    if ui.button("Post refund").clicked() {
+                        result = Some((|| {
+                            let bank = bank.ok_or_else(|| {
+                                Error::Validation("Select a cash or bank ledger".into())
+                            })?;
+                            let allocation = NoteRefundAllocation {
+                                credit_id: *credit,
+                                amount: parse_amount(amount)?,
+                            };
+                            self.store.refund_bill_note_credits(
+                                company,
+                                bank,
+                                date,
+                                reference,
+                                &[allocation],
+                            )?;
+                            Ok("Credit refund posted")
+                        })());
                     }
                 });
             }

@@ -1780,7 +1780,7 @@ impl App {
                     self.voucher_reversal_target = None;
                 }
             });
-            ui.small("The counter-entry offsets the original postings and restores any linked bill balances from the reversal date.");
+            ui.small("The counter-entry offsets the original postings and restores linked bill balances or available credit from the reversal date.");
         }
         match self.store.vouchers(company) {
             Ok(vouchers) => {
@@ -1798,6 +1798,10 @@ impl App {
                     };
                     let protected = invoice_backed || reversal.is_some();
                     let bill_note = self.store.is_bill_note(company, voucher.id).unwrap_or(true);
+                    let named_refund = self
+                        .store
+                        .is_named_credit_refund(company, voucher.id)
+                        .unwrap_or(true);
                     let foreign = self
                         .store
                         .is_foreign_voucher(company, voucher.id)
@@ -1817,7 +1821,7 @@ impl App {
                         }
                         if ui
                             .add_enabled(
-                                !protected && !bill_note && !foreign && !recurring,
+                                !protected && !bill_note && !named_refund && !foreign && !recurring,
                                 egui::Button::new("Edit"),
                             )
                             .clicked()
@@ -1857,6 +1861,8 @@ impl App {
                             ui.small("Monthly journal. Use a reversal to correct it.");
                         } else if bill_note {
                             ui.small("Bill-linked note. Use a reversal to correct it.");
+                        } else if named_refund && !protected {
+                            ui.small("Named credit refund. Use a reversal to correct it.");
                         } else if protected {
                             ui.small("Linked or reversed postings cannot be edited here.");
                         }
@@ -4098,7 +4104,7 @@ impl App {
         ui.small("Invoice balances include all saved settlements and reversals. Use Outstanding for a specific date.");
         if let Some(voucher) = self.reversal_target {
             crate::theme::section(ui, format!("Reverse settlement voucher {voucher}"));
-            ui.label("This reverses the cash, discounts, bill allocations and advances on the voucher. Release any active applications first.");
+            ui.label("This reverses the cash and all discounts, bill allocations, advances and refunds on the voucher. Release any active advance applications first.");
             ui.horizontal(|ui| {
                 ui.label("Date");
                 ui.add(egui::TextEdit::singleline(&mut self.reversal_date).hint_text("YYYY-MM-DD"));
@@ -4813,7 +4819,7 @@ impl App {
         }
         if let Some(plan) = &self.import_preview {
             ui.label(format!(
-                "Preview: {} account groups, {} ledgers, {} opening balances, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} units, {} stock groups, {} locations, {} items, {} opening quantities",
+                "Preview: {} account groups, {} ledgers, {} opening balances, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations, {} items, {} opening quantities",
                 plan.group_count(),
                 plan.ledger_count(),
                 plan.opening_count(),
@@ -4828,6 +4834,7 @@ impl App {
                 plan.advance_application_count(),
                 plan.note_credit_count(),
                 plan.credit_application_count(),
+                plan.note_refund_count(),
                 plan.unit_count(),
                 plan.stock_group_count(),
                 plan.location_count(),
@@ -4863,8 +4870,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} units, {} stock groups, {} locations and {} items",
-                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.units, counts.stock_groups, counts.locations, counts.items
+                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
+                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
                         );
                         self.import_preview = None;
                     }
@@ -4872,7 +4879,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills retain due dates or whole-day credit periods. Named opening advances retain their original dates and can fund later invoices. Balance records the difference between the named opening entries and the ledger opening total on account. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills and applications of named advances or note credits must add up to the party amount on a sales or purchase transaction. Financial notes can reduce open bills or leave named credit for later invoices. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. A voucher can contain bill settlements, named advances and on-account amounts. Named advances retain a due date or whole-day credit period. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, credit terms on on-account amounts and unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills retain due dates or whole-day credit periods. Named opening advances retain their original dates and can fund later invoices. Balance records the difference between the named opening entries and the ledger opening total on account. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills and applications of named advances or note credits must add up to the party amount on a sales or purchase transaction. Financial notes can reduce open bills or leave named credit for later invoices. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. A voucher can contain bill settlements, note credit refunds, named advances and on-account amounts. Named advances retain a due date or whole-day credit period. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, credit terms on on-account amounts and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(ui, "Bank clearance");
