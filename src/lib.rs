@@ -56,7 +56,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 84;
+const SCHEMA_VERSION: i64 = 85;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -1010,6 +1010,10 @@ impl Store {
         if version < 84 {
             bill_notes::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 84)?;
+        }
+        if version < 85 {
+            exchange::migrate_voucher_keys(&tx)?;
+            tx.pragma_update(None, "user_version", 85)?;
         }
         tx.commit()?;
         Ok(Self { conn })

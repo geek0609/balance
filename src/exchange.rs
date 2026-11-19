@@ -30,6 +30,19 @@ use std::str::FromStr;
 pub const MAX_XML_IMPORT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_XML_NODES: u32 = 1_000_000;
 
+pub(crate) fn migrate_voucher_keys(conn: &Connection) -> Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('imported_record_metadata') WHERE name = 'voucher_key')",
+        [], |row| row.get(0),
+    )?;
+    if !present {
+        conn.execute_batch(
+            "ALTER TABLE imported_record_metadata ADD COLUMN voucher_key TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct Group {
     name: String,
@@ -229,6 +242,7 @@ struct SourceMetadata {
     remote_id: String,
     master_id: String,
     alteration_id: String,
+    voucher_key: String,
 }
 impl SourceMetadata {
     fn is_empty(&self) -> bool {
@@ -236,12 +250,14 @@ impl SourceMetadata {
             && self.remote_id.is_empty()
             && self.master_id.is_empty()
             && self.alteration_id.is_empty()
+            && self.voucher_key.is_empty()
     }
-    fn identities(&self) -> [(&'static str, &str); 3] {
+    fn identities(&self) -> [(&'static str, &str); 4] {
         [
             ("guid", &self.guid),
             ("remote", &self.remote_id),
             ("master", &self.master_id),
+            ("voucher key", &self.voucher_key),
         ]
     }
 }
@@ -486,6 +502,7 @@ fn meaningful(node: Node<'_, '_>) -> bool {
 }
 fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut Vec<String>) {
     let mut singletons = HashSet::new();
+    let voucher = local_name(node).eq_ignore_ascii_case("VOUCHER");
     let record = [
         "GROUP",
         "LEDGER",
@@ -499,10 +516,11 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
     .any(|tag| local_name(node).eq_ignore_ascii_case(tag));
     for child in node.children().filter(|n| n.is_element()) {
         let tag = local_name(child);
-        let metadata = record
-            && ["GUID", "REMOTEID", "MASTERID", "ALTERID"]
-                .iter()
-                .any(|a| tag.eq_ignore_ascii_case(a));
+        let metadata = (voucher && tag.eq_ignore_ascii_case("VCHKEY"))
+            || record
+                && ["GUID", "REMOTEID", "MASTERID", "ALTERID"]
+                    .iter()
+                    .any(|a| tag.eq_ignore_ascii_case(a));
         if !allowed.iter().any(|a| tag.eq_ignore_ascii_case(a)) && !metadata && meaningful(child) {
             issues.push(format!("{label}: field {tag} is not supported"));
         }
@@ -548,8 +566,8 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
                 && ["GUID", "REMOTEID", "MASTERID", "ALTERID"]
                     .iter()
                     .any(|a| attribute.name().eq_ignore_ascii_case(a)))
-            && !(local_name(node).eq_ignore_ascii_case("VOUCHER")
-                && ["DATE", "VCHTYPE", "OBJVIEW"]
+            && !(voucher
+                && ["DATE", "VCHTYPE", "OBJVIEW", "VCHKEY"]
                     .iter()
                     .any(|a| attribute.name().eq_ignore_ascii_case(a)))
             && !(attribute.name().eq_ignore_ascii_case("TYPE")
@@ -576,16 +594,21 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
 fn source_metadata(node: Node<'_, '_>, label: &str, issues: &mut Vec<String>) -> SourceMetadata {
     let value = |name: &str, issues: &mut Vec<String>| {
         let child = direct_text(node, name).unwrap_or_default();
-        let attribute = node
+        let mut attributes = node
             .attributes()
-            .find(|a| a.name().eq_ignore_ascii_case(name))
-            .map(|a| a.value().trim().to_owned())
+            .filter(|a| a.name().eq_ignore_ascii_case(name));
+        let attribute = attributes
+            .next()
+            .map(|a| a.value().trim())
             .unwrap_or_default();
+        if attributes.next().is_some() {
+            issues.push(format!("{label}: attribute {name} occurs more than once"));
+        }
         if !child.is_empty() && !attribute.is_empty() && child != attribute {
             issues.push(format!("{label}: conflicting {name} values"));
         }
         if child.is_empty() {
-            attribute
+            attribute.to_owned()
         } else {
             child
         }
@@ -595,6 +618,11 @@ fn source_metadata(node: Node<'_, '_>, label: &str, issues: &mut Vec<String>) ->
         remote_id: value("REMOTEID", issues),
         master_id: value("MASTERID", issues),
         alteration_id: value("ALTERID", issues),
+        voucher_key: if local_name(node).eq_ignore_ascii_case("VOUCHER") {
+            value("VCHKEY", issues)
+        } else {
+            String::new()
+        },
     }
 }
 fn register_metadata(
@@ -620,35 +648,37 @@ fn save_metadata(
     if meta.is_empty() {
         return Ok(());
     }
-    let existing: Option<(String, String, String, String)> = conn.query_row("SELECT guid, remote_id, master_id, alteration_id FROM imported_record_metadata WHERE company_id = ?1 AND kind = ?2 AND local_id = ?3", params![company, kind, local_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
-    if let Some((guid, remote_id, master_id, alteration_id)) = existing {
-        if *meta
-            == (SourceMetadata {
-                guid,
-                remote_id,
-                master_id,
-                alteration_id,
-            })
-        {
+    let existing = conn.query_row(
+        "SELECT guid, remote_id, master_id, alteration_id, voucher_key FROM imported_record_metadata
+         WHERE company_id = ?1 AND kind = ?2 AND local_id = ?3",
+        params![company, kind, local_id],
+        |r| Ok(SourceMetadata {
+            guid: r.get(0)?, remote_id: r.get(1)?, master_id: r.get(2)?, alteration_id: r.get(3)?, voucher_key: r.get(4)?,
+        }),
+    ).optional()?;
+    if let Some(existing) = existing {
+        if *meta == existing {
             return Ok(());
         }
         return Err(Error::Validation(
             "Imported identifiers changed since preview".into(),
         ));
     }
-    let mut stmt = conn.prepare("SELECT guid, remote_id, master_id FROM imported_record_metadata WHERE company_id = ?1 AND kind = ?2")?;
+    let mut stmt = conn.prepare("SELECT guid, remote_id, master_id, voucher_key FROM imported_record_metadata WHERE company_id = ?1 AND kind = ?2")?;
     let rows = stmt.query_map(params![company, kind], |r| {
-        Ok((
+        Ok([
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
-        ))
+            r.get::<_, String>(3)?,
+        ])
     })?;
+    let identities = meta.identities().map(|(_, value)| normalized(value));
     for row in rows {
-        let (guid, remote, master) = row?;
-        if (!meta.guid.is_empty() && normalized(&meta.guid) == normalized(&guid))
-            || (!meta.remote_id.is_empty() && normalized(&meta.remote_id) == normalized(&remote))
-            || (!meta.master_id.is_empty() && normalized(&meta.master_id) == normalized(&master))
+        if identities
+            .iter()
+            .zip(row?)
+            .any(|(key, value)| !key.is_empty() && *key == normalized(&value))
         {
             return Err(Error::Validation(
                 "An imported identifier already exists".into(),
@@ -656,7 +686,7 @@ fn save_metadata(
         }
     }
     drop(stmt);
-    conn.execute("INSERT INTO imported_record_metadata(company_id, kind, local_id, guid, remote_id, master_id, alteration_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![company, kind, local_id, meta.guid, meta.remote_id, meta.master_id, meta.alteration_id])?;
+    conn.execute("INSERT INTO imported_record_metadata(company_id, kind, local_id, guid, remote_id, master_id, alteration_id, voucher_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![company, kind, local_id, meta.guid, meta.remote_id, meta.master_id, meta.alteration_id, meta.voucher_key])?;
     Ok(())
 }
 fn check_language_names(node: Node<'_, '_>, name: &str, label: &str, issues: &mut Vec<String>) {
@@ -2942,18 +2972,24 @@ impl Store {
         };
         let mut seen_metadata = HashSet::<(String, String, String)>::new();
         {
-            let mut stmt = self.conn.prepare("SELECT kind, guid, remote_id, master_id FROM imported_record_metadata WHERE company_id = ?1")?;
+            let mut stmt = self.conn.prepare("SELECT kind, guid, remote_id, master_id, voucher_key FROM imported_record_metadata WHERE company_id = ?1")?;
             let rows = stmt.query_map([company_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })?;
             for row in rows {
-                let (kind, guid, remote, master) = row?;
-                for (key, value) in [("guid", guid), ("remote", remote), ("master", master)] {
+                let (kind, guid, remote, master, voucher_key) = row?;
+                for (key, value) in [
+                    ("guid", guid),
+                    ("remote", remote),
+                    ("master", master),
+                    ("voucher key", voucher_key),
+                ] {
                     if !value.is_empty() {
                         seen_metadata.insert((kind.clone(), key.to_owned(), normalized(&value)));
                     }
@@ -5434,6 +5470,74 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voucher_keys_survive_import_and_block_duplicate_records() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Voucher keys").unwrap();
+        store
+            .create_ledger(company, "Bank", Category::Asset)
+            .unwrap();
+        store
+            .create_ledger(company, "Capital", Category::Equity)
+            .unwrap();
+        let key = "ad4056cb-9b5b-4f58-9fa6-f38a2116eb99-00142cfa:00000017";
+        let entry = |reference, key, child| {
+            format!(
+                r#"
+            <VOUCHER VCHKEY="{key}" VCHTYPE="Journal" ACTION="Create" OBJVIEW="Accounting Voucher View">
+             <DATE>20260101</DATE><VOUCHERTYPENAME>Journal</VOUCHERTYPENAME><VOUCHERNUMBER>{reference}</VOUCHERNUMBER>{child}
+             <ALLLEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-73.25</AMOUNT></ALLLEDGERENTRIES.LIST>
+             <ALLLEDGERENTRIES.LIST><LEDGERNAME>Capital</LEDGERNAME><AMOUNT>73.25</AMOUNT></ALLLEDGERENTRIES.LIST>
+            </VOUCHER>"#
+            )
+        };
+        let envelope = |body: &str| {
+            format!("<ENVELOPE><BODY><DATA><MESSAGE>{body}</MESSAGE></DATA></BODY></ENVELOPE>")
+        };
+        let first = entry("J-01", key, "");
+        let upper_key = key.to_ascii_uppercase();
+        let second = entry("J-02", upper_key.as_str(), "");
+        let conflicts = entry("J-01", key, "<VCHKEY>different-key</VCHKEY>");
+        let conflict_plan = store
+            .preview_xml_import(company, envelope(&conflicts).as_bytes())
+            .unwrap();
+        assert!(conflict_plan
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("conflicting VCHKEY values")));
+        let batch_plan = store
+            .preview_xml_import(company, envelope(&format!("{first}{second}")).as_bytes())
+            .unwrap();
+        assert!(batch_plan
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("imported identifier voucher key already exists")));
+        let stale = store
+            .preview_xml_import(company, envelope(&second).as_bytes())
+            .unwrap();
+        assert!(stale.can_apply(), "{:?}", stale.issues());
+        let plan = store
+            .preview_xml_import(company, envelope(&first).as_bytes())
+            .unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        assert_eq!(store.apply_xml_import(&plan).unwrap().vouchers, 1);
+        assert!(store
+            .apply_xml_import(&stale)
+            .unwrap_err()
+            .to_string()
+            .contains("identifier already exists"));
+        let duplicate = store
+            .preview_xml_import(company, envelope(&second).as_bytes())
+            .unwrap();
+        assert!(duplicate
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("imported identifier voucher key already exists")));
+        assert_eq!(store.vouchers(company).unwrap().len(), 1);
+        let stored: String = store.conn.query_row("SELECT voucher_key FROM imported_record_metadata WHERE company_id = ?1 AND kind = 'voucher'", [company], |row| row.get(0)).unwrap();
+        assert_eq!(stored, key);
+    }
 
     #[test]
     fn financial_notes_keep_one_voucher_across_split_and_opening_bills() {
