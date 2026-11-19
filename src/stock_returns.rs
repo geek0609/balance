@@ -514,6 +514,7 @@ mod tests {
             credit_days: None,
             reference: "INV-01".into(),
             bill_reference: None,
+            bill_splits: Vec::new(),
             narration: String::new(),
             party_ledger_id: customer,
             trade_ledger_id: sales,

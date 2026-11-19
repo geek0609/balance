@@ -364,6 +364,7 @@ pub(crate) fn insert_invoice_credit(
     reductions_only: bool,
 ) -> Result<i64> {
     crate::opening_bills::ensure_trade_invoice(tx, company, id)?;
+    crate::bill_splits::require_unsplit(tx, id)?;
     if crate::invoice_reversals::for_invoice(tx, company, id)?.is_some() {
         return Err(Error::Validation(
             "A reversed invoice cannot accept a credit or debit note".into(),

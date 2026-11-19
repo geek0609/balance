@@ -230,7 +230,7 @@ pub(crate) fn insert_opening_bill(
         draft.kind,
         draft.party_ledger_id,
         reference,
-        reference,
+        &[reference],
         None,
     )?;
     let control = opening::ensure_control(conn, company)?;

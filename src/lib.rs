@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod actual_cost;
 pub mod advances;
 pub mod banking;
+pub mod bill_splits;
 pub mod budgets;
 pub mod cash_flow;
 pub mod company;
@@ -53,7 +54,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 74;
+const SCHEMA_VERSION: i64 = 75;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -964,6 +965,10 @@ impl Store {
                      CHECK(entry_mode IN ('Invoice', 'Voucher'));",
             )?;
             tx.pragma_update(None, "user_version", 74)?;
+        }
+        if version < 75 {
+            bill_splits::migrate(&tx)?;
+            tx.pragma_update(None, "user_version", 75)?;
         }
         tx.commit()?;
         Ok(Self { conn })

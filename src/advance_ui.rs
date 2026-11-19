@@ -344,6 +344,7 @@ impl App {
                         && invoice.kind == advance.kind
                         && invoice.reversal.is_none()
                         && invoice.outstanding > 0
+                        && invoice.bill_splits.is_empty()
                 })
                 .collect::<Vec<_>>(),
             Err(error) => {

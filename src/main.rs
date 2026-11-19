@@ -1,13 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use balance::banking::{parse_signed_amount, BankEntry, StatementPlan};
+use balance::bill_splits::BillSplitDraft;
 use balance::company::CompanyProfile;
 use balance::contacts::LedgerProfile;
 use balance::exchange::{ImportPlan, MAX_XML_IMPORT_BYTES};
 use balance::inventory::{
-    discounted_line_amount, format_quantity, parse_quantity, InvoiceAdjustment, InvoiceAllocation,
-    InvoiceDiscount, InvoiceDraft, InvoiceEntryMode, InvoiceKind, InvoiceLine,
-    SettlementAllocation, StockBatch, StockItem, StockLocation,
+    discounted_line_amount, format_quantity, parse_quantity, BillSettlementAllocation,
+    BillSettlementTarget, InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft,
+    InvoiceEntryMode, InvoiceKind, InvoiceLine, StockBatch, StockItem, StockLocation,
 };
 use balance::pricing::PriceList;
 use balance::reorder::ReorderRule;
@@ -239,6 +240,7 @@ struct App {
     invoice_credit_days: String,
     invoice_reference: String,
     invoice_bill_reference: String,
+    invoice_bill_splits: Vec<BillSplitForm>,
     invoice_narration: String,
     invoice_party: Option<i64>,
     invoice_trade: Option<i64>,
@@ -270,7 +272,7 @@ struct App {
     currency_screen: CurrencyScreen,
     cash_flow_screen: CashFlowScreen,
     invoice_document_path: String,
-    settlement_invoice: Option<i64>,
+    settlement_invoice: Option<BillSettlementTarget>,
     settlement_bank: Option<i64>,
     settlement_date: String,
     settlement_reference: String,
@@ -292,8 +294,32 @@ struct InvoiceReversalForm {
     reason: String,
 }
 struct SettlementLineForm {
-    invoice: Option<i64>,
+    target: Option<BillSettlementTarget>,
     amount: String,
+}
+#[derive(Default)]
+struct BillSplitForm {
+    reference: String,
+    amount: String,
+    due_date: String,
+    credit_days: String,
+}
+impl BillSplitForm {
+    fn draft(&self) -> balance::Result<BillSplitDraft> {
+        let credit_days = self.credit_days.trim();
+        Ok(BillSplitDraft {
+            reference: self.reference.clone(),
+            amount: parse_amount(&self.amount)?,
+            due_date: (!self.due_date.trim().is_empty()).then(|| self.due_date.trim().to_owned()),
+            credit_days: if credit_days.is_empty() {
+                None
+            } else {
+                Some(credit_days.parse().map_err(|_| {
+                    balance::Error::Validation("Use whole credit days for each split bill".into())
+                })?)
+            },
+        })
+    }
 }
 #[derive(Default)]
 struct InvoiceTaxForm {
@@ -518,6 +544,7 @@ impl App {
             invoice_credit_days: String::new(),
             invoice_reference: String::new(),
             invoice_bill_reference: String::new(),
+            invoice_bill_splits: Vec::new(),
             invoice_narration: String::new(),
             invoice_party: None,
             invoice_trade: None,
@@ -685,6 +712,7 @@ impl App {
         self.cash_flow_screen = CashFlowScreen::default();
         self.invoice_reference.clear();
         self.invoice_bill_reference.clear();
+        self.invoice_bill_splits.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
         self.invoice_credit_days.clear();
@@ -3181,6 +3209,7 @@ impl App {
         self.invoice_date.clear();
         self.invoice_reference.clear();
         self.invoice_bill_reference.clear();
+        self.invoice_bill_splits.clear();
         self.invoice_narration.clear();
         self.invoice_due_date.clear();
         self.invoice_credit_days.clear();
@@ -3224,6 +3253,27 @@ impl App {
         } else {
             String::new()
         };
+        self.invoice_bill_splits = draft
+            .bill_splits
+            .into_iter()
+            .map(|bill| BillSplitForm {
+                reference: if edit.is_some() {
+                    bill.reference
+                } else {
+                    String::new()
+                },
+                amount: format_amount(bill.amount),
+                due_date: if edit.is_some() {
+                    bill.due_date.unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                credit_days: bill
+                    .credit_days
+                    .map(|days| days.to_string())
+                    .unwrap_or_default(),
+            })
+            .collect();
         self.invoice_narration = draft.narration;
         self.invoice_party = Some(draft.party_ledger_id);
         self.invoice_trade = Some(draft.trade_ledger_id);
@@ -3293,6 +3343,41 @@ impl App {
             })
             .collect();
     }
+    fn invoice_bill_schedule(&mut self, ui: &mut egui::Ui) {
+        ui.small("Bill amounts must add up to the document total.");
+        let can_remove = self.invoice_bill_splits.len() > 2;
+        let mut remove = None;
+        egui::Grid::new("invoice-bill-schedule").show(ui, |ui| {
+            for label in ["Bill reference", "Amount", "Due date", "Credit days"] {
+                ui.strong(label);
+            }
+            ui.end_row();
+            for (index, bill) in self.invoice_bill_splits.iter_mut().enumerate() {
+                ui.add(egui::TextEdit::singleline(&mut bill.reference).desired_width(160.0));
+                ui.add(egui::TextEdit::singleline(&mut bill.amount).desired_width(85.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut bill.due_date)
+                        .hint_text("YYYY-MM-DD")
+                        .desired_width(105.0),
+                );
+                ui.add(egui::TextEdit::singleline(&mut bill.credit_days).desired_width(65.0));
+                if ui
+                    .add_enabled(can_remove, egui::Button::new("Remove"))
+                    .clicked()
+                {
+                    remove = Some(index);
+                }
+                ui.end_row();
+            }
+        });
+        if let Some(index) = remove {
+            self.invoice_bill_splits.remove(index);
+        }
+        if ui.button("Add bill").clicked() {
+            self.invoice_bill_splits.push(BillSplitForm::default());
+        }
+    }
+
     fn invoice_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(
             ui,
@@ -3368,14 +3453,18 @@ impl App {
             });
             ui.label("Date");
             ui.add(egui::TextEdit::singleline(&mut self.invoice_date).hint_text("YYYY-MM-DD"));
-            ui.label("Due date (optional)");
-            ui.add(egui::TextEdit::singleline(&mut self.invoice_due_date).hint_text("YYYY-MM-DD"));
-            ui.label("or credit days");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.invoice_credit_days)
-                    .hint_text("Days")
-                    .desired_width(60.0),
-            );
+            if self.invoice_bill_splits.is_empty() {
+                ui.label("Due date (optional)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.invoice_due_date).hint_text("YYYY-MM-DD"),
+                );
+                ui.label("or credit days");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.invoice_credit_days)
+                        .hint_text("Days")
+                        .desired_width(60.0),
+                );
+            }
             ui.label("Reference");
             ui.text_edit_singleline(&mut self.invoice_reference);
         });
@@ -3387,12 +3476,35 @@ impl App {
                         ui.selectable_value(&mut self.invoice_entry_mode, mode, mode.as_str());
                     }
                 });
-            ui.label("Bill reference");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.invoice_bill_reference)
-                    .hint_text("Defaults to invoice reference"),
-            );
+            if self.invoice_bill_splits.is_empty() {
+                ui.label("Bill reference");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.invoice_bill_reference)
+                        .hint_text("Defaults to invoice reference"),
+                );
+            }
+            let mut split = !self.invoice_bill_splits.is_empty();
+            if ui.checkbox(&mut split, "Split into bills").changed() {
+                if split {
+                    self.invoice_bill_splits = vec![
+                        BillSplitForm {
+                            reference: std::mem::take(&mut self.invoice_bill_reference),
+                            due_date: std::mem::take(&mut self.invoice_due_date),
+                            credit_days: std::mem::take(&mut self.invoice_credit_days),
+                            ..BillSplitForm::default()
+                        },
+                        BillSplitForm::default(),
+                    ];
+                } else if let Some(first) = self.invoice_bill_splits.drain(..).next() {
+                    self.invoice_bill_reference = first.reference;
+                    self.invoice_due_date = first.due_date;
+                    self.invoice_credit_days = first.credit_days;
+                }
+            }
         });
+        if !self.invoice_bill_splits.is_empty() {
+            self.invoice_bill_schedule(ui);
+        }
         let lists = match self.store.price_lists(company) {
             Ok(lists) => lists,
             Err(e) => {
@@ -3476,7 +3588,8 @@ impl App {
                             if ui
                                 .add_enabled(
                                     self.invoice_due_date.trim().is_empty()
-                                        && self.invoice_credit_days.trim().is_empty(),
+                                        && self.invoice_credit_days.trim().is_empty()
+                                        && self.invoice_bill_splits.is_empty(),
                                     egui::Button::new(format!(
                                         "Apply default credit period: {days} days"
                                     )),
@@ -3760,6 +3873,7 @@ impl App {
             self.invoice_trade = None;
             self.invoice_reference.clear();
             self.invoice_bill_reference.clear();
+            self.invoice_bill_splits.clear();
             self.invoice_narration.clear();
             self.invoice_due_date.clear();
             self.invoice_credit_days.clear();
@@ -3867,6 +3981,11 @@ impl App {
                     reference: self.invoice_reference.clone(),
                     bill_reference: (!self.invoice_bill_reference.trim().is_empty())
                         .then(|| self.invoice_bill_reference.trim().to_owned()),
+                    bill_splits: self
+                        .invoice_bill_splits
+                        .iter()
+                        .map(BillSplitForm::draft)
+                        .collect::<balance::Result<Vec<_>>>()?,
                     narration: self.invoice_narration.clone(),
                     party_ledger_id: self.invoice_party.ok_or_else(|| {
                         balance::Error::Validation("Select a party ledger".into())
@@ -3914,6 +4033,7 @@ impl App {
                     self.message = format!("Invoice {id} saved");
                     self.invoice_reference.clear();
                     self.invoice_bill_reference.clear();
+                    self.invoice_bill_splits.clear();
                     self.invoice_narration.clear();
                     self.invoice_due_date.clear();
                     self.invoice_credit_days.clear();
@@ -3971,41 +4091,47 @@ impl App {
         match self.store.invoices(company) {
             Ok(invoices) => {
                 crate::theme::section(ui, "Record a receipt or payment");
-                ui.small("Allocate one receipt or payment to one or more outstanding invoices of the same party and type.");
-                let selected = invoices
-                    .iter()
-                    .find(|invoice| Some(invoice.id) == self.settlement_invoice)
-                    .map(|invoice| {
-                        format!(
-                            "{} {} — outstanding {}",
-                            invoice.document_type(),
-                            reference_with_bill(&invoice.reference, &invoice.bill_reference),
-                            money(invoice.outstanding)
-                        )
-                    })
-                    .unwrap_or_else(|| "Select invoice".into());
-                egui::ComboBox::from_label("Invoice")
-                    .selected_text(selected)
-                    .show_ui(ui, |ui| {
-                        for invoice in &invoices {
-                            if invoice.outstanding > 0 {
-                                ui.selectable_value(
-                                    &mut self.settlement_invoice,
-                                    Some(invoice.id),
-                                    format!(
-                                        "{} {} — {} ({})",
-                                        invoice.document_type(),
-                                        reference_with_bill(
-                                            &invoice.reference,
-                                            &invoice.bill_reference
-                                        ),
-                                        invoice.party,
-                                        money(invoice.outstanding)
-                                    ),
-                                );
-                            }
+                ui.small("Choose outstanding bills of the same party and type.");
+                let mut bill_choices = Vec::new();
+                for invoice in &invoices {
+                    if invoice.outstanding <= 0 {
+                        continue;
+                    }
+                    let mut add = |split_id, bill_reference: &str, amount| {
+                        if amount > 0 {
+                            bill_choices.push((
+                                BillSettlementTarget {
+                                    invoice_id: invoice.id,
+                                    split_id,
+                                },
+                                format!(
+                                    "{} {} - {} ({})",
+                                    invoice.document_type(),
+                                    reference_with_bill(&invoice.reference, bill_reference),
+                                    invoice.party,
+                                    money(amount)
+                                ),
+                            ));
                         }
-                    });
+                    };
+                    if invoice.bill_splits.is_empty() {
+                        add(None, &invoice.bill_reference, invoice.outstanding);
+                    } else {
+                        for bill in &invoice.bill_splits {
+                            add(
+                                Some(bill.id),
+                                &bill.reference,
+                                i128::from(bill.amount) - bill.settled,
+                            );
+                        }
+                    }
+                }
+                pick_settlement_bill(
+                    ui,
+                    "settlement-bill",
+                    &bill_choices,
+                    &mut self.settlement_invoice,
+                );
                 pick_account(
                     ui,
                     "settlement-bank",
@@ -4028,44 +4154,12 @@ impl App {
                 let mut remove_allocation = None;
                 for (index, line) in self.settlement_extra.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
-                        let selected = invoices
-                            .iter()
-                            .find(|invoice| Some(invoice.id) == line.invoice)
-                            .map(|invoice| {
-                                format!(
-                                    "{} {} — {} ({})",
-                                    invoice.document_type(),
-                                    reference_with_bill(
-                                        &invoice.reference,
-                                        &invoice.bill_reference
-                                    ),
-                                    invoice.party,
-                                    money(invoice.outstanding)
-                                )
-                            })
-                            .unwrap_or_else(|| "Select invoice".into());
-                        egui::ComboBox::from_id_salt(("settlement-extra", index))
-                            .selected_text(selected)
-                            .show_ui(ui, |ui| {
-                                for invoice in &invoices {
-                                    if invoice.outstanding > 0 {
-                                        ui.selectable_value(
-                                            &mut line.invoice,
-                                            Some(invoice.id),
-                                            format!(
-                                                "{} {} — {} ({})",
-                                                invoice.document_type(),
-                                                reference_with_bill(
-                                                    &invoice.reference,
-                                                    &invoice.bill_reference
-                                                ),
-                                                invoice.party,
-                                                money(invoice.outstanding)
-                                            ),
-                                        );
-                                    }
-                                }
-                            });
+                        pick_settlement_bill(
+                            ui,
+                            ("settlement-extra", index),
+                            &bill_choices,
+                            &mut line.target,
+                        );
                         ui.label("Amount");
                         ui.text_edit_singleline(&mut line.amount);
                         if ui.button("Remove").clicked() {
@@ -4076,31 +4170,31 @@ impl App {
                 if let Some(index) = remove_allocation {
                     self.settlement_extra.remove(index);
                 }
-                if ui.button("Add invoice allocation").clicked() {
+                if ui.button("Add bill allocation").clicked() {
                     self.settlement_extra.push(SettlementLineForm {
-                        invoice: None,
+                        target: None,
                         amount: String::new(),
                     });
                 }
                 if ui.button("Save receipt / payment").clicked() {
                     let result = (|| -> balance::Result<i64> {
-                        let mut allocations = vec![SettlementAllocation {
-                            invoice_id: self.settlement_invoice.ok_or_else(|| {
-                                balance::Error::Validation("Select an invoice".into())
+                        let mut allocations = vec![BillSettlementAllocation {
+                            target: self.settlement_invoice.ok_or_else(|| {
+                                balance::Error::Validation("Select a bill".into())
                             })?,
                             amount: parse_amount(&self.settlement_amount)?,
                         }];
                         for line in &self.settlement_extra {
-                            allocations.push(SettlementAllocation {
-                                invoice_id: line.invoice.ok_or_else(|| {
+                            allocations.push(BillSettlementAllocation {
+                                target: line.target.ok_or_else(|| {
                                     balance::Error::Validation(
-                                        "Select an invoice for every allocation".into(),
+                                        "Select a bill for every allocation".into(),
                                     )
                                 })?,
                                 amount: parse_amount(&line.amount)?,
                             });
                         }
-                        let (voucher, _) = self.store.settle_invoices(
+                        let (voucher, _) = self.store.settle_bills(
                             company,
                             self.settlement_bank.ok_or_else(|| {
                                 balance::Error::Validation("Select a cash or bank ledger".into())
@@ -4148,6 +4242,15 @@ impl App {
                     ));
                     if let Some(bill) = &invoice.opening_bill {
                         ui.label(format!("Original bill date {}", bill.original_date));
+                    }
+                    for bill in &invoice.bill_splits {
+                        ui.label(format!(
+                            "Bill {} · {} · Due {} · Cash settled {}",
+                            bill.reference,
+                            format_amount(bill.amount),
+                            bill.due_date.as_deref().unwrap_or("—"),
+                            money(bill.settled)
+                        ));
                     }
                     if invoice.opening_bill.is_none()
                         && ui.button("Export printable invoice").clicked()
@@ -4300,6 +4403,12 @@ impl App {
                                         self.reversal_target = Some(payment.voucher_id);
                                     }
                                 });
+                                for (reference, amount) in payment.bill_allocations {
+                                    ui.small(format!(
+                                        "Bill {reference} · {}",
+                                        format_amount(amount)
+                                    ));
+                                }
                             }
                         }
                         Err(e) => {
@@ -4347,6 +4456,14 @@ impl App {
                                         }
                                         if let Some(due_date) = &revision.due_date {
                                             ui.label(format!("Due: {due_date}"));
+                                        }
+                                        for bill in &revision.bill_splits {
+                                            ui.label(format!(
+                                                "Bill {} · {} · Due {}",
+                                                bill.reference,
+                                                format_amount(bill.amount),
+                                                bill.due_date.as_deref().unwrap_or("—")
+                                            ));
                                         }
                                         if let Some(days) = revision.credit_days {
                                             ui.label(format!(
@@ -4633,7 +4750,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. Each imported invoice or billed sales or purchase voucher needs one new bill reference for the full party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed bill allocations, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills on an imported invoice or sales or purchase voucher must add up to the party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed bill allocations, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(ui, "Bank clearance");
@@ -5809,6 +5926,26 @@ fn reference_with_bill(reference: &str, bill_reference: &str) -> String {
     } else {
         format!("{reference} · Bill {bill_reference}")
     }
+}
+
+fn pick_settlement_bill(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    choices: &[(BillSettlementTarget, String)],
+    selection: &mut Option<BillSettlementTarget>,
+) {
+    let selected = choices
+        .iter()
+        .find(|(target, _)| Some(*target) == *selection)
+        .map(|(_, caption)| caption.as_str())
+        .unwrap_or("Select bill");
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            for (target, caption) in choices {
+                ui.selectable_value(selection, Some(*target), caption);
+            }
+        });
 }
 
 fn money(value: i128) -> String {

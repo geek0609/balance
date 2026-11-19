@@ -56,6 +56,10 @@ impl Store {
                 || (!search.is_empty()
                     && !invoice.reference.to_lowercase().contains(&search)
                     && !invoice.bill_reference.to_lowercase().contains(&search)
+                    && !invoice
+                        .bill_splits
+                        .iter()
+                        .any(|bill| bill.reference.to_lowercase().contains(&search))
                     && !invoice.party.to_lowercase().contains(&search)
                     && !invoice.id.to_string().contains(&search))
             {

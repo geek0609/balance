@@ -1,13 +1,14 @@
 //! Import of a limited accounting XML interchange format.
 //! Unsupported or ambiguous data is reported before any database writes.
 use crate::advances::{insert_party_advance, AdvanceDraft, AdvanceSourceBill};
+use crate::bill_splits::BillSplitDraft;
 use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
     discounted_line_amount, find_stock_batch, insert_direct_invoice,
     insert_settlement_on_connection, insert_stock_adjustment, invoice_total, parse_quantity,
-    InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft, InvoiceEntryMode,
-    InvoiceKind, InvoiceLine, SettlementAllocation, StockInvoicePosting,
+    BillSettlementAllocation, BillSettlementTarget, InvoiceAdjustment, InvoiceAllocation,
+    InvoiceDiscount, InvoiceDraft, InvoiceEntryMode, InvoiceKind, InvoiceLine, StockInvoicePosting,
 };
 use crate::opening_bills::OpeningBillDraft;
 use crate::{
@@ -136,9 +137,8 @@ struct ImportedInvoice {
     kind: InvoiceKind,
     entry_mode: InvoiceEntryMode,
     date: String,
-    credit_days: Option<u32>,
     reference: String,
-    bill_reference: String,
+    bills: Vec<BillSplitDraft>,
     narration: String,
     party: String,
     existing_party_id: Option<i64>,
@@ -153,7 +153,7 @@ struct ImportedInvoice {
 struct ImportedBillAllocation {
     reference: String,
     amount: i64,
-    existing_invoice_id: Option<i64>,
+    existing_target: Option<BillSettlementTarget>,
     expected_outstanding: i128,
     credit_days: Option<u32>,
 }
@@ -1260,7 +1260,7 @@ fn parse_imported_settlement(
                 allocations.push(ImportedBillAllocation {
                     reference: bill_reference,
                     amount: value,
-                    existing_invoice_id: None,
+                    existing_target: None,
                     expected_outstanding: 0,
                     credit_days: credit.map(|v| xml_credit_days(&v)).transpose()?,
                 });
@@ -1415,7 +1415,6 @@ fn parse_imported_invoice(
     }
     let mut party = None;
     let header_party = direct_text(node, "PARTYLEDGERNAME").filter(|name| !name.is_empty());
-    let mut credit_days = None;
     let mut adjustments = Vec::new();
     let mut original_postings = Vec::new();
     struct StockLedgerBreakdown {
@@ -1500,37 +1499,57 @@ fn parse_imported_invoice(
                     "party ledger must be an asset or liability".into(),
                 ));
             }
-            if party.is_some() || (amount > 0) != party_debit || bills.len() != 1 {
+            if party.is_some() || (amount > 0) != party_debit || bills.is_empty() {
                 return Err(Error::Validation(
-                    "invoice needs one party and one new bill reference with the correct direction"
-                        .into(),
+                    "The document needs one party and new bills with the correct direction".into(),
                 ));
             }
-            let bill = bills[0];
-            invoice_list_fields(
-                bill,
-                &["NAME", "BILLTYPE", "AMOUNT", "BILLCREDITPERIOD"],
-                label,
-                issues,
-            );
-            let bill_reference = invoice_field(bill, "NAME")?;
-            if !invoice_field(bill, "BILLTYPE")?.eq_ignore_ascii_case("New Ref")
-                || xml_amount(&invoice_field(bill, "AMOUNT")?)? != amount
-            {
+            let mut schedule = Vec::with_capacity(bills.len());
+            let mut signed_total = 0_i128;
+            for bill in bills {
+                invoice_list_fields(
+                    bill,
+                    &["NAME", "BILLTYPE", "AMOUNT", "BILLCREDITPERIOD"],
+                    label,
+                    issues,
+                );
+                let reference = invoice_field(bill, "NAME")?;
+                let bill_amount = xml_amount(&invoice_field(bill, "AMOUNT")?)?;
+                if !invoice_field(bill, "BILLTYPE")?.eq_ignore_ascii_case("New Ref")
+                    || bill_amount == 0
+                    || (bill_amount > 0) != party_debit
+                {
+                    return Err(Error::Validation(
+                        "Each bill must be a new reference in the party's direction".into(),
+                    ));
+                }
+                let credit_days = direct_text(bill, "BILLCREDITPERIOD")
+                    .filter(|v| !v.is_empty())
+                    .map(|value| xml_credit_days(&value))
+                    .transpose()?;
+                if let Some(days) = credit_days {
+                    parse_date(&date)?
+                        .checked_add_days(chrono::Days::new(u64::from(days)))
+                        .ok_or_else(|| {
+                            Error::Validation("Credit period produces an invalid due date".into())
+                        })?;
+                }
+                signed_total += i128::from(bill_amount);
+                schedule.push(BillSplitDraft {
+                    reference,
+                    amount: bill_amount
+                        .checked_abs()
+                        .ok_or_else(|| Error::Validation("Bill amount is too large".into()))?,
+                    due_date: None,
+                    credit_days,
+                });
+            }
+            if signed_total != i128::from(amount) {
                 return Err(Error::Validation(
-                    "A new bill reference must cover the full party amount".into(),
+                    "The new bills must add up to the full party amount".into(),
                 ));
             }
-            if let Some(term) = direct_text(bill, "BILLCREDITPERIOD").filter(|v| !v.is_empty()) {
-                let days = xml_credit_days(&term)?;
-                parse_date(&date)?
-                    .checked_add_days(chrono::Days::new(u64::from(days)))
-                    .ok_or_else(|| {
-                        Error::Validation("credit period produces an invalid due date".into())
-                    })?;
-                credit_days = Some(days);
-            }
-            party = Some((ledger, amount, bill_reference));
+            party = Some((ledger, amount, schedule));
         } else {
             if !bills.is_empty() {
                 return Err(Error::Validation(
@@ -1546,7 +1565,7 @@ fn parse_imported_invoice(
             }
         }
     }
-    let (party_name, party_amount, bill_reference) =
+    let (party_name, party_amount, bills) =
         party.ok_or_else(|| Error::Validation("party ledger is missing".into()))?;
     if header_party.is_some_and(|name| normalized(&name) != normalized(&party_name)) {
         return Err(Error::Validation(
@@ -1888,9 +1907,8 @@ fn parse_imported_invoice(
         kind,
         entry_mode,
         date,
-        credit_days,
         reference,
-        bill_reference,
+        bills,
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
         party: party_name,
         existing_party_id,
@@ -3032,8 +3050,9 @@ impl Store {
         let mut bill_references = HashSet::<(String, String, String)>::new();
         {
             let mut stmt = self.conn.prepare(
-                "SELECT i.kind, l.name, v.reference, COALESCE(i.bill_reference, v.reference)
+                "SELECT i.kind, l.name, v.reference, COALESCE(b.reference, i.bill_reference, v.reference)
                  FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
+                 LEFT JOIN invoice_bill_splits b ON b.invoice_id = i.id
                  JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1",
             )?;
             for row in stmt.query_map([company_id], |r| {
@@ -3160,15 +3179,17 @@ impl Store {
                         )) {
                             plan.issues.push(format!("{label}: an invoice with the same type, party and reference already exists"));
                         }
-                        if !bill_references.insert((
-                            normalized(invoice.kind.as_str()),
-                            normalized(&invoice.party),
-                            normalized(&invoice.bill_reference),
-                        )) {
-                            plan.issues.push(format!(
-                                "{label}: bill reference {} already exists for this party and type",
-                                invoice.bill_reference
-                            ));
+                        for bill in &invoice.bills {
+                            if !bill_references.insert((
+                                normalized(invoice.kind.as_str()),
+                                normalized(&invoice.party),
+                                normalized(&bill.reference),
+                            )) {
+                                plan.issues.push(format!(
+                                    "{label}: bill reference {} already exists for this party and type",
+                                    bill.reference
+                                ));
+                            }
                         }
                         plan.invoices.push(invoice);
                     }
@@ -3344,18 +3365,18 @@ impl Store {
             });
         }
         if !pending_settlements.is_empty() {
-            let mut invoice_balances = HashMap::<
-                (String, String, String),
-                (
-                    Option<i64>,
-                    String,
-                    String,
-                    i128,
-                    Option<NaiveDate>,
-                    Option<u32>,
-                    HashSet<String>,
-                ),
-            >::new();
+            type ReferenceKey = (String, String, String);
+            struct PreviewBill {
+                target: Option<BillSettlementTarget>,
+                invoice_key: ReferenceKey,
+                invoice_date: String,
+                reference: String,
+                outstanding: i128,
+                latest_reversal: Option<NaiveDate>,
+                credit_days: Option<u32>,
+            }
+            let mut invoice_balances = HashMap::<ReferenceKey, PreviewBill>::new();
+            let mut payment_references = HashMap::<ReferenceKey, HashSet<String>>::new();
             for invoice in self.invoices(company_id)? {
                 let mut latest_reversal = crate::advances::invoice_allocation_state(
                     &self.conn, company_id, invoice.id, None,
@@ -3365,71 +3386,100 @@ impl Store {
                     crate::invoice_credits::state(&self.conn, company_id, invoice.id, None)?
                         .latest_reversal,
                 );
-                let mut settlement_references = HashSet::new();
+                let invoice_key = (
+                    normalized(invoice.kind.as_str()),
+                    normalized(&invoice.party),
+                    normalized(&invoice.reference),
+                );
+                let used = payment_references.entry(invoice_key.clone()).or_default();
                 for settlement in self.invoice_settlements(company_id, invoice.id)? {
-                    settlement_references.insert(normalized(&settlement.reference));
+                    used.insert(normalized(&settlement.reference));
                     if let Some(date) = settlement.reversal_date {
                         let date = parse_date(&date)?;
                         latest_reversal =
                             Some(latest_reversal.map_or(date, |old: NaiveDate| old.max(date)));
                     }
                 }
-                let key = (
-                    normalized(invoice.kind.as_str()),
-                    normalized(&invoice.party),
-                    normalized(&invoice.bill_reference),
-                );
-                if invoice_balances
-                    .insert(
-                        key,
-                        (
-                            Some(invoice.id),
-                            invoice.date,
-                            invoice.bill_reference,
-                            invoice.outstanding,
-                            latest_reversal,
-                            invoice.credit_days,
-                            settlement_references,
-                        ),
-                    )
-                    .is_some()
-                {
-                    plan.issues
-                        .push("Existing bill references are ambiguous".into());
+                let entries = if invoice.bill_splits.is_empty() {
+                    vec![(
+                        None,
+                        invoice.bill_reference,
+                        invoice.outstanding,
+                        invoice.credit_days,
+                    )]
+                } else {
+                    invoice
+                        .bill_splits
+                        .into_iter()
+                        .map(|bill| {
+                            let remaining = if invoice.reversal.is_some() {
+                                0
+                            } else {
+                                i128::from(bill.amount) - bill.settled
+                            };
+                            (Some(bill.id), bill.reference, remaining, bill.credit_days)
+                        })
+                        .collect()
+                };
+                for (split_id, reference, outstanding, credit_days) in entries {
+                    let key = (
+                        invoice_key.0.clone(),
+                        invoice_key.1.clone(),
+                        normalized(&reference),
+                    );
+                    if invoice_balances
+                        .insert(
+                            key,
+                            PreviewBill {
+                                target: Some(BillSettlementTarget {
+                                    invoice_id: invoice.id,
+                                    split_id,
+                                }),
+                                invoice_key: invoice_key.clone(),
+                                invoice_date: invoice.date.clone(),
+                                reference,
+                                outstanding,
+                                latest_reversal,
+                                credit_days,
+                            },
+                        )
+                        .is_some()
+                    {
+                        plan.issues
+                            .push("Existing bill references are ambiguous".into());
+                    }
                 }
             }
             for invoice in &plan.invoices {
-                let key = (
+                let invoice_key = (
                     normalized(invoice.kind.as_str()),
                     normalized(&invoice.party),
-                    normalized(&invoice.bill_reference),
+                    normalized(&invoice.reference),
                 );
-                let mut total = 0_i128;
-                for line in &invoice.lines {
-                    total += i128::from(
-                        discounted_line_amount(line.quantity, line.unit_price, &line.discount)?.0,
+                for bill in &invoice.bills {
+                    let key = (
+                        invoice_key.0.clone(),
+                        invoice_key.1.clone(),
+                        normalized(&bill.reference),
                     );
-                }
-                for adjustment in &invoice.adjustments {
-                    total += i128::from(adjustment.amount);
-                }
-                if invoice_balances
-                    .insert(
-                        key,
-                        (
-                            None,
-                            invoice.date.clone(),
-                            invoice.bill_reference.clone(),
-                            total,
-                            None,
-                            invoice.credit_days,
-                            HashSet::new(),
-                        ),
-                    )
-                    .is_some()
-                {
-                    plan.issues
-                        .push("Imported bill references are ambiguous".into());
+                    if invoice_balances
+                        .insert(
+                            key,
+                            PreviewBill {
+                                target: None,
+                                invoice_key: invoice_key.clone(),
+                                invoice_date: invoice.date.clone(),
+                                reference: bill.reference.clone(),
+                                outstanding: i128::from(bill.amount),
+                                latest_reversal: None,
+                                credit_days: bill.credit_days,
+                            },
+                        )
+                        .is_some()
+                    {
+                        plan.issues
+                            .push("Imported bill references are ambiguous".into());
+                    }
                 }
             }
             if let Some(opening_date) = &plan.opening_date {
@@ -3442,16 +3492,16 @@ impl Store {
                         );
                         if invoice_balances
                             .insert(
-                                key,
-                                (
-                                    None,
-                                    opening_date.clone(),
-                                    bill.reference.clone(),
-                                    i128::from(bill.amount),
-                                    None,
-                                    bill.credit_days,
-                                    HashSet::new(),
-                                ),
+                                key.clone(),
+                                PreviewBill {
+                                    target: None,
+                                    invoice_key: key,
+                                    invoice_date: opening_date.clone(),
+                                    reference: bill.reference.clone(),
+                                    outstanding: i128::from(bill.amount),
+                                    latest_reversal: None,
+                                    credit_days: bill.credit_days,
+                                },
                             )
                             .is_some()
                         {
@@ -3506,62 +3556,57 @@ impl Store {
                             plan.settlements.push(settlement);
                             continue;
                         };
+                        let mut referenced_invoices = HashSet::new();
                         for allocation in allocations {
                             let key = (
                                 normalized(settlement.kind.as_str()),
                                 normalized(&settlement.party),
                                 normalized(&allocation.reference),
                             );
-                            if let Some((
-                                id,
-                                invoice_date,
-                                reference,
-                                outstanding,
-                                reversal,
-                                invoice_credit_days,
-                                settlement_references,
-                            )) = invoice_balances.get_mut(&key)
-                            {
-                                if allocation.credit_days.is_some()
-                                    && allocation.credit_days != *invoice_credit_days
-                                {
-                                    plan.issues.push(format!(
-                                        "{label}: bill credit period differs from the invoice"
-                                    ));
-                                }
-                                if !settlement_references.insert(normalized(&settlement.reference))
-                                {
-                                    plan.issues.push(format!(
-                                    "{label}: settlement reference already exists for the invoice"
-                                ));
-                                }
-                                if *reference != allocation.reference {
-                                    plan.issues.push(format!(
-                                        "{label}: bill reference spelling differs from the saved bill"
-                                    ));
-                                }
-                                let date = parse_date(&settlement.date)?;
-                                if date < parse_date(invoice_date)?
-                                    || reversal.is_some_and(|value| date < value)
-                                {
-                                    plan.issues.push(format!(
-                                        "{label}: settlement precedes the invoice, a reversal or an advance release"
-                                    ));
-                                }
-                                if i128::from(allocation.amount) > *outstanding {
-                                    plan.issues.push(format!(
-                                    "{label}: allocation exceeds the invoice outstanding amount"
-                                ));
-                                }
-                                allocation.existing_invoice_id = *id;
-                                allocation.expected_outstanding = *outstanding;
-                                *outstanding -= i128::from(allocation.amount);
-                            } else {
+                            let Some(bill) = invoice_balances.get_mut(&key) else {
                                 plan.issues.push(format!(
                                     "{label}: referenced bill {} is unavailable",
                                     allocation.reference
                                 ));
+                                continue;
+                            };
+                            if allocation.credit_days.is_some()
+                                && allocation.credit_days != bill.credit_days
+                            {
+                                plan.issues.push(format!(
+                                    "{label}: bill credit period differs from the saved bill"
+                                ));
                             }
+                            if referenced_invoices.insert(bill.invoice_key.clone())
+                                && !payment_references
+                                    .entry(bill.invoice_key.clone())
+                                    .or_default()
+                                    .insert(normalized(&settlement.reference))
+                            {
+                                plan.issues.push(format!(
+                                    "{label}: settlement reference already exists for the invoice"
+                                ));
+                            }
+                            if bill.reference != allocation.reference {
+                                plan.issues.push(format!(
+                                    "{label}: bill reference spelling differs from the saved bill"
+                                ));
+                            }
+                            let date = parse_date(&settlement.date)?;
+                            if date < parse_date(&bill.invoice_date)?
+                                || bill.latest_reversal.is_some_and(|value| date < value)
+                            {
+                                plan.issues.push(format!("{label}: settlement precedes the invoice, a reversal or an advance release"));
+                            }
+                            if i128::from(allocation.amount) > bill.outstanding {
+                                plan.issues.push(format!(
+                                    "{label}: allocation exceeds bill {}'s outstanding amount",
+                                    bill.reference
+                                ));
+                            }
+                            allocation.existing_target = bill.target;
+                            allocation.expected_outstanding = bill.outstanding;
+                            bill.outstanding -= i128::from(allocation.amount);
                         }
                         plan.settlements.push(settlement);
                     }
@@ -4119,9 +4164,19 @@ impl Store {
                 entry_mode: invoice.entry_mode,
                 date: invoice.date.clone(),
                 due_date: None,
-                credit_days: invoice.credit_days,
+                credit_days: if invoice.bills.len() == 1 {
+                    invoice.bills[0].credit_days
+                } else {
+                    None
+                },
                 reference: invoice.reference.clone(),
-                bill_reference: Some(invoice.bill_reference.clone()),
+                bill_reference: (invoice.bills.len() == 1)
+                    .then(|| invoice.bills[0].reference.clone()),
+                bill_splits: if invoice.bills.len() > 1 {
+                    invoice.bills.clone()
+                } else {
+                    Vec::new()
+                },
                 narration: invoice.narration.clone(),
                 party_ledger_id: party_id,
                 trade_ledger_id: trade_id,
@@ -4258,71 +4313,84 @@ impl Store {
             let mut allocations = Vec::new();
             for allocation in source_allocations {
                 let mut stmt = tx.prepare(
-                    "SELECT i.id, COALESCE(i.bill_reference, v.reference), i.tax_amount, i.credit_days
+                    "SELECT i.id, b.id, COALESCE(b.reference, i.bill_reference, v.reference), i.tax_amount,
+                            CASE WHEN b.id IS NULL THEN i.credit_days ELSE b.credit_days END
                      FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
+                     LEFT JOIN invoice_bill_splits b ON b.invoice_id = i.id
                      WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3",
                 )?;
-                let mut found: Option<(i64, i64, Option<u32>)> = None;
+                let mut found = None;
                 for row in stmt.query_map(
                     params![plan.company_id, settlement.kind.as_str(), party_id],
                     |r| {
                         Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, i64>(2)?,
-                            r.get::<_, Option<u32>>(3)?,
+                            BillSettlementTarget {
+                                invoice_id: r.get(0)?,
+                                split_id: r.get(1)?,
+                            },
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, Option<u32>>(4)?,
                         ))
                     },
                 )? {
-                    let (id, reference, tax, credit_days) = row?;
+                    let (target, reference, tax, credit_days) = row?;
                     if normalized(&reference) == normalized(&allocation.reference) {
                         if found.is_some() || reference != allocation.reference {
                             return Err(Error::Validation(
                                 "Bill reference changed or became ambiguous since preview".into(),
                             ));
                         }
-                        found = Some((id, tax, credit_days));
+                        found = Some((target, tax, credit_days));
                     }
                 }
                 drop(stmt);
-                let (id, tax, credit_days) = found.ok_or_else(|| {
+                let (target, tax, credit_days) = found.ok_or_else(|| {
                     Error::Validation(format!("Bill {} is missing", allocation.reference))
                 })?;
-                if allocation.credit_days.is_some() && allocation.credit_days != credit_days {
-                    return Err(Error::Validation(format!(
-                        "Invoice {} credit period changed since preview",
+                let changed = || {
+                    Error::Validation(format!(
+                        "Bill {} changed since preview",
                         allocation.reference
-                    )));
-                }
-                if allocation
-                    .existing_invoice_id
-                    .is_some_and(|expected| expected != id)
+                    ))
+                };
+                if allocation.credit_days.is_some() && allocation.credit_days != credit_days
+                    || allocation
+                        .existing_target
+                        .is_some_and(|expected| expected != target)
                 {
-                    return Err(Error::Validation(format!(
-                        "Invoice {} changed since preview",
-                        allocation.reference
-                    )));
+                    return Err(changed());
                 }
-                let advances =
-                    crate::advances::invoice_allocation_state(&tx, plan.company_id, id, None)?;
-                let credits = crate::invoice_credits::state(&tx, plan.company_id, id, None)?;
-                let mut outstanding =
-                    invoice_total(&tx, id, tax)? - advances.applied - credits.applied;
-                let mut paid = tx.prepare("SELECT s.amount FROM invoice_settlements s WHERE s.company_id = ?1 AND s.invoice_id = ?2 AND NOT EXISTS(SELECT 1 FROM settlement_reversals r WHERE r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id)")?;
-                for amount in
-                    paid.query_map(params![plan.company_id, id], |r| r.get::<_, i64>(0))?
-                {
-                    outstanding -= i128::from(amount?);
-                }
-                drop(paid);
+                let id = target.invoice_id;
+                let outstanding = if let Some(split_id) = target.split_id {
+                    let bill = crate::bill_splits::read(&tx, id, None)?
+                        .into_iter()
+                        .find(|bill| bill.id == split_id)
+                        .ok_or_else(changed)?;
+                    i128::from(bill.amount) - bill.settled
+                } else {
+                    let advances =
+                        crate::advances::invoice_allocation_state(&tx, plan.company_id, id, None)?;
+                    let credits = crate::invoice_credits::state(&tx, plan.company_id, id, None)?;
+                    let mut outstanding =
+                        invoice_total(&tx, id, tax)? - advances.applied - credits.applied;
+                    let mut paid = tx.prepare(
+                        "SELECT s.amount FROM invoice_settlements s WHERE s.company_id = ?1 AND s.invoice_id = ?2
+                         AND NOT EXISTS(SELECT 1 FROM settlement_reversals r
+                             WHERE r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id)",
+                    )?;
+                    for amount in
+                        paid.query_map(params![plan.company_id, id], |r| r.get::<_, i64>(0))?
+                    {
+                        outstanding -= i128::from(amount?);
+                    }
+                    outstanding
+                };
                 if outstanding != allocation.expected_outstanding {
-                    return Err(Error::Validation(format!(
-                        "Invoice {} changed since preview",
-                        allocation.reference
-                    )));
+                    return Err(changed());
                 }
-                allocations.push(SettlementAllocation {
-                    invoice_id: id,
+                allocations.push(BillSettlementAllocation {
+                    target,
                     amount: allocation.amount,
                 });
             }
@@ -4364,6 +4432,128 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_bills_keep_their_terms_and_cash_allocations_through_reversal() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        store
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        let bank = store
+            .create_ledger(company, "Bank", Category::Asset)
+            .unwrap();
+        let invoice = br#"<ENVELOPE><BODY><DATA><MESSAGE><VOUCHER>
+            <DATE>20260101</DATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+            <VOUCHERNUMBER>INV-01</VOUCHERNUMBER><ISINVOICE>Yes</ISINVOICE>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME>
+                <ISPARTYLEDGER>Yes</ISPARTYLEDGER><AMOUNT>-100.00</AMOUNT>
+                <BILLALLOCATIONS.LIST><NAME>FIRST</NAME><BILLTYPE>New Ref</BILLTYPE>
+                    <AMOUNT>-35.00</AMOUNT><BILLCREDITPERIOD>10 Days</BILLCREDITPERIOD></BILLALLOCATIONS.LIST>
+                <BILLALLOCATIONS.LIST><NAME>SECOND</NAME><BILLTYPE>New Ref</BILLTYPE>
+                    <AMOUNT>-65.00</AMOUNT><BILLCREDITPERIOD>30 Days</BILLCREDITPERIOD></BILLALLOCATIONS.LIST>
+            </LEDGERENTRIES.LIST>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Sales</LEDGERNAME><AMOUNT>100.00</AMOUNT></LEDGERENTRIES.LIST>
+        </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let receipt = br#"<ENVELOPE><BODY><DATA><MESSAGE><VOUCHER>
+            <DATE>20260108</DATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>RC-01</VOUCHERNUMBER>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME><AMOUNT>40.00</AMOUNT>
+                <BILLALLOCATIONS.LIST><NAME>FIRST</NAME><BILLTYPE>Agst Ref</BILLTYPE><AMOUNT>15.00</AMOUNT></BILLALLOCATIONS.LIST>
+                <BILLALLOCATIONS.LIST><NAME>SECOND</NAME><BILLTYPE>Agst Ref</BILLTYPE><AMOUNT>25.00</AMOUNT></BILLALLOCATIONS.LIST>
+            </LEDGERENTRIES.LIST>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-40.00</AMOUNT></LEDGERENTRIES.LIST>
+        </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let plan = store
+            .preview_xml_import_batch(company, &[invoice, receipt], None)
+            .unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        let imported = store.apply_xml_import(&plan).unwrap();
+        assert_eq!((imported.invoices, imported.settlements), (1, 1));
+        let row = store
+            .invoice_register(company, None, None, None, None, "SECOND")
+            .unwrap()
+            .remove(0);
+        assert_eq!(row.total, 10000);
+        assert_eq!(row.outstanding, 6000);
+        let settlement = store
+            .invoice_settlements(company, row.id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(settlement.amount, 4000);
+        assert_eq!(
+            settlement.bill_allocations,
+            [("FIRST".into(), 1500), ("SECOND".into(), 2500)]
+        );
+        let report = store.outstanding_invoices(company, "2026-01-15").unwrap();
+        assert_eq!(
+            report
+                .iter()
+                .map(|bill| (
+                    bill.bill_reference.as_str(),
+                    bill.outstanding,
+                    bill.overdue_days
+                ))
+                .collect::<Vec<_>>(),
+            [("FIRST", 2000, Some(4)), ("SECOND", 4000, Some(0))]
+        );
+        let totals = store.party_outstanding(company, "2026-01-15").unwrap();
+        assert_eq!(
+            (
+                totals[0].invoices,
+                totals[0].receivable,
+                totals[0].overdue_receivable
+            ),
+            (1, 6000, 2000)
+        );
+
+        let first = BillSettlementTarget {
+            invoice_id: row.id,
+            split_id: report[0].split_id,
+        };
+        assert!(store
+            .settle_bills(
+                company,
+                bank,
+                "2026-01-15",
+                "TOO-MUCH",
+                &[BillSettlementAllocation {
+                    target: first,
+                    amount: 2001
+                }]
+            )
+            .is_err());
+        assert!(store
+            .settle_invoice(company, row.id, bank, "2026-01-15", "NO-BILL", 1)
+            .is_err());
+        store
+            .reverse_settlement(
+                company,
+                settlement.voucher_id,
+                "2026-01-20",
+                "REVERSE",
+                "Wrong receipt",
+            )
+            .unwrap();
+        let prior = store.outstanding_invoices(company, "2026-01-19").unwrap();
+        let reversed = store.outstanding_invoices(company, "2026-01-20").unwrap();
+        assert_eq!(
+            prior
+                .iter()
+                .map(|bill| bill.outstanding)
+                .collect::<Vec<_>>(),
+            [2000, 4000]
+        );
+        assert_eq!(
+            reversed
+                .iter()
+                .map(|bill| bill.outstanding)
+                .collect::<Vec<_>>(),
+            [3500, 6500]
+        );
+    }
 
     #[test]
     fn accounting_trade_vouchers_preserve_stock_postings_and_bill_links() {
@@ -4854,9 +5044,13 @@ mod tests {
             kind: InvoiceKind::Sale,
             entry_mode: InvoiceEntryMode::Invoice,
             date: date.into(),
-            credit_days: None,
             reference: "SELL-01".into(),
-            bill_reference: "SELL-01".into(),
+            bills: vec![BillSplitDraft {
+                reference: "SELL-01".into(),
+                amount: 3000,
+                due_date: None,
+                credit_days: None,
+            }],
             narration: String::new(),
             party: "Customer".into(),
             existing_party_id: Some(customer),
@@ -4887,7 +5081,7 @@ mod tests {
         let mut purchase = sale.clone();
         purchase.kind = InvoiceKind::Purchase;
         purchase.reference = "BUY-01".into();
-        purchase.bill_reference = "BUY-01".into();
+        purchase.bills[0].reference = "BUY-01".into();
         purchase.party = "Supplier".into();
         purchase.existing_party_id = Some(supplier);
         purchase.trade = "Purchases".into();

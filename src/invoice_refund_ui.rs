@@ -171,6 +171,7 @@ impl App {
                     bill.kind == invoice.kind
                         && bill.party_ledger_id == invoice.party_ledger_id
                         && bill.outstanding > 0
+                        && bill.bill_splits.is_empty()
                 })
                 .collect();
             let label = |bill: &InvoiceSummary| {

@@ -663,6 +663,17 @@ impl Store {
                 escape(&invoice.bill_reference)
             );
         }
+        for bill in &invoice.bill_splits {
+            let _ = write!(
+                html,
+                "<br>Bill {}: {}",
+                escape(&bill.reference),
+                format_amount(bill.amount)
+            );
+            if let Some(date) = &bill.due_date {
+                let _ = write!(html, " · Due {}", escape(date));
+            }
+        }
         if let Some(date) = &invoice.due_date {
             let _ = write!(html, "<br>Due: {}", escape(date));
         }

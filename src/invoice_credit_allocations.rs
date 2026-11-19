@@ -97,6 +97,7 @@ impl Store {
         let unpaid = crate::invoice_credits::unpaid_for_allocation(
             &tx, company, invoice, kind, party, date,
         )?;
+        crate::bill_splits::require_unsplit(&tx, invoice)?;
         if i128::from(amount) > unpaid {
             return Err(Error::Validation(
                 "Credit allocation exceeds the outstanding bill balance".into(),

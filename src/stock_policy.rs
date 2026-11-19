@@ -219,7 +219,11 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "ALTER TABLE invoices DROP COLUMN entry_mode;
+                "DROP TABLE bill_split_settlements;
+                 DROP TABLE invoice_bill_split_revisions;
+                 DROP TABLE invoice_bill_splits;
+                 DROP INDEX invoice_settlements_with_invoice;
+                 ALTER TABLE invoices DROP COLUMN entry_mode;
                  ALTER TABLE invoice_revisions DROP COLUMN entry_mode;
                  ALTER TABLE invoices DROP COLUMN bill_reference;
                  ALTER TABLE invoice_revisions DROP COLUMN bill_reference;
@@ -242,6 +246,7 @@ mod tests {
             date: "2026-02-01".into(),
             reference: "BUY-01".into(),
             bill_reference: None,
+            bill_splits: Vec::new(),
             narration: String::new(),
             due_date: None,
             credit_days: None,

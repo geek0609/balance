@@ -568,6 +568,7 @@ impl App {
             if self.invoice_draft_in_use()
                 || !self.invoice_reference.trim().is_empty()
                 || !self.invoice_bill_reference.trim().is_empty()
+                || !self.invoice_bill_splits.is_empty()
                 || !self.invoice_narration.trim().is_empty()
                 || !self.invoice_tax_amount.trim().is_empty()
                 || !self.invoice_additional_taxes.is_empty()

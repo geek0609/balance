@@ -1028,6 +1028,7 @@ impl Store {
             "credited",
             "bill_reference",
             "entry_mode",
+            "split_bill_id",
         ]);
         contextual_row(&mut csv, &strings(&["company", "as_of"]), &details)?;
         let mut context_fields = vec![String::new(); details.len()];
@@ -1067,6 +1068,7 @@ impl Store {
                         entry.entry_mode.as_str()
                     }
                     .into(),
+                    entry.split_id.map(|id| id.to_string()).unwrap_or_default(),
                 ],
             )?;
         }
@@ -1115,6 +1117,7 @@ impl Store {
             "credited_all_dates",
             "bill_reference",
             "entry_mode",
+            "split_bill_references",
         ]);
         let mut csv = writer();
         contextual_row(
@@ -1179,8 +1182,20 @@ impl Store {
                     money(invoice.advance_applied),
                     money(invoice.outstanding),
                     money(invoice.credited),
-                    text_cell(&invoice.bill_reference),
+                    if invoice.bill_splits.is_empty() {
+                        text_cell(&invoice.bill_reference)
+                    } else {
+                        String::new()
+                    },
                     invoice.entry_mode.as_str().into(),
+                    text_cell(
+                        &invoice
+                            .bill_splits
+                            .iter()
+                            .map(|bill| bill.reference.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                    ),
                 ],
             )?;
         }

@@ -1,5 +1,6 @@
 //! Stock quantities and basic sales/purchase invoices.
 //! Quantities use thousandths; prices and accounting amounts use hundredths.
+use crate::bill_splits::{BillSplit, BillSplitDraft};
 use crate::tax_profiles::{TaxCalculation, TaxCalculationDetail};
 use crate::taxes::{InvoiceTaxDetail, InvoiceTaxLine};
 use crate::{
@@ -222,6 +223,7 @@ pub struct InvoiceDraft {
     pub reference: String,
     /// Optional reference for settling the bill. Defaults to the invoice reference.
     pub bill_reference: Option<String>,
+    pub bill_splits: Vec<BillSplitDraft>,
     pub narration: String,
     pub party_ledger_id: i64,
     pub trade_ledger_id: i64,
@@ -243,6 +245,7 @@ pub struct InvoiceSummary {
     pub credit_days: Option<u32>,
     pub reference: String,
     pub bill_reference: String,
+    pub bill_splits: Vec<BillSplit>,
     pub party: String,
     pub party_ledger_id: i64,
     pub total: i128,
@@ -286,10 +289,22 @@ pub struct Settlement {
     pub reversal_voucher_id: Option<i64>,
     pub reversal_date: Option<String>,
     pub reversal_reason: Option<String>,
+    pub bill_allocations: Vec<(String, i64)>,
 }
 #[derive(Debug, Clone)]
 pub struct SettlementAllocation {
     pub invoice_id: i64,
+    pub amount: i64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BillSettlementTarget {
+    pub invoice_id: i64,
+    pub split_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BillSettlementAllocation {
+    pub target: BillSettlementTarget,
     pub amount: i64,
 }
 #[derive(Debug, Clone)]
@@ -302,6 +317,7 @@ pub struct InvoiceRevision {
     pub entry_mode: InvoiceEntryMode,
     pub reference: String,
     pub bill_reference: String,
+    pub bill_splits: Vec<BillSplitDraft>,
     pub narration: String,
     pub party: String,
     pub trade: String,
@@ -315,6 +331,7 @@ pub struct InvoiceRevision {
 #[derive(Debug, Clone)]
 pub struct OutstandingInvoice {
     pub invoice_id: i64,
+    pub split_id: Option<i64>,
     pub opening_date: Option<String>,
     pub kind: InvoiceKind,
     pub entry_mode: InvoiceEntryMode,
@@ -452,6 +469,7 @@ struct PreparedInvoice {
     credit_days: Option<u32>,
     reference: String,
     bill_reference: Option<String>,
+    bill_splits: Vec<BillSplitDraft>,
     postings: Vec<Posting>,
     amounts: Vec<i64>,
     discounts: Vec<i64>,
@@ -489,6 +507,11 @@ fn prepare_invoice(
         .transpose()?
         .filter(|value| *value != reference)
         .map(str::to_owned);
+    if !draft.bill_splits.is_empty() && (draft.bill_reference.is_some() || due_date.is_some()) {
+        return Err(Error::Validation(
+            "Enter references and due dates on the split bills".into(),
+        ));
+    }
     if draft.lines.is_empty() && draft.adjustments.is_empty() {
         return Err(Error::Validation(
             "An invoice needs at least one item or service / charge line".into(),
@@ -520,15 +543,6 @@ fn prepare_invoice(
             "The trade ledger has an incompatible category".into(),
         ));
     }
-    check_invoice_references(
-        conn,
-        company_id,
-        draft.kind,
-        draft.party_ledger_id,
-        &reference,
-        bill_reference.as_deref().unwrap_or(&reference),
-        excluding,
-    )?;
     let mut amounts = Vec::with_capacity(draft.lines.len());
     let mut discounts = Vec::with_capacity(draft.lines.len());
     let mut subtotal = 0_i128;
@@ -652,6 +666,24 @@ fn prepare_invoice(
     }
     let total = i64::try_from(total)
         .map_err(|_| Error::Validation("Invoice amount is too large".into()))?;
+    let bill_splits = crate::bill_splits::prepare(&draft.bill_splits, invoice_date, total)?;
+    let bill_references = if bill_splits.is_empty() {
+        vec![bill_reference.as_deref().unwrap_or(&reference)]
+    } else {
+        bill_splits
+            .iter()
+            .map(|bill| bill.reference.as_str())
+            .collect()
+    };
+    check_invoice_references(
+        conn,
+        company_id,
+        draft.kind,
+        draft.party_ledger_id,
+        &reference,
+        &bill_references,
+        excluding,
+    )?;
     let direction = if draft.kind == InvoiceKind::Sale {
         1
     } else {
@@ -692,6 +724,7 @@ fn prepare_invoice(
         credit_days: draft.credit_days,
         reference,
         bill_reference,
+        bill_splits,
         postings,
         amounts,
         discounts,
@@ -703,17 +736,21 @@ pub(crate) fn check_invoice_references(
     kind: InvoiceKind,
     party: i64,
     reference: &str,
-    bill_reference: &str,
+    bill_references: &[&str],
     excluding: Option<i64>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT v.reference, COALESCE(i.bill_reference, v.reference)
+        "SELECT v.reference, COALESCE(b.reference, i.bill_reference, v.reference)
          FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
+         LEFT JOIN invoice_bill_splits b ON b.invoice_id = i.id
          WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3
                AND (?4 IS NULL OR i.id != ?4)",
     )?;
     let key = reference.to_lowercase();
-    let bill_key = bill_reference.to_lowercase();
+    let bill_keys: HashSet<_> = bill_references
+        .iter()
+        .map(|reference| reference.to_lowercase())
+        .collect();
     for existing in stmt.query_map(params![company_id, kind.as_str(), party, excluding], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })? {
@@ -723,7 +760,7 @@ pub(crate) fn check_invoice_references(
                 "An invoice with this type, party and reference already exists".into(),
             ));
         }
-        if bill_reference.trim().to_lowercase() == bill_key {
+        if bill_keys.contains(&bill_reference.trim().to_lowercase()) {
             return Err(Error::Validation(
                 "A bill with this type, party and reference already exists".into(),
             ));
@@ -1022,6 +1059,7 @@ fn insert_invoice(
         ],
     )?;
     let invoice_id = conn.last_insert_rowid();
+    crate::bill_splits::write(conn, invoice_id, &prepared.bill_splits)?;
     write_invoice_lines(
         conn,
         invoice_id,
@@ -1326,7 +1364,7 @@ pub(crate) fn insert_settlement_on_connection(
     bank_ledger_id: i64,
     date: &str,
     reference: &str,
-    allocations: &[SettlementAllocation],
+    allocations: &[BillSettlementAllocation],
     narration: &str,
 ) -> Result<(i64, Vec<i64>)> {
     let parsed_date = parse_date(date)?;
@@ -1341,23 +1379,59 @@ pub(crate) fn insert_settlement_on_connection(
         ));
     }
     let mut seen = HashSet::new();
-    let mut common: Option<(InvoiceKind, i64)> = None;
-    let mut total = 0_i128;
+    let mut positions = HashMap::new();
+    let mut groups = Vec::<(i64, i128, Vec<(i64, i64)>)>::new();
     for allocation in allocations {
-        if allocation.amount <= 0 || !seen.insert(allocation.invoice_id) {
+        let target = allocation.target;
+        if allocation.amount <= 0 || !seen.insert(target) {
             return Err(Error::Validation(
-                "Each invoice must appear once with a positive allocation".into(),
+                "Each bill must appear once with a positive allocation".into(),
             ));
         }
-        let (kind, party, invoice_date, tax): (String, i64, String, i64) = conn.query_row("SELECT i.kind, i.party_ledger_id, v.date, i.tax_amount FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![allocation.invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
+        let index = *positions.entry(target.invoice_id).or_insert_with(|| {
+            groups.push((target.invoice_id, 0, Vec::new()));
+            groups.len() - 1
+        });
+        let group = &mut groups[index];
+        group.1 += i128::from(allocation.amount);
+        if let Some(split_id) = target.split_id {
+            group.2.push((split_id, allocation.amount));
+        }
+    }
+    let mut common: Option<(InvoiceKind, i64)> = None;
+    let mut total = 0_i128;
+    for (invoice_id, amount, splits) in &groups {
+        let invoice_id = *invoice_id;
+        let (kind, party, invoice_date, tax): (String, i64, String, i64) = conn.query_row("SELECT i.kind, i.party_ledger_id, v.date, i.tax_amount FROM invoices i JOIN vouchers v ON v.id = i.voucher_id WHERE i.id = ?1 AND i.company_id = ?2", params![invoice_id, company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Invoice not found in the selected company".into()), other => Error::Database(other) })?;
+        let bills = crate::bill_splits::read(conn, invoice_id, None)?;
+        if !bills.is_empty()
+            && seen.contains(&BillSettlementTarget {
+                invoice_id,
+                split_id: None,
+            })
+        {
+            return Err(Error::Validation(
+                "Select the individual bills to settle on this invoice".into(),
+            ));
+        }
+        for (id, amount) in splits {
+            let bill = bills.iter().find(|bill| bill.id == *id).ok_or_else(|| {
+                Error::Validation("The selected bill is unavailable on this invoice".into())
+            })?;
+            if i128::from(*amount) > i128::from(bill.amount) - bill.settled {
+                return Err(Error::Validation(format!(
+                    "The allocation exceeds the outstanding amount for bill {}",
+                    bill.reference
+                )));
+            }
+        }
         let kind = InvoiceKind::parse(&kind)?;
         if parsed_date < parse_date(&invoice_date)? {
             return Err(Error::Validation(
                 "Settlement date must not precede any invoice date".into(),
             ));
         }
-        if crate::invoice_reversals::for_invoice(conn, company_id, allocation.invoice_id)?.is_some()
-        {
+        if crate::invoice_reversals::for_invoice(conn, company_id, invoice_id)?.is_some() {
             return Err(Error::Validation(
                 "A reversed invoice cannot accept settlements".into(),
             ));
@@ -1373,14 +1447,10 @@ pub(crate) fn insert_settlement_on_connection(
             ));
         }
         common = Some((kind, party));
-        let total_on_invoice = invoice_total(conn, allocation.invoice_id, tax)?;
-        let advances = crate::advances::invoice_allocation_state(
-            conn,
-            company_id,
-            allocation.invoice_id,
-            None,
-        )?;
-        let credits = crate::invoice_credits::state(conn, company_id, allocation.invoice_id, None)?;
+        let total_on_invoice = invoice_total(conn, invoice_id, tax)?;
+        let advances =
+            crate::advances::invoice_allocation_state(conn, company_id, invoice_id, None)?;
+        let credits = crate::invoice_credits::state(conn, company_id, invoice_id, None)?;
         if advances
             .latest_release
             .max(credits.latest_reversal)
@@ -1393,7 +1463,7 @@ pub(crate) fn insert_settlement_on_connection(
         }
         let mut paid = 0_i128;
         let mut previous = conn.prepare("SELECT s.amount, v.reference, rv.date FROM invoice_settlements s JOIN vouchers v ON v.id = s.voucher_id LEFT JOIN settlement_reversals r ON r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id WHERE s.invoice_id = ?1 AND s.company_id = ?2")?;
-        for row in previous.query_map(params![allocation.invoice_id, company_id], |r| {
+        for row in previous.query_map(params![invoice_id, company_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -1418,14 +1488,12 @@ pub(crate) fn insert_settlement_on_connection(
             }
         }
         drop(previous);
-        if i128::from(allocation.amount)
-            > total_on_invoice - paid - advances.applied - credits.applied
-        {
+        if *amount > total_on_invoice - paid - advances.applied - credits.applied {
             return Err(Error::Validation(
                 "An allocation exceeds its invoice's outstanding amount".into(),
             ));
         }
-        total += i128::from(allocation.amount);
+        total += amount;
     }
     let total = i64::try_from(total)
         .map_err(|_| Error::Validation("Settlement total is too large".into()))?;
@@ -1453,10 +1521,20 @@ pub(crate) fn insert_settlement_on_connection(
     conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, voucher_kind.as_str(), reference, date, narration.trim()])?;
     let voucher_id = conn.last_insert_rowid();
     write_postings(conn, voucher_id, &postings)?;
-    let mut ids = Vec::with_capacity(allocations.len());
-    for allocation in allocations {
-        conn.execute("INSERT INTO invoice_settlements(company_id, invoice_id, voucher_id, bank_ledger_id, amount) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, allocation.invoice_id, voucher_id, bank_ledger_id, allocation.amount])?;
-        ids.push(conn.last_insert_rowid());
+    let mut ids = Vec::with_capacity(groups.len());
+    for (invoice_id, amount, splits) in groups {
+        let amount = i64::try_from(amount)
+            .map_err(|_| Error::Validation("Settlement amount is too large".into()))?;
+        conn.execute("INSERT INTO invoice_settlements(company_id, invoice_id, voucher_id, bank_ledger_id, amount) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, invoice_id, voucher_id, bank_ledger_id, amount])?;
+        let settlement_id = conn.last_insert_rowid();
+        for (split_id, amount) in splits {
+            conn.execute(
+                "INSERT INTO bill_split_settlements(settlement_id, split_id, invoice_id, amount)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![settlement_id, split_id, invoice_id, amount],
+            )?;
+        }
+        ids.push(settlement_id);
     }
     Ok((voucher_id, ids))
 }
@@ -2499,6 +2577,19 @@ impl Store {
             credit_days,
             reference,
             bill_reference,
+            bill_splits: crate::bill_splits::read(&self.conn, invoice_id, None)?
+                .into_iter()
+                .map(|bill| BillSplitDraft {
+                    reference: bill.reference,
+                    amount: bill.amount,
+                    due_date: if bill.credit_days.is_some() {
+                        None
+                    } else {
+                        bill.due_date
+                    },
+                    credit_days: bill.credit_days,
+                })
+                .collect(),
             narration,
             party_ledger_id,
             trade_ledger_id,
@@ -2593,6 +2684,12 @@ impl Store {
         )?;
         let revision_id = tx.last_insert_rowid();
         tx.execute(
+            "INSERT INTO invoice_bill_split_revisions(revision_id, reference, amount, due_date, credit_days)
+             SELECT ?1, reference, amount, due_date, credit_days FROM invoice_bill_splits
+             WHERE invoice_id = ?2 ORDER BY id",
+            params![revision_id, invoice_id],
+        )?;
+        tx.execute(
             "INSERT INTO invoice_revision_tax_calculations(revision_id, version_id, taxable_amount, whole_invoice)
              SELECT ?1, version_id, taxable_amount, whole_invoice FROM invoice_tax_calculations WHERE invoice_id = ?2",
             params![revision_id, invoice_id],
@@ -2623,6 +2720,11 @@ impl Store {
             ],
         )?;
         tx.execute("DELETE FROM postings WHERE voucher_id = ?1", [voucher_id])?;
+        tx.execute(
+            "DELETE FROM invoice_bill_splits WHERE invoice_id = ?1",
+            [invoice_id],
+        )?;
+        crate::bill_splits::write(&tx, invoice_id, &prepared.bill_splits)?;
         tx.execute("DELETE FROM invoice_line_allocations WHERE line_id IN (SELECT id FROM invoice_lines WHERE invoice_id = ?1)", [invoice_id])?;
         tx.execute(
             "DELETE FROM invoice_lines WHERE invoice_id = ?1",
@@ -2760,6 +2862,7 @@ impl Store {
                 entry_mode: InvoiceEntryMode::parse(&entry_mode)?,
                 reference,
                 bill_reference,
+                bill_splits: crate::bill_splits::revisions(&self.conn, id)?,
                 narration,
                 party,
                 trade,
@@ -2883,6 +2986,7 @@ impl Store {
                 credit_days,
                 reference,
                 bill_reference,
+                bill_splits: crate::bill_splits::read(&self.conn, id, None)?,
                 party,
                 party_ledger_id,
                 total,
@@ -2939,6 +3043,28 @@ impl Store {
         date: &str,
         reference: &str,
         allocations: &[SettlementAllocation],
+    ) -> Result<(i64, Vec<i64>)> {
+        let allocations = allocations
+            .iter()
+            .map(|allocation| BillSettlementAllocation {
+                target: BillSettlementTarget {
+                    invoice_id: allocation.invoice_id,
+                    split_id: None,
+                },
+                amount: allocation.amount,
+            })
+            .collect::<Vec<_>>();
+        self.settle_bills(company_id, bank_ledger_id, date, reference, &allocations)
+    }
+
+    /// Post a receipt or payment with explicit allocations to any split bills.
+    pub fn settle_bills(
+        &mut self,
+        company_id: i64,
+        bank_ledger_id: i64,
+        date: &str,
+        reference: &str,
+        allocations: &[BillSettlementAllocation],
     ) -> Result<(i64, Vec<i64>)> {
         let tx = self.conn.transaction()?;
         let result = insert_settlement_on_connection(
@@ -3081,7 +3207,7 @@ impl Store {
     }
     pub fn invoice_settlements(&self, company_id: i64, invoice_id: i64) -> Result<Vec<Settlement>> {
         let mut stmt = self.conn.prepare("SELECT s.id, s.voucher_id, v.date, v.reference, s.amount, l.name, r.reversal_voucher_id, rv.date, r.reason FROM invoice_settlements s JOIN vouchers v ON v.id = s.voucher_id JOIN ledgers l ON l.id = s.bank_ledger_id AND l.company_id = s.company_id LEFT JOIN settlement_reversals r ON r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id WHERE s.company_id = ?1 AND s.invoice_id = ?2 ORDER BY v.date, s.id")?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(params![company_id, invoice_id], |r| {
                 Ok(Settlement {
                     id: r.get(0)?,
@@ -3093,9 +3219,14 @@ impl Store {
                     reversal_voucher_id: r.get(6)?,
                     reversal_date: r.get(7)?,
                     reversal_reason: r.get(8)?,
+                    bill_allocations: Vec::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for settlement in &mut rows {
+            settlement.bill_allocations =
+                crate::bill_splits::settlement_allocations(&self.conn, settlement.id)?;
+        }
         Ok(rows)
     }
     /// Unsettled invoices at the end of the requested date. Payments posted
@@ -3106,6 +3237,7 @@ impl Store {
         as_of: &str,
     ) -> Result<Vec<OutstandingInvoice>> {
         let end = parse_date(as_of)?;
+        let end_text = end.to_string();
         let mut result = Vec::new();
         for invoice in self.invoices(company_id)? {
             let date = parse_date(&invoice.date)?;
@@ -3140,45 +3272,83 @@ impl Store {
             let credited =
                 crate::invoice_credits::state(&self.conn, company_id, invoice.id, Some(end))?
                     .applied;
-            let outstanding = invoice.total - settled - advance_applied - credited;
-            if outstanding < 0 {
-                return Err(Error::Validation(
-                    "Allocations and notes exceed the invoice total".into(),
-                ));
-            }
-            if outstanding == 0 {
-                continue;
-            }
-            let overdue_days = invoice
-                .due_date
-                .as_deref()
-                .map(parse_date)
-                .transpose()?
-                .map(|due| (end - due).num_days().max(0));
             let (bill_date, opening_date) = match invoice.opening_bill {
                 Some(bill) => (bill.original_date, Some(invoice.date)),
                 None => (invoice.date, None),
             };
             let age = (end - parse_date(&bill_date)?).num_days();
-            result.push(OutstandingInvoice {
-                invoice_id: invoice.id,
-                opening_date,
-                kind: invoice.kind,
-                entry_mode: invoice.entry_mode,
-                date: bill_date,
-                due_date: invoice.due_date,
-                reference: invoice.reference,
-                bill_reference: invoice.bill_reference,
-                party: invoice.party,
-                party_ledger_id: invoice.party_ledger_id,
-                total: invoice.total,
-                settled,
-                advance_applied,
-                credited,
-                outstanding,
-                age_days: age,
-                overdue_days,
-            });
+            let bills = if invoice.bill_splits.is_empty() {
+                vec![(
+                    None,
+                    invoice.bill_reference,
+                    invoice.due_date,
+                    invoice.total,
+                    settled,
+                )]
+            } else {
+                let bills = crate::bill_splits::read(&self.conn, invoice.id, Some(&end_text))?;
+                if bills.iter().map(|bill| bill.settled).sum::<i128>() != settled
+                    || bills
+                        .iter()
+                        .map(|bill| i128::from(bill.amount))
+                        .sum::<i128>()
+                        != invoice.total
+                    || advance_applied != 0
+                    || credited != 0
+                {
+                    return Err(Error::Validation(
+                        "Split bill allocations do not reconcile to the invoice".into(),
+                    ));
+                }
+                bills
+                    .into_iter()
+                    .map(|bill| {
+                        (
+                            Some(bill.id),
+                            bill.reference,
+                            bill.due_date,
+                            i128::from(bill.amount),
+                            bill.settled,
+                        )
+                    })
+                    .collect()
+            };
+            for (split_id, bill_reference, due_date, total, settled) in bills {
+                let outstanding = total - settled - advance_applied - credited;
+                if outstanding < 0 {
+                    return Err(Error::Validation(
+                        "Allocations and notes exceed the bill total".into(),
+                    ));
+                }
+                if outstanding == 0 {
+                    continue;
+                }
+                let overdue_days = due_date
+                    .as_deref()
+                    .map(parse_date)
+                    .transpose()?
+                    .map(|due| (end - due).num_days().max(0));
+                result.push(OutstandingInvoice {
+                    invoice_id: invoice.id,
+                    split_id,
+                    opening_date: opening_date.clone(),
+                    kind: invoice.kind,
+                    entry_mode: invoice.entry_mode,
+                    date: bill_date.clone(),
+                    due_date,
+                    reference: invoice.reference.clone(),
+                    bill_reference,
+                    party: invoice.party.clone(),
+                    party_ledger_id: invoice.party_ledger_id,
+                    total,
+                    settled,
+                    advance_applied,
+                    credited,
+                    outstanding,
+                    age_days: age,
+                    overdue_days,
+                });
+            }
         }
         result.sort_by(|a, b| {
             a.party
@@ -3193,6 +3363,7 @@ impl Store {
     /// Group as-of open invoices by party without netting receivables and payables.
     pub fn party_outstanding(&self, company: i64, as_of: &str) -> Result<Vec<PartyOutstanding>> {
         let mut parties = BTreeMap::<i64, PartyOutstanding>::new();
+        let mut seen_invoices = HashSet::new();
         for invoice in self.outstanding_invoices(company, as_of)? {
             let entry =
                 parties
@@ -3206,7 +3377,9 @@ impl Store {
                         overdue_payable: 0,
                         invoices: 0,
                     });
-            entry.invoices += 1;
+            if seen_invoices.insert(invoice.invoice_id) {
+                entry.invoices += 1;
+            }
             let overdue = invoice.overdue_days.is_some_and(|days| days > 0);
             match invoice.kind {
                 InvoiceKind::Sale => {

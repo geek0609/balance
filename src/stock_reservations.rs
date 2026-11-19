@@ -590,6 +590,7 @@ mod tests {
             date: DATE.into(),
             reference: "INV-01".into(),
             bill_reference: None,
+            bill_splits: Vec::new(),
             narration: String::new(),
             due_date: None,
             credit_days: None,

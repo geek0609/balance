@@ -437,7 +437,11 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "ALTER TABLE invoices DROP COLUMN entry_mode;
+                "DROP TABLE bill_split_settlements;
+                 DROP TABLE invoice_bill_split_revisions;
+                 DROP TABLE invoice_bill_splits;
+                 DROP INDEX invoice_settlements_with_invoice;
+                 ALTER TABLE invoices DROP COLUMN entry_mode;
                  ALTER TABLE invoice_revisions DROP COLUMN entry_mode;
                  ALTER TABLE invoices DROP COLUMN bill_reference;
                  ALTER TABLE invoice_revisions DROP COLUMN bill_reference;

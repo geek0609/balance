@@ -452,6 +452,7 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| Error::Validation("Invoice not found in this company".into()))?;
+        crate::bill_splits::require_unsplit(&tx, invoice)?;
         if party != invoice_party || kind != invoice_kind {
             return Err(Error::Validation(
                 "Advance and invoice must have the same party and type".into(),
