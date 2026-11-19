@@ -105,6 +105,20 @@ impl App {
         egui::CollapsingHeader::new(heading)
             .id_salt(("invoice-credits", invoice.id))
             .show(ui, |ui| {
+                match self.store.imported_stock_return_lines(company, invoice.id) {
+                    Ok(lines) => {
+                        for line in lines {
+                            ui.label(format!("{} · Return {} (voucher #{}) · {} {} {} · {} · Batch {} · {}",
+                                line.date, line.reference, line.voucher_id, format_quantity(line.stock.quantity.into()),
+                                line.stock.unit, line.stock.item, line.stock.location,
+                                line.stock.batch.as_deref().unwrap_or("unbatched"), money(line.stock.net_amount.into())));
+                            if let Some(date) = line.reversed_on {
+                                ui.small(format!("Reversed on {date}"));
+                            }
+                        }
+                    }
+                    Err(error) => self.failure(error),
+                }
                 match self.store.bill_note_allocations(company, invoice.id) {
                     Ok(allocations) => {
                         for allocation in allocations {

@@ -80,6 +80,7 @@ pub(crate) struct CreditState {
     pub(crate) latest_reversal: Option<NaiveDate>,
     latest_active_date: Option<NaiveDate>,
     pub(crate) has_history: bool,
+    pub(crate) has_active_stock_returns: bool,
 }
 
 fn notes(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<CreditNote>> {
@@ -154,6 +155,12 @@ pub(crate) fn state(
     result.latest_reversal = result.latest_reversal.max(incoming.latest_release);
     result.latest_active_date = result.latest_active_date.max(incoming.latest_active_date);
     result.has_history |= incoming.has_history;
+    let (history, latest_active, latest_reversal) =
+        crate::invoice_returns::imported_return_dates(conn, company, invoice, as_of)?;
+    result.has_history |= history;
+    result.has_active_stock_returns = latest_active.is_some();
+    result.latest_active_date = result.latest_active_date.max(latest_active);
+    result.latest_reversal = result.latest_reversal.max(latest_reversal);
     Ok(result)
 }
 
@@ -662,7 +669,7 @@ impl Store {
         let orders = crate::invoice_returns::reverse_movements(
             &tx,
             company,
-            note,
+            original,
             date,
             &format!("Invoice return {note} reversal: {reason}"),
         )?;

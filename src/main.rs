@@ -1741,7 +1741,7 @@ impl App {
         crate::theme::section(ui, "Voucher history");
         if let Some(target) = self.voucher_reversal_target {
             ui.label(format!(
-                "Reverse ordinary voucher #{target} with a separate journal entry"
+                "Reverse voucher #{target} with a separate journal entry"
             ));
             ui.horizontal(|ui| {
                 ui.label("Date (YYYY-MM-DD)");
@@ -4665,6 +4665,7 @@ impl App {
         let can_reverse = invoice.settled == 0
             && invoice.advance_applied == 0
             && invoice.credit_total == 0
+            && !invoice.has_active_stock_returns
             && invoice.credited == 0
             && self.editing_invoice != Some(invoice.id);
         if self.invoice_reversal.is_none()

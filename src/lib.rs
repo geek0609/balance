@@ -58,7 +58,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 87;
+const SCHEMA_VERSION: i64 = 88;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -544,6 +544,7 @@ impl Store {
         store
             .conn
             .prepare("SELECT credit_id, voucher_id, amount, reversal_date FROM bill_note_refund_history LIMIT 0")?;
+        store.conn.prepare("SELECT allocation_id, voucher_id, reversal_voucher_id FROM invoice_stock_return_history LIMIT 0")?;
         Ok(())
     }
     fn from_connection(mut conn: Connection) -> Result<Self> {
@@ -1030,6 +1031,10 @@ impl Store {
         if version < 87 {
             bill_note_refunds::migrate(&tx)?;
             tx.pragma_update(None, "user_version", 87)?;
+        }
+        if version < 88 {
+            invoice_returns::migrate_voucher_links(&tx)?;
+            tx.pragma_update(None, "user_version", 88)?;
         }
         tx.commit()?;
         Ok(Self { conn })

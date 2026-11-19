@@ -55,13 +55,18 @@ impl Store {
             ));
         }
         crate::bill_note_credits::check_reversal(&tx, company, original, date)?;
-        let date = date.format("%Y-%m-%d").to_string();
-        let reversed = counter_postings(&tx, company, original, &date)?;
-        tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, VoucherKind::Journal.as_str(), reference, date, format!("Reversal of voucher {original}: {reason}")])?;
+        let date_text = date.to_string();
+        let reversed = counter_postings(&tx, company, original, &date_text)?;
+        tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company, VoucherKind::Journal.as_str(), reference, date_text, format!("Reversal of voucher {original}: {reason}")])?;
         let reversal = tx.last_insert_rowid();
         write_counter_postings(&tx, company, original, reversal, &reversed)?;
         crate::currencies::copy_foreign_reversal(&tx, company, original, reversal)?;
+        let orders =
+            crate::invoice_returns::reverse_movements(&tx, company, original, date, reason)?;
         tx.execute("INSERT INTO voucher_reversals(company_id, original_voucher_id, reversal_voucher_id, reason) VALUES (?1, ?2, ?3, ?4)", params![company, original, reversal, reason])?;
+        for order in orders {
+            crate::stock_reservations::check_order_coverage(&tx, order)?;
+        }
         tx.commit()?;
         Ok(reversal)
     }

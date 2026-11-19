@@ -234,7 +234,14 @@ struct ImportedBillNote {
     bills: Vec<ImportedBillAllocation>,
     credits: Vec<ImportedNoteCredit>,
     stock: Vec<ImportedInvoiceLine>,
+    original_invoice: Option<OriginalReturnInvoice>,
     metadata: SourceMetadata,
+}
+#[derive(Debug, Clone)]
+struct OriginalReturnInvoice {
+    reference: String,
+    date: Option<String>,
+    existing_id: Option<i64>,
 }
 #[derive(Debug, Clone)]
 struct ImportedNoteCredit {
@@ -368,7 +375,7 @@ impl ImportPlan {
                 self.bill_notes
                     .iter()
                     .enumerate()
-                    .filter(|(_, note)| !note.bills.is_empty())
+                    .filter(|(_, note)| !note.bills.is_empty() || !note.stock.is_empty())
                     .map(|(index, row)| (&row.date, row.source_order, BillChange::Note(index))),
             )
             .collect();
@@ -1295,41 +1302,86 @@ struct BilledVoucher<'a, 'input> {
     entries: Vec<Node<'a, 'input>>,
 }
 
+const RETURN_REFERENCE_FIELDS: [&str; 4] =
+    ["REFERENCE", "REF", "ORIGINALINVOICENUMBER", "ORIGINALINVNO"];
+const RETURN_DATE_FIELDS: [&str; 4] = [
+    "REFERENCEDATE",
+    "REFDATE",
+    "ORIGINALINVOICEDATE",
+    "ORIGINALINVDATE",
+];
+
+fn original_return_invoice(node: Node<'_, '_>) -> Result<Option<OriginalReturnInvoice>> {
+    let mut references = RETURN_REFERENCE_FIELDS
+        .iter()
+        .filter_map(|field| direct_text(node, field))
+        .filter(|value| !value.is_empty());
+    let reference = references.next();
+    if references.any(|value| Some(&value) != reference.as_ref()) {
+        return Err(Error::Validation(
+            "Conflicting original invoice references".into(),
+        ));
+    }
+    let mut dates = RETURN_DATE_FIELDS
+        .iter()
+        .filter_map(|field| direct_text(node, field))
+        .filter(|value| !value.is_empty())
+        .map(|value| xml_date(&value));
+    let date = dates.next().transpose()?;
+    for value in dates {
+        if Some(value?) != date {
+            return Err(Error::Validation(
+                "Conflicting original invoice dates".into(),
+            ));
+        }
+    }
+    if reference.is_none() && date.is_some() {
+        return Err(Error::Validation(
+            "Original invoice date requires its reference".into(),
+        ));
+    }
+    Ok(reference.map(|reference| OriginalReturnInvoice {
+        reference,
+        date,
+        existing_id: None,
+    }))
+}
+
 fn billed_voucher<'a, 'input>(
     node: Node<'a, 'input>,
     label: &str,
     issues: &mut Vec<String>,
 ) -> Result<BilledVoucher<'a, 'input>> {
-    check_fields(
-        node,
-        &[
-            "DATE",
-            "VOUCHERTYPENAME",
-            "VOUCHERNUMBER",
-            "NARRATION",
-            "PARTYLEDGERNAME",
-            "PERSISTEDVIEW",
-            "OBJVIEW",
-            "ISINVOICE",
-            "LEDGERENTRIES.LIST",
-            "ALLLEDGERENTRIES.LIST",
-            "ALLINVENTORYENTRIES.LIST",
-        ],
-        label,
-        issues,
-    );
-    if node
-        .attributes()
-        .any(|a| a.name().eq_ignore_ascii_case("NAME") && !a.value().trim().is_empty())
-    {
-        issues.push(format!("{label}: voucher name attribute is not supported"));
-    }
     let voucher_kind = parse_kind(&invoice_field(node, "VOUCHERTYPENAME")?)
         .ok_or_else(|| Error::Validation("unsupported voucher type".into()))?;
     let is_note = matches!(
         voucher_kind,
         VoucherKind::CreditNote | VoucherKind::DebitNote
     );
+    let mut fields = vec![
+        "DATE",
+        "VOUCHERTYPENAME",
+        "VOUCHERNUMBER",
+        "NARRATION",
+        "PARTYLEDGERNAME",
+        "PERSISTEDVIEW",
+        "OBJVIEW",
+        "ISINVOICE",
+        "LEDGERENTRIES.LIST",
+        "ALLLEDGERENTRIES.LIST",
+        "ALLINVENTORYENTRIES.LIST",
+    ];
+    if is_note {
+        fields.extend(RETURN_REFERENCE_FIELDS);
+        fields.extend(RETURN_DATE_FIELDS);
+    }
+    check_fields(node, &fields, label, issues);
+    if node
+        .attributes()
+        .any(|a| a.name().eq_ignore_ascii_case("NAME") && !a.value().trim().is_empty())
+    {
+        issues.push(format!("{label}: voucher name attribute is not supported"));
+    }
     if !is_note
         && node.children().any(|row| {
             row.is_element()
@@ -1844,11 +1896,20 @@ fn parse_imported_bill_note(
         batches,
         issues,
     )?;
-    if !stock.is_empty()
-        && (!credits.is_empty() || stock_total > i128::from(lines[party_index].0.amount).abs())
-    {
+    let original_invoice = original_return_invoice(node)?;
+    if stock.is_empty() && original_invoice.is_some() {
         return Err(Error::Validation(
-            "Apply the full stock return amount to open bills on one invoice".into(),
+            "Original invoice references on financial notes require stock details".into(),
+        ));
+    }
+    if !stock.is_empty() && stock_total > i128::from(lines[party_index].0.amount).abs() {
+        return Err(Error::Validation(
+            "Return item amounts exceed the note amount".into(),
+        ));
+    }
+    if !stock.is_empty() && allocations.is_empty() && original_invoice.is_none() {
+        return Err(Error::Validation(
+            "A stock return with unused credit needs the original invoice reference".into(),
         ));
     }
     Ok(ImportedBillNote {
@@ -1861,6 +1922,7 @@ fn parse_imported_bill_note(
         bills: allocations,
         credits,
         stock,
+        original_invoice,
         metadata,
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
     })
@@ -3150,6 +3212,14 @@ fn attach_note_bill_allocations(
         &source.date,
         &source.bills,
     )?;
+    write_note_bill_allocations(conn, voucher, &allocations)
+}
+
+fn write_note_bill_allocations(
+    conn: &Connection,
+    voucher: i64,
+    allocations: &[BillSettlementAllocation],
+) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO bill_note_allocations(voucher_id, invoice_id, split_id, amount) VALUES (?1, ?2, ?3, ?4)",
     )?;
@@ -3164,9 +3234,88 @@ fn attach_note_bill_allocations(
     Ok(())
 }
 
-fn apply_stock_return(conn: &Connection, company: i64, source: &ImportedBillNote) -> Result<()> {
+fn resolve_return_invoice(
+    conn: &Connection,
+    company: i64,
+    party: i64,
+    source: &ImportedBillNote,
+    bills: &[BillSettlementAllocation],
+) -> Result<i64> {
+    let invoice = if let Some(original) = &source.original_invoice {
+        let mut stmt = conn.prepare_cached(
+            "SELECT i.id, v.reference, v.date FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
+             WHERE i.company_id = ?1 AND i.party_ledger_id = ?2 AND i.kind = ?3",
+        )?;
+        let mut candidates = Vec::new();
+        for row in stmt.query_map(params![company, party, source.kind.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (id, reference, date) = row?;
+            if normalized(&reference) == normalized(&original.reference)
+                && original
+                    .date
+                    .as_ref()
+                    .is_none_or(|expected| expected == &date)
+            {
+                candidates.push((id, reference, date));
+            }
+        }
+        let [(invoice, reference, date)] = candidates.as_slice() else {
+            return Err(Error::Validation(
+                "Original invoice is missing or ambiguous".into(),
+            ));
+        };
+        if reference != &original.reference
+            || original
+                .existing_id
+                .is_some_and(|expected| expected != *invoice)
+        {
+            return Err(Error::Validation(
+                "Original invoice changed since preview".into(),
+            ));
+        }
+        if parse_date(date)? > parse_date(&source.date)? {
+            return Err(Error::Validation(
+                "Return cannot precede the original invoice".into(),
+            ));
+        }
+        *invoice
+    } else {
+        bills
+            .first()
+            .ok_or_else(|| {
+                Error::Validation("Stock return needs the original invoice reference".into())
+            })?
+            .target
+            .invoice_id
+    };
+    if bills.iter().any(|row| row.target.invoice_id != invoice) {
+        return Err(Error::Validation(
+            "Stock return must apply to bills on the original invoice".into(),
+        ));
+    }
+    if crate::invoice_reversals::for_invoice(conn, company, invoice)?.is_some() {
+        return Err(Error::Validation(
+            "A reversed invoice cannot accept a stock return".into(),
+        ));
+    }
+    Ok(invoice)
+}
+
+fn apply_stock_return(
+    conn: &Connection,
+    company: i64,
+    source: &ImportedBillNote,
+    voucher: Option<i64>,
+) -> Result<()> {
     let kind = source.voucher_kind();
-    check_new_bill_voucher(conn, company, kind, &source.date, &source.reference)?;
+    if voucher.is_none() {
+        check_new_bill_voucher(conn, company, kind, &source.date, &source.reference)?;
+    }
     let (party, existing) = &source.lines[source.party_index];
     let party_id = import_ledger(conn, company, &party.ledger, *existing)?;
     let bills = resolve_imported_bill_allocations(
@@ -3177,15 +3326,7 @@ fn apply_stock_return(conn: &Connection, company: i64, source: &ImportedBillNote
         &source.date,
         &source.bills,
     )?;
-    let first = bills.first().ok_or_else(|| {
-        Error::Validation("Stock return needs an open bill on the original invoice".into())
-    })?;
-    let invoice = first.target.invoice_id;
-    if bills.iter().any(|row| row.target.invoice_id != invoice) {
-        return Err(Error::Validation(
-            "Stock return must reference one original invoice".into(),
-        ));
-    }
+    let invoice = resolve_return_invoice(conn, company, party_id, source, &bills)?;
     let allocations = bills
         .iter()
         .filter_map(|row| {
@@ -3312,6 +3453,18 @@ fn apply_stock_return(conn: &Connection, company: i64, source: &ImportedBillNote
             is_tax: component.is_tax,
             amount,
         });
+    }
+    if let Some(voucher) = voucher {
+        crate::invoice_returns::attach_imported_stock_return(
+            conn,
+            company,
+            invoice,
+            voucher,
+            parse_date(&source.date)?,
+            &source.reference,
+            &stock,
+        )?;
+        return write_note_bill_allocations(conn, voucher, &bills);
     }
     let reason = if source.narration.is_empty() {
         "Imported stock return"
@@ -4893,6 +5046,7 @@ impl Store {
             }
             let mut invoice_balances = HashMap::<ReferenceKey, PreviewBill>::new();
             let mut payment_references = HashMap::<ReferenceKey, HashSet<String>>::new();
+            let mut stock_origins = HashMap::<ReferenceKey, Vec<OriginalReturnInvoice>>::new();
             for invoice in self.invoices(company_id)? {
                 let mut latest_reversal = crate::advances::invoice_allocation_state(
                     &self.conn, company_id, invoice.id, None,
@@ -4907,6 +5061,15 @@ impl Store {
                     normalized(&invoice.party),
                     normalized(&invoice.reference),
                 );
+                if !invoice.lines.is_empty() && invoice.reversal.is_none() {
+                    stock_origins.entry(invoice_key.clone()).or_default().push(
+                        OriginalReturnInvoice {
+                            reference: invoice.reference.clone(),
+                            date: Some(invoice.date.clone()),
+                            existing_id: Some(invoice.id),
+                        },
+                    );
+                }
                 let used = payment_references.entry(invoice_key.clone()).or_default();
                 for settlement in self.invoice_settlements(company_id, invoice.id)? {
                     used.insert(normalized(&settlement.reference));
@@ -4981,6 +5144,15 @@ impl Store {
                     normalized(&invoice.party),
                     normalized(&invoice.reference),
                 );
+                if !invoice.lines.is_empty() {
+                    stock_origins.entry(invoice_key.clone()).or_default().push(
+                        OriginalReturnInvoice {
+                            reference: invoice.reference.clone(),
+                            date: Some(invoice.date.clone()),
+                            existing_id: None,
+                        },
+                    );
+                }
                 for bill in &invoice.bills {
                     if invoice.funded_bill_reference.as_ref() == Some(&bill.reference) {
                         continue;
@@ -5052,39 +5224,75 @@ impl Store {
                 }
             }
             for change in bill_changes {
-                let (kind, party, date, reference, allocations, is_settlement, is_stock_return) =
-                    match change {
-                        BillChange::Settlement(index) => {
-                            let row = &mut plan.settlements[index];
-                            preview_refund_allocations(
-                                row,
-                                &mut funding,
-                                |key| invoice_balances.contains_key(key),
-                                &mut plan.issues,
-                            )?;
-                            (
-                                row.kind,
-                                &row.party,
-                                &row.date,
-                                &row.reference,
-                                &mut row.bills.invoices,
-                                true,
-                                false,
-                            )
-                        }
-                        BillChange::Note(index) => {
-                            let row = &mut plan.bill_notes[index];
-                            (
-                                row.kind,
-                                &row.lines[row.party_index].0.ledger,
-                                &row.date,
-                                &row.reference,
-                                &mut row.bills,
-                                false,
-                                !row.stock.is_empty(),
-                            )
-                        }
-                    };
+                let (
+                    kind,
+                    party,
+                    date,
+                    reference,
+                    allocations,
+                    is_settlement,
+                    is_stock_return,
+                    origin_key,
+                ) = match change {
+                    BillChange::Settlement(index) => {
+                        let row = &mut plan.settlements[index];
+                        preview_refund_allocations(
+                            row,
+                            &mut funding,
+                            |key| invoice_balances.contains_key(key),
+                            &mut plan.issues,
+                        )?;
+                        (
+                            row.kind,
+                            &row.party,
+                            &row.date,
+                            &row.reference,
+                            &mut row.bills.invoices,
+                            true,
+                            false,
+                            None,
+                        )
+                    }
+                    BillChange::Note(index) => {
+                        let row = &mut plan.bill_notes[index];
+                        let party = &row.lines[row.party_index].0.ledger;
+                        let origin_key = if let Some(original) = &mut row.original_invoice {
+                            let key = funding_key(row.kind, party, &original.reference);
+                            let mut candidates = stock_origins
+                                .get(&key)
+                                .into_iter()
+                                .flatten()
+                                .filter(|candidate| {
+                                    original
+                                        .date
+                                        .as_ref()
+                                        .is_none_or(|date| Some(date) == candidate.date.as_ref())
+                                });
+                            match (candidates.next(), candidates.next()) {
+                                    (Some(candidate), None) if candidate.reference == original.reference => {
+                                        if candidate.date.as_ref().is_some_and(|date| date > &row.date) {
+                                            plan.issues.push(format!("Voucher {}: return precedes its original invoice", row.reference));
+                                        }
+                                        original.existing_id = candidate.existing_id;
+                                    }
+                                    _ => plan.issues.push(format!("Voucher {}: original stock invoice {} is unavailable or ambiguous", row.reference, original.reference)),
+                                }
+                            Some(key)
+                        } else {
+                            None
+                        };
+                        (
+                            row.kind,
+                            party,
+                            &row.date,
+                            &row.reference,
+                            &mut row.bills,
+                            false,
+                            !row.stock.is_empty(),
+                            origin_key,
+                        )
+                    }
+                };
                 let label = format!("Voucher {reference}");
                 let date = parse_date(date)?;
                 let mut referenced_invoices = HashSet::new();
@@ -5128,6 +5336,12 @@ impl Store {
                         plan.issues.push(format!(
                             "{label}: stock return must reference one original invoice"
                         ));
+                    }
+                    if origin_key
+                        .as_ref()
+                        .is_some_and(|key| key != &bill.invoice_key)
+                    {
+                        plan.issues.push(format!("{label}: bill {} belongs to a different invoice than the returned stock", allocation.reference));
                     }
                     if bill.reference != allocation.reference {
                         plan.issues.push(format!(
@@ -5992,7 +6206,12 @@ impl Store {
                 BillChange::Note(index) => {
                     let note = &plan.bill_notes[index];
                     if !note.stock.is_empty() {
-                        apply_stock_return(&tx, plan.company_id, note)?;
+                        apply_stock_return(
+                            &tx,
+                            plan.company_id,
+                            note,
+                            posted_notes[index].map(|(voucher, _)| voucher),
+                        )?;
                         continue;
                     }
                     let (voucher, party) = match posted_notes[index] {
@@ -6339,6 +6558,194 @@ mod tests {
                 2200,
                 200,
             );
+            let bank = store
+                .create_ledger(company, "Bank", Category::Asset)
+                .unwrap();
+            let named_amount = if sign == 1 { 22 } else { 18 };
+            let applied_amount = 22 - named_amount;
+            let settlement = invoice
+                .bill_splits
+                .iter()
+                .map(|bill| BillSettlementAllocation {
+                    target: BillSettlementTarget {
+                        invoice_id: invoice.id,
+                        split_id: Some(bill.id),
+                    },
+                    amount: bill.amount
+                        - if bill.reference == "SECOND" {
+                            applied_amount * 100
+                        } else {
+                            0
+                        },
+                })
+                .collect::<Vec<_>>();
+            store
+                .settle_bills(company, bank, "2026-04-05", "SETTLED", &settlement)
+                .unwrap();
+            let due = if applied_amount > 0 {
+                bill("SECOND", "Agst Ref", sign * applied_amount)
+            } else {
+                String::new()
+            };
+            let returned_stock = lines(
+                "Party",
+                sign * 22,
+                due + &bill("CARRY", "New Ref", sign * named_amount),
+            ) + &lines("Trade", -sign * 20, String::new())
+                + &lines("Charge", -sign * 2, String::new())
+                + &stock("ALLINVENTORYENTRIES.LIST", 1, 10, -sign);
+            let origin = if sign == 1 {
+                "<REFERENCE>INV</REFERENCE><REFERENCEDATE>20260402</REFERENCEDATE>"
+            } else {
+                "<ORIGINALINVOICENUMBER>INV</ORIGINALINVOICENUMBER><ORIGINALINVOICEDATE>2026-04-02</ORIGINALINVOICEDATE>"
+            };
+            let return_with_credit = voucher(
+                "20260406",
+                note_kind,
+                "RETURN-CREDIT",
+                "Yes",
+                format!("{origin}{returned_stock}"),
+            );
+            let wrong_day = return_with_credit
+                .replace("20260402", "20260401")
+                .replace("2026-04-02", "2026-04-01");
+            let invalid = store
+                .preview_xml_import(company, xml(&wrong_day).as_bytes())
+                .unwrap();
+            assert!(invalid
+                .issues()
+                .iter()
+                .any(|issue| issue.contains("original stock invoice INV is unavailable")));
+            let later = voucher(
+                "20260407",
+                invoice_kind,
+                "FUNDED",
+                "Yes",
+                lines(
+                    "Party",
+                    -sign * named_amount,
+                    bill("CARRY", "Agst Ref", -sign * named_amount),
+                ) + &lines("Trade", sign * named_amount, String::new()),
+            );
+            let input = xml(&(later + &return_with_credit));
+            let plan = store.preview_xml_import(company, input.as_bytes()).unwrap();
+            assert!(plan.can_apply(), "{:?}", plan.issues());
+            let counts = store.apply_xml_import(&plan).unwrap();
+            assert_eq!(
+                (
+                    counts.bill_notes,
+                    counts.note_credits,
+                    counts.credit_applications
+                ),
+                (1, 1, 1)
+            );
+            let credit = store.bill_note_credits(company, None).unwrap().remove(0);
+            assert_eq!(credit.available, 0);
+            let history = store
+                .imported_stock_return_lines(company, invoice.id)
+                .unwrap();
+            assert_eq!(history.len(), 2);
+            assert!(history
+                .iter()
+                .all(|row| row.voucher_id == credit.voucher_id));
+            let at_return = store
+                .bill_note_credits(company, Some("2026-04-06"))
+                .unwrap();
+            assert_eq!(at_return[0].available, 100 * i128::from(named_amount));
+            assert!(store
+                .outstanding_invoices(company, "2026-04-07")
+                .unwrap()
+                .is_empty());
+            let cash = store
+                .ledger_register(company, bank, None, Some("2026-04-07"))
+                .unwrap()
+                .closing_balance;
+            assert_eq!(cash, i128::from(sign * (44 - applied_amount) * 100));
+            assert!(store
+                .reverse_voucher(
+                    company,
+                    credit.voucher_id,
+                    "2026-04-08",
+                    "EARLY",
+                    "Credit still applied"
+                )
+                .is_err());
+            let application = store
+                .bill_note_credit_applications(company, credit.id)
+                .unwrap()[0]
+                .id;
+            store
+                .release_bill_note_credit(
+                    company,
+                    application,
+                    "2026-04-08",
+                    "Restore credit before reversal",
+                )
+                .unwrap();
+            assert!(store
+                .reverse_voucher(
+                    company,
+                    credit.voucher_id,
+                    "2026-04-07",
+                    "EARLIER",
+                    "Release dated later"
+                )
+                .is_err());
+            store
+                .reverse_voucher(
+                    company,
+                    credit.voucher_id,
+                    "2026-04-09",
+                    "REVERSE-CREDIT-RETURN",
+                    "Undo credit and stock",
+                )
+                .unwrap();
+            assert_eq!(
+                store.bill_note_credits(company, None).unwrap()[0].available,
+                0
+            );
+            assert_eq!(
+                store
+                    .outstanding_invoices(company, "2026-04-09")
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.outstanding)
+                    .sum::<i128>(),
+                2200
+            );
+            assert_eq!(
+                store
+                    .ledger_register(company, party, None, Some("2026-04-09"))
+                    .unwrap()
+                    .closing_balance,
+                2200 * i128::from(sign)
+            );
+            for (location, batch) in [(west, a), (east, b)] {
+                assert_eq!(
+                    store
+                        .stock_batch_quantity(
+                            company,
+                            item,
+                            batch,
+                            Some(location),
+                            Some("2026-04-06")
+                        )
+                        .unwrap(),
+                    i128::from(5000 - sign * 1000)
+                );
+                assert_eq!(
+                    store
+                        .stock_batch_quantity(
+                            company,
+                            item,
+                            batch,
+                            Some(location),
+                            Some("2026-04-09")
+                        )
+                        .unwrap(),
+                    i128::from(5000 - sign * 2000)
+                );
+            }
         }
     }
 
