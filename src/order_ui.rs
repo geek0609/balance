@@ -1240,7 +1240,14 @@ impl App {
                         .desired_width(115.0),
                 )
                 .changed();
-            if maximum_changed || date_changed {
+            let expiry_changed = ui
+                .add(
+                    egui::TextEdit::singleline(&mut form.expires_on)
+                        .hint_text("Expiry YYYY-MM-DD (optional)")
+                        .desired_width(165.0),
+                )
+                .changed();
+            if maximum_changed || date_changed || expiry_changed {
                 form.plan = None;
             }
         });
@@ -1256,7 +1263,7 @@ impl App {
                 .then(|| parse_quantity(&form.maximum))
                 .transpose()?;
             form.plan = Some(
-                self.store.preview_stock_allocation(
+                self.store.preview_stock_allocation_until(
                     company,
                     &StockAllocationDraft {
                         item_id,
@@ -1266,6 +1273,7 @@ impl App {
                         expected_through: (!form.expected_through.trim().is_empty())
                             .then(|| form.expected_through.clone()),
                     },
+                    (!form.expires_on.trim().is_empty()).then_some(form.expires_on.as_str()),
                 )?,
             );
         }
@@ -1317,11 +1325,6 @@ impl App {
             .horizontal_wrapped(|ui| {
                 ui.label("Reservation reason");
                 ui.text_edit_singleline(&mut form.reason);
-                ui.add(
-                    egui::TextEdit::singleline(&mut form.expires_on)
-                        .hint_text("Expiry YYYY-MM-DD (optional)")
-                        .desired_width(165.0),
-                );
                 ui.add_enabled(
                     !form.reason.trim().is_empty(),
                     egui::Button::new("Apply reservations"),

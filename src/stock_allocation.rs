@@ -1,10 +1,8 @@
 //! Preview and reserve available stock against pending sales orders.
-use crate::inventory::{
-    check_quantity_precision, check_stock_batch, check_stock_location, stock_available_to_reserve,
-};
+use crate::inventory::{check_quantity_precision, check_stock_batch, check_stock_location};
 use crate::orders::remaining_quantity;
 use crate::stock_reservations::{
-    check_stock_coverage, insert_reservation, record_expiry, reserved_in_bucket,
+    available_to_reserve, check_stock_coverage, insert_reservation, record_expiry,
     StockReservationDraft,
 };
 use crate::{parse_date, required, Error, Result, Store};
@@ -53,6 +51,7 @@ fn preview(
     conn: &Connection,
     company: i64,
     draft: &StockAllocationDraft,
+    expires_on: Option<&str>,
 ) -> Result<StockAllocationPlan> {
     let through = draft
         .expected_through
@@ -67,20 +66,14 @@ fn preview(
     check_quantity_precision(conn, company, draft.item_id, draft.maximum.unwrap_or(0))?;
     check_stock_location(conn, company, draft.location_id)?;
     check_stock_batch(conn, company, draft.item_id, draft.batch_id)?;
-    let available = (stock_available_to_reserve(
+    let available = available_to_reserve(
         conn,
         company,
         draft.item_id,
         draft.location_id,
         draft.batch_id,
-    )? - reserved_in_bucket(
-        conn,
-        company,
-        draft.item_id,
-        draft.location_id,
-        draft.batch_id,
-    )?)
-    .max(0);
+        expires_on,
+    )?;
     let mut budget = draft
         .maximum
         .map_or(available, |limit| available.min(i128::from(limit)));
@@ -151,8 +144,17 @@ impl Store {
         company: i64,
         draft: &StockAllocationDraft,
     ) -> Result<StockAllocationPlan> {
+        self.preview_stock_allocation_until(company, draft, None)
+    }
+
+    pub fn preview_stock_allocation_until(
+        &self,
+        company: i64,
+        draft: &StockAllocationDraft,
+        expires_on: Option<&str>,
+    ) -> Result<StockAllocationPlan> {
         let tx = self.conn.unchecked_transaction()?;
-        let plan = preview(&tx, company, draft)?;
+        let plan = preview(&tx, company, draft, expires_on)?;
         tx.commit()?;
         Ok(plan)
     }
@@ -182,7 +184,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = preview(&tx, company, &plan.draft)?;
+        let current = preview(&tx, company, &plan.draft, expires_on)?;
         if current.allocations != plan.allocations {
             return Err(Error::Validation(
                 "The proposed reservations changed. Preview the allocation again.".into(),

@@ -1420,25 +1420,6 @@ pub(crate) fn stock_bucket_changes(
     Ok(changes)
 }
 
-/// Lowest closing balance from today through the last recorded stock movement.
-pub(crate) fn stock_available_to_reserve(
-    conn: &Connection,
-    company: i64,
-    item: i64,
-    location: i64,
-    batch: Option<i64>,
-) -> Result<i128> {
-    let today: String = conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))?;
-    let today = parse_date(&today)?;
-    Ok(
-        stock_bucket_changes(conn, company, item, location, batch, today)?
-            .closing_balances(today)
-            .map(|(_, quantity)| quantity)
-            .min()
-            .unwrap_or_default(),
-    )
-}
-
 pub(crate) fn check_stock_after_decrease(
     conn: &Connection,
     company: i64,

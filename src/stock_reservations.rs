@@ -1,10 +1,11 @@
 //! Location and batch commitments for pending sales order quantities.
 use crate::inventory::{
-    check_quantity_precision, check_stock_batch, check_stock_location, stock_available_to_reserve,
+    check_quantity_precision, check_stock_batch, check_stock_location, stock_bucket_changes,
 };
 use crate::{parse_date, required, Error, Result, Store};
+use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -61,19 +62,28 @@ pub(crate) fn record_expiry(
     expires_on: Option<&str>,
 ) -> Result<()> {
     if let Some(expires_on) = expires_on {
-        let date = parse_date(expires_on)?;
-        let today: String = conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))?;
-        if date < parse_date(&today)? || chrono::Datelike::year(&date) > 9999 {
-            return Err(Error::Validation(
-                "Expiry must be today or later, with a four-digit year".into(),
-            ));
-        }
+        let date = valid_expiry(expires_on, local_date(conn)?)?;
         conn.execute(
             "INSERT INTO stock_reservation_expiries(reservation_id, expires_on) VALUES (?1, ?2)",
             params![reservation, date.to_string()],
         )?;
     }
     Ok(())
+}
+
+fn local_date(conn: &Connection) -> Result<NaiveDate> {
+    let today: String = conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))?;
+    parse_date(&today)
+}
+
+fn valid_expiry(expires_on: &str, today: NaiveDate) -> Result<NaiveDate> {
+    let date = parse_date(expires_on)?;
+    if date < today || chrono::Datelike::year(&date) > 9999 {
+        return Err(Error::Validation(
+            "Expiry must be today or later, with a four-digit year".into(),
+        ));
+    }
+    Ok(date)
 }
 
 pub struct StockReservationDraft {
@@ -156,25 +166,66 @@ pub(crate) fn reserved_by_item(conn: &Connection, company: i64) -> Result<HashMa
     Ok(quantities)
 }
 
-pub(crate) fn reserved_in_bucket(
+fn reservation_margin(
     conn: &Connection,
     company: i64,
     item: i64,
     location: i64,
     batch: Option<i64>,
+    existing_only: bool,
+    expires_on: Option<&str>,
 ) -> Result<i128> {
+    let today = local_date(conn)?;
+    let through = expires_on
+        .map(|date| valid_expiry(date, today))
+        .transpose()?;
     let mut stmt = conn.prepare_cached(
-        "SELECT remaining FROM active_stock_reservation_balances
+        "SELECT remaining, expires_on FROM active_stock_reservation_balances
          WHERE company_id = ?1 AND item_id = ?2 AND location_id = ?3 AND batch_id IS ?4
            AND remaining > 0",
     )?;
     let mut reserved = 0_i128;
+    let mut expiries = BTreeMap::<NaiveDate, i128>::new();
     for row in stmt.query_map(params![company, item, location, batch], |r| {
-        r.get::<_, i64>(0)
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
     })? {
-        reserved += i128::from(row?);
+        let (quantity, expiry) = row?;
+        reserved += i128::from(quantity);
+        if let Some(expiry) = expiry {
+            *expiries.entry(parse_date(&expiry)?).or_default() += i128::from(quantity);
+        }
     }
-    Ok(reserved)
+    if existing_only && reserved == 0 {
+        return Ok(0);
+    }
+    let mut expiries = expiries.into_iter().peekable();
+    let mut margin = i128::MAX;
+    for (date, stock) in
+        stock_bucket_changes(conn, company, item, location, batch, today)?.closing_balances(today)
+    {
+        if through.is_some_and(|expiry| date > expiry) {
+            break;
+        }
+        while expiries.peek().is_some_and(|(expiry, _)| *expiry < date) {
+            let (_, released) = expiries.next().expect("peeked expiry");
+            reserved -= released;
+        }
+        if !existing_only || reserved > 0 {
+            margin = margin.min(stock - reserved);
+        }
+    }
+    Ok(margin)
+}
+
+pub(crate) fn available_to_reserve(
+    conn: &Connection,
+    company: i64,
+    item: i64,
+    location: i64,
+    batch: Option<i64>,
+    expires_on: Option<&str>,
+) -> Result<i128> {
+    Ok(reservation_margin(conn, company, item, location, batch, false, expires_on)?.max(0))
 }
 
 pub(crate) fn check_stock_coverage(
@@ -184,9 +235,7 @@ pub(crate) fn check_stock_coverage(
     location: i64,
     batch: Option<i64>,
 ) -> Result<()> {
-    let reserved = reserved_in_bucket(conn, company, item, location, batch)?;
-    if reserved > 0 && stock_available_to_reserve(conn, company, item, location, batch)? < reserved
-    {
+    if reservation_margin(conn, company, item, location, batch, true, None)? < 0 {
         return Err(Error::Validation(
             "Insufficient unreserved stock in this location and batch. Check the sales order reservations."
                 .into(),
@@ -437,6 +486,17 @@ mod tests {
             .reserve_order_stock_until(company, order, &draft, Some(&today))
             .unwrap();
         assert_eq!(store.order_availability(company).unwrap()[0].reserved, 4000);
+        assert!(store
+            .adjust_stock(company, item, &today, -2000, "Issue while held")
+            .is_err());
+        let tomorrow = super::parse_date(&today)
+            .unwrap()
+            .succ_opt()
+            .unwrap()
+            .to_string();
+        store
+            .adjust_stock(company, item, &tomorrow, -3000, "Issue after expiry")
+            .unwrap();
         store.conn.execute(
             "UPDATE stock_reservation_expiries SET expires_on = date('now','localtime','-1 day') WHERE reservation_id = ?1",
             [id],
@@ -446,7 +506,16 @@ mod tests {
         assert_eq!(detail.reservations[0].id, id);
         assert_eq!(detail.reservations[0].remaining, 0);
         assert_eq!(detail.lines[0].unfulfilled(), 5000);
-        store.reserve_order_stock(company, order, &draft).unwrap();
+        store
+            .reserve_order_stock(
+                company,
+                order,
+                &super::StockReservationDraft {
+                    quantity: 2000,
+                    ..draft
+                },
+            )
+            .unwrap();
     }
     use super::*;
     use crate::inventory::{
