@@ -96,35 +96,37 @@ impl Default for CreateOrderForm {
     }
 }
 
-impl CreateOrderForm {
-    fn fill_prices(&mut self, store: &balance::Store, company: i64) -> Result<usize> {
-        let list = self
-            .price_list
-            .ok_or_else(|| Error::Validation("Select a price list".into()))?;
-        let mut prices = Vec::new();
-        for (index, line) in self
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.price.trim().is_empty())
-        {
-            let item = line.item.ok_or_else(|| {
-                Error::Validation(format!("Select an item on line {}", index + 1))
+fn fill_blank_prices(
+    lines: &mut [LineForm],
+    store: &balance::Store,
+    company: i64,
+    list: i64,
+    date: &str,
+) -> Result<usize> {
+    let mut prices = Vec::new();
+    for (index, line) in lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.price.trim().is_empty())
+    {
+        let item = line
+            .item
+            .ok_or_else(|| Error::Validation(format!("Select an item on line {}", index + 1)))?;
+        let price = store
+            .stock_price(company, list, item, date)?
+            .ok_or_else(|| {
+                Error::Validation(format!("No applicable price for item line {}", index + 1))
             })?;
-            let price = store
-                .stock_price(company, list, item, &self.date)?
-                .ok_or_else(|| {
-                    Error::Validation(format!("No applicable price for item line {}", index + 1))
-                })?;
-            prices.push((index, price));
-        }
-        let count = prices.len();
-        for (index, price) in prices {
-            self.lines[index].price = format_amount(price);
-        }
-        Ok(count)
+        prices.push((index, price));
     }
+    let count = prices.len();
+    for (index, price) in prices {
+        lines[index].price = format_amount(price);
+    }
+    Ok(count)
+}
 
+impl CreateOrderForm {
     fn has_content(&self) -> bool {
         self.party.is_some()
             || [
@@ -163,6 +165,8 @@ impl CreateOrderForm {
 struct OrderAmendmentForm {
     order: i64,
     base_revision: Option<i64>,
+    date: String,
+    price_list: Option<i64>,
     reference: String,
     expected_on: String,
     notes: String,
@@ -175,6 +179,8 @@ impl OrderAmendmentForm {
         Self {
             order: detail.summary.id,
             base_revision: detail.summary.revision,
+            date: detail.summary.date.clone(),
+            price_list: None,
             reference: detail.summary.reference.clone(),
             expected_on: detail.summary.expected_on.clone().unwrap_or_default(),
             notes: detail.summary.notes.clone(),
@@ -751,8 +757,8 @@ impl App {
                     .clicked()
                 })
                 .inner;
-            if fill {
-                match form.fill_prices(&self.store, company) {
+            if let (true, Some(list)) = (fill, form.price_list) {
+                match fill_blank_prices(&mut form.lines, &self.store, company, list, &form.date) {
                     Ok(0) => self.message = "There are no blank item prices to fill".into(),
                     Ok(_) => self.message = "Blank prices filled using the draft date".into(),
                     Err(error) => self.message = error.to_string(),
@@ -1216,6 +1222,31 @@ impl App {
             }
         });
         let items = self.store.stock_items(company)?;
+        let lists = self.store.price_lists(company)?;
+        if !lists.is_empty() {
+            let fill = ui
+                .horizontal(|ui| {
+                    pick_price_list(ui, "amend-order-price-list", &lists, &mut form.price_list);
+                    ui.add_enabled(
+                        form.price_list.is_some(),
+                        egui::Button::new("Fill using order date"),
+                    )
+                    .clicked()
+                })
+                .inner;
+            if let (true, Some(list)) = (fill, form.price_list) {
+                self.message = match fill_blank_prices(
+                    &mut form.lines,
+                    &self.store,
+                    company,
+                    list,
+                    &form.date,
+                )? {
+                    0 => "There are no blank item prices to fill".into(),
+                    _ => format!("Blank item prices filled for {}", form.date),
+                };
+            }
+        }
         order_line_fields(ui, &mut form.lines, &items);
         let (save, cancel) = ui
             .horizontal(|ui| {
