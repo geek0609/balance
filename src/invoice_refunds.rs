@@ -349,6 +349,7 @@ mod tests {
     fn invoice(kind: InvoiceKind, party: i64, trade: i64) -> InvoiceDraft {
         InvoiceDraft {
             kind,
+            entry_mode: crate::inventory::InvoiceEntryMode::Invoice,
             date: "2026-03-01".into(),
             due_date: None,
             credit_days: None,

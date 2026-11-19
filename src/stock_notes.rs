@@ -1007,6 +1007,7 @@ mod combined_billing_tests {
         }
         let mut draft = InvoiceDraft {
             kind: InvoiceKind::Sale,
+            entry_mode: crate::inventory::InvoiceEntryMode::Invoice,
             date: "2026-04-02".into(),
             due_date: None,
             credit_days: None,

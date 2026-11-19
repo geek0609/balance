@@ -135,6 +135,39 @@ impl InvoiceKind {
         }
     }
 }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceEntryMode {
+    #[default]
+    Invoice,
+    Voucher,
+}
+impl InvoiceEntryMode {
+    pub const ALL: [Self; 2] = [Self::Invoice, Self::Voucher];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Invoice => "Invoice",
+            Self::Voucher => "Voucher",
+        }
+    }
+
+    pub fn label(self, kind: InvoiceKind) -> &'static str {
+        match (self, kind) {
+            (Self::Invoice, _) => kind.as_str(),
+            (Self::Voucher, InvoiceKind::Sale) => "Sales voucher",
+            (Self::Voucher, InvoiceKind::Purchase) => "Purchase voucher",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "Invoice" => Ok(Self::Invoice),
+            "Voucher" => Ok(Self::Voucher),
+            _ => Err(Error::Validation("Unknown invoice entry mode".into())),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InvoiceLine {
     pub item_id: i64,
@@ -182,6 +215,7 @@ pub struct InvoiceAdjustmentDetail {
 #[derive(Debug, Clone)]
 pub struct InvoiceDraft {
     pub kind: InvoiceKind,
+    pub entry_mode: InvoiceEntryMode,
     pub date: String,
     pub due_date: Option<String>,
     pub credit_days: Option<u32>,
@@ -203,6 +237,7 @@ pub struct InvoiceSummary {
     pub id: i64,
     pub voucher_id: i64,
     pub kind: InvoiceKind,
+    pub entry_mode: InvoiceEntryMode,
     pub date: String,
     pub due_date: Option<String>,
     pub credit_days: Option<u32>,
@@ -236,7 +271,7 @@ impl InvoiceSummary {
         if self.opening_bill.is_some() {
             crate::opening_bills::label(self.kind)
         } else {
-            self.kind.as_str()
+            self.entry_mode.label(self.kind)
         }
     }
 }
@@ -264,6 +299,7 @@ pub struct InvoiceRevision {
     pub due_date: Option<String>,
     pub credit_days: Option<u32>,
     pub kind: InvoiceKind,
+    pub entry_mode: InvoiceEntryMode,
     pub reference: String,
     pub bill_reference: String,
     pub narration: String,
@@ -281,6 +317,7 @@ pub struct OutstandingInvoice {
     pub invoice_id: i64,
     pub opening_date: Option<String>,
     pub kind: InvoiceKind,
+    pub entry_mode: InvoiceEntryMode,
     pub date: String,
     pub due_date: Option<String>,
     pub reference: String,
@@ -933,14 +970,43 @@ pub(crate) fn insert_invoice_on_connection(
     company_id: i64,
     draft: &InvoiceDraft,
 ) -> Result<(i64, i64)> {
+    insert_invoice(conn, company_id, draft, None)
+}
+
+fn insert_invoice(
+    conn: &Connection,
+    company_id: i64,
+    draft: &InvoiceDraft,
+    original_postings: Option<&[Posting]>,
+) -> Result<(i64, i64)> {
     let prepared = prepare_invoice(conn, company_id, draft, None)?;
+    let postings = if let Some(original) = original_postings {
+        validate_voucher(&prepared.date, original)?;
+        check_ledgers(conn, company_id, original)?;
+        let totals = |postings: &[Posting]| {
+            let mut totals = BTreeMap::<i64, i128>::new();
+            for posting in postings {
+                *totals.entry(posting.ledger_id).or_default() += i128::from(posting.amount);
+            }
+            totals.retain(|_, amount| *amount != 0);
+            totals
+        };
+        if totals(original) != totals(&prepared.postings) {
+            return Err(Error::Validation(
+                "The imported ledger postings do not match the bill and stock amounts".into(),
+            ));
+        }
+        original
+    } else {
+        &prepared.postings
+    };
     conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim()])?;
     let voucher_id = conn.last_insert_rowid();
-    write_postings(conn, voucher_id, &prepared.postings)?;
+    write_invoice_postings(conn, voucher_id, draft, postings)?;
     conn.execute(
         "INSERT INTO invoices(company_id, voucher_id, kind, party_ledger_id, trade_ledger_id,
-             tax_ledger_id, tax_amount, due_date, credit_days, bill_reference)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             tax_ledger_id, tax_amount, due_date, credit_days, bill_reference, entry_mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             company_id,
             voucher_id,
@@ -951,7 +1017,8 @@ pub(crate) fn insert_invoice_on_connection(
             draft.tax_amount,
             prepared.due_date,
             prepared.credit_days,
-            prepared.bill_reference
+            prepared.bill_reference,
+            draft.entry_mode.as_str(),
         ],
     )?;
     let invoice_id = conn.last_insert_rowid();
@@ -966,6 +1033,26 @@ pub(crate) fn insert_invoice_on_connection(
     crate::taxes::write_additional(conn, invoice_id, &draft.additional_taxes)?;
     crate::tax_profiles::write_calculation(conn, invoice_id, draft.tax_calculation)?;
     Ok((invoice_id, voucher_id))
+}
+
+fn write_invoice_postings(
+    conn: &Connection,
+    voucher: i64,
+    draft: &InvoiceDraft,
+    postings: &[Posting],
+) -> Result<()> {
+    if draft.entry_mode == InvoiceEntryMode::Voucher {
+        let party_lines: Vec<_> = postings
+            .iter()
+            .enumerate()
+            .filter_map(|(index, posting)| {
+                (posting.ledger_id == draft.party_ledger_id).then_some(index)
+            })
+            .collect();
+        crate::write_voucher_postings(conn, voucher, postings, &party_lines)
+    } else {
+        write_postings(conn, voucher, postings)
+    }
 }
 
 fn invoice_stock_allocations(
@@ -983,19 +1070,25 @@ fn invoice_stock_allocations(
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-pub(crate) enum StockInvoicePosting {
+pub(crate) enum StockInvoicePosting<'a> {
     Direct,
     Order(i64),
-    Import,
+    Import {
+        original_postings: Option<&'a [Posting]>,
+    },
 }
 
 pub(crate) fn insert_direct_invoice(
     conn: &Connection,
     company: i64,
     draft: &InvoiceDraft,
-    posting: StockInvoicePosting,
+    posting: StockInvoicePosting<'_>,
 ) -> Result<(i64, i64)> {
-    let ids = insert_invoice_on_connection(conn, company, draft)?;
+    let original_postings = match &posting {
+        StockInvoicePosting::Import { original_postings } => *original_postings,
+        _ => None,
+    };
+    let ids = insert_invoice(conn, company, draft, original_postings)?;
     if draft.kind == InvoiceKind::Sale {
         let allocations = invoice_stock_allocations(conn, ids.0)?;
         let mut buckets = HashSet::new();
@@ -1010,7 +1103,7 @@ pub(crate) fn insert_direct_invoice(
         }
         for (item, location, batch) in buckets {
             crate::stock_reservations::check_stock_coverage(conn, company, item, location, batch)?;
-            if !matches!(posting, StockInvoicePosting::Import) {
+            if !matches!(posting, StockInvoicePosting::Import { .. }) {
                 crate::stock_policy::check_bucket(conn, company, item, location, batch)?;
             }
         }
@@ -2317,14 +2410,14 @@ impl Store {
     pub fn invoice_draft(&self, company_id: i64, invoice_id: i64) -> Result<InvoiceDraft> {
         crate::opening_bills::ensure_trade_invoice(&self.conn, company_id, invoice_id)?;
         let (kind, date, reference, narration, party_ledger_id, trade_ledger_id,
-            tax_ledger_id, tax_amount, due_date, credit_days, bill_reference) = self.conn.query_row(
+            tax_ledger_id, tax_amount, due_date, credit_days, bill_reference, entry_mode) = self.conn.query_row(
             "SELECT i.kind, v.date, v.reference, v.narration, i.party_ledger_id, i.trade_ledger_id,
-                    i.tax_ledger_id, i.tax_amount, i.due_date, i.credit_days, i.bill_reference
+                    i.tax_ledger_id, i.tax_amount, i.due_date, i.credit_days, i.bill_reference, i.entry_mode
              FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
              WHERE i.id = ?1 AND i.company_id = ?2",
             params![invoice_id, company_id],
             |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
-                    r.get(6)?, r.get(7)?, r.get(8)?, r.get::<_, Option<u32>>(9)?, r.get(10)?)),
+                    r.get(6)?, r.get(7)?, r.get(8)?, r.get::<_, Option<u32>>(9)?, r.get(10)?, r.get::<_, String>(11)?)),
         ).map_err(|error| match error {
             rusqlite::Error::QueryReturnedNoRows => {
                 Error::Validation("Invoice not found in the selected company".into())
@@ -2396,6 +2489,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(InvoiceDraft {
             kind: InvoiceKind::parse(&kind)?,
+            entry_mode: InvoiceEntryMode::parse(&entry_mode)?,
             date,
             due_date: if credit_days.is_some() {
                 None
@@ -2484,12 +2578,16 @@ impl Store {
             return Err(Error::Validation("Associated voucher not found".into()));
         }
         let voucher_revision = tx.last_insert_rowid();
-        tx.execute("INSERT INTO revision_postings(revision_id, ledger_id, amount) SELECT ?1, ledger_id, amount FROM postings WHERE voucher_id = ?2 ORDER BY id", params![voucher_revision, voucher_id])?;
+        tx.execute(
+            "INSERT INTO revision_postings(revision_id, ledger_id, amount, is_party)
+             SELECT ?1, ledger_id, amount, is_party FROM postings WHERE voucher_id = ?2 ORDER BY id",
+            params![voucher_revision, voucher_id],
+        )?;
         tx.execute(
             "INSERT INTO invoice_revisions(company_id, invoice_id, voucher_revision_id, kind, party_ledger_id,
-                 trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days, bill_reference)
+                 trade_ledger_id, tax_ledger_id, tax_amount, due_date, credit_days, bill_reference, entry_mode)
              SELECT company_id, id, ?1, kind, party_ledger_id, trade_ledger_id, tax_ledger_id,
-                    tax_amount, due_date, credit_days, bill_reference
+                    tax_amount, due_date, credit_days, bill_reference, entry_mode
              FROM invoices WHERE id = ?2 AND company_id = ?3",
             params![voucher_revision, invoice_id, company_id],
         )?;
@@ -2507,10 +2605,22 @@ impl Store {
         tx.execute("UPDATE vouchers SET kind = ?1, reference = ?2, date = ?3, narration = ?4 WHERE id = ?5 AND company_id = ?6", params![draft.kind.voucher_kind().as_str(), prepared.reference, prepared.date, draft.narration.trim(), voucher_id, company_id])?;
         tx.execute(
             "UPDATE invoices SET kind = ?1, party_ledger_id = ?2, trade_ledger_id = ?3,
-                 tax_ledger_id = ?4, tax_amount = ?5, due_date = ?6, credit_days = ?7, bill_reference = ?8
-             WHERE id = ?9 AND company_id = ?10",
-            params![draft.kind.as_str(), draft.party_ledger_id, draft.trade_ledger_id, draft.tax_ledger_id,
-                draft.tax_amount, prepared.due_date, prepared.credit_days, prepared.bill_reference, invoice_id, company_id],
+                 tax_ledger_id = ?4, tax_amount = ?5, due_date = ?6, credit_days = ?7,
+                 bill_reference = ?8, entry_mode = ?9
+             WHERE id = ?10 AND company_id = ?11",
+            params![
+                draft.kind.as_str(),
+                draft.party_ledger_id,
+                draft.trade_ledger_id,
+                draft.tax_ledger_id,
+                draft.tax_amount,
+                prepared.due_date,
+                prepared.credit_days,
+                prepared.bill_reference,
+                draft.entry_mode.as_str(),
+                invoice_id,
+                company_id
+            ],
         )?;
         tx.execute("DELETE FROM postings WHERE voucher_id = ?1", [voucher_id])?;
         tx.execute("DELETE FROM invoice_line_allocations WHERE line_id IN (SELECT id FROM invoice_lines WHERE invoice_id = ?1)", [invoice_id])?;
@@ -2522,7 +2632,7 @@ impl Store {
             "DELETE FROM invoice_adjustments WHERE invoice_id = ?1",
             [invoice_id],
         )?;
-        write_postings(&tx, voucher_id, &prepared.postings)?;
+        write_invoice_postings(&tx, voucher_id, draft, &prepared.postings)?;
         write_invoice_lines(
             &tx,
             invoice_id,
@@ -2569,7 +2679,7 @@ impl Store {
     ) -> Result<Vec<InvoiceRevision>> {
         let mut stmt = self.conn.prepare(
             "SELECT r.id, r.changed_at, r.kind, v.date, v.reference, v.narration, p.name, t.name,
-                    x.name, r.tax_amount, r.due_date, r.credit_days, COALESCE(r.bill_reference, v.reference)
+                    x.name, r.tax_amount, r.due_date, r.credit_days, COALESCE(r.bill_reference, v.reference), r.entry_mode
              FROM invoice_revisions r JOIN voucher_revisions v ON v.id = r.voucher_revision_id
              JOIN ledgers p ON p.id = r.party_ledger_id JOIN ledgers t ON t.id = r.trade_ledger_id
              LEFT JOIN ledgers x ON x.id = r.tax_ledger_id
@@ -2591,6 +2701,7 @@ impl Store {
                     r.get::<_, Option<String>>(10)?,
                     r.get::<_, Option<u32>>(11)?,
                     r.get::<_, String>(12)?,
+                    r.get::<_, String>(13)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2609,6 +2720,7 @@ impl Store {
             due_date,
             credit_days,
             bill_reference,
+            entry_mode,
         ) in rows
         {
             let mut items = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name, l.id FROM invoice_revision_lines l JOIN invoice_revisions r ON r.id = l.revision_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, r.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.revision_id = ?1 ORDER BY l.id")?;
@@ -2645,6 +2757,7 @@ impl Store {
                 due_date,
                 credit_days,
                 kind: InvoiceKind::parse(&kind)?,
+                entry_mode: InvoiceEntryMode::parse(&entry_mode)?,
                 reference,
                 bill_reference,
                 narration,
@@ -2663,7 +2776,7 @@ impl Store {
     pub fn invoices(&self, company_id: i64) -> Result<Vec<InvoiceSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.voucher_id, i.kind, v.date, v.reference, l.name, i.tax_amount, i.due_date,
-                    i.credit_days, i.party_ledger_id, x.name, COALESCE(i.bill_reference, v.reference)
+                    i.credit_days, i.party_ledger_id, x.name, COALESCE(i.bill_reference, v.reference), i.entry_mode
              FROM invoices i JOIN vouchers v ON v.id = i.voucher_id JOIN ledgers l ON l.id = i.party_ledger_id
              LEFT JOIN ledgers x ON x.id = i.tax_ledger_id WHERE i.company_id = ?1 ORDER BY v.date DESC, i.id DESC",
         )?;
@@ -2681,6 +2794,7 @@ impl Store {
                 r.get::<_, i64>(9)?,
                 r.get::<_, Option<String>>(10)?,
                 r.get::<_, String>(11)?,
+                r.get::<_, String>(12)?,
             ))
         })?;
         let mut result = Vec::new();
@@ -2698,6 +2812,7 @@ impl Store {
                 party_ledger_id,
                 primary_tax_name,
                 bill_reference,
+                entry_mode,
             ) = row?;
             let mut amounts = self.conn.prepare("SELECT s.name, s.unit, l.quantity, l.unit_price, l.amount, loc.name, b.name, trade.name, l.id FROM invoice_lines l JOIN invoices i ON i.id = l.invoice_id JOIN ledgers trade ON trade.id = COALESCE(l.trade_ledger_id, i.trade_ledger_id) JOIN stock_items s ON s.id = l.item_id JOIN stock_locations loc ON loc.id = l.location_id LEFT JOIN stock_batches b ON b.id = l.batch_id WHERE l.invoice_id = ?1 ORDER BY l.id")?;
             let line_amounts = amounts.query_map([id], |r| {
@@ -2762,6 +2877,7 @@ impl Store {
                 id,
                 voucher_id,
                 kind: InvoiceKind::parse(&kind)?,
+                entry_mode: InvoiceEntryMode::parse(&entry_mode)?,
                 date,
                 due_date,
                 credit_days,
@@ -3048,6 +3164,7 @@ impl Store {
                 invoice_id: invoice.id,
                 opening_date,
                 kind: invoice.kind,
+                entry_mode: invoice.entry_mode,
                 date: bill_date,
                 due_date: invoice.due_date,
                 reference: invoice.reference,

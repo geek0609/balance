@@ -508,6 +508,7 @@ mod tests {
 
         let mut invoice = InvoiceDraft {
             kind: InvoiceKind::Sale,
+            entry_mode: crate::inventory::InvoiceEntryMode::Invoice,
             date: "2026-01-02".into(),
             due_date: None,
             credit_days: None,

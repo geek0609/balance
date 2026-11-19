@@ -6,8 +6,8 @@ use balance::contacts::LedgerProfile;
 use balance::exchange::{ImportPlan, MAX_XML_IMPORT_BYTES};
 use balance::inventory::{
     discounted_line_amount, format_quantity, parse_quantity, InvoiceAdjustment, InvoiceAllocation,
-    InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine, SettlementAllocation, StockBatch,
-    StockItem, StockLocation,
+    InvoiceDiscount, InvoiceDraft, InvoiceEntryMode, InvoiceKind, InvoiceLine,
+    SettlementAllocation, StockBatch, StockItem, StockLocation,
 };
 use balance::pricing::PriceList;
 use balance::reorder::ReorderRule;
@@ -233,6 +233,7 @@ struct App {
     adjustment_increase: bool,
     adjustment_reason: String,
     invoice_kind: InvoiceKind,
+    invoice_entry_mode: InvoiceEntryMode,
     invoice_date: String,
     invoice_due_date: String,
     invoice_credit_days: String,
@@ -511,6 +512,7 @@ impl App {
             adjustment_increase: true,
             adjustment_reason: String::new(),
             invoice_kind: InvoiceKind::Sale,
+            invoice_entry_mode: InvoiceEntryMode::Invoice,
             invoice_date: String::new(),
             invoice_due_date: String::new(),
             invoice_credit_days: String::new(),
@@ -3173,6 +3175,7 @@ impl App {
     ) {
         self.invoice_source = Some(source);
         self.invoice_kind = kind;
+        self.invoice_entry_mode = InvoiceEntryMode::Invoice;
         self.invoice_party = Some(party);
         self.invoice_trade = None;
         self.invoice_date.clear();
@@ -3196,6 +3199,7 @@ impl App {
         self.editing_invoice = edit;
         self.copying_invoice = edit.is_none();
         self.invoice_kind = draft.kind;
+        self.invoice_entry_mode = draft.entry_mode;
         self.invoice_date = if edit.is_some() {
             draft.date
         } else {
@@ -3376,6 +3380,13 @@ impl App {
             ui.text_edit_singleline(&mut self.invoice_reference);
         });
         ui.horizontal(|ui| {
+            egui::ComboBox::from_label("Entry mode")
+                .selected_text(self.invoice_entry_mode.as_str())
+                .show_ui(ui, |ui| {
+                    for mode in InvoiceEntryMode::ALL {
+                        ui.selectable_value(&mut self.invoice_entry_mode, mode, mode.as_str());
+                    }
+                });
             ui.label("Bill reference");
             ui.add(
                 egui::TextEdit::singleline(&mut self.invoice_bill_reference)
@@ -3835,6 +3846,7 @@ impl App {
                 }
                 let draft = InvoiceDraft {
                     kind: self.invoice_kind,
+                    entry_mode: self.invoice_entry_mode,
                     date: self.invoice_date.clone(),
                     due_date: (!self.invoice_due_date.trim().is_empty())
                         .then(|| self.invoice_due_date.trim().to_owned()),
@@ -4308,7 +4320,7 @@ impl App {
                                             "Replaced at {} UTC • {} • {} • {} • {}",
                                             revision.changed_at,
                                             revision.date,
-                                            revision.kind.as_str(),
+                                            revision.entry_mode.label(revision.kind),
                                             reference_with_bill(
                                                 &revision.reference,
                                                 &revision.bill_reference
@@ -4621,7 +4633,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. Invoices require one new bill reference for the full party amount. Item invoices require one accounting allocation per item. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed bill allocations, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. Each imported invoice or billed sales or purchase voucher needs one new bill reference for the full party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed bill allocations, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(ui, "Bank clearance");
@@ -5389,7 +5401,7 @@ impl App {
                             ui.label(balance::opening_bills::label(row.kind))
                                 .on_hover_text(format!("Posted to the books on {date}"));
                         } else {
-                            ui.label(row.kind.as_str());
+                            ui.label(row.entry_mode.label(row.kind));
                         }
                         ui.label(row.party);
                         ui.label(row.date);

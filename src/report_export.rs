@@ -1027,6 +1027,7 @@ impl Store {
             "overdue_days",
             "credited",
             "bill_reference",
+            "entry_mode",
         ]);
         contextual_row(&mut csv, &strings(&["company", "as_of"]), &details)?;
         let mut context_fields = vec![String::new(); details.len()];
@@ -1060,6 +1061,12 @@ impl Store {
                         .unwrap_or_default(),
                     money(entry.credited),
                     text_cell(&entry.bill_reference),
+                    if entry.opening_date.is_some() {
+                        "Opening bill"
+                    } else {
+                        entry.entry_mode.as_str()
+                    }
+                    .into(),
                 ],
             )?;
         }
@@ -1107,6 +1114,7 @@ impl Store {
             "outstanding_all_dates",
             "credited_all_dates",
             "bill_reference",
+            "entry_mode",
         ]);
         let mut csv = writer();
         contextual_row(
@@ -1172,6 +1180,7 @@ impl Store {
                     money(invoice.outstanding),
                     money(invoice.credited),
                     text_cell(&invoice.bill_reference),
+                    invoice.entry_mode.as_str().into(),
                 ],
             )?;
         }

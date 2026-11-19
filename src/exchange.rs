@@ -6,8 +6,8 @@ use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
     discounted_line_amount, find_stock_batch, insert_direct_invoice,
     insert_settlement_on_connection, insert_stock_adjustment, invoice_total, parse_quantity,
-    InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft, InvoiceKind, InvoiceLine,
-    SettlementAllocation, StockInvoicePosting,
+    InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft, InvoiceEntryMode,
+    InvoiceKind, InvoiceLine, SettlementAllocation, StockInvoicePosting,
 };
 use crate::opening_bills::OpeningBillDraft;
 use crate::{
@@ -134,6 +134,7 @@ struct ImportedInvoiceAdjustment {
 #[derive(Debug, Clone)]
 struct ImportedInvoice {
     kind: InvoiceKind,
+    entry_mode: InvoiceEntryMode,
     date: String,
     credit_days: Option<u32>,
     reference: String,
@@ -145,6 +146,7 @@ struct ImportedInvoice {
     existing_trade_id: Option<i64>,
     lines: Vec<ImportedInvoiceLine>,
     adjustments: Vec<ImportedInvoiceAdjustment>,
+    original_postings: Vec<Line>,
     metadata: SourceMetadata,
 }
 #[derive(Debug, Clone)]
@@ -451,7 +453,7 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
                     .iter()
                     .any(|a| attribute.name().eq_ignore_ascii_case(a)))
             && !(local_name(node).eq_ignore_ascii_case("VOUCHER")
-                && ["DATE", "VCHTYPE"]
+                && ["DATE", "VCHTYPE", "OBJVIEW"]
                     .iter()
                     .any(|a| attribute.name().eq_ignore_ascii_case(a)))
             && !(attribute.name().eq_ignore_ascii_case("TYPE")
@@ -696,6 +698,21 @@ fn party_flag(entry: Node<'_, '_>) -> Result<bool> {
         None => Ok(false),
         _ => Err(Error::Validation("invalid party flag".into())),
     }
+}
+fn check_voucher_view(node: Node<'_, '_>, allowed: &[&str]) -> Result<()> {
+    for field in ["PERSISTEDVIEW", "OBJVIEW"] {
+        let attribute = node
+            .attributes()
+            .find(|attribute| attribute.name().eq_ignore_ascii_case(field))
+            .map(|attribute| attribute.value().trim());
+        let value = direct_text(node, field);
+        for view in attribute.into_iter().chain(value.as_deref()) {
+            if !view.is_empty() && !allowed.iter().any(|name| view.eq_ignore_ascii_case(name)) {
+                return Err(Error::Validation(format!("unsupported {field}")));
+            }
+        }
+    }
+    Ok(())
 }
 fn xml_date(value: &str) -> Result<String> {
     let parsed = if value.trim().len() == 8 && value.trim().bytes().all(|b| b.is_ascii_digit()) {
@@ -1054,6 +1071,7 @@ fn parse_imported_settlement(
             "NARRATION",
             "PARTYLEDGERNAME",
             "PERSISTEDVIEW",
+            "OBJVIEW",
             "ISINVOICE",
             "LEDGERENTRIES.LIST",
             "ALLLEDGERENTRIES.LIST",
@@ -1067,11 +1085,7 @@ fn parse_imported_settlement(
     {
         issues.push(format!("{label}: voucher name attribute is not supported"));
     }
-    if direct_text(node, "PERSISTEDVIEW")
-        .is_some_and(|v| !v.is_empty() && !v.eq_ignore_ascii_case("Accounting Voucher View"))
-    {
-        return Err(Error::Validation("unsupported settlement view".into()));
-    }
+    check_voucher_view(node, &["Accounting Voucher View"])?;
     if direct_text(node, "ISINVOICE")
         .is_some_and(|v| !v.is_empty() && !v.eq_ignore_ascii_case("no"))
     {
@@ -1303,6 +1317,7 @@ fn parse_imported_invoice(
     node: Node<'_, '_>,
     label: &str,
     metadata: SourceMetadata,
+    entry_mode: InvoiceEntryMode,
     ledgers: &HashMap<String, (Option<i64>, Category)>,
     items: &HashMap<String, (Option<i64>, String, u8)>,
     locations: &HashMap<String, Option<i64>>,
@@ -1316,6 +1331,7 @@ fn parse_imported_invoice(
             "VOUCHERTYPENAME",
             "VOUCHERNUMBER",
             "NARRATION",
+            "PARTYLEDGERNAME",
             "PERSISTEDVIEW",
             "OBJVIEW",
             "ISINVOICE",
@@ -1332,20 +1348,22 @@ fn parse_imported_invoice(
     {
         issues.push(format!("{label}: voucher name attribute is not supported"));
     }
-    let has_inventory = node.children().any(|child| {
-        child.is_element()
-            && local_name(child).eq_ignore_ascii_case("ALLINVENTORYENTRIES.LIST")
-            && meaningful(child)
-    });
-    for field in ["PERSISTEDVIEW", "OBJVIEW"] {
-        if direct_text(node, field).is_some_and(|v| {
-            !v.is_empty()
-                && !v.eq_ignore_ascii_case("Invoice Voucher View")
-                && !(!has_inventory && v.eq_ignore_ascii_case("Accounting Voucher View"))
-        }) {
-            return Err(Error::Validation(format!("unsupported {field}")));
-        }
-    }
+    let mut inventory_rows: Vec<_> = node
+        .children()
+        .filter(|child| {
+            child.is_element()
+                && local_name(*child).eq_ignore_ascii_case("ALLINVENTORYENTRIES.LIST")
+                && meaningful(*child)
+        })
+        .map(|child| (child, None))
+        .collect();
+    let has_header_inventory = !inventory_rows.is_empty();
+    let allowed_views: &[&str] = match entry_mode {
+        InvoiceEntryMode::Voucher => &["Accounting Voucher View"],
+        InvoiceEntryMode::Invoice if has_header_inventory => &["Invoice Voucher View"],
+        InvoiceEntryMode::Invoice => &["Invoice Voucher View", "Accounting Voucher View"],
+    };
+    check_voucher_view(node, allowed_views)?;
     let voucher_kind = parse_kind(&invoice_field(node, "VOUCHERTYPENAME")?)
         .ok_or_else(|| Error::Validation("unsupported invoice type".into()))?;
     let kind = match voucher_kind {
@@ -1396,8 +1414,16 @@ fn parse_imported_invoice(
         ));
     }
     let mut party = None;
+    let header_party = direct_text(node, "PARTYLEDGERNAME").filter(|name| !name.is_empty());
     let mut credit_days = None;
     let mut adjustments = Vec::new();
+    let mut original_postings = Vec::new();
+    struct StockLedgerBreakdown {
+        ledger: String,
+        posting_amount: i64,
+        stock_amount: i128,
+    }
+    let mut breakdowns = Vec::<StockLedgerBreakdown>::new();
     let party_debit = kind == InvoiceKind::Sale;
     for entry in entries {
         invoice_list_fields(
@@ -1409,6 +1435,7 @@ fn parse_imported_invoice(
                 "ISLASTDEEMEDPOSITIVE",
                 "ISPARTYLEDGER",
                 "BILLALLOCATIONS.LIST",
+                "INVENTORYALLOCATIONS.LIST",
             ],
             label,
             issues,
@@ -1423,7 +1450,42 @@ fn parse_imported_invoice(
         }
         invoice_side(entry, "ISDEEMEDPOSITIVE", amount > 0)?;
         invoice_side(entry, "ISLASTDEEMEDPOSITIVE", amount > 0)?;
-        let is_party = party_flag(entry)?;
+        let named_party = header_party
+            .as_ref()
+            .is_some_and(|name| normalized(name) == normalized(&ledger));
+        let is_party = party_flag(entry)?
+            || (named_party
+                && direct_text(entry, "ISPARTYLEDGER").is_none_or(|value| value.is_empty()));
+        if entry_mode == InvoiceEntryMode::Voucher {
+            original_postings.push(Line {
+                ledger: ledger.clone(),
+                amount,
+                is_party,
+            });
+        }
+        let stock: Vec<_> = entry
+            .children()
+            .filter(|child| {
+                child.is_element()
+                    && local_name(*child).eq_ignore_ascii_case("INVENTORYALLOCATIONS.LIST")
+                    && meaningful(*child)
+            })
+            .collect();
+        let has_stock = !stock.is_empty();
+        if has_stock {
+            if entry_mode != InvoiceEntryMode::Voucher || is_party || has_header_inventory {
+                return Err(Error::Validation(
+                    "Ledger inventory allocations must belong to an unmarked trade posting in voucher mode".into(),
+                ));
+            }
+            let breakdown = breakdowns.len();
+            inventory_rows.extend(stock.into_iter().map(|row| (row, Some(breakdown))));
+            breakdowns.push(StockLedgerBreakdown {
+                ledger: ledger.clone(),
+                posting_amount: amount,
+                stock_amount: 0,
+            });
+        }
         let bills: Vec<_> = entry
             .children()
             .filter(|n| {
@@ -1475,21 +1537,26 @@ fn parse_imported_invoice(
                     "additional ledger bill allocations are not supported".into(),
                 ));
             }
-            adjustments.push(ImportedInvoiceAdjustment {
-                ledger,
-                existing_ledger_id: *existing_ledger_id,
-                amount: if party_debit { -amount } else { amount },
-            });
+            if !has_stock {
+                adjustments.push(ImportedInvoiceAdjustment {
+                    ledger,
+                    existing_ledger_id: *existing_ledger_id,
+                    amount: if party_debit { -amount } else { amount },
+                });
+            }
         }
     }
     let (party_name, party_amount, bill_reference) =
         party.ok_or_else(|| Error::Validation("party ledger is missing".into()))?;
+    if header_party.is_some_and(|name| normalized(&name) != normalized(&party_name)) {
+        return Err(Error::Validation(
+            "Voucher party differs from its bill ledger".into(),
+        ));
+    }
     let mut lines = Vec::new();
     let mut trade: Option<String> = None;
     let mut subtotal = 0_i128;
-    for item_node in node.children().filter(|n| {
-        n.is_element() && local_name(*n).eq_ignore_ascii_case("ALLINVENTORYENTRIES.LIST")
-    }) {
+    for (item_node, posting) in inventory_rows {
         invoice_list_fields(
             item_node,
             &[
@@ -1524,14 +1591,6 @@ fn parse_imported_invoice(
         if quantity % 10_i64.pow(u32::from(3 - *precision)) != 0 {
             return Err(Error::Validation("quantity exceeds unit precision".into()));
         }
-        let rate = invoice_field(item_node, "RATE")?;
-        let (price, rate_unit) = rate
-            .split_once('/')
-            .ok_or_else(|| Error::Validation("rate must specify the base unit".into()))?;
-        if normalized(rate_unit) != normalized(unit) {
-            return Err(Error::Validation("rate uses another unit".into()));
-        }
-        let unit_price = parse_amount(price)?;
         let source_amount = xml_amount(&invoice_field(item_node, "AMOUNT")?)?;
         if source_amount != 0 && (source_amount > 0) == party_debit {
             return Err(Error::Validation(
@@ -1547,11 +1606,6 @@ fn parse_imported_invoice(
             let rate = value
                 .parse::<rust_decimal::Decimal>()
                 .map_err(|_| Error::Validation("invalid item discount percentage".into()))?;
-            discounted_line_amount(
-                quantity,
-                unit_price,
-                &InvoiceDiscount::Percent(value.clone()),
-            )?;
             !rate.is_zero()
         } else {
             false
@@ -1568,6 +1622,29 @@ fn parse_imported_invoice(
         } else {
             InvoiceDiscount::None
         };
+        let unit_price =
+            if let Some(rate) = direct_text(item_node, "RATE").filter(|v| !v.is_empty()) {
+                let (price, rate_unit) = rate
+                    .split_once('/')
+                    .ok_or_else(|| Error::Validation("rate must specify the base unit".into()))?;
+                if normalized(rate_unit) != normalized(unit) {
+                    return Err(Error::Validation("rate uses another unit".into()));
+                }
+                parse_amount(price)?
+            } else {
+                if posting.is_none() || !matches!(discount, InvoiceDiscount::None) {
+                    return Err(Error::Validation("item rate is missing".into()));
+                }
+                let numerator = i128::from(source_amount).abs() * 1000;
+                let quantity = i128::from(quantity);
+                if numerator % quantity != 0 {
+                    return Err(Error::Validation(
+                        "An omitted item rate cannot be derived exactly in hundredths".into(),
+                    ));
+                }
+                i64::try_from(numerator / quantity)
+                    .map_err(|_| Error::Validation("item rate is too large".into()))?
+            };
         let (amount, _) = discounted_line_amount(quantity, unit_price, &discount)?;
         let expected = if party_debit { -amount } else { amount };
         if source_amount != expected {
@@ -1582,20 +1659,38 @@ fn parse_imported_invoice(
                 n.is_element() && local_name(*n).eq_ignore_ascii_case("ACCOUNTINGALLOCATIONS.LIST")
             })
             .collect();
-        if allocations.len() != 1 {
-            return Err(Error::Validation(
-                "each item needs exactly one accounting allocation".into(),
-            ));
-        }
-        let allocation = allocations[0];
-        invoice_list_fields(
-            allocation,
-            &["LEDGERNAME", "AMOUNT", "ISDEEMEDPOSITIVE"],
-            label,
-            issues,
-        );
-        let ledger = invoice_field(allocation, "LEDGERNAME")?;
-        let (_, category) = ledgers
+        let ledger = if let Some(index) = posting {
+            if allocations.iter().any(|allocation| meaningful(*allocation)) {
+                return Err(Error::Validation(
+                    "Stock on a ledger posting cannot also have an item accounting allocation"
+                        .into(),
+                ));
+            }
+            let breakdown = &mut breakdowns[index];
+            breakdown.stock_amount += i128::from(expected);
+            breakdown.ledger.clone()
+        } else {
+            if allocations.len() != 1 {
+                return Err(Error::Validation(
+                    "each item needs exactly one accounting allocation".into(),
+                ));
+            }
+            let allocation = allocations[0];
+            invoice_list_fields(
+                allocation,
+                &["LEDGERNAME", "AMOUNT", "ISDEEMEDPOSITIVE"],
+                label,
+                issues,
+            );
+            if xml_amount(&invoice_field(allocation, "AMOUNT")?)? != expected {
+                return Err(Error::Validation(
+                    "item accounting allocation differs from the item amount".into(),
+                ));
+            }
+            invoice_side(allocation, "ISDEEMEDPOSITIVE", !party_debit)?;
+            invoice_field(allocation, "LEDGERNAME")?
+        };
+        let (existing_trade_ledger_id, category) = ledgers
             .get(&normalized(&ledger))
             .ok_or_else(|| Error::Validation(format!("ledger {ledger} is unavailable")))?;
         if (kind == InvoiceKind::Sale && *category != Category::Income)
@@ -1604,11 +1699,6 @@ fn parse_imported_invoice(
         {
             return Err(Error::Validation(
                 "item accounting ledger has an incompatible category".into(),
-            ));
-        }
-        if xml_amount(&invoice_field(allocation, "AMOUNT")?)? != expected {
-            return Err(Error::Validation(
-                "item accounting allocation differs from the item amount".into(),
             ));
         }
         let locations_in_line: Vec<_> = item_node
@@ -1713,7 +1803,6 @@ fn parse_imported_invoice(
                 ));
             }
         }
-        invoice_side(allocation, "ISDEEMEDPOSITIVE", !party_debit)?;
         if trade.is_none() {
             trade = Some(ledger.clone());
         }
@@ -1724,12 +1813,20 @@ fn parse_imported_invoice(
             unit: unit.clone(),
             precision: *precision,
             allocations: stock_allocations,
-            existing_trade_ledger_id: ledgers[&normalized(&ledger)].0,
+            existing_trade_ledger_id: *existing_trade_ledger_id,
             trade_ledger: ledger,
             quantity,
             unit_price,
             discount,
         });
+    }
+    for breakdown in breakdowns {
+        if breakdown.stock_amount != i128::from(breakdown.posting_amount) {
+            return Err(Error::Validation(format!(
+                "Stock amounts do not reconcile to the posting for {}",
+                breakdown.ledger
+            )));
+        }
     }
     let trade = match trade {
         Some(trade) => trade,
@@ -1789,6 +1886,7 @@ fn parse_imported_invoice(
     let existing_trade_id = ledgers[&normalized(&trade)].0;
     Ok(ImportedInvoice {
         kind,
+        entry_mode,
         date,
         credit_days,
         reference,
@@ -1800,6 +1898,7 @@ fn parse_imported_invoice(
         existing_trade_id,
         lines,
         adjustments,
+        original_postings,
         metadata,
     })
 }
@@ -2997,11 +3096,44 @@ impl Store {
                 &mut seen_metadata,
                 &mut plan.issues,
             );
-            if direct_text(node, "ISINVOICE").is_some_and(|v| v.eq_ignore_ascii_case("yes")) {
+            let has_bill_details = node
+                .children()
+                .filter(|entry| {
+                    entry.is_element()
+                        && ["LEDGERENTRIES.LIST", "ALLLEDGERENTRIES.LIST"]
+                            .iter()
+                            .any(|tag| local_name(*entry).eq_ignore_ascii_case(tag))
+                })
+                .any(|entry| {
+                    entry.children().any(|bill| {
+                        bill.is_element()
+                            && local_name(bill).eq_ignore_ascii_case("BILLALLOCATIONS.LIST")
+                            && meaningful(bill)
+                    })
+                });
+            let kind = direct_text(node, "VOUCHERTYPENAME").and_then(|value| parse_kind(&value));
+            let invoice_flag = direct_text(node, "ISINVOICE");
+            let entry_mode = if invoice_flag
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("yes"))
+            {
+                Some(InvoiceEntryMode::Invoice)
+            } else if has_bill_details
+                && matches!(kind, Some(VoucherKind::Sales | VoucherKind::Purchase))
+                && invoice_flag
+                    .as_deref()
+                    .is_none_or(|value| value.is_empty() || value.eq_ignore_ascii_case("no"))
+            {
+                Some(InvoiceEntryMode::Voucher)
+            } else {
+                None
+            };
+            if let Some(entry_mode) = entry_mode {
                 match parse_imported_invoice(
                     node,
                     &label,
                     metadata,
+                    entry_mode,
                     &invoice_ledgers,
                     &invoice_items,
                     &known_locations,
@@ -3044,22 +3176,7 @@ impl Store {
                 }
                 continue;
             }
-            if node
-                .children()
-                .filter(|n| {
-                    n.is_element()
-                        && ["LEDGERENTRIES.LIST", "ALLLEDGERENTRIES.LIST"]
-                            .iter()
-                            .any(|tag| local_name(*n).eq_ignore_ascii_case(tag))
-                })
-                .any(|entry| {
-                    entry.children().any(|bill| {
-                        bill.is_element()
-                            && local_name(bill).eq_ignore_ascii_case("BILLALLOCATIONS.LIST")
-                            && meaningful(bill)
-                    })
-                })
-            {
+            if has_bill_details {
                 pending_settlements.push((node, label, metadata));
                 continue;
             }
@@ -3071,6 +3188,7 @@ impl Store {
                     "VOUCHERNUMBER",
                     "NARRATION",
                     "PERSISTEDVIEW",
+                    "OBJVIEW",
                     "ISINVOICE",
                     "LEDGERENTRIES.LIST",
                     "ALLLEDGERENTRIES.LIST",
@@ -3082,13 +3200,10 @@ impl Store {
                 plan.issues
                     .push(format!("{label}: invoices and inventory are not supported"));
             }
-            if direct_text(node, "PERSISTEDVIEW").is_some_and(|v| {
-                !v.is_empty() && !v.eq_ignore_ascii_case("Accounting Voucher View")
-            }) {
-                plan.issues
-                    .push(format!("{label}: unsupported voucher view"));
+            if let Err(error) = check_voucher_view(node, &["Accounting Voucher View"]) {
+                plan.issues.push(format!("{label}: {error}"));
             }
-            let kind = match direct_text(node, "VOUCHERTYPENAME").and_then(|v| parse_kind(&v)) {
+            let kind = match kind {
                 Some(v) => v,
                 None => {
                     plan.issues
@@ -4001,6 +4116,7 @@ impl Store {
             }
             let draft = InvoiceDraft {
                 kind: invoice.kind,
+                entry_mode: invoice.entry_mode,
                 date: invoice.date.clone(),
                 due_date: None,
                 credit_days: invoice.credit_days,
@@ -4029,8 +4145,25 @@ impl Store {
                     })
                     .collect::<Result<Vec<_>>>()?,
             };
-            let (_, voucher_id) =
-                insert_direct_invoice(&tx, plan.company_id, &draft, StockInvoicePosting::Import)?;
+            let original_postings = invoice
+                .original_postings
+                .iter()
+                .map(|line| {
+                    Ok(Posting {
+                        ledger_id: resolve_ledger(&line.ledger, None)?,
+                        amount: line.amount,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (_, voucher_id) = insert_direct_invoice(
+                &tx,
+                plan.company_id,
+                &draft,
+                StockInvoicePosting::Import {
+                    original_postings: (invoice.entry_mode == InvoiceEntryMode::Voucher)
+                        .then_some(original_postings.as_slice()),
+                },
+            )?;
             save_metadata(
                 &tx,
                 plan.company_id,
@@ -4233,6 +4366,151 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accounting_trade_vouchers_preserve_stock_postings_and_bill_links() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Example").unwrap();
+        let customer = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        let supplier = store
+            .create_ledger(company, "Supplier", Category::Liability)
+            .unwrap();
+        let sales = store
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        store
+            .create_ledger(company, "Purchases", Category::Expense)
+            .unwrap();
+        store
+            .create_ledger(company, "Bank", Category::Asset)
+            .unwrap();
+        store.create_stock_item(company, "Part", "Each").unwrap();
+        let location = store.stock_locations(company).unwrap()[0].id;
+        store
+            .set_negative_stock_policy(company, Some("2026-01-01"), "Check stock")
+            .unwrap();
+        let allocation = |quantity: &str, amount: &str, rate: &str| {
+            format!(
+                r#"<INVENTORYALLOCATIONS.LIST><STOCKITEMNAME>Part</STOCKITEMNAME>{rate}
+                <AMOUNT>{amount}</AMOUNT><ACTUALQTY>{quantity} Each</ACTUALQTY>
+                <BILLEDQTY>{quantity} Each</BILLEDQTY>
+                <BATCHALLOCATIONS.LIST><GODOWNNAME>Main</GODOWNNAME><BATCHNAME>Lot-1</BATCHNAME>
+                    <AMOUNT>{amount}</AMOUNT><ACTUALQTY>{quantity} Each</ACTUALQTY>
+                    <BILLEDQTY>{quantity} Each</BILLEDQTY>
+                </BATCHALLOCATIONS.LIST></INVENTORYALLOCATIONS.LIST>"#
+            )
+        };
+        let purchased = allocation("4", "-100.00", "");
+        let first_sale = allocation("1", "40.00", "");
+        let second_sale = allocation("2", "70.00", "<RATE>35.00/Each</RATE>");
+        let xml = format!(
+            r#"<ENVELOPE><BODY><DATA><MESSAGE>
+            <VOUCHER OBJVIEW="Accounting Voucher View">
+                <DATE>20260102</DATE><VOUCHERTYPENAME>Purchase</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>PV-01</VOUCHERNUMBER><PARTYLEDGERNAME>Supplier</PARTYLEDGERNAME>
+                <ALLLEDGERENTRIES.LIST><LEDGERNAME>Purchases</LEDGERNAME><AMOUNT>-100.00</AMOUNT>
+                    {purchased}
+                </ALLLEDGERENTRIES.LIST>
+                <ALLLEDGERENTRIES.LIST><LEDGERNAME>Supplier</LEDGERNAME><AMOUNT>100.00</AMOUNT>
+                    <BILLALLOCATIONS.LIST><NAME>SUP-01</NAME><BILLTYPE>New Ref</BILLTYPE>
+                        <AMOUNT>100.00</AMOUNT></BILLALLOCATIONS.LIST>
+                </ALLLEDGERENTRIES.LIST>
+            </VOUCHER>
+            <VOUCHER VCHTYPE="Sales" OBJVIEW="Accounting Voucher View">
+                <DATE>20260103</DATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>SV-01</VOUCHERNUMBER><ISINVOICE>No</ISINVOICE>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME>
+                    <ISPARTYLEDGER>Yes</ISPARTYLEDGER><AMOUNT>-110.00</AMOUNT>
+                    <BILLALLOCATIONS.LIST><NAME>CUST-01</NAME><BILLTYPE>New Ref</BILLTYPE>
+                        <AMOUNT>-110.00</AMOUNT></BILLALLOCATIONS.LIST>
+                </LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Sales</LEDGERNAME><AMOUNT>40.00</AMOUNT>
+                    {first_sale}
+                </LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Sales</LEDGERNAME><AMOUNT>70.00</AMOUNT>
+                    {second_sale}
+                </LEDGERENTRIES.LIST>
+            </VOUCHER>
+            <VOUCHER>
+                <DATE>20260104</DATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>RC-01</VOUCHERNUMBER>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME><AMOUNT>25.00</AMOUNT>
+                    <BILLALLOCATIONS.LIST><NAME>CUST-01</NAME><BILLTYPE>Agst Ref</BILLTYPE>
+                        <AMOUNT>25.00</AMOUNT></BILLALLOCATIONS.LIST>
+                </LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-25.00</AMOUNT>
+                </LEDGERENTRIES.LIST>
+            </VOUCHER>
+        </MESSAGE></DATA></BODY></ENVELOPE>"#
+        );
+        let mismatch = xml.replace(
+            "<LEDGERNAME>Sales</LEDGERNAME><AMOUNT>70.00",
+            "<LEDGERNAME>Sales</LEDGERNAME><AMOUNT>71.00",
+        );
+        let blocked = store
+            .preview_xml_import(company, mismatch.as_bytes())
+            .unwrap();
+        assert!(!blocked.can_apply());
+        assert!(blocked
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("Stock amounts do not reconcile")));
+        assert!(store.apply_xml_import(&blocked).is_err());
+        assert!(store.vouchers(company).unwrap().is_empty());
+
+        let plan = store.preview_xml_import(company, xml.as_bytes()).unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        let counts = store.apply_xml_import(&plan).unwrap();
+        assert_eq!((counts.invoices, counts.settlements), (2, 1));
+        assert_eq!(
+            store
+                .stock_location_balances(company, location, Some("2026-01-04"))
+                .unwrap()[0]
+                .quantity,
+            1000
+        );
+        let bills = store.outstanding_invoices(company, "2026-01-04").unwrap();
+        let receivable = bills
+            .iter()
+            .find(|bill| bill.party_ledger_id == customer)
+            .unwrap();
+        let payable = bills
+            .iter()
+            .find(|bill| bill.party_ledger_id == supplier)
+            .unwrap();
+        assert_eq!(
+            (receivable.bill_reference.as_str(), receivable.outstanding),
+            ("CUST-01", 8500)
+        );
+        assert_eq!(
+            (payable.bill_reference.as_str(), payable.outstanding),
+            ("SUP-01", 10000)
+        );
+        assert!(bills
+            .iter()
+            .all(|bill| bill.entry_mode == InvoiceEntryMode::Voucher));
+        let register = store
+            .invoice_register(company, None, None, None, None, "SV-01")
+            .unwrap();
+        assert_eq!(register[0].document_type(), "Sales voucher");
+        assert_eq!(register[0].lines[0].unit_price, 4000);
+        assert_eq!(register[0].lines[1].unit_price, 3500);
+        let postings = store.vouchers(company).unwrap();
+        let sale = postings
+            .iter()
+            .find(|voucher| voucher.id == register[0].voucher_id)
+            .unwrap();
+        assert_eq!(sale.party_lines, [0]);
+        assert_eq!(
+            sale.postings
+                .iter()
+                .map(|row| (row.ledger_id, row.amount))
+                .collect::<Vec<_>>(),
+            [(customer, 11000), (sales, -4000), (sales, -7000)]
+        );
+    }
+
+    #[test]
     fn receipts_resolve_bill_references_independently_of_document_numbers() {
         let mut store = Store::memory().unwrap();
         let company = store.create_company("Example").unwrap();
@@ -4282,7 +4560,9 @@ mod tests {
             )
         };
         let sale = invoice("INV-01", "BILL-07");
-        let other = invoice("BILL-07", "INV-01");
+        let other = invoice("BILL-07", "INV-01")
+            .replace("<ISINVOICE>Yes", "<ISINVOICE>No")
+            .replace("Invoice Voucher View", "Accounting Voucher View");
         let paid = receipt("RCPT-01", "BILL-07", "40.00");
         let plan = store
             .preview_xml_import_batch(
@@ -4313,15 +4593,18 @@ mod tests {
         let stale = store.preview_xml_import(company, stale.as_bytes()).unwrap();
         assert!(stale.can_apply(), "{:?}", stale.issues());
         let mut draft = store.invoice_draft(company, second.invoice_id).unwrap();
+        assert_eq!(draft.entry_mode, InvoiceEntryMode::Voucher);
         assert_eq!(draft.bill_reference.as_deref(), Some("INV-01"));
         draft.bill_reference = Some("BILL-08".into());
         store
             .update_invoice(company, second.invoice_id, &draft)
             .unwrap();
-        assert_eq!(
-            store.invoice_revisions(company, second.invoice_id).unwrap()[0].bill_reference,
-            "INV-01"
-        );
+        let revision = store
+            .invoice_revisions(company, second.invoice_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(revision.bill_reference, "INV-01");
+        assert_eq!(revision.entry_mode, InvoiceEntryMode::Voucher);
         assert!(store.apply_xml_import(&stale).is_err());
 
         let duplicate = invoice("INV-03", "bill-08");
@@ -4400,7 +4683,7 @@ mod tests {
         assert!(preview
             .issues()
             .iter()
-            .any(|issue| issue.contains("bill allocations require a receipt or payment")));
+            .any(|issue| issue.contains("adjustment ledger must differ from the party")));
 
         let preview = store.preview_xml_import(company, xml.as_bytes()).unwrap();
         assert!(preview.can_apply(), "{:?}", preview.issues());
@@ -4569,6 +4852,7 @@ mod tests {
             .unwrap();
         let sale = ImportedInvoice {
             kind: InvoiceKind::Sale,
+            entry_mode: InvoiceEntryMode::Invoice,
             date: date.into(),
             credit_days: None,
             reference: "SELL-01".into(),
@@ -4579,6 +4863,7 @@ mod tests {
             trade: "Sales".into(),
             existing_trade_id: Some(sales),
             adjustments: Vec::new(),
+            original_postings: Vec::new(),
             metadata: SourceMetadata::default(),
             lines: vec![ImportedInvoiceLine {
                 item: "Part".into(),

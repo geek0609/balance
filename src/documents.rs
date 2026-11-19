@@ -643,10 +643,16 @@ impl Store {
                 let _ = write!(html, "{}: {}<br>", label, escape(value));
             }
         }
+        let document_title = match invoice.entry_mode {
+            crate::inventory::InvoiceEntryMode::Invoice => {
+                format!("{} invoice", invoice.kind.as_str())
+            }
+            crate::inventory::InvoiceEntryMode::Voucher => invoice.document_type().to_owned(),
+        };
         let _ = write!(
             html,
-            "</p><p><strong>{} invoice record</strong><br>Reference: {}<br>Date: {}",
-            invoice.kind.as_str(),
+            "</p><p><strong>{} record</strong><br>Reference: {}<br>Date: {}",
+            document_title,
             escape(&invoice.reference),
             escape(&invoice.date)
         );

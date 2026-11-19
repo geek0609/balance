@@ -586,6 +586,7 @@ mod tests {
     ) -> InvoiceDraft {
         InvoiceDraft {
             kind,
+            entry_mode: crate::inventory::InvoiceEntryMode::Invoice,
             date: DATE.into(),
             reference: "INV-01".into(),
             bill_reference: None,

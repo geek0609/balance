@@ -53,7 +53,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 73;
+const SCHEMA_VERSION: i64 = 74;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -955,6 +955,15 @@ impl Store {
                      CHECK(bill_reference IS NULL OR length(trim(bill_reference)) > 0);",
             )?;
             tx.pragma_update(None, "user_version", 73)?;
+        }
+        if version < 74 {
+            tx.execute_batch(
+                "ALTER TABLE invoices ADD COLUMN entry_mode TEXT NOT NULL DEFAULT 'Invoice'
+                     CHECK(entry_mode IN ('Invoice', 'Voucher'));
+                 ALTER TABLE invoice_revisions ADD COLUMN entry_mode TEXT NOT NULL DEFAULT 'Invoice'
+                     CHECK(entry_mode IN ('Invoice', 'Voucher'));",
+            )?;
+            tx.pragma_update(None, "user_version", 74)?;
         }
         tx.commit()?;
         Ok(Self { conn })
