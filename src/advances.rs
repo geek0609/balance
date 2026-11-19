@@ -58,6 +58,7 @@ pub struct PartyAdvance {
     pub reference: String,
     pub narration: String,
     pub amount: i64,
+    pub includes_settlements: bool,
     pub applied: i128,
     pub available: i128,
     pub source_bill: Option<AdvanceSourceBill>,
@@ -84,6 +85,7 @@ pub(crate) fn insert_party_advance(
     company: i64,
     draft: &AdvanceDraft,
     source_bill: Option<&AdvanceSourceBill>,
+    settled_amount: i64,
 ) -> Result<(i64, i64)> {
     let date = parse_date(&draft.date)?.format("%Y-%m-%d").to_string();
     let reference = required(&draft.reference, "Advance reference")?;
@@ -119,9 +121,14 @@ pub(crate) fn insert_party_advance(
             "An advance with this party, type and reference already exists".into(),
         ));
     }
+    let total = draft
+        .amount
+        .checked_add(settled_amount)
+        .filter(|_| settled_amount >= 0)
+        .ok_or_else(|| Error::Validation("Invalid receipt or payment total".into()))?;
     let (voucher_kind, cash) = match draft.kind {
-        InvoiceKind::Sale => (VoucherKind::Receipt, draft.amount),
-        InvoiceKind::Purchase => (VoucherKind::Payment, -draft.amount),
+        InvoiceKind::Sale => (VoucherKind::Receipt, total),
+        InvoiceKind::Purchase => (VoucherKind::Payment, -total),
     };
     conn.execute(
         "INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -148,7 +155,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (advance, _) = insert_party_advance(&tx, company, draft, None)?;
+        let (advance, _) = insert_party_advance(&tx, company, draft, None, 0)?;
         tx.commit()?;
         Ok(advance)
     }
@@ -187,17 +194,14 @@ impl Store {
                 "Reversal date cannot precede the advance date".into(),
             ));
         }
-        let state = allocation_state(&tx, company, AllocationTarget::Advance(advance), None)?;
-        if state.applied > 0 {
-            return Err(Error::Validation(
-                "Release active allocations before reversing this advance".into(),
-            ));
+        if voucher_has_bill_settlements(&tx, company, original)? {
+            let voucher = crate::inventory::reverse_settlement_on_connection(
+                &tx, company, original, date, reference, reason,
+            )?;
+            tx.commit()?;
+            return Ok(voucher);
         }
-        if state.latest_release.is_some_and(|released| date < released) {
-            return Err(Error::Validation(
-                "Reversal date cannot precede an allocation release".into(),
-            ));
-        }
+        check_advance_reversal(&tx, company, advance, date)?;
         let kind = match InvoiceKind::parse(&kind)? {
             InvoiceKind::Sale => VoucherKind::Payment,
             InvoiceKind::Purchase => VoucherKind::Receipt,
@@ -224,6 +228,34 @@ impl Store {
     }
 }
 
+fn voucher_has_bill_settlements(conn: &Connection, company: i64, voucher: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2)",
+        params![company, voucher],
+        |row| row.get(0),
+    )?)
+}
+
+pub(crate) fn check_advance_reversal(
+    conn: &Connection,
+    company: i64,
+    advance: i64,
+    date: NaiveDate,
+) -> Result<()> {
+    let state = advance_allocation_state(conn, company, advance, None)?;
+    if state.applied > 0 {
+        return Err(Error::Validation(
+            "Release active allocations before reversing this advance".into(),
+        ));
+    }
+    if state.latest_release.is_some_and(|released| date < released) {
+        return Err(Error::Validation(
+            "Reversal date cannot precede an allocation release".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn read_party_advances(
     conn: &Connection,
     company: i64,
@@ -232,7 +264,8 @@ pub(crate) fn read_party_advances(
     let mut stmt = conn.prepare(
             "SELECT a.id, a.kind, a.party_ledger_id, party.name, bank.name, v.id, v.date, v.reference,
                     v.narration, a.amount, rv.id, rv.date, rv.reference, a.reversal_reason,
-                    a.source_bill_type, a.source_bill_reference
+                    a.source_bill_type, a.source_bill_reference,
+                    EXISTS(SELECT 1 FROM invoice_settlements s WHERE s.voucher_id = a.voucher_id AND s.company_id = a.company_id)
              FROM party_advances a JOIN vouchers v ON v.id = a.voucher_id AND v.company_id = a.company_id
              JOIN ledgers party ON party.id = a.party_ledger_id AND party.company_id = a.company_id
              JOIN ledgers bank ON bank.id = a.bank_ledger_id AND bank.company_id = a.company_id
@@ -296,6 +329,7 @@ pub(crate) fn read_party_advances(
                 reference: row.get(7)?,
                 narration: row.get(8)?,
                 amount,
+                includes_settlements: row.get(16)?,
                 applied,
                 available,
                 source_bill,

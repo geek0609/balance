@@ -268,7 +268,7 @@ impl App {
             ui.label(&advance.narration);
         }
         ui.label(format!(
-            "Received or paid {} | Applied {} | Available {}",
+            "On account {} | Applied {} | Available {}",
             money(advance.amount.into()),
             money(advance.applied),
             money(advance.available)
@@ -289,9 +289,14 @@ impl App {
                 .id_salt(advance.id)
                 .show(ui, |ui| self.advance_allocation_form(ui, company, advance));
         }
+        let reverse_label = if advance.includes_settlements {
+            "Reverse whole receipt / payment"
+        } else {
+            "Reverse advance"
+        };
         if self.advance_screen.reversal.is_none()
             && ui
-                .add_enabled(advance.applied == 0, egui::Button::new("Reverse advance"))
+                .add_enabled(advance.applied == 0, egui::Button::new(reverse_label))
                 .on_disabled_hover_text("Release the active allocations first.")
                 .clicked()
         {
@@ -300,6 +305,9 @@ impl App {
         let Some(form) = &mut self.advance_screen.reversal else {
             return;
         };
+        if advance.includes_settlements {
+            ui.label("This reverses the bill allocations and the amount kept on account.");
+        }
         egui::Grid::new(("reverse-advance", advance.id)).show(ui, |ui| {
             for (label, field) in [
                 ("Reversal date (YYYY-MM-DD)", &mut form.date),
@@ -314,7 +322,7 @@ impl App {
         let mut reverse = false;
         let mut dismiss = false;
         ui.horizontal(|ui| {
-            reverse = ui.button("Post advance reversal").clicked();
+            reverse = ui.button("Post reversal").clicked();
             dismiss = ui.button("Cancel").clicked();
         });
         if reverse {

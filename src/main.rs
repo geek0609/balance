@@ -277,6 +277,7 @@ struct App {
     settlement_date: String,
     settlement_reference: String,
     settlement_amount: String,
+    settlement_on_account: String,
     settlement_extra: Vec<SettlementLineForm>,
     reversal_target: Option<i64>,
     reversal_date: String,
@@ -581,6 +582,7 @@ impl App {
             settlement_date: String::new(),
             settlement_reference: String::new(),
             settlement_amount: String::new(),
+            settlement_on_account: String::new(),
             settlement_extra: Vec::new(),
             reversal_target: None,
             reversal_date: String::new(),
@@ -723,6 +725,7 @@ impl App {
         self.settlement_bank = None;
         self.settlement_reference.clear();
         self.settlement_amount.clear();
+        self.settlement_on_account.clear();
         self.settlement_extra.clear();
         self.reversal_target = None;
         self.reversal_date.clear();
@@ -4055,7 +4058,7 @@ impl App {
         ui.small("Invoice balances include all saved settlements and reversals. Use Outstanding for a specific date.");
         if let Some(voucher) = self.reversal_target {
             crate::theme::section(ui, format!("Reverse settlement voucher {voucher}"));
-            ui.label("This reverses the entire receipt or payment, including all invoices allocated to it.");
+            ui.label("This reverses the entire receipt or payment, including its bill allocations and any amount kept on account.");
             ui.horizontal(|ui| {
                 ui.label("Date");
                 ui.add(egui::TextEdit::singleline(&mut self.reversal_date).hint_text("YYYY-MM-DD"));
@@ -4143,6 +4146,13 @@ impl App {
                         amount: String::new(),
                     });
                 }
+                ui.horizontal(|ui| {
+                    ui.label("Additional amount to keep on account");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settlement_on_account)
+                            .hint_text("Optional"),
+                    );
+                });
                 if ui.button("Save receipt / payment").clicked() {
                     let result = (|| -> balance::Result<i64> {
                         let mut allocations = vec![BillSettlementAllocation {
@@ -4161,7 +4171,12 @@ impl App {
                                 amount: parse_amount(&line.amount)?,
                             });
                         }
-                        let (voucher, _) = self.store.settle_bills(
+                        let on_account = if self.settlement_on_account.trim().is_empty() {
+                            0
+                        } else {
+                            parse_amount(&self.settlement_on_account)?
+                        };
+                        let (voucher, _) = self.store.settle_bills_with_advance(
                             company,
                             self.settlement_bank.ok_or_else(|| {
                                 balance::Error::Validation("Select a cash or bank ledger".into())
@@ -4169,6 +4184,7 @@ impl App {
                             &self.settlement_date,
                             &self.settlement_reference,
                             &allocations,
+                            on_account,
                         )?;
                         Ok(voucher)
                     })();
@@ -4178,6 +4194,7 @@ impl App {
                             self.settlement_invoice = None;
                             self.settlement_reference.clear();
                             self.settlement_amount.clear();
+                            self.settlement_on_account.clear();
                             self.settlement_extra.clear();
                         }
                         Err(e) => self.failure(e),
@@ -4728,7 +4745,7 @@ impl App {
                 }
             }
         }
-        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills and applications of named advances on a sales or purchase transaction must add up to the party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices or record a single advance for the whole amount. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, mixed allocations in receipts or payments, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
+        ui.small("This initial importer handles simple groups, ledgers, selected contact details, opening balances and bill details, accounting vouchers, simple units, stock groups, stock locations with parent links, stock items, restricted item and non-stock invoices, and simple receipts or payments against invoices. Opening bills must reconcile to their ledger balance. Opening stock can include locations, batches, manufacture dates and reconciled acquisition costs. New bills and applications of named advances on a sales or purchase transaction must add up to the party amount. Item invoices require one accounting allocation per item. Stock allocations inside a voucher ledger line must add up to that posting. Additional ledger postings become unclassified service, charge or deduction lines. Separate fixed or percentage item discounts must match the source amounts; combined discounts and fixed discounts across multiple stock allocations are unsupported. Location and batch allocations must agree with item quantities and rounded amounts. Receipts and payments require one party and one cash or bank asset ledger. They can settle invoices and leave one advance or on-account allocation in the same voucher. Tax details, expiry dates, invoice batch dates, conflicting location hierarchies, multiple advances in one receipt or payment, advance credit terms and unsupported fields block import. Import has not been verified against representative exports.");
     }
     fn bank_page(&mut self, ui: &mut egui::Ui, company: i64) {
         crate::theme::section(ui, "Bank clearance");

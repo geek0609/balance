@@ -8,7 +8,7 @@ use crate::{
     VoucherKind,
 };
 use chrono::NaiveDate;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -1366,6 +1366,7 @@ pub(crate) fn insert_settlement_on_connection(
     reference: &str,
     allocations: &[BillSettlementAllocation],
     narration: &str,
+    advance_voucher: Option<i64>,
 ) -> Result<(i64, Vec<i64>)> {
     let parsed_date = parse_date(date)?;
     let date = parsed_date.format("%Y-%m-%d").to_string();
@@ -1495,10 +1496,24 @@ pub(crate) fn insert_settlement_on_connection(
         }
         total += amount;
     }
-    let total = i64::try_from(total)
-        .map_err(|_| Error::Validation("Settlement total is too large".into()))?;
     let (kind, party) =
         common.ok_or_else(|| Error::Validation("Select at least one invoice".into()))?;
+    let voucher_kind = if kind == InvoiceKind::Sale {
+        VoucherKind::Receipt
+    } else {
+        VoucherKind::Payment
+    };
+    let advance = advance_voucher
+        .map(|voucher| settlement_advance(conn, company_id, voucher, kind, party, bank_ledger_id))
+        .transpose()?
+        .flatten();
+    if advance_voucher.is_some() && advance.is_none() {
+        return Err(Error::Validation(
+            "Advance for this settlement is missing".into(),
+        ));
+    }
+    let total = i64::try_from(total + advance.map_or(0, |(_, amount)| i128::from(amount)))
+        .map_err(|_| Error::Validation("Settlement total is too large".into()))?;
     let direction = if kind == InvoiceKind::Sale { 1 } else { -1 };
     let postings = [
         Posting {
@@ -1513,14 +1528,27 @@ pub(crate) fn insert_settlement_on_connection(
     validate_voucher(&date, &postings)?;
     check_ledgers(conn, company_id, &postings)?;
     crate::opening::check_no_control_postings(conn, company_id, &postings)?;
-    let voucher_kind = if kind == InvoiceKind::Sale {
-        VoucherKind::Receipt
+    let voucher_id = if let Some(voucher) = advance_voucher {
+        let can_attach: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM vouchers v
+                WHERE v.id = ?1 AND v.company_id = ?2 AND v.kind = ?3 AND v.date = ?4 AND v.reference = ?5
+                AND NOT EXISTS(SELECT 1 FROM invoice_settlements s WHERE s.voucher_id = v.id))",
+            params![voucher, company_id, voucher_kind.as_str(), date, reference],
+            |row| row.get(0),
+        )?;
+        if !can_attach {
+            return Err(Error::Validation(
+                "Advance voucher does not match the settlement".into(),
+            ));
+        }
+        check_settlement_postings(conn, voucher, bank_ledger_id, party, direction * total)?;
+        voucher
     } else {
-        VoucherKind::Payment
+        conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, voucher_kind.as_str(), reference, date, narration.trim()])?;
+        let voucher = conn.last_insert_rowid();
+        write_postings(conn, voucher, &postings)?;
+        voucher
     };
-    conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, voucher_kind.as_str(), reference, date, narration.trim()])?;
-    let voucher_id = conn.last_insert_rowid();
-    write_postings(conn, voucher_id, &postings)?;
     let mut ids = Vec::with_capacity(groups.len());
     for (invoice_id, amount, splits) in groups {
         let amount = i64::try_from(amount)
@@ -1537,6 +1565,163 @@ pub(crate) fn insert_settlement_on_connection(
         ids.push(settlement_id);
     }
     Ok((voucher_id, ids))
+}
+
+fn settlement_advance(
+    conn: &Connection,
+    company: i64,
+    voucher: i64,
+    kind: InvoiceKind,
+    party: i64,
+    bank: i64,
+) -> Result<Option<(i64, i64)>> {
+    let row: Option<(i64, i64, String, i64, i64, bool)> = conn.query_row(
+        "SELECT id, amount, kind, party_ledger_id, bank_ledger_id, reversal_voucher_id IS NOT NULL
+         FROM party_advances WHERE company_id = ?1 AND voucher_id = ?2",
+        params![company, voucher],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    ).optional()?;
+    match row {
+        None => Ok(None),
+        Some((id, amount, stored_kind, stored_party, stored_bank, reversed))
+            if !reversed
+                && stored_kind == kind.as_str()
+                && stored_party == party
+                && stored_bank == bank =>
+        {
+            Ok(Some((id, amount)))
+        }
+        Some(_) => Err(Error::Validation(
+            "Settlement and advance are inconsistent".into(),
+        )),
+    }
+}
+
+fn check_settlement_postings(
+    conn: &Connection,
+    voucher: i64,
+    bank: i64,
+    party: i64,
+    cash: i64,
+) -> Result<()> {
+    let counts: (i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COUNT(CASE WHEN ledger_id = ?2 AND amount = ?4 THEN 1 END),
+                COUNT(CASE WHEN ledger_id = ?3 AND amount = -?4 THEN 1 END)
+         FROM postings WHERE voucher_id = ?1",
+        params![voucher, bank, party, cash],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if counts != (2, 1, 1) {
+        return Err(Error::Validation(
+            "Settlement postings do not match its allocations".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn reverse_settlement_on_connection(
+    conn: &Connection,
+    company_id: i64,
+    settlement_voucher: i64,
+    reversal_date: NaiveDate,
+    reference: &str,
+    reason: &str,
+) -> Result<i64> {
+    let date = reversal_date.format("%Y-%m-%d").to_string();
+    let (original_date, original_kind): (String, String) = conn.query_row(
+            "SELECT v.date, v.kind FROM vouchers v WHERE v.id = ?1 AND v.company_id = ?2 AND EXISTS(SELECT 1 FROM invoice_settlements s WHERE s.company_id = v.company_id AND s.voucher_id = v.id)",
+            params![settlement_voucher, company_id], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Settlement voucher not found in the selected company".into()), other => Error::Database(other) })?;
+    if reversal_date < parse_date(&original_date)? {
+        return Err(Error::Validation(
+            "Reversal date must not precede the settlement".into(),
+        ));
+    }
+    let already_reversed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND settlement_voucher_id = ?2)", params![company_id, settlement_voucher], |r| r.get(0))?;
+    if already_reversed {
+        return Err(Error::Validation(
+            "Settlement has already been reversed".into(),
+        ));
+    }
+    let mut allocations = conn.prepare("SELECT s.amount, s.bank_ledger_id, i.party_ledger_id, i.kind, i.company_id FROM invoice_settlements s JOIN invoices i ON i.id = s.invoice_id WHERE s.company_id = ?1 AND s.voucher_id = ?2")?;
+    let mut total = 0_i128;
+    let mut allocation_count = 0_i64;
+    let mut common: Option<(i64, i64, InvoiceKind)> = None;
+    for row in allocations.query_map(params![company_id, settlement_voucher], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })? {
+        let (amount, bank, party, kind, owner) = row?;
+        let kind = InvoiceKind::parse(&kind)?;
+        if owner != company_id
+            || amount <= 0
+            || common.is_some_and(|value| value != (bank, party, kind))
+        {
+            return Err(Error::Validation(
+                "Settlement allocations are inconsistent".into(),
+            ));
+        }
+        common = Some((bank, party, kind));
+        total += i128::from(amount);
+        allocation_count += 1;
+    }
+    drop(allocations);
+    let stored_count: i64 = conn.query_row(
+        "SELECT count(*) FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2",
+        params![company_id, settlement_voucher],
+        |r| r.get(0),
+    )?;
+    if allocation_count != stored_count {
+        return Err(Error::Validation(
+            "Settlement allocations are incomplete".into(),
+        ));
+    }
+    let (bank, party, kind) =
+        common.ok_or_else(|| Error::Validation("Settlement has no allocations".into()))?;
+    let advance = settlement_advance(conn, company_id, settlement_voucher, kind, party, bank)?;
+    if let Some((id, amount)) = advance {
+        crate::advances::check_advance_reversal(conn, company_id, id, reversal_date)?;
+        total += i128::from(amount);
+    }
+    let total = i64::try_from(total)
+        .map_err(|_| Error::Validation("Settlement total is too large".into()))?;
+    let direction = if kind == InvoiceKind::Sale { 1 } else { -1 };
+    let expected_kind = if kind == InvoiceKind::Sale {
+        VoucherKind::Receipt
+    } else {
+        VoucherKind::Payment
+    };
+    if original_kind != expected_kind.as_str() {
+        return Err(Error::Validation(
+            "Settlement voucher type is inconsistent".into(),
+        ));
+    }
+    check_settlement_postings(conn, settlement_voucher, bank, party, direction * total)?;
+    let postings = crate::reversals::counter_postings(conn, company_id, settlement_voucher, &date)?;
+    conn.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, expected_kind.as_str(), reference, date, format!("Reversal of settlement voucher {settlement_voucher}: {reason}")])?;
+    let reversal_voucher = conn.last_insert_rowid();
+    crate::reversals::write_counter_postings(
+        conn,
+        company_id,
+        settlement_voucher,
+        reversal_voucher,
+        &postings,
+    )?;
+    conn.execute("INSERT INTO settlement_reversals(company_id, settlement_voucher_id, reversal_voucher_id, reason) VALUES (?1, ?2, ?3, ?4)", params![company_id, settlement_voucher, reversal_voucher, reason])?;
+    if let Some((id, _)) = advance {
+        conn.execute(
+            "UPDATE party_advances SET reversal_voucher_id = ?1, reversal_reason = ?2
+             WHERE company_id = ?3 AND id = ?4",
+            params![reversal_voucher, reason, company_id, id],
+        )?;
+    }
+    Ok(reversal_voucher)
 }
 
 // None for the batch means the unbatched bucket. None for location includes all locations.
@@ -3066,7 +3251,66 @@ impl Store {
         reference: &str,
         allocations: &[BillSettlementAllocation],
     ) -> Result<(i64, Vec<i64>)> {
-        let tx = self.conn.transaction()?;
+        self.settle_bills_with_advance(company_id, bank_ledger_id, date, reference, allocations, 0)
+    }
+
+    /// Save one receipt or payment, with an optional amount kept on account.
+    pub fn settle_bills_with_advance(
+        &mut self,
+        company_id: i64,
+        bank_ledger_id: i64,
+        date: &str,
+        reference: &str,
+        allocations: &[BillSettlementAllocation],
+        advance: i64,
+    ) -> Result<(i64, Vec<i64>)> {
+        if advance < 0 {
+            return Err(Error::Validation(
+                "Amount kept on account cannot be negative".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let advance_voucher = if advance > 0 {
+            let first = allocations
+                .first()
+                .ok_or_else(|| Error::Validation("Select at least one invoice".into()))?;
+            let (kind, party): (String, i64) = tx
+                .query_row(
+                    "SELECT kind, party_ledger_id FROM invoices WHERE company_id = ?1 AND id = ?2",
+                    params![company_id, first.target.invoice_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::Validation("Invoice not found in the selected company".into())
+                })?;
+            let settled = allocations
+                .iter()
+                .map(|allocation| i128::from(allocation.amount))
+                .sum::<i128>();
+            let settled = i64::try_from(settled)
+                .map_err(|_| Error::Validation("Settlement amount is too large".into()))?;
+            let (_, voucher) = crate::advances::insert_party_advance(
+                &tx,
+                company_id,
+                &crate::advances::AdvanceDraft {
+                    kind: InvoiceKind::parse(&kind)?,
+                    party_ledger_id: party,
+                    bank_ledger_id,
+                    date: date.into(),
+                    reference: reference.into(),
+                    amount: advance,
+                    narration: "Invoice settlement and advance".into(),
+                },
+                None,
+                settled,
+            )?;
+            Some(voucher)
+        } else {
+            None
+        };
         let result = insert_settlement_on_connection(
             &tx,
             company_id,
@@ -3075,6 +3319,7 @@ impl Store {
             reference,
             allocations,
             "Invoice settlement",
+            advance_voucher,
         )?;
         tx.commit()?;
         Ok(result)
@@ -3088,122 +3333,20 @@ impl Store {
         reference: &str,
         reason: &str,
     ) -> Result<i64> {
-        let reversal_date = parse_date(date)?;
-        let date = reversal_date.format("%Y-%m-%d").to_string();
+        let date = parse_date(date)?;
         let reference = required(reference, "Reversal reference")?;
         let reason = required(reason, "Reversal reason")?;
         let tx = self.conn.transaction()?;
-        let (original_date, original_kind): (String, String) = tx.query_row(
-            "SELECT v.date, v.kind FROM vouchers v WHERE v.id = ?1 AND v.company_id = ?2 AND EXISTS(SELECT 1 FROM invoice_settlements s WHERE s.company_id = v.company_id AND s.voucher_id = v.id)",
-            params![settlement_voucher, company_id], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => Error::Validation("Settlement voucher not found in the selected company".into()), other => Error::Database(other) })?;
-        if reversal_date < parse_date(&original_date)? {
-            return Err(Error::Validation(
-                "Reversal date must not precede the settlement".into(),
-            ));
-        }
-        let already_reversed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM settlement_reversals WHERE company_id = ?1 AND settlement_voucher_id = ?2)", params![company_id, settlement_voucher], |r| r.get(0))?;
-        if already_reversed {
-            return Err(Error::Validation(
-                "Settlement has already been reversed".into(),
-            ));
-        }
-        let mut allocations = tx.prepare("SELECT s.amount, s.bank_ledger_id, i.party_ledger_id, i.kind, i.company_id FROM invoice_settlements s JOIN invoices i ON i.id = s.invoice_id WHERE s.company_id = ?1 AND s.voucher_id = ?2")?;
-        let mut total = 0_i128;
-        let mut allocation_count = 0_i64;
-        let mut common: Option<(i64, i64, InvoiceKind)> = None;
-        for row in allocations.query_map(params![company_id, settlement_voucher], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-            ))
-        })? {
-            let (amount, bank, party, kind, owner) = row?;
-            let kind = InvoiceKind::parse(&kind)?;
-            if owner != company_id
-                || amount <= 0
-                || common.is_some_and(|value| value != (bank, party, kind))
-            {
-                return Err(Error::Validation(
-                    "Settlement allocations are inconsistent".into(),
-                ));
-            }
-            common = Some((bank, party, kind));
-            total += i128::from(amount);
-            allocation_count += 1;
-        }
-        drop(allocations);
-        let stored_count: i64 = tx.query_row(
-            "SELECT count(*) FROM invoice_settlements WHERE company_id = ?1 AND voucher_id = ?2",
-            params![company_id, settlement_voucher],
-            |r| r.get(0),
+        let voucher = reverse_settlement_on_connection(
+            &tx,
+            company_id,
+            settlement_voucher,
+            date,
+            reference,
+            reason,
         )?;
-        if allocation_count != stored_count {
-            return Err(Error::Validation(
-                "Settlement allocations are incomplete".into(),
-            ));
-        }
-        let (bank, party, kind) =
-            common.ok_or_else(|| Error::Validation("Settlement has no allocations".into()))?;
-        let total = i64::try_from(total)
-            .map_err(|_| Error::Validation("Settlement total is too large".into()))?;
-        let direction = if kind == InvoiceKind::Sale { 1 } else { -1 };
-        let expected_kind = if kind == InvoiceKind::Sale {
-            VoucherKind::Receipt
-        } else {
-            VoucherKind::Payment
-        };
-        if original_kind != expected_kind.as_str() {
-            return Err(Error::Validation(
-                "Settlement voucher type is inconsistent".into(),
-            ));
-        }
-        let mut stmt =
-            tx.prepare("SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1 ORDER BY id")?;
-        let original = stmt
-            .query_map([settlement_voucher], |r| {
-                Ok(Posting {
-                    ledger_id: r.get(0)?,
-                    amount: r.get(1)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-        if original.len() != 2
-            || !original
-                .iter()
-                .any(|p| p.ledger_id == bank && p.amount == direction * total)
-            || !original
-                .iter()
-                .any(|p| p.ledger_id == party && p.amount == -direction * total)
-        {
-            return Err(Error::Validation(
-                "Settlement postings do not match its allocations".into(),
-            ));
-        }
-        let postings = original
-            .iter()
-            .map(|p| {
-                Ok(Posting {
-                    ledger_id: p.ledger_id,
-                    amount: p.amount.checked_neg().ok_or_else(|| {
-                        Error::Validation("Posting amount cannot be reversed".into())
-                    })?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        validate_voucher(&date, &postings)?;
-        check_ledgers(&tx, company_id, &postings)?;
-        crate::opening::check_no_control_postings(&tx, company_id, &postings)?;
-        tx.execute("INSERT INTO vouchers(company_id, kind, reference, date, narration) VALUES (?1, ?2, ?3, ?4, ?5)", params![company_id, expected_kind.as_str(), reference, date, format!("Reversal of settlement voucher {settlement_voucher}: {reason}")])?;
-        let reversal_voucher = tx.last_insert_rowid();
-        write_postings(&tx, reversal_voucher, &postings)?;
-        tx.execute("INSERT INTO settlement_reversals(company_id, settlement_voucher_id, reversal_voucher_id, reason) VALUES (?1, ?2, ?3, ?4)", params![company_id, settlement_voucher, reversal_voucher, reason])?;
         tx.commit()?;
-        Ok(reversal_voucher)
+        Ok(voucher)
     }
     pub fn invoice_settlements(&self, company_id: i64, invoice_id: i64) -> Result<Vec<Settlement>> {
         let mut stmt = self.conn.prepare("SELECT s.id, s.voucher_id, v.date, v.reference, s.amount, l.name, r.reversal_voucher_id, rv.date, r.reason FROM invoice_settlements s JOIN vouchers v ON v.id = s.voucher_id JOIN ledgers l ON l.id = s.bank_ledger_id AND l.company_id = s.company_id LEFT JOIN settlement_reversals r ON r.company_id = s.company_id AND r.settlement_voucher_id = s.voucher_id LEFT JOIN vouchers rv ON rv.id = r.reversal_voucher_id WHERE s.company_id = ?1 AND s.invoice_id = ?2 ORDER BY v.date, s.id")?;
