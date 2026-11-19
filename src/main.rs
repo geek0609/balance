@@ -15,7 +15,7 @@ use balance::pricing::PriceList;
 use balance::reorder::ReorderRule;
 use balance::settlement_discounts::SettlementDiscount;
 use balance::tax_profiles::TaxCalculation;
-use balance::taxes::InvoiceTaxLine;
+use balance::taxes::{format_source_tax_rates, InvoiceTaxDetail, InvoiceTaxLine};
 use balance::terms::LedgerTerms;
 use balance::{
     format_amount, parse_amount, Category, Ledger, Posting, Store, VoucherDraft, VoucherKind,
@@ -340,6 +340,15 @@ impl BillSplitForm {
 struct InvoiceTaxForm {
     ledger: Option<i64>,
     amount: String,
+    original: Option<InvoiceTaxLine>,
+}
+impl InvoiceTaxForm {
+    fn source_rates(&self, amount: i64) -> &[rust_decimal::Decimal] {
+        self.original
+            .as_ref()
+            .filter(|original| self.ledger == Some(original.ledger_id) && amount == original.amount)
+            .map_or(&[], |original| original.source_rates.as_slice())
+    }
 }
 struct InvoiceAdjustmentForm {
     ledger: Option<i64>,
@@ -3362,6 +3371,7 @@ impl App {
             .map(|tax| InvoiceTaxForm {
                 ledger: Some(tax.ledger_id),
                 amount: format_amount(tax.amount),
+                original: (edit.is_some() && !tax.source_rates.is_empty()).then_some(tax),
             })
             .collect();
         self.invoice_lines = draft
@@ -3723,6 +3733,12 @@ impl App {
                             .hint_text("Tax amount")
                             .desired_width(100.0),
                     );
+                    if let Ok(amount) = parse_amount(&tax.amount) {
+                        let rates = tax.source_rates(amount);
+                        if !rates.is_empty() {
+                            ui.small(format!("Source rates {}", format_source_tax_rates(rates)));
+                        }
+                    }
                     if ui.button("Remove tax").clicked() {
                         remove_tax = Some(index);
                     }
@@ -4008,13 +4024,15 @@ impl App {
                     .invoice_additional_taxes
                     .iter()
                     .map(|tax| {
+                        let amount = parse_amount(&tax.amount)?;
                         Ok(InvoiceTaxLine {
                             ledger_id: tax.ledger.ok_or_else(|| {
                                 balance::Error::Validation(
                                     "Choose a ledger for every tax component".into(),
                                 )
                             })?,
-                            amount: parse_amount(&tax.amount)?,
+                            amount,
+                            source_rates: tax.source_rates(amount).to_vec(),
                         })
                     })
                     .collect::<balance::Result<Vec<_>>>()?;
@@ -4510,11 +4528,7 @@ impl App {
                         ));
                     }
                     for tax in &invoice.taxes {
-                        ui.label(format!(
-                            "  Tax in {} | {}",
-                            tax.ledger,
-                            format_amount(tax.amount)
-                        ));
+                        ui.label(invoice_tax_detail_label(tax));
                     }
                     for adjustment in invoice.adjustments {
                         ui.label(format!(
@@ -4611,11 +4625,7 @@ impl App {
                                             ));
                                         }
                                         for tax in &revision.taxes {
-                                            ui.label(format!(
-                                                "Tax in {} | {}",
-                                                tax.ledger,
-                                                format_amount(tax.amount)
-                                            ));
+                                            ui.label(invoice_tax_detail_label(tax));
                                         }
                                         if let Some(due_date) = &revision.due_date {
                                             ui.label(format!("Due: {due_date}"));
@@ -6124,6 +6134,17 @@ fn external_invoice_label(reference: &InvoiceExternalReference) -> Option<String
         (Some(value), None) | (None, Some(value)) => Some(value.clone()),
         (None, None) => None,
     }
+}
+
+fn invoice_tax_detail_label(tax: &InvoiceTaxDetail) -> String {
+    let mut label = format!("Tax in {} | {}", tax.ledger, format_amount(tax.amount));
+    if !tax.source_rates.is_empty() {
+        label.push_str(&format!(
+            " | Source rates {}",
+            format_source_tax_rates(&tax.source_rates)
+        ));
+    }
+    label
 }
 
 fn outstanding_bill_choices<'a>(

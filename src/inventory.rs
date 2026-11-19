@@ -2954,8 +2954,8 @@ impl Store {
              SELECT ?1, version_id, taxable_amount, whole_invoice FROM invoice_tax_calculations WHERE invoice_id = ?2",
             params![revision_id, invoice_id],
         )?;
-        tx.execute("INSERT INTO invoice_revision_additional_taxes(revision_id, ledger_id, amount)
-                    SELECT ?1, ledger_id, amount FROM invoice_additional_taxes WHERE invoice_id = ?2 ORDER BY id",
+        tx.execute("INSERT INTO invoice_revision_additional_taxes(revision_id, ledger_id, amount, source_rates)
+                    SELECT ?1, ledger_id, amount, source_rates FROM invoice_additional_taxes WHERE invoice_id = ?2 ORDER BY id",
                    params![revision_id, invoice_id])?;
         copy_invoice_line_revisions(&tx, invoice_id, revision_id)?;
         tx.execute("INSERT INTO invoice_revision_adjustments(revision_id, ledger_id, amount, description) SELECT ?1, ledger_id, amount, description FROM invoice_adjustments WHERE invoice_id = ?2 ORDER BY id", params![revision_id, invoice_id])?;

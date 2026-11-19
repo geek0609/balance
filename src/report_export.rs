@@ -577,6 +577,7 @@ impl Store {
             "amount",
             "sales_tax",
             "purchase_tax",
+            "source_tax_rates",
         ]);
         contextual_row(
             &mut csv,
@@ -606,6 +607,7 @@ impl Store {
                     money(row.amount),
                     String::new(),
                     String::new(),
+                    text_cell(&crate::taxes::format_source_tax_rates(&row.source_rates)),
                 ],
             )?;
         }

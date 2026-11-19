@@ -17,6 +17,7 @@ use crate::inventory::{
 };
 use crate::opening_bills::OpeningBillDraft;
 use crate::settlement_discounts::SettlementDiscount;
+use crate::taxes::InvoiceTaxLine;
 use crate::{
     check_new_bill_voucher, insert_voucher_draft, parse_amount, parse_date, Category, Error,
     Posting, Result, Store, VoucherDraft, VoucherKind,
@@ -152,6 +153,15 @@ struct ImportedInvoiceAdjustment {
     existing_ledger_id: Option<i64>,
     amount: i64,
 }
+
+#[derive(Debug, Clone)]
+struct ImportedInvoiceTax {
+    ledger: String,
+    existing_ledger_id: Option<i64>,
+    amount: i64,
+    source_rates: Vec<Decimal>,
+}
+
 #[derive(Debug, Clone)]
 struct ImportedInvoice {
     kind: InvoiceKind,
@@ -169,6 +179,7 @@ struct ImportedInvoice {
     existing_trade_id: Option<i64>,
     lines: Vec<ImportedInvoiceLine>,
     adjustments: Vec<ImportedInvoiceAdjustment>,
+    taxes: Vec<ImportedInvoiceTax>,
     original_postings: Vec<Line>,
     metadata: SourceMetadata,
 }
@@ -1977,6 +1988,53 @@ fn parse_imported_bill_note(
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
     })
 }
+const INVOICE_TAX_RATE_FIELD: &str = "BASICRATEOFINVOICETAX";
+const INVOICE_TAX_RATE_LIST: &str = "BASICRATEOFINVOICETAX.LIST";
+
+fn xml_invoice_tax_rates(entry: Node<'_, '_>) -> Result<Vec<Decimal>> {
+    let mut rates = Vec::new();
+    let numeric_attributes = |node: Node<'_, '_>| {
+        node.attributes().all(|attribute| {
+            attribute.name().eq_ignore_ascii_case("TYPE")
+                && attribute.value().eq_ignore_ascii_case("Number")
+        })
+    };
+    for list in entry.children().filter(|node| {
+        node.is_element() && local_name(*node).eq_ignore_ascii_case(INVOICE_TAX_RATE_LIST)
+    }) {
+        if !numeric_attributes(list)
+            || list.children().any(|node| {
+                node.is_text() && node.text().is_some_and(|text| !text.trim().is_empty())
+            })
+        {
+            return Err(Error::Validation(
+                "Invoice tax rates must be a list of numbers".into(),
+            ));
+        }
+        for field in list.children().filter(|node| node.is_element()) {
+            if !local_name(field).eq_ignore_ascii_case(INVOICE_TAX_RATE_FIELD)
+                || !numeric_attributes(field)
+                || field.children().any(|node| node.is_element())
+            {
+                return Err(Error::Validation(
+                    "Invalid field in invoice tax rate list".into(),
+                ));
+            }
+            let value: String = field
+                .children()
+                .filter(|node| node.is_text())
+                .filter_map(|node| node.text())
+                .collect();
+            if !value.trim().is_empty() {
+                rates.push(Decimal::from_str_exact(value.trim()).map_err(|_| {
+                    Error::Validation("Invoice tax rate must be a decimal number".into())
+                })?);
+            }
+        }
+    }
+    Ok(rates)
+}
+
 /// Parse only invoices whose party, accounting, amounts and bill reference
 /// can all be represented without dropping information.
 fn parse_imported_invoice(
@@ -2086,6 +2144,8 @@ fn parse_imported_invoice(
     let mut party = None;
     let header_party = direct_text(node, "PARTYLEDGERNAME").filter(|name| !name.is_empty());
     let mut adjustments = Vec::new();
+    let mut taxes = Vec::new();
+    let mut tax_ledgers = HashSet::new();
     let mut original_postings = Vec::new();
     let mut breakdowns = Vec::<StockLedgerBreakdown>::new();
     let party_debit = kind == InvoiceKind::Sale;
@@ -2100,6 +2160,7 @@ fn parse_imported_invoice(
                 "ISPARTYLEDGER",
                 "BILLALLOCATIONS.LIST",
                 "INVENTORYALLOCATIONS.LIST",
+                INVOICE_TAX_RATE_LIST,
             ],
             label,
             issues,
@@ -2158,6 +2219,33 @@ fn parse_imported_invoice(
                     && meaningful(*n)
             })
             .collect();
+        let source_rates = xml_invoice_tax_rates(entry)?;
+        if !source_rates.is_empty() {
+            if is_party
+                || has_stock
+                || !bills.is_empty()
+                || !matches!(category, Category::Asset | Category::Liability)
+                || (amount > 0) == party_debit
+            {
+                return Err(Error::Validation(format!(
+                    "Invoice tax on {ledger} needs a tax ledger and an amount in the invoice tax direction"
+                )));
+            }
+            if !tax_ledgers.insert(normalized(&ledger)) {
+                return Err(Error::Validation(format!(
+                    "Invoice has more than one tax posting on {ledger}"
+                )));
+            }
+            taxes.push(ImportedInvoiceTax {
+                ledger,
+                existing_ledger_id: *existing_ledger_id,
+                amount: amount
+                    .checked_abs()
+                    .ok_or_else(|| Error::Validation("Invoice tax amount is too large".into()))?,
+                source_rates,
+            });
+            continue;
+        }
         if is_party {
             if !matches!(category, Category::Asset | Category::Liability) {
                 return Err(Error::Validation(
@@ -2289,15 +2377,21 @@ fn parse_imported_invoice(
                 )
             })?,
     };
+    if tax_ledgers.contains(&normalized(&trade)) {
+        return Err(Error::Validation(
+            "Invoice tax ledger must differ from the trade ledger".into(),
+        ));
+    }
     i64::try_from(subtotal).map_err(|_| Error::Validation("invoice amount is too large".into()))?;
     let total = subtotal
         + adjustments
             .iter()
             .map(|adjustment| i128::from(adjustment.amount))
-            .sum::<i128>();
+            .sum::<i128>()
+        + taxes.iter().map(|tax| i128::from(tax.amount)).sum::<i128>();
     if total <= 0 || i128::from(party_amount).abs() != total {
         return Err(Error::Validation(
-            "party amount does not equal items plus ledger adjustments".into(),
+            "party amount does not equal items, taxes and ledger adjustments".into(),
         ));
     }
     if normalized(&party_name) == normalized(&trade) {
@@ -2343,6 +2437,7 @@ fn parse_imported_invoice(
         existing_trade_id,
         lines,
         adjustments,
+        taxes,
         original_postings,
         metadata,
     })
@@ -2550,6 +2645,7 @@ fn parse_invoice_stock(
                     location_node,
                     &[
                         "GODOWNNAME",
+                        "DESTINATIONGODOWNNAME",
                         "BATCHNAME",
                         "ACTUALQTY",
                         "BILLEDQTY",
@@ -2591,6 +2687,13 @@ fn parse_invoice_stock(
                     ));
                 }
                 let location = invoice_field(location_node, "GODOWNNAME")?;
+                if direct_text(location_node, "DESTINATIONGODOWNNAME").is_some_and(|destination| {
+                    !destination.is_empty() && normalized(&destination) != normalized(&location)
+                }) {
+                    return Err(Error::Validation(
+                        "Invoice batch source and destination locations differ".into(),
+                    ));
+                }
                 let existing_location_id =
                     *locations.get(&normalized(&location)).ok_or_else(|| {
                         Error::Validation(format!("stock location {location} is unavailable"))
@@ -6210,7 +6313,17 @@ impl Store {
                 trade_ledger_id: trade_id,
                 tax_ledger_id: None,
                 tax_amount: 0,
-                additional_taxes: Vec::new(),
+                additional_taxes: invoice
+                    .taxes
+                    .iter()
+                    .map(|tax| {
+                        Ok(InvoiceTaxLine {
+                            ledger_id: resolve_ledger(&tax.ledger, tax.existing_ledger_id)?,
+                            amount: tax.amount,
+                            source_rates: tax.source_rates.clone(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
                 tax_calculation: None,
                 lines,
                 adjustments: invoice
@@ -6441,6 +6554,177 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_recorded_invoice_taxes_and_mirrored_batch_locations() {
+        for (kind, sign, party_category, trade_category) in [
+            ("Sales", 1, Category::Asset, Category::Income),
+            ("Purchase", -1, Category::Liability, Category::Expense),
+        ] {
+            let mut store = Store::memory().unwrap();
+            let company = store.create_company("Invoice tax migration").unwrap();
+            let party = store
+                .create_ledger(company, "Party", party_category)
+                .unwrap();
+            store
+                .create_ledger(company, "Trade", trade_category)
+                .unwrap();
+            let tax = store
+                .create_ledger(company, "Tax", Category::Liability)
+                .unwrap();
+            let item = store.create_stock_item(company, "Parts", "pcs").unwrap();
+            let location = store.create_stock_location(company, "Warehouse").unwrap();
+            let batch = store
+                .create_stock_batch(company, item, "P1", None, None)
+                .unwrap();
+            store
+                .adjust_stock_batch(
+                    company,
+                    item,
+                    location,
+                    Some(batch),
+                    "2026-04-01",
+                    2000,
+                    "Opening",
+                )
+                .unwrap();
+
+            let (mode, view, inventory_tag, ledger_allocation) = if sign == 1 {
+                (
+                    "Yes",
+                    "Invoice Voucher View",
+                    "ALLINVENTORYENTRIES.LIST",
+                    "<ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Trade</LEDGERNAME><AMOUNT>100</AMOUNT></ACCOUNTINGALLOCATIONS.LIST>",
+                )
+            } else {
+                (
+                    "No",
+                    "Accounting Voucher View",
+                    "INVENTORYALLOCATIONS.LIST",
+                    "",
+                )
+            };
+            let party_amount = -sign * 115;
+            let stock_amount = sign * 100;
+            let tax_amount = sign * 15;
+            let inventory = format!(
+                r#"<{inventory_tag}>
+                <STOCKITEMNAME>Parts</STOCKITEMNAME><RATE>100/pcs</RATE>
+                <ACTUALQTY>1 pcs</ACTUALQTY><BILLEDQTY>1 pcs</BILLEDQTY>
+                <AMOUNT>{stock_amount}</AMOUNT>{ledger_allocation}
+                <BATCHALLOCATIONS.LIST>
+                    <GODOWNNAME>Warehouse</GODOWNNAME><BATCHNAME>P1</BATCHNAME>
+                    <DESTINATIONGODOWNNAME>Warehouse</DESTINATIONGODOWNNAME>
+                    <ACTUALQTY>1 pcs</ACTUALQTY><BILLEDQTY>1 pcs</BILLEDQTY>
+                    <AMOUNT>{stock_amount}</AMOUNT>
+                </BATCHALLOCATIONS.LIST>
+            </{inventory_tag}>"#
+            );
+            let inventory = if sign == 1 {
+                inventory
+            } else {
+                format!(
+                    "<LEDGERENTRIES.LIST><LEDGERNAME>Trade</LEDGERNAME><AMOUNT>{stock_amount}</AMOUNT>{inventory}</LEDGERENTRIES.LIST>"
+                )
+            };
+            let xml = format!(
+                r#"<ENVELOPE><BODY><DATA><MESSAGE>
+                <VOUCHER><DATE>20260402</DATE><VOUCHERTYPENAME>{kind}</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>DOC</VOUCHERNUMBER><ISINVOICE>{mode}</ISINVOICE>
+                <PERSISTEDVIEW>{view}</PERSISTEDVIEW><PARTYLEDGERNAME>Party</PARTYLEDGERNAME>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Party</LEDGERNAME><AMOUNT>{party_amount}</AMOUNT>
+                    <BILLALLOCATIONS.LIST><NAME>BILL</NAME><BILLTYPE>New Ref</BILLTYPE>
+                    <AMOUNT>{party_amount}</AMOUNT></BILLALLOCATIONS.LIST>
+                </LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Tax</LEDGERNAME><AMOUNT>{tax_amount}</AMOUNT>
+                    <BASICRATEOFINVOICETAX.LIST TYPE="Number">
+                        <BASICRATEOFINVOICETAX>14.1250</BASICRATEOFINVOICETAX>
+                        <BASICRATEOFINVOICETAX>2</BASICRATEOFINVOICETAX>
+                    </BASICRATEOFINVOICETAX.LIST>
+                </LEDGERENTRIES.LIST>
+                {inventory}</VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#
+            );
+            for (invalid, issue) in [
+                (
+                    xml.replace(
+                        "<DESTINATIONGODOWNNAME>Warehouse",
+                        "<DESTINATIONGODOWNNAME>A different warehouse",
+                    ),
+                    "batch source and destination locations differ",
+                ),
+                (
+                    xml.replace(">14.1250<", ">unknown<"),
+                    "tax rate must be a decimal",
+                ),
+            ] {
+                let preview = store
+                    .preview_xml_import(company, invalid.as_bytes())
+                    .unwrap();
+                assert!(!preview.can_apply());
+                assert!(
+                    preview.issues().iter().any(|actual| actual.contains(issue)),
+                    "{:?}",
+                    preview.issues()
+                );
+                assert!(store.apply_xml_import(&preview).is_err());
+                assert!(store.invoices(company).unwrap().is_empty());
+            }
+            let preview = store.preview_xml_import(company, xml.as_bytes()).unwrap();
+            assert!(preview.can_apply(), "{:?}", preview.issues());
+            store.apply_xml_import(&preview).unwrap();
+            let saved = store.invoices(company).unwrap().remove(0);
+            assert_eq!(
+                (saved.total, saved.outstanding, saved.tax_amount),
+                (11500, 11500, 1500)
+            );
+            assert_eq!(saved.bill_reference, "BILL");
+            assert_eq!(saved.lines[0].allocations[0].location, "Warehouse");
+            let rates = &saved.taxes[0].source_rates;
+            assert_eq!(
+                rates.iter().map(Decimal::to_string).collect::<Vec<_>>(),
+                ["14.1250", "2"]
+            );
+            assert_eq!(
+                store
+                    .ledger_register(company, party, None, None)
+                    .unwrap()
+                    .closing_balance,
+                i128::from(sign) * 11500,
+            );
+            assert_eq!(
+                store
+                    .stock_batch_quantity(company, item, batch, Some(location), None)
+                    .unwrap(),
+                2000 - sign * 1000,
+            );
+            let mut draft = store.invoice_draft(company, saved.id).unwrap();
+            assert_eq!(draft.additional_taxes[0].source_rates, *rates);
+            draft.narration = "Retain source rates when saving remarks".into();
+            store.update_invoice(company, saved.id, &draft).unwrap();
+            let revisions = store.invoice_revisions(company, saved.id).unwrap();
+            assert_eq!(revisions[0].taxes[0].source_rates, *rates);
+            let register = store
+                .invoice_tax_register(company, None, None, None, Some(tax))
+                .unwrap();
+            assert_eq!(register.entries[0].source_rates, *rates);
+            assert_eq!(register.entries[0].amount, 1500);
+            store
+                .reverse_invoice(company, saved.id, "2026-04-03", "REVERSE", "Test reversal")
+                .unwrap();
+            let reversed = store
+                .invoice_tax_register(company, None, None, None, Some(tax))
+                .unwrap();
+            assert_eq!(reversed.entries.len(), 2);
+            assert_eq!(reversed.entries[1].amount, -1500);
+            assert_eq!(reversed.entries[1].source_rates, *rates);
+            assert_eq!(
+                store
+                    .stock_batch_quantity(company, item, batch, Some(location), None)
+                    .unwrap(),
+                2000,
+            );
+        }
+    }
 
     #[test]
     fn imports_sales_and_purchase_returns_into_original_batches_and_bills() {
@@ -9787,6 +10071,7 @@ mod tests {
             trade: "Sales".into(),
             existing_trade_id: Some(sales),
             adjustments: Vec::new(),
+            taxes: Vec::new(),
             original_postings: Vec::new(),
             metadata: SourceMetadata::default(),
             lines: vec![ImportedInvoiceLine {

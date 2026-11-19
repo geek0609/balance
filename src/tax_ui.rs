@@ -1,7 +1,7 @@
 use super::{money, pick_account, App, InvoiceTaxForm};
 use balance::inventory::{discounted_line_amount, parse_quantity, InvoiceKind};
 use balance::tax_profiles::{format_tax_rate, parse_tax_rate, TaxProfileDraft, TaxRate};
-use balance::taxes::InvoiceTaxRegister;
+use balance::taxes::{format_source_tax_rates, InvoiceTaxRegister};
 use balance::{format_amount, parse_amount, Category, Error, Result};
 use eframe::egui;
 
@@ -144,6 +144,7 @@ impl App {
                             "Party",
                             "Tax ledger",
                             "Amount",
+                            "Source rates",
                         ] {
                             ui.strong(label);
                         }
@@ -156,6 +157,7 @@ impl App {
                             ui.label(&row.party);
                             ui.label(&row.ledger);
                             ui.label(money(row.amount));
+                            ui.label(format_source_tax_rates(&row.source_rates));
                             ui.end_row();
                         }
                     });
@@ -452,6 +454,7 @@ impl App {
                             .map(|tax| InvoiceTaxForm {
                                 ledger: Some(tax.ledger_id),
                                 amount: format_amount(tax.amount),
+                                original: None,
                             })
                             .collect();
                         self.invoice_tax_calculation = Some(calculation);

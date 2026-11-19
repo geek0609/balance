@@ -151,6 +151,7 @@ fn calculate(rates: &[TaxRate], taxable: i64) -> Result<Vec<InvoiceTaxLine>> {
                 ledger_id: rate.ledger_id,
                 amount: i64::try_from(amount)
                     .map_err(|_| Error::Validation("Tax amount is too large".into()))?,
+                source_rates: Vec::new(),
             });
         }
     }

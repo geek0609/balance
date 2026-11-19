@@ -751,10 +751,19 @@ impl Store {
             money(subtotal)
         );
         for tax in &invoice.taxes {
+            let ledger = if tax.source_rates.is_empty() {
+                tax.ledger.clone()
+            } else {
+                format!(
+                    "{} (source rates {})",
+                    tax.ledger,
+                    crate::taxes::format_source_tax_rates(&tax.source_rates)
+                )
+            };
             let _ = write!(
                 html,
                 "<tr><td>Tax in {}</td><td class=\"num\">{}</td></tr>",
-                escape(&tax.ledger),
+                escape(&ledger),
                 format_amount(tax.amount)
             );
         }

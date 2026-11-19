@@ -3,6 +3,7 @@ use crate::inventory::{ledger_category, InvoiceDraft, InvoiceKind};
 use crate::{parse_date, Category, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::{params, Connection};
+use rust_decimal::Decimal;
 use std::collections::{BTreeMap, HashSet};
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -25,16 +26,60 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_source_rates(conn: &Connection) -> Result<()> {
+    for table in [
+        "invoice_additional_taxes",
+        "invoice_revision_additional_taxes",
+    ] {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'source_rates')",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !present {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN source_rates TEXT NOT NULL DEFAULT ''"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceTaxLine {
     pub ledger_id: i64,
     pub amount: i64,
+    /// Percentages recorded on the source posting, in source order.
+    pub source_rates: Vec<Decimal>,
 }
 
 #[derive(Debug, Clone)]
 pub struct InvoiceTaxDetail {
     pub ledger: String,
     pub amount: i64,
+    pub source_rates: Vec<Decimal>,
+}
+
+fn read_source_rates(value: &str) -> Result<Vec<Decimal>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|rate| {
+            Decimal::from_str_exact(rate)
+                .map_err(|_| Error::Validation("Invalid saved source tax rate".into()))
+        })
+        .collect()
+}
+
+pub fn format_source_tax_rates(rates: &[Decimal]) -> String {
+    rates
+        .iter()
+        .map(|rate| format!("{rate}%"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub(crate) fn checked_total(lines: impl Iterator<Item = i64>) -> Result<i64> {
@@ -57,6 +102,7 @@ pub(crate) fn validate_draft_taxes(
         rows.push(InvoiceTaxLine {
             ledger_id,
             amount: draft.tax_amount,
+            source_rates: Vec::new(),
         });
     }
     rows.extend_from_slice(&draft.additional_taxes);
@@ -90,9 +136,16 @@ pub(crate) fn write_additional(
     taxes: &[InvoiceTaxLine],
 ) -> Result<()> {
     for tax in taxes {
+        let rates = tax
+            .source_rates
+            .iter()
+            .map(Decimal::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         conn.execute(
-            "INSERT INTO invoice_additional_taxes(invoice_id, ledger_id, amount) VALUES (?1, ?2, ?3)",
-            params![invoice, tax.ledger_id, tax.amount],
+            "INSERT INTO invoice_additional_taxes(invoice_id, ledger_id, amount, source_rates)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![invoice, tax.ledger_id, tax.amount, rates],
         )?;
     }
     Ok(())
@@ -100,15 +153,19 @@ pub(crate) fn write_additional(
 
 pub(crate) fn additional_lines(conn: &Connection, invoice: i64) -> Result<Vec<InvoiceTaxLine>> {
     let mut stmt = conn.prepare(
-        "SELECT ledger_id, amount FROM invoice_additional_taxes WHERE invoice_id = ?1 ORDER BY id",
+        "SELECT ledger_id, amount, source_rates FROM invoice_additional_taxes
+         WHERE invoice_id = ?1 ORDER BY id",
     )?;
-    let rows = stmt.query_map([invoice], |row| {
-        Ok(InvoiceTaxLine {
+    let mut rows = stmt.query([invoice])?;
+    let mut taxes = Vec::new();
+    while let Some(row) = rows.next()? {
+        taxes.push(InvoiceTaxLine {
             ledger_id: row.get(0)?,
             amount: row.get(1)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            source_rates: read_source_rates(&row.get::<_, String>(2)?)?,
+        });
+    }
+    Ok(taxes)
 }
 
 pub(crate) fn tax_details(
@@ -119,10 +176,10 @@ pub(crate) fn tax_details(
     primary_amount: i64,
 ) -> Result<Vec<InvoiceTaxDetail>> {
     let sql = if revision {
-        "SELECT l.name, t.amount FROM invoice_revision_additional_taxes t JOIN ledgers l ON l.id = t.ledger_id
+        "SELECT l.name, t.amount, t.source_rates FROM invoice_revision_additional_taxes t JOIN ledgers l ON l.id = t.ledger_id
          WHERE t.revision_id = ?1 ORDER BY t.id"
     } else {
-        "SELECT l.name, t.amount FROM invoice_additional_taxes t JOIN ledgers l ON l.id = t.ledger_id
+        "SELECT l.name, t.amount, t.source_rates FROM invoice_additional_taxes t JOIN ledgers l ON l.id = t.ledger_id
          WHERE t.invoice_id = ?1 ORDER BY t.id"
     };
     let mut taxes = Vec::new();
@@ -132,16 +189,17 @@ pub(crate) fn tax_details(
         taxes.push(InvoiceTaxDetail {
             ledger: ledger.into(),
             amount: primary_amount,
+            source_rates: Vec::new(),
         });
     }
     let mut stmt = conn.prepare(sql)?;
-    for row in stmt.query_map([id], |row| {
-        Ok(InvoiceTaxDetail {
+    let mut rows = stmt.query([id])?;
+    while let Some(row) = rows.next()? {
+        taxes.push(InvoiceTaxDetail {
             ledger: row.get(0)?,
             amount: row.get(1)?,
-        })
-    })? {
-        taxes.push(row?);
+            source_rates: read_source_rates(&row.get::<_, String>(2)?)?,
+        });
     }
     Ok(taxes)
 }
@@ -157,6 +215,7 @@ pub struct InvoiceTaxEntry {
     pub ledger_id: i64,
     pub ledger: String,
     pub amount: i128,
+    pub source_rates: Vec<Decimal>,
     pub reversal: bool,
     pub credit_note: bool,
 }
@@ -217,19 +276,19 @@ impl Store {
             }
         }
         let mut stmt = self.conn.prepare(
-            "WITH tax(invoice_id, ledger_id, amount, note_id) AS (
-                SELECT id, tax_ledger_id, tax_amount, NULL FROM invoices
+            "WITH tax(invoice_id, ledger_id, amount, note_id, source_rates) AS (
+                SELECT id, tax_ledger_id, tax_amount, NULL, '' FROM invoices
                 WHERE company_id = ?1 AND tax_amount > 0
                 UNION ALL
-                SELECT t.invoice_id, t.ledger_id, t.amount, NULL FROM invoice_additional_taxes t
+                SELECT t.invoice_id, t.ledger_id, t.amount, NULL, t.source_rates FROM invoice_additional_taxes t
                 JOIN invoices i ON i.id = t.invoice_id WHERE i.company_id = ?1
                 UNION ALL
-                SELECT n.invoice_id, l.ledger_id, l.reduction, n.id FROM invoice_credit_notes n
+                SELECT n.invoice_id, l.ledger_id, l.reduction, n.id, '' FROM invoice_credit_notes n
                 JOIN invoice_credit_lines l ON l.note_id = n.id AND l.is_tax = 1
                 WHERE n.company_id = ?1
              )
              SELECT i.id, i.kind, v.id, v.date, v.reference, p.name, l.id, l.name, tax.amount,
-                    rv.id, rv.date, rv.reference, n.id IS NOT NULL
+                    rv.id, rv.date, rv.reference, n.id IS NOT NULL, tax.source_rates
              FROM tax JOIN invoices i ON i.id = tax.invoice_id AND i.company_id = ?1
              LEFT JOIN invoice_credit_notes n ON n.id = tax.note_id
              JOIN vouchers v ON v.id = COALESCE(n.voucher_id, i.voucher_id) AND v.company_id = i.company_id
@@ -249,6 +308,7 @@ impl Store {
             let kind = InvoiceKind::parse(&row.get::<_, String>(1)?)?;
             let amount = i128::from(row.get::<_, i64>(8)?);
             let credit_note: bool = row.get(12)?;
+            let source_rates = read_source_rates(&row.get::<_, String>(13)?)?;
             let ledger_id = row.get(6)?;
             let ledger: String = row.get(7)?;
             let events: [Option<(i64, NaiveDate, String, bool)>; 2] = [
@@ -304,6 +364,7 @@ impl Store {
                     ledger_id,
                     ledger: ledger.clone(),
                     amount,
+                    source_rates: source_rates.clone(),
                     reversal,
                     credit_note,
                 });
