@@ -334,67 +334,170 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let kind: String = tx.query_row(
-            "SELECT kind FROM invoices WHERE company_id = ?1 AND id = ?2",
-            params![company, invoice],
-            |row| row.get(0),
-        )?;
-        let kind = InvoiceKind::parse(&kind)?;
         let planned = plan(&tx, company, invoice, lines)?;
-        let mut trade = BTreeMap::<i64, i128>::new();
-        for row in &planned {
-            *trade.entry(row.allocation.ledger).or_default() += i128::from(row.net_amount);
-        }
-        let mut credits = taxes.to_vec();
-        for (ledger_id, amount) in trade {
-            if amount > 0 {
-                credits.push(CreditLineDraft {
-                    ledger_id,
-                    is_tax: false,
-                    amount: i64::try_from(amount)
-                        .map_err(|_| Error::Validation("Return amount is too large".into()))?,
-                });
-            }
-        }
-        let note = crate::invoice_credits::insert_invoice_credit(
+        let note = post_planned_return(
             &tx,
             company,
             invoice,
             date,
             reference,
             reason,
-            &credits,
-            true,
+            planned,
+            taxes,
             bill_allocations,
         )?;
-        let movement_reason = format!("Invoice return {reference}: {reason}");
-        for row in planned {
-            if kind == InvoiceKind::Purchase {
-                crate::stock_returns::require_available(&tx, company, date, &row.allocation.stock)?;
-            }
-            let adjustment = stock_notes::insert_movement(
-                &tx,
-                company,
-                date,
-                &row.allocation.stock,
-                -stock_notes::stock_direction(kind),
-                &movement_reason,
-            )?;
-            tx.execute(
-                "INSERT INTO invoice_return_lines(note_id, allocation_id, quantity, net_amount, adjustment_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![note, row.allocation.available.id, row.allocation.stock.quantity, row.net_amount, adjustment],
-            )?;
-            let id = tx.last_insert_rowid();
-            for span in row.share.spans() {
-                tx.execute(
-                    "INSERT INTO invoice_return_spans VALUES (?1, ?2, ?3)",
-                    params![id, span.start, span.end - span.start],
-                )?;
-            }
-        }
         tx.commit()?;
         Ok(note)
     }
+}
+
+fn post_planned_return(
+    conn: &Connection,
+    company: i64,
+    invoice: i64,
+    date: NaiveDate,
+    reference: &str,
+    reason: &str,
+    planned: Vec<ReturnPlan>,
+    adjustments: &[CreditLineDraft],
+    bill_allocations: Option<&[crate::invoice_credits::NoteBillAllocation]>,
+) -> Result<i64> {
+    let kind: String = conn.query_row(
+        "SELECT kind FROM invoices WHERE company_id = ?1 AND id = ?2",
+        params![company, invoice],
+        |row| row.get(0),
+    )?;
+    let kind = InvoiceKind::parse(&kind)?;
+    let mut trade = BTreeMap::<i64, i128>::new();
+    for row in &planned {
+        *trade.entry(row.allocation.ledger).or_default() += i128::from(row.net_amount);
+    }
+    let mut credits = adjustments.to_vec();
+    for (ledger_id, amount) in trade {
+        if amount > 0 {
+            let amount = i64::try_from(amount)
+                .map_err(|_| Error::Validation("Return amount is too large".into()))?;
+            if let Some(line) = credits
+                .iter_mut()
+                .find(|line| line.ledger_id == ledger_id && !line.is_tax)
+            {
+                line.amount = line
+                    .amount
+                    .checked_add(amount)
+                    .ok_or_else(|| Error::Validation("Return amount is too large".into()))?;
+            } else {
+                credits.push(CreditLineDraft {
+                    ledger_id,
+                    is_tax: false,
+                    amount,
+                });
+            }
+        }
+    }
+    let note = crate::invoice_credits::insert_invoice_credit(
+        conn,
+        company,
+        invoice,
+        date,
+        reference,
+        reason,
+        &credits,
+        true,
+        bill_allocations,
+    )?;
+    let movement_reason = format!("Invoice return {reference}: {reason}");
+    for row in planned {
+        if kind == InvoiceKind::Purchase {
+            crate::stock_returns::require_available(conn, company, date, &row.allocation.stock)?;
+        }
+        let adjustment = stock_notes::insert_movement(
+            conn,
+            company,
+            date,
+            &row.allocation.stock,
+            -stock_notes::stock_direction(kind),
+            &movement_reason,
+        )?;
+        conn.execute(
+            "INSERT INTO invoice_return_lines(note_id, allocation_id, quantity, net_amount, adjustment_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![note, row.allocation.available.id, row.allocation.stock.quantity, row.net_amount, adjustment],
+        )?;
+        let id = conn.last_insert_rowid();
+        for span in row.share.spans() {
+            conn.execute(
+                "INSERT INTO invoice_return_spans VALUES (?1, ?2, ?3)",
+                params![id, span.start, span.end - span.start],
+            )?;
+        }
+    }
+    Ok(note)
+}
+
+pub(crate) struct ImportedReturnAllocation {
+    pub item: i64,
+    pub location: i64,
+    pub batch: Option<i64>,
+    pub ledger: i64,
+    pub quantity: i64,
+    pub amount: i64,
+}
+
+pub(crate) fn insert_imported_return(
+    conn: &Connection,
+    company: i64,
+    invoice: i64,
+    date: NaiveDate,
+    reference: &str,
+    reason: &str,
+    allocations_from_xml: &[ImportedReturnAllocation],
+    bills: &[crate::invoice_credits::NoteBillAllocation],
+    adjustments: &[CreditLineDraft],
+) -> Result<i64> {
+    let original = allocations(conn, company, invoice)?;
+    let mut lines = Vec::with_capacity(allocations_from_xml.len());
+    for requested in allocations_from_xml {
+        let mut matches = original.iter().filter(|entry| {
+            entry.stock.item_id == requested.item
+                && entry.stock.location_id == requested.location
+                && entry.stock.batch_id == requested.batch
+                && entry.ledger == requested.ledger
+                && entry.available.remaining >= requested.quantity
+        });
+        let matched = matches.next().ok_or_else(|| {
+            Error::Validation(
+                "Returned stock does not match an available allocation on the original invoice"
+                    .into(),
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(Error::Validation(
+                "Returned stock matches multiple original invoice allocations".into(),
+            ));
+        }
+        lines.push(ReturnLineDraft {
+            allocation: matched.available.id,
+            quantity: requested.quantity,
+        });
+    }
+    let planned = plan(conn, company, invoice, &lines)?;
+    for (stock, requested) in planned.iter().zip(allocations_from_xml) {
+        if stock.net_amount != requested.amount {
+            return Err(Error::Validation(
+                "Return amount differs from the original invoice allocation".into(),
+            ));
+        }
+    }
+    post_planned_return(
+        conn,
+        company,
+        invoice,
+        date,
+        reference,
+        reason,
+        planned,
+        adjustments,
+        Some(bills),
+    )
 }
 
 pub(crate) fn reverse_movements(

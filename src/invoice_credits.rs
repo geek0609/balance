@@ -294,6 +294,15 @@ fn components(
     Ok(result)
 }
 
+pub(crate) fn credit_components(
+    conn: &Connection,
+    company: i64,
+    invoice: i64,
+) -> Result<Vec<CreditComponent>> {
+    let header = invoice_header(conn, company, invoice)?;
+    components(conn, company, invoice, &header)
+}
+
 struct CreditCapacity {
     unpaid: i128,
     remaining_total: i128,
@@ -569,8 +578,7 @@ impl Store {
         company: i64,
         invoice: i64,
     ) -> Result<Vec<CreditComponent>> {
-        let header = invoice_header(&self.conn, company, invoice)?;
-        components(&self.conn, company, invoice, &header)
+        credit_components(&self.conn, company, invoice)
     }
 
     pub fn post_invoice_credit(

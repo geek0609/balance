@@ -233,6 +233,7 @@ struct ImportedBillNote {
     party_index: usize,
     bills: Vec<ImportedBillAllocation>,
     credits: Vec<ImportedNoteCredit>,
+    stock: Vec<ImportedInvoiceLine>,
     metadata: SourceMetadata,
 }
 #[derive(Debug, Clone)]
@@ -1312,6 +1313,7 @@ fn billed_voucher<'a, 'input>(
             "ISINVOICE",
             "LEDGERENTRIES.LIST",
             "ALLLEDGERENTRIES.LIST",
+            "ALLINVENTORYENTRIES.LIST",
         ],
         label,
         issues,
@@ -1328,6 +1330,17 @@ fn billed_voucher<'a, 'input>(
         voucher_kind,
         VoucherKind::CreditNote | VoucherKind::DebitNote
     );
+    if !is_note
+        && node.children().any(|row| {
+            row.is_element()
+                && local_name(row).eq_ignore_ascii_case("ALLINVENTORYENTRIES.LIST")
+                && meaningful(row)
+        })
+    {
+        return Err(Error::Validation(
+            "Stock belongs on an inventory invoice or return".into(),
+        ));
+    }
     let views: &[&str] = if is_note {
         &["Accounting Voucher View", "Invoice Voucher View"]
     } else {
@@ -1625,6 +1638,9 @@ fn parse_imported_bill_note(
     source_order: usize,
     metadata: SourceMetadata,
     ledgers: &HashMap<String, (Option<i64>, Category)>,
+    items: &HashMap<String, (Option<i64>, String, u8)>,
+    locations: &HashMap<String, Option<i64>>,
+    batches: &HashMap<(String, String), i64>,
     issues: &mut Vec<String>,
 ) -> Result<ImportedBillNote> {
     let BilledVoucher {
@@ -1638,6 +1654,17 @@ fn parse_imported_bill_note(
         VoucherKind::DebitNote => InvoiceKind::Purchase,
         _ => return Err(Error::Validation("expected a credit or debit note".into())),
     };
+    let mut inventory_rows = node
+        .children()
+        .filter(|row| {
+            row.is_element()
+                && local_name(*row).eq_ignore_ascii_case("ALLINVENTORYENTRIES.LIST")
+                && meaningful(*row)
+        })
+        .map(|row| (row, None))
+        .collect::<Vec<_>>();
+    let header_inventory = !inventory_rows.is_empty();
+    let mut breakdowns = Vec::new();
     let mut lines = Vec::with_capacity(entries.len());
     let mut allocations = Vec::new();
     let mut credits = Vec::new();
@@ -1652,6 +1679,7 @@ fn parse_imported_bill_note(
                 "ISLASTDEEMEDPOSITIVE",
                 "ISPARTYLEDGER",
                 "BILLALLOCATIONS.LIST",
+                "INVENTORYALLOCATIONS.LIST",
             ],
             label,
             issues,
@@ -1675,6 +1703,28 @@ fn parse_imported_bill_note(
                     && meaningful(*bill)
             })
             .collect();
+        let stock = entry
+            .children()
+            .filter(|row| {
+                row.is_element()
+                    && local_name(*row).eq_ignore_ascii_case("INVENTORYALLOCATIONS.LIST")
+                    && meaningful(*row)
+            })
+            .collect::<Vec<_>>();
+        if !stock.is_empty() {
+            if header_inventory || is_party || !bills.is_empty() {
+                return Err(Error::Validation(
+                    "Return stock must use one inventory representation on trade lines".into(),
+                ));
+            }
+            let index = breakdowns.len();
+            inventory_rows.extend(stock.into_iter().map(|row| (row, Some(index))));
+            breakdowns.push(StockLedgerBreakdown {
+                ledger: ledger.clone(),
+                posting_amount: amount,
+                stock_amount: 0,
+            });
+        }
         if !bills.is_empty() {
             if party.is_some() || !matches!(category, Category::Asset | Category::Liability) {
                 return Err(Error::Validation(
@@ -1782,6 +1832,25 @@ fn parse_imported_bill_note(
     {
         return Err(Error::Validation("note postings do not balance".into()));
     }
+    let (stock, stock_total) = parse_invoice_stock(
+        inventory_rows,
+        breakdowns,
+        kind,
+        true,
+        label,
+        ledgers,
+        items,
+        locations,
+        batches,
+        issues,
+    )?;
+    if !stock.is_empty()
+        && (!credits.is_empty() || stock_total > i128::from(lines[party_index].0.amount).abs())
+    {
+        return Err(Error::Validation(
+            "Apply the full stock return amount to open bills on one invoice".into(),
+        ));
+    }
     Ok(ImportedBillNote {
         source_order,
         kind,
@@ -1791,6 +1860,7 @@ fn parse_imported_bill_note(
         lines,
         bills: allocations,
         credits,
+        stock,
         metadata,
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
     })
@@ -1901,11 +1971,6 @@ fn parse_imported_invoice(
     let header_party = direct_text(node, "PARTYLEDGERNAME").filter(|name| !name.is_empty());
     let mut adjustments = Vec::new();
     let mut original_postings = Vec::new();
-    struct StockLedgerBreakdown {
-        ledger: String,
-        posting_amount: i64,
-        stock_amount: i128,
-    }
     let mut breakdowns = Vec::<StockLedgerBreakdown>::new();
     let party_debit = kind == InvoiceKind::Sale;
     for entry in entries {
@@ -2073,8 +2138,114 @@ fn parse_imported_invoice(
             "Voucher party differs from its bill ledger".into(),
         ));
     }
+    let (lines, subtotal) = parse_invoice_stock(
+        inventory_rows,
+        breakdowns,
+        kind,
+        false,
+        label,
+        ledgers,
+        items,
+        locations,
+        batches,
+        issues,
+    )?;
+    let trade = lines.first().map(|line| line.trade_ledger.clone());
+    let trade = match trade {
+        Some(trade) => trade,
+        None => adjustments
+            .iter()
+            .find(|adjustment| {
+                if adjustment.amount <= 0 {
+                    return false;
+                }
+                let category = ledgers
+                    .get(&normalized(&adjustment.ledger))
+                    .map(|entry| entry.1);
+                (kind == InvoiceKind::Sale && category == Some(Category::Income))
+                    || (kind == InvoiceKind::Purchase
+                        && matches!(category, Some(Category::Expense | Category::Asset)))
+            })
+            .map(|adjustment| adjustment.ledger.clone())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "a non-stock invoice needs a positive sales or purchase ledger line".into(),
+                )
+            })?,
+    };
+    i64::try_from(subtotal).map_err(|_| Error::Validation("invoice amount is too large".into()))?;
+    let total = subtotal
+        + adjustments
+            .iter()
+            .map(|adjustment| i128::from(adjustment.amount))
+            .sum::<i128>();
+    if total <= 0 || i128::from(party_amount).abs() != total {
+        return Err(Error::Validation(
+            "party amount does not equal items plus ledger adjustments".into(),
+        ));
+    }
+    if normalized(&party_name) == normalized(&trade) {
+        return Err(Error::Validation(
+            "party and trade ledgers must be different".into(),
+        ));
+    }
+    if lines
+        .iter()
+        .any(|line| normalized(&line.trade_ledger) == normalized(&party_name))
+    {
+        return Err(Error::Validation(
+            "item ledger must differ from the party".into(),
+        ));
+    }
+    if adjustments
+        .iter()
+        .any(|adjustment| normalized(&adjustment.ledger) == normalized(&party_name))
+    {
+        return Err(Error::Validation(
+            "adjustment ledger must differ from the party".into(),
+        ));
+    }
+    let existing_party_id = ledgers[&normalized(&party_name)].0;
+    let existing_trade_id = ledgers[&normalized(&trade)].0;
+    Ok(ImportedInvoice {
+        kind,
+        entry_mode,
+        date,
+        reference,
+        bills,
+        funding_applications,
+        funded_bill_reference: None,
+        narration: direct_text(node, "NARRATION").unwrap_or_default(),
+        party: party_name,
+        existing_party_id,
+        trade,
+        existing_trade_id,
+        lines,
+        adjustments,
+        original_postings,
+        metadata,
+    })
+}
+struct StockLedgerBreakdown {
+    ledger: String,
+    posting_amount: i64,
+    stock_amount: i128,
+}
+
+fn parse_invoice_stock(
+    inventory_rows: Vec<(Node<'_, '_>, Option<usize>)>,
+    mut breakdowns: Vec<StockLedgerBreakdown>,
+    kind: InvoiceKind,
+    returning: bool,
+    label: &str,
+    ledgers: &HashMap<String, (Option<i64>, Category)>,
+    items: &HashMap<String, (Option<i64>, String, u8)>,
+    locations: &HashMap<String, Option<i64>>,
+    batches: &HashMap<(String, String), i64>,
+    issues: &mut Vec<String>,
+) -> Result<(Vec<ImportedInvoiceLine>, i128)> {
+    let party_debit = (kind == InvoiceKind::Sale) != returning;
     let mut lines = Vec::new();
-    let mut trade: Option<String> = None;
     let mut subtotal = 0_i128;
     for (item_node, posting) in inventory_rows {
         invoice_list_fields(
@@ -2100,7 +2271,10 @@ fn parse_imported_invoice(
             .ok_or_else(|| Error::Validation(format!("stock item {name} is unavailable")))?;
         let actual = xml_stock_quantity(&invoice_field(item_node, "ACTUALQTY")?, unit)?;
         let billed = xml_stock_quantity(&invoice_field(item_node, "BILLEDQTY")?, unit)?;
-        if actual != billed || actual == 0 || (actual < 0 && kind == InvoiceKind::Purchase) {
+        if actual != billed
+            || actual == 0
+            || (actual < 0 && kind == InvoiceKind::Purchase && !returning)
+        {
             return Err(Error::Validation(
                 "actual and billed quantities must match the supported stock direction".into(),
             ));
@@ -2323,9 +2497,6 @@ fn parse_imported_invoice(
                 ));
             }
         }
-        if trade.is_none() {
-            trade = Some(ledger.clone());
-        }
         subtotal += i128::from(amount);
         lines.push(ImportedInvoiceLine {
             item: name,
@@ -2348,81 +2519,9 @@ fn parse_imported_invoice(
             )));
         }
     }
-    let trade = match trade {
-        Some(trade) => trade,
-        None => adjustments
-            .iter()
-            .find(|adjustment| {
-                if adjustment.amount <= 0 {
-                    return false;
-                }
-                let category = ledgers
-                    .get(&normalized(&adjustment.ledger))
-                    .map(|entry| entry.1);
-                (kind == InvoiceKind::Sale && category == Some(Category::Income))
-                    || (kind == InvoiceKind::Purchase
-                        && matches!(category, Some(Category::Expense | Category::Asset)))
-            })
-            .map(|adjustment| adjustment.ledger.clone())
-            .ok_or_else(|| {
-                Error::Validation(
-                    "a non-stock invoice needs a positive sales or purchase ledger line".into(),
-                )
-            })?,
-    };
-    i64::try_from(subtotal).map_err(|_| Error::Validation("invoice amount is too large".into()))?;
-    let total = subtotal
-        + adjustments
-            .iter()
-            .map(|adjustment| i128::from(adjustment.amount))
-            .sum::<i128>();
-    if total <= 0 || i128::from(party_amount).abs() != total {
-        return Err(Error::Validation(
-            "party amount does not equal items plus ledger adjustments".into(),
-        ));
-    }
-    if normalized(&party_name) == normalized(&trade) {
-        return Err(Error::Validation(
-            "party and trade ledgers must be different".into(),
-        ));
-    }
-    if lines
-        .iter()
-        .any(|line| normalized(&line.trade_ledger) == normalized(&party_name))
-    {
-        return Err(Error::Validation(
-            "item ledger must differ from the party".into(),
-        ));
-    }
-    if adjustments
-        .iter()
-        .any(|adjustment| normalized(&adjustment.ledger) == normalized(&party_name))
-    {
-        return Err(Error::Validation(
-            "adjustment ledger must differ from the party".into(),
-        ));
-    }
-    let existing_party_id = ledgers[&normalized(&party_name)].0;
-    let existing_trade_id = ledgers[&normalized(&trade)].0;
-    Ok(ImportedInvoice {
-        kind,
-        entry_mode,
-        date,
-        reference,
-        bills,
-        funding_applications,
-        funded_bill_reference: None,
-        narration: direct_text(node, "NARRATION").unwrap_or_default(),
-        party: party_name,
-        existing_party_id,
-        trade,
-        existing_trade_id,
-        lines,
-        adjustments,
-        original_postings,
-        metadata,
-    })
+    Ok((lines, subtotal))
 }
+
 type ReferenceKey = (String, String, String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3063,6 +3162,193 @@ fn attach_note_bill_allocations(
         ])?;
     }
     Ok(())
+}
+
+fn apply_stock_return(conn: &Connection, company: i64, source: &ImportedBillNote) -> Result<()> {
+    let kind = source.voucher_kind();
+    check_new_bill_voucher(conn, company, kind, &source.date, &source.reference)?;
+    let (party, existing) = &source.lines[source.party_index];
+    let party_id = import_ledger(conn, company, &party.ledger, *existing)?;
+    let bills = resolve_imported_bill_allocations(
+        conn,
+        company,
+        source.kind,
+        party_id,
+        &source.date,
+        &source.bills,
+    )?;
+    let first = bills.first().ok_or_else(|| {
+        Error::Validation("Stock return needs an open bill on the original invoice".into())
+    })?;
+    let invoice = first.target.invoice_id;
+    if bills.iter().any(|row| row.target.invoice_id != invoice) {
+        return Err(Error::Validation(
+            "Stock return must reference one original invoice".into(),
+        ));
+    }
+    let allocations = bills
+        .iter()
+        .filter_map(|row| {
+            row.target
+                .split_id
+                .map(|split_id| crate::invoice_credits::NoteBillAllocation {
+                    split_id,
+                    amount: row.amount,
+                })
+        })
+        .collect::<Vec<_>>();
+    let mut stock = Vec::new();
+    for line in &source.stock {
+        let item = find_stock_item(conn, company, &line.item)?
+            .ok_or_else(|| Error::Validation(format!("Stock item {} is unavailable", line.item)))?;
+        if line
+            .existing_item_id
+            .is_some_and(|expected| expected != item)
+        {
+            return Err(Error::Validation(format!(
+                "Stock item {} changed since preview",
+                line.item
+            )));
+        }
+        let ledger = import_ledger(
+            conn,
+            company,
+            &line.trade_ledger,
+            line.existing_trade_ledger_id,
+        )?;
+        for source_stock in &line.allocations {
+            let location =
+                find_stock_location(conn, company, &source_stock.location)?.ok_or_else(|| {
+                    Error::Validation(format!(
+                        "Stock location {} is unavailable",
+                        source_stock.location
+                    ))
+                })?;
+            if source_stock
+                .existing_location_id
+                .is_some_and(|expected| expected != location)
+            {
+                return Err(Error::Validation(format!(
+                    "Stock location {} changed since preview",
+                    source_stock.location
+                )));
+            }
+            let batch = source_stock
+                .batch
+                .as_deref()
+                .map(|name| {
+                    find_stock_batch(conn, company, item, name)?.ok_or_else(|| {
+                        Error::Validation(format!("Stock batch {name} is unavailable"))
+                    })
+                })
+                .transpose()?;
+            if source_stock
+                .existing_batch_id
+                .is_some_and(|expected| Some(expected) != batch)
+            {
+                return Err(Error::Validation(
+                    "Stock batch changed since preview".into(),
+                ));
+            }
+            stock.push(crate::invoice_returns::ImportedReturnAllocation {
+                item,
+                location,
+                batch,
+                ledger,
+                quantity: source_stock.quantity,
+                amount: discounted_line_amount(
+                    source_stock.quantity,
+                    line.unit_price,
+                    &line.discount,
+                )?
+                .0,
+            });
+        }
+    }
+    let mut expected = BTreeMap::<i64, i128>::new();
+    for (line, existing) in &source.lines {
+        let ledger_id = import_ledger(conn, company, &line.ledger, *existing)?;
+        *expected.entry(ledger_id).or_default() += i128::from(line.amount);
+    }
+    let mut item_amounts = BTreeMap::<i64, i128>::new();
+    for part in &stock {
+        *item_amounts.entry(part.ledger).or_default() += i128::from(part.amount);
+    }
+    let sign = if source.kind == InvoiceKind::Sale {
+        1
+    } else {
+        -1
+    };
+    let components = crate::invoice_credits::credit_components(conn, company, invoice)?;
+    let mut adjustments = Vec::new();
+    for (&ledger, &amount) in &expected {
+        if ledger == party_id {
+            continue;
+        }
+        let items = item_amounts.get(&ledger).copied().unwrap_or_default();
+        let remainder = sign * amount - items;
+        if remainder == 0 {
+            continue;
+        }
+        let Some(amount) = i64::try_from(remainder).ok().filter(|amount| *amount > 0) else {
+            return Err(Error::Validation(
+                "Return posting differs from the item credit".into(),
+            ));
+        };
+        let mut matches = components.iter().filter(|component| {
+            let used = if component.is_tax { 0 } else { items };
+            component.ledger_id == ledger && component.remaining - used >= remainder
+        });
+        let component = matches.next().ok_or_else(|| {
+            Error::Validation("Return posting is unavailable on the original invoice".into())
+        })?;
+        if matches.next().is_some() {
+            return Err(Error::Validation(
+                "Return posting matches multiple original invoice components".into(),
+            ));
+        }
+        adjustments.push(crate::invoice_credits::CreditLineDraft {
+            ledger_id: ledger,
+            is_tax: component.is_tax,
+            amount,
+        });
+    }
+    let reason = if source.narration.is_empty() {
+        "Imported stock return"
+    } else {
+        &source.narration
+    };
+    let note = crate::invoice_returns::insert_imported_return(
+        conn,
+        company,
+        invoice,
+        parse_date(&source.date)?,
+        &source.reference,
+        reason,
+        &stock,
+        &allocations,
+        &adjustments,
+    )?;
+    let voucher: i64 = conn.query_row(
+        "SELECT voucher_id FROM invoice_credit_notes WHERE id = ?1",
+        [note],
+        |row| row.get(0),
+    )?;
+    let mut stmt =
+        conn.prepare_cached("SELECT ledger_id, amount FROM postings WHERE voucher_id = ?1")?;
+    let mut posted = BTreeMap::<i64, i128>::new();
+    for row in stmt.query_map([voucher], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })? {
+        let (ledger, amount) = row?;
+        *posted.entry(ledger).or_default() += i128::from(amount);
+    }
+    if posted != expected {
+        return Err(Error::Validation(
+            "Return ledger postings differ from the original invoice components".into(),
+        ));
+    }
+    save_metadata(conn, company, "voucher", voucher, &source.metadata)
 }
 fn find_stock_item(conn: &Connection, company: i64, name: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare("SELECT id, name FROM stock_items WHERE company_id = ?1")?;
@@ -4278,6 +4564,9 @@ impl Store {
                     source_order,
                     metadata,
                     &invoice_ledgers,
+                    &invoice_items,
+                    &known_locations,
+                    &invoice_batches,
                     &mut plan.issues,
                 ) {
                     Ok(note) => {
@@ -4763,36 +5052,39 @@ impl Store {
                 }
             }
             for change in bill_changes {
-                let (kind, party, date, reference, allocations, is_settlement) = match change {
-                    BillChange::Settlement(index) => {
-                        let row = &mut plan.settlements[index];
-                        preview_refund_allocations(
-                            row,
-                            &mut funding,
-                            |key| invoice_balances.contains_key(key),
-                            &mut plan.issues,
-                        )?;
-                        (
-                            row.kind,
-                            &row.party,
-                            &row.date,
-                            &row.reference,
-                            &mut row.bills.invoices,
-                            true,
-                        )
-                    }
-                    BillChange::Note(index) => {
-                        let row = &mut plan.bill_notes[index];
-                        (
-                            row.kind,
-                            &row.lines[row.party_index].0.ledger,
-                            &row.date,
-                            &row.reference,
-                            &mut row.bills,
-                            false,
-                        )
-                    }
-                };
+                let (kind, party, date, reference, allocations, is_settlement, is_stock_return) =
+                    match change {
+                        BillChange::Settlement(index) => {
+                            let row = &mut plan.settlements[index];
+                            preview_refund_allocations(
+                                row,
+                                &mut funding,
+                                |key| invoice_balances.contains_key(key),
+                                &mut plan.issues,
+                            )?;
+                            (
+                                row.kind,
+                                &row.party,
+                                &row.date,
+                                &row.reference,
+                                &mut row.bills.invoices,
+                                true,
+                                false,
+                            )
+                        }
+                        BillChange::Note(index) => {
+                            let row = &mut plan.bill_notes[index];
+                            (
+                                row.kind,
+                                &row.lines[row.party_index].0.ledger,
+                                &row.date,
+                                &row.reference,
+                                &mut row.bills,
+                                false,
+                                !row.stock.is_empty(),
+                            )
+                        }
+                    };
                 let label = format!("Voucher {reference}");
                 let date = parse_date(date)?;
                 let mut referenced_invoices = HashSet::new();
@@ -4827,6 +5119,14 @@ impl Store {
                     {
                         plan.issues.push(format!(
                             "{label}: settlement reference already exists for the invoice"
+                        ));
+                    }
+                    if is_stock_return
+                        && referenced_invoices.insert(bill.invoice_key.clone())
+                        && referenced_invoices.len() > 1
+                    {
+                        plan.issues.push(format!(
+                            "{label}: stock return must reference one original invoice"
                         ));
                     }
                     if bill.reference != allocation.reference {
@@ -5691,6 +5991,10 @@ impl Store {
                 BillChange::Settlement(index) => index,
                 BillChange::Note(index) => {
                     let note = &plan.bill_notes[index];
+                    if !note.stock.is_empty() {
+                        apply_stock_return(&tx, plan.company_id, note)?;
+                        continue;
+                    }
                     let (voucher, party) = match posted_notes[index] {
                         Some(saved) => saved,
                         None => post_imported_bill_note(&tx, plan.company_id, note)?,
@@ -5810,6 +6114,233 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_sales_and_purchase_returns_into_original_batches_and_bills() {
+        for (invoice_kind, note_kind, party_kind, trade_kind, sign) in [
+            (
+                "Sales",
+                "Credit note",
+                Category::Asset,
+                Category::Income,
+                1_i64,
+            ),
+            (
+                "Purchase",
+                "Debit note",
+                Category::Liability,
+                Category::Expense,
+                -1,
+            ),
+        ] {
+            let mut store = Store::memory().unwrap();
+            let company = store.create_company("Return migration").unwrap();
+            let party = store.create_ledger(company, "Party", party_kind).unwrap();
+            let trade = store.create_ledger(company, "Trade", trade_kind).unwrap();
+            let charge = store.create_ledger(company, "Charge", trade_kind).unwrap();
+            let item = store.create_stock_item(company, "Widget", "pcs").unwrap();
+            let west = store.create_stock_location(company, "West").unwrap();
+            let east = store.create_stock_location(company, "East").unwrap();
+            let a = store
+                .create_stock_batch(company, item, "A", None, None)
+                .unwrap();
+            let b = store
+                .create_stock_batch(company, item, "B", None, None)
+                .unwrap();
+            for (location, batch) in [(west, a), (east, b)] {
+                store
+                    .adjust_stock_batch(
+                        company,
+                        item,
+                        location,
+                        Some(batch),
+                        "2026-04-01",
+                        5000,
+                        "Test opening stock",
+                    )
+                    .unwrap();
+            }
+            let lines = |ledger, amount: i64, details: String| {
+                format!(
+                "<LEDGERENTRIES.LIST><LEDGERNAME>{ledger}</LEDGERNAME><AMOUNT>{amount}</AMOUNT>{details}</LEDGERENTRIES.LIST>"
+            )
+            };
+            let bill = |reference, mode, amount: i64| {
+                format!(
+                "<BILLALLOCATIONS.LIST><NAME>{reference}</NAME><BILLTYPE>{mode}</BILLTYPE><AMOUNT>{amount}</AMOUNT></BILLALLOCATIONS.LIST>"
+            )
+            };
+            let batch = |location, name, qty, amount| {
+                format!(
+                "<BATCHALLOCATIONS.LIST><GODOWNNAME>{location}</GODOWNNAME><BATCHNAME>{name}</BATCHNAME><ACTUALQTY>{qty} pcs</ACTUALQTY><BILLEDQTY>{qty} pcs</BILLEDQTY><AMOUNT>{amount}</AMOUNT></BATCHALLOCATIONS.LIST>"
+            )
+            };
+            let stock = |tag, qty_each: i64, rate: i64, direction| {
+                let quantity = qty_each * 2;
+                let total = direction * quantity * rate;
+                let once = direction * qty_each * rate;
+                let ledger = if tag == "ALLINVENTORYENTRIES.LIST" {
+                    format!("<ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Trade</LEDGERNAME><AMOUNT>{total}</AMOUNT></ACCOUNTINGALLOCATIONS.LIST>")
+                } else {
+                    String::new()
+                };
+                let west = batch("West", "A", qty_each, once);
+                let east = batch("East", "B", qty_each, once);
+                format!("<{tag}><STOCKITEMNAME>Widget</STOCKITEMNAME><RATE>{rate}/pcs</RATE><ACTUALQTY>{quantity} pcs</ACTUALQTY><BILLEDQTY>{quantity} pcs</BILLEDQTY><AMOUNT>{total}</AMOUNT>{ledger}{west}{east}</{tag}>")
+            };
+            let voucher = |date, kind, reference, mode, contents| {
+                format!(
+                "<VOUCHER><DATE>{date}</DATE><VOUCHERTYPENAME>{kind}</VOUCHERTYPENAME><VOUCHERNUMBER>{reference}</VOUCHERNUMBER><PARTYLEDGERNAME>Party</PARTYLEDGERNAME><ISINVOICE>{mode}</ISINVOICE>{contents}</VOUCHER>"
+            )
+            };
+            let invoice = voucher(
+                "20260402",
+                invoice_kind,
+                "INV",
+                "Yes",
+                lines(
+                    "Party",
+                    -sign * 44,
+                    bill("FIRST", "New Ref", -sign * 15) + &bill("SECOND", "New Ref", -sign * 29),
+                ) + &stock("ALLINVENTORYENTRIES.LIST", 2, 10, sign)
+                    + &lines("Charge", sign * 4, String::new()),
+            );
+            let note = |rate| {
+                let contents = lines(
+                    "Party",
+                    sign * (rate * 2 + 2),
+                    bill("FIRST", "Agst Ref", sign * 5)
+                        + &bill("SECOND", "Agst Ref", sign * (rate * 2 - 3)),
+                ) + &lines("Charge", -sign * 2, String::new());
+                if sign == 1 {
+                    voucher(
+                        "20260403",
+                        note_kind,
+                        "RETURN",
+                        "Yes",
+                        contents
+                            + &lines("Trade", -sign * rate * 2, String::new())
+                            + &stock("ALLINVENTORYENTRIES.LIST", 1, rate, -sign),
+                    )
+                } else {
+                    voucher(
+                        "20260403",
+                        note_kind,
+                        "RETURN",
+                        "No",
+                        contents
+                            + &lines(
+                                "Trade",
+                                -sign * rate * 2,
+                                stock("INVENTORYALLOCATIONS.LIST", 1, rate, -sign),
+                            ),
+                    )
+                }
+            };
+            let xml = |body: &str| {
+                format!("<ENVELOPE><BODY><DATA><MESSAGE>{body}</MESSAGE></DATA></BODY></ENVELOPE>")
+            };
+            let standalone = sign < 0;
+            if standalone {
+                let input = xml(&invoice);
+                let plan = store.preview_xml_import(company, input.as_bytes()).unwrap();
+                assert!(plan.can_apply(), "{:?}", plan.issues());
+                store.apply_xml_import(&plan).unwrap();
+            }
+            let input = |rate| {
+                if standalone {
+                    xml(&note(rate))
+                } else {
+                    xml(&(note(rate) + &invoice))
+                }
+            };
+            let plan = store
+                .preview_xml_import(company, input(8).as_bytes())
+                .unwrap();
+            assert!(plan.can_apply(), "{:?}", plan.issues());
+            assert!(store
+                .apply_xml_import(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("Return amount differs from the original invoice allocation"));
+            assert_eq!(
+                store.vouchers(company).unwrap().len(),
+                usize::from(standalone)
+            );
+            let plan = store
+                .preview_xml_import(company, input(10).as_bytes())
+                .unwrap();
+            assert!(plan.can_apply(), "{:?}", plan.issues());
+            assert_eq!(store.apply_xml_import(&plan).unwrap().bill_notes, 1);
+            let invoice = store.invoices(company).unwrap().remove(0);
+            let saved = store
+                .invoice_credit_notes(company, invoice.id)
+                .unwrap()
+                .remove(0);
+            let returned = store.invoice_return_lines(company, saved.id).unwrap();
+            assert_eq!(returned.len(), 2);
+            assert_eq!(
+                saved.bill_allocations,
+                [("FIRST".into(), 500), ("SECOND".into(), 1700)]
+            );
+            let check = |s: &Store, date, expected_stock, expected_owed, expected_charge| {
+                for (location, batch) in [(west, a), (east, b)] {
+                    assert_eq!(
+                        s.stock_batch_quantity(company, item, batch, Some(location), Some(date))
+                            .unwrap(),
+                        expected_stock
+                    );
+                }
+                let balance = |ledger| {
+                    s.ledger_register(company, ledger, None, Some(date))
+                        .unwrap()
+                        .closing_balance
+                };
+                assert_eq!(balance(party), i128::from(sign) * expected_owed);
+                assert_eq!(balance(charge), -i128::from(sign) * expected_charge);
+                assert_eq!(balance(trade) + balance(charge), -balance(party));
+                assert_eq!(
+                    s.outstanding_invoices(company, date)
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.outstanding)
+                        .sum::<i128>(),
+                    expected_owed
+                );
+            };
+            check(
+                &store,
+                "2026-04-02",
+                i128::from(5000 - sign * 2000),
+                4400,
+                400,
+            );
+            check(
+                &store,
+                "2026-04-03",
+                i128::from(5000 - sign * 1000),
+                2200,
+                200,
+            );
+            store
+                .reverse_invoice_credit(company, saved.id, "2026-04-04", "UNDO", "Reverse return")
+                .unwrap();
+            check(
+                &store,
+                "2026-04-04",
+                i128::from(5000 - sign * 2000),
+                4400,
+                400,
+            );
+            check(
+                &store,
+                "2026-04-03",
+                i128::from(5000 - sign * 1000),
+                2200,
+                200,
+            );
+        }
+    }
 
     #[test]
     fn named_refunds_reconcile_cash_credit_and_combined_vouchers() {
