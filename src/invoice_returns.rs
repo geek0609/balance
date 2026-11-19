@@ -306,6 +306,23 @@ impl Store {
         lines: &[ReturnLineDraft],
         taxes: &[CreditLineDraft],
     ) -> Result<i64> {
+        self.post_invoice_stock_return_with_bills(
+            company, invoice, date, reference, reason, lines, taxes, None,
+        )
+    }
+
+    /// Post an invoiced stock return and allocate the note to named bills.
+    pub fn post_invoice_stock_return_with_bills(
+        &mut self,
+        company: i64,
+        invoice: i64,
+        date: &str,
+        reference: &str,
+        reason: &str,
+        lines: &[ReturnLineDraft],
+        taxes: &[CreditLineDraft],
+        bill_allocations: Option<&[crate::invoice_credits::NoteBillAllocation]>,
+    ) -> Result<i64> {
         let date = parse_date(date)?;
         let reference = required(reference, "Return reference")?;
         let reason = required(reason, "Return reason")?;
@@ -340,7 +357,15 @@ impl Store {
             }
         }
         let note = crate::invoice_credits::insert_invoice_credit(
-            &tx, company, invoice, date, reference, reason, &credits, true,
+            &tx,
+            company,
+            invoice,
+            date,
+            reference,
+            reason,
+            &credits,
+            true,
+            bill_allocations,
         )?;
         let movement_reason = format!("Invoice return {reference}: {reason}");
         for row in planned {
@@ -546,6 +571,123 @@ mod tests {
                 }],
             }
         }
+    }
+
+    #[test]
+    fn split_purchase_return_keeps_bill_reductions_and_reversals_separate() {
+        use crate::bill_splits::BillSplitDraft;
+        use crate::inventory::BillSettlementTarget;
+        use crate::invoice_credits::NoteBillAllocation;
+
+        let mut f = Fixture::new();
+        let company = f.company;
+        let purchases = f
+            .store
+            .create_ledger(company, "Purchases", Category::Expense)
+            .unwrap();
+        let mut draft = f.draft(InvoiceKind::Purchase, f.supplier, purchases, 3000);
+        draft.bill_splits = vec![
+            BillSplitDraft {
+                reference: "FIRST".into(),
+                amount: 4000,
+                due_date: None,
+                credit_days: Some(10),
+            },
+            BillSplitDraft {
+                reference: "SECOND".into(),
+                amount: 5000,
+                due_date: None,
+                credit_days: Some(20),
+            },
+        ];
+        let invoice = f.store.create_invoice(company, &draft).unwrap();
+        let bills = f.store.invoices(company).unwrap().remove(0).bill_splits;
+        let stock = f
+            .store
+            .invoice_return_allocations(company, invoice)
+            .unwrap();
+        let returned = [ReturnLineDraft {
+            allocation: stock[0].id,
+            quantity: 1000,
+        }];
+        assert!(f
+            .store
+            .post_invoice_stock_return_with_bills(
+                company,
+                invoice,
+                "2026-02-03",
+                "EXCESS",
+                "Test",
+                &returned,
+                &[],
+                Some(&[NoteBillAllocation {
+                    split_id: bills[0].id,
+                    amount: 3500
+                }]),
+            )
+            .is_err());
+        let note = f
+            .store
+            .post_invoice_stock_return_with_bills(
+                company,
+                invoice,
+                "2026-02-03",
+                "RETURN-1",
+                "Defective item",
+                &returned,
+                &[],
+                Some(&[NoteBillAllocation {
+                    split_id: bills[0].id,
+                    amount: 1250,
+                }]),
+            )
+            .unwrap();
+        let history = f.store.invoice_credit_notes(company, invoice).unwrap();
+        assert_eq!(history[0].bill_allocations, [("FIRST".into(), 1250)]);
+        assert_eq!(history[0].refundable, 1750);
+        let target = BillSettlementTarget {
+            invoice_id: invoice,
+            split_id: Some(bills[1].id),
+        };
+        let application = f
+            .store
+            .apply_invoice_credit_to_bill(company, note, target, "2026-02-04", 1750)
+            .unwrap();
+        assert_eq!(
+            f.store.invoice_credit_allocations(company, note).unwrap()[0].bill_reference,
+            "SECOND"
+        );
+        assert!(f
+            .store
+            .reverse_invoice_credit(company, note, "2026-02-06", "EARLY", "Test")
+            .is_err());
+        f.store
+            .release_invoice_credit(company, application, "2026-02-07", "Unapply credit")
+            .unwrap();
+        f.store
+            .reverse_invoice_credit(company, note, "2026-02-08", "REV-1", "Return cancelled")
+            .unwrap();
+
+        let outstanding = |date| {
+            f.store
+                .outstanding_invoices(company, date)
+                .unwrap()
+                .into_iter()
+                .map(|bill| (bill.outstanding, bill.credited))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(outstanding("2026-02-03"), [(2750, 1250), (5000, 0)]);
+        assert_eq!(outstanding("2026-02-04"), [(2750, 1250), (3250, 1750)]);
+        assert_eq!(outstanding("2026-02-07"), [(2750, 1250), (5000, 0)]);
+        assert_eq!(outstanding("2026-02-08"), [(4000, 0), (5000, 0)]);
+        let stock_at = |date| {
+            f.store
+                .stock_location_balances(company, f.main, Some(date))
+                .unwrap()[0]
+                .quantity
+        };
+        assert_eq!(stock_at("2026-02-07"), 2000);
+        assert_eq!(stock_at("2026-02-08"), 3000);
     }
 
     #[test]

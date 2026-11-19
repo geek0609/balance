@@ -299,6 +299,14 @@ impl Store {
                 format_amount(refundable)
             );
         }
+        for (reference, amount) in crate::bill_splits::note_allocations(&tx, note)? {
+            let _ = write!(
+                html,
+                "<p>Applied to bill {} · {}</p>",
+                escape(&reference),
+                format_amount(amount)
+            );
+        }
         let returned = self.invoice_return_lines(company, note)?;
         let document_label = if returned.is_empty() {
             "Financial adjustment record"

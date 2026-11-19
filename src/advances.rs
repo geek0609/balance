@@ -492,18 +492,7 @@ impl Store {
                 "A reversed invoice cannot accept an advance".into(),
             ));
         }
-        let bills = crate::bill_splits::read(&tx, invoice, None)?;
-        let bill = match target.split_id {
-            Some(id) => Some(bills.iter().find(|bill| bill.id == id).ok_or_else(|| {
-                Error::Validation("The selected bill is unavailable on this invoice".into())
-            })?),
-            None if bills.is_empty() => None,
-            None => {
-                return Err(Error::Validation(
-                    "Select the individual bill for this advance".into(),
-                ))
-            }
-        };
+        let bill = crate::bill_splits::target(&tx, target)?;
         let advance_state =
             allocation_state(&tx, company, AllocationTarget::Advance(advance), None)?;
         let invoice_state = invoice_allocation_state(&tx, company, invoice, None)?;
@@ -551,7 +540,7 @@ impl Store {
                 "Allocation exceeds the outstanding invoice amount".into(),
             ));
         }
-        if let Some(bill) = bill {
+        if let Some(bill) = &bill {
             if i128::from(amount) > bill.outstanding() {
                 return Err(Error::Validation(format!(
                     "Allocation exceeds the outstanding amount for bill {}",

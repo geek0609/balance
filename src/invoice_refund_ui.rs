@@ -18,7 +18,7 @@ pub(crate) struct RefundForm {
     note: i64,
     action: CreditAction,
     bank: Option<i64>,
-    invoice: Option<i64>,
+    bill: Option<balance::inventory::BillSettlementTarget>,
     date: String,
     reference: String,
     amount: String,
@@ -91,7 +91,10 @@ impl App {
                 ui.label(format!(
                     "Applied {} to {} on {}",
                     money(application.amount.into()),
-                    application.invoice_reference,
+                    crate::reference_with_bill(
+                        &application.invoice_reference,
+                        &application.bill_reference
+                    ),
                     application.date
                 ));
                 if let Some(date) = application.released_on {
@@ -163,38 +166,11 @@ impl App {
             );
         }
         if matches!(form.action, CreditAction::Apply) {
-            let bills: Vec<_> = self
-                .store
-                .invoices(company)?
-                .into_iter()
-                .filter(|bill| {
-                    bill.kind == invoice.kind
-                        && bill.party_ledger_id == invoice.party_ledger_id
-                        && bill.outstanding > 0
-                        && bill.bill_splits.is_empty()
-                })
-                .collect();
-            let label = |bill: &InvoiceSummary| {
-                format!(
-                    "{} · {} · Due {}",
-                    crate::reference_with_bill(&bill.reference, &bill.bill_reference),
-                    bill.date,
-                    money(bill.outstanding)
-                )
-            };
-            egui::ComboBox::from_id_salt(("credit-target", note))
-                .selected_text(
-                    bills
-                        .iter()
-                        .find(|bill| Some(bill.id) == form.invoice)
-                        .map(label)
-                        .unwrap_or_else(|| "Select an outstanding bill".into()),
-                )
-                .show_ui(ui, |ui| {
-                    for bill in &bills {
-                        ui.selectable_value(&mut form.invoice, Some(bill.id), label(bill));
-                    }
-                });
+            let invoices = self.store.invoices(company)?;
+            let choices = crate::outstanding_bill_choices(invoices.iter().filter(|bill| {
+                bill.kind == invoice.kind && bill.party_ledger_id == invoice.party_ledger_id
+            }));
+            crate::pick_settlement_bill(ui, ("credit-target", note), &choices, &mut form.bill);
         }
         egui::Grid::new(("invoice-refund", note)).show(ui, |ui| {
             ui.label("Date (YYYY-MM-DD)");
@@ -258,9 +234,9 @@ impl App {
                 }
                 CreditAction::Apply => {
                     let bill = form
-                        .invoice
+                        .bill
                         .ok_or_else(|| Error::Validation("Select an outstanding bill".into()))?;
-                    self.store.apply_invoice_credit(
+                    self.store.apply_invoice_credit_to_bill(
                         company,
                         note,
                         bill,

@@ -55,6 +55,32 @@ pub(crate) fn migrate_advances(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_credits(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX credit_allocations_with_invoice ON invoice_credit_allocations(id, invoice_id);
+        CREATE TABLE bill_split_credit_allocations(
+            allocation_id INTEGER PRIMARY KEY,
+            split_id INTEGER NOT NULL,
+            invoice_id INTEGER NOT NULL,
+            FOREIGN KEY(allocation_id, invoice_id) REFERENCES invoice_credit_allocations(id, invoice_id),
+            FOREIGN KEY(split_id, invoice_id) REFERENCES invoice_bill_splits(id, invoice_id)
+        );
+        CREATE INDEX bill_split_credit_allocations_split ON bill_split_credit_allocations(split_id);
+        CREATE UNIQUE INDEX credit_notes_with_invoice ON invoice_credit_notes(id, invoice_id);
+        CREATE TABLE bill_split_note_credits(
+            note_id INTEGER NOT NULL,
+            split_id INTEGER NOT NULL,
+            invoice_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            PRIMARY KEY(note_id, split_id),
+            FOREIGN KEY(note_id, invoice_id) REFERENCES invoice_credit_notes(id, invoice_id),
+            FOREIGN KEY(split_id, invoice_id) REFERENCES invoice_bill_splits(id, invoice_id)
+        );
+        CREATE INDEX bill_split_note_credits_split ON bill_split_note_credits(split_id);",
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct BillSplitDraft {
     pub reference: String,
@@ -73,11 +99,12 @@ pub struct BillSplit {
     pub credit_days: Option<u32>,
     pub settled: i128,
     pub advance_applied: i128,
+    pub credited: i128,
 }
 
 impl BillSplit {
     pub fn outstanding(&self) -> i128 {
-        i128::from(self.amount) - self.settled - self.advance_applied
+        i128::from(self.amount) - self.settled - self.advance_applied - self.credited
     }
 }
 
@@ -171,7 +198,17 @@ pub(crate) fn read(conn: &Connection, invoice: i64, as_of: Option<&str>) -> Resu
            COALESCE((SELECT SUM(a.amount) FROM bill_split_advances s
              JOIN advance_allocations a ON a.id = s.allocation_id
              WHERE s.split_id = b.id AND (?2 IS NULL OR a.date <= ?2)
-               AND (a.released_on IS NULL OR (?2 IS NOT NULL AND a.released_on > ?2))), 0)
+               AND (a.released_on IS NULL OR (?2 IS NOT NULL AND a.released_on > ?2))), 0),
+           COALESCE((SELECT SUM(a.amount) FROM bill_split_credit_allocations s
+             JOIN invoice_credit_allocations a ON a.id = s.allocation_id
+             WHERE s.split_id = b.id AND (?2 IS NULL OR a.date <= ?2)
+               AND (a.released_on IS NULL OR (?2 IS NOT NULL AND a.released_on > ?2))), 0),
+           COALESCE((SELECT SUM(s.amount) FROM bill_split_note_credits s
+             JOIN invoice_credit_notes n ON n.id = s.note_id
+             JOIN vouchers v ON v.id = n.voucher_id
+             LEFT JOIN vouchers rv ON rv.id = n.reversal_voucher_id
+             WHERE s.split_id = b.id AND (?2 IS NULL OR v.date <= ?2)
+               AND (rv.id IS NULL OR (?2 IS NOT NULL AND rv.date > ?2))), 0)
          FROM invoice_bill_splits b WHERE b.invoice_id = ?1 ORDER BY b.id",
     )?;
     let rows = stmt
@@ -184,25 +221,31 @@ pub(crate) fn read(conn: &Connection, invoice: i64, as_of: Option<&str>) -> Resu
                 credit_days: row.get(4)?,
                 settled: i128::from(row.get::<_, i64>(5)?),
                 advance_applied: i128::from(row.get::<_, i64>(6)?),
+                credited: i128::from(row.get::<_, i64>(7)?) + i128::from(row.get::<_, i64>(8)?),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
 }
 
-pub(crate) fn require_unsplit(conn: &Connection, invoice: i64) -> Result<()> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM invoice_bill_splits WHERE invoice_id = ?1)",
-        [invoice],
-        |row| row.get(0),
-    )?;
-    if exists {
-        return Err(Error::Validation(
-            "Credit and debit notes on a split bill schedule require individual bill allocations"
-                .into(),
-        ));
+pub(crate) fn target(
+    conn: &Connection,
+    target: crate::inventory::BillSettlementTarget,
+) -> Result<Option<BillSplit>> {
+    let bills = read(conn, target.invoice_id, None)?;
+    match target.split_id {
+        Some(id) => bills
+            .into_iter()
+            .find(|bill| bill.id == id)
+            .map(Some)
+            .ok_or_else(|| {
+                Error::Validation("The selected bill is unavailable on this invoice".into())
+            }),
+        None if bills.is_empty() => Ok(None),
+        None => Err(Error::Validation(
+            "Select the individual bill on this invoice".into(),
+        )),
     }
-    Ok(())
 }
 
 pub(crate) fn revisions(conn: &Connection, revision: i64) -> Result<Vec<BillSplitDraft>> {
@@ -234,6 +277,18 @@ pub(crate) fn settlement_allocations(
     )?;
     let rows = stmt
         .query_map([settlement], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+pub(crate) fn note_allocations(conn: &Connection, note: i64) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.reference, a.amount FROM bill_split_note_credits a
+         JOIN invoice_bill_splits b ON b.id = a.split_id AND b.invoice_id = a.invoice_id
+         WHERE a.note_id = ?1 ORDER BY b.id",
+    )?;
+    let rows = stmt
+        .query_map([note], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
 }

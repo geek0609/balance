@@ -1,6 +1,7 @@
 //! Noncash application and release of credit available on an invoice note.
 
 use crate::advances::{read_allocation_state, AllocationState};
+use crate::inventory::BillSettlementTarget;
 use crate::{parse_date, required, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -41,6 +42,7 @@ pub(crate) fn state(
 pub struct CreditAllocation {
     pub id: i64,
     pub invoice_reference: String,
+    pub bill_reference: String,
     pub date: String,
     pub amount: i64,
     pub released_on: Option<String>,
@@ -54,9 +56,12 @@ impl Store {
         note: i64,
     ) -> Result<Vec<CreditAllocation>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT a.id, v.reference, a.date, a.amount, a.released_on, a.release_reason
+            "SELECT a.id, v.reference, a.date, a.amount, a.released_on, a.release_reason,
+                    COALESCE(b.reference, i.bill_reference, v.reference)
              FROM invoice_credit_allocations a JOIN invoices i ON i.id = a.invoice_id AND i.company_id = a.company_id
              JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = i.company_id
+             LEFT JOIN bill_split_credit_allocations s ON s.allocation_id = a.id AND s.invoice_id = i.id
+             LEFT JOIN invoice_bill_splits b ON b.id = s.split_id AND b.invoice_id = i.id
              WHERE a.company_id = ?1 AND a.note_id = ?2 ORDER BY a.date, a.id",
         )?;
         let rows = stmt
@@ -64,6 +69,7 @@ impl Store {
                 Ok(CreditAllocation {
                     id: row.get(0)?,
                     invoice_reference: row.get(1)?,
+                    bill_reference: row.get(6)?,
                     date: row.get(2)?,
                     amount: row.get(3)?,
                     released_on: row.get(4)?,
@@ -82,6 +88,27 @@ impl Store {
         date: &str,
         amount: i64,
     ) -> Result<i64> {
+        self.apply_invoice_credit_to_bill(
+            company,
+            note,
+            BillSettlementTarget {
+                invoice_id: invoice,
+                split_id: None,
+            },
+            date,
+            amount,
+        )
+    }
+
+    pub fn apply_invoice_credit_to_bill(
+        &mut self,
+        company: i64,
+        note: i64,
+        target: BillSettlementTarget,
+        date: &str,
+        amount: i64,
+    ) -> Result<i64> {
+        let invoice = target.invoice_id;
         let date = parse_date(date)?;
         let tx = self
             .conn
@@ -97,7 +124,10 @@ impl Store {
         let unpaid = crate::invoice_credits::unpaid_for_allocation(
             &tx, company, invoice, kind, party, date,
         )?;
-        crate::bill_splits::require_unsplit(&tx, invoice)?;
+        let bill = crate::bill_splits::target(&tx, target)?;
+        let unpaid = bill
+            .as_ref()
+            .map_or(unpaid, |bill| unpaid.min(bill.outstanding()));
         if i128::from(amount) > unpaid {
             return Err(Error::Validation(
                 "Credit allocation exceeds the outstanding bill balance".into(),
@@ -108,6 +138,13 @@ impl Store {
             params![company, note, invoice, date.to_string(), amount],
         )?;
         let id = tx.last_insert_rowid();
+        if let Some(bill) = bill {
+            tx.execute(
+                "INSERT INTO bill_split_credit_allocations(allocation_id, split_id, invoice_id)
+                 VALUES (?1, ?2, ?3)",
+                params![id, bill.id, invoice],
+            )?;
+        }
         tx.commit()?;
         Ok(id)
     }

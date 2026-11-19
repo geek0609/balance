@@ -3285,6 +3285,7 @@ impl Store {
                     invoice.total,
                     settled,
                     advance_applied,
+                    credited,
                 )]
             } else {
                 let bills = crate::bill_splits::read(&self.conn, invoice.id, Some(&end_text))?;
@@ -3296,7 +3297,7 @@ impl Store {
                         != invoice.total
                     || bills.iter().map(|bill| bill.advance_applied).sum::<i128>()
                         != advance_applied
-                    || credited != 0
+                    || bills.iter().map(|bill| bill.credited).sum::<i128>() != credited
                 {
                     return Err(Error::Validation(
                         "Split bill allocations do not reconcile to the invoice".into(),
@@ -3312,11 +3313,14 @@ impl Store {
                             i128::from(bill.amount),
                             bill.settled,
                             bill.advance_applied,
+                            bill.credited,
                         )
                     })
                     .collect()
             };
-            for (split_id, bill_reference, due_date, total, settled, advance_applied) in bills {
+            for (split_id, bill_reference, due_date, total, settled, advance_applied, credited) in
+                bills
+            {
                 let outstanding = total - settled - advance_applied - credited;
                 if outstanding < 0 {
                     return Err(Error::Validation(

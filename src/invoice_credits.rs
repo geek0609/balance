@@ -60,10 +60,17 @@ pub struct CreditNote {
     pub reference: String,
     pub amount: i64,
     pub refundable: i64,
+    pub bill_allocations: Vec<(String, i64)>,
     pub reason: String,
     pub reversal_voucher_id: Option<i64>,
     pub reversal_date: Option<String>,
     pub reversal_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NoteBillAllocation {
+    pub split_id: i64,
+    pub amount: i64,
 }
 
 #[derive(Default)]
@@ -98,6 +105,7 @@ fn notes(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<CreditNote
                 reversal_date: r.get(7)?,
                 reversal_reason: r.get(8)?,
                 refundable: r.get(9)?,
+                bill_allocations: Vec::new(),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -362,9 +370,9 @@ pub(crate) fn insert_invoice_credit(
     reason: &str,
     lines: &[CreditLineDraft],
     reductions_only: bool,
+    bill_allocations: Option<&[NoteBillAllocation]>,
 ) -> Result<i64> {
     crate::opening_bills::ensure_trade_invoice(tx, company, id)?;
-    crate::bill_splits::require_unsplit(tx, id)?;
     if crate::invoice_reversals::for_invoice(tx, company, id)?.is_some() {
         return Err(Error::Validation(
             "A reversed invoice cannot accept a credit or debit note".into(),
@@ -410,7 +418,49 @@ pub(crate) fn insert_invoice_credit(
                 .into(),
         ));
     }
-    let refundable = total - total.min(capacity.unpaid);
+    let bills = crate::bill_splits::read(tx, id, None)?;
+    let bill_allocations = if bills.is_empty() {
+        let allocations = bill_allocations.unwrap_or_default();
+        if !allocations.is_empty() {
+            return Err(Error::Validation("This invoice has no split bills".into()));
+        }
+        allocations
+    } else {
+        bill_allocations.ok_or_else(|| {
+            Error::Validation("Choose how to allocate the note to the split bills".into())
+        })?
+    };
+    let applied = if bills.is_empty() {
+        total.min(capacity.unpaid)
+    } else {
+        let mut seen_bills = HashSet::new();
+        let mut applied = 0_i128;
+        for allocation in bill_allocations {
+            let bill = bills
+                .iter()
+                .find(|bill| bill.id == allocation.split_id)
+                .ok_or_else(|| {
+                    Error::Validation("The selected bill is unavailable on this invoice".into())
+                })?;
+            if allocation.amount <= 0
+                || !seen_bills.insert(bill.id)
+                || i128::from(allocation.amount) > bill.outstanding()
+            {
+                return Err(Error::Validation(format!(
+                    "Enter one positive allocation within the outstanding amount for bill {}",
+                    bill.reference
+                )));
+            }
+            applied += i128::from(allocation.amount);
+        }
+        if applied > total || applied > capacity.unpaid {
+            return Err(Error::Validation(
+                "Bill allocations exceed the note or invoice balance".into(),
+            ));
+        }
+        applied
+    };
+    let refundable = total - applied;
     if refundable > 0
         && capacity
             .earliest_refundable_date
@@ -465,6 +515,13 @@ pub(crate) fn insert_invoice_credit(
         return Err(Error::Validation("This invoice already has a note with that reference".into()));
     }
     let note = tx.last_insert_rowid();
+    for allocation in bill_allocations {
+        tx.execute(
+            "INSERT INTO bill_split_note_credits(note_id, split_id, invoice_id, amount)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![note, allocation.split_id, id, allocation.amount],
+        )?;
+    }
     if refundable > 0 {
         tx.execute(
             "INSERT INTO invoice_refund_credits(note_id, amount) VALUES (?1, ?2)",
@@ -483,7 +540,11 @@ pub(crate) fn insert_invoice_credit(
 
 impl Store {
     pub fn invoice_credit_notes(&self, company: i64, invoice: i64) -> Result<Vec<CreditNote>> {
-        notes(&self.conn, company, invoice)
+        let mut notes = notes(&self.conn, company, invoice)?;
+        for note in &mut notes {
+            note.bill_allocations = crate::bill_splits::note_allocations(&self.conn, note.id)?;
+        }
+        Ok(notes)
     }
 
     pub fn invoice_credit_components(
@@ -504,13 +565,37 @@ impl Store {
         reason: &str,
         lines: &[CreditLineDraft],
     ) -> Result<i64> {
+        self.post_invoice_credit_with_bills(company, id, date, reference, reason, lines, None)
+    }
+
+    /// Post a note with an explicit split bill allocation. The unused amount stays available.
+    pub fn post_invoice_credit_with_bills(
+        &mut self,
+        company: i64,
+        id: i64,
+        date: &str,
+        reference: &str,
+        reason: &str,
+        lines: &[CreditLineDraft],
+        bill_allocations: Option<&[NoteBillAllocation]>,
+    ) -> Result<i64> {
         let date = parse_date(date)?;
         let reference = required(reference, "Credit or debit note reference")?;
         let reason = required(reason, "Reason for reducing the invoice")?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let note = insert_invoice_credit(&tx, company, id, date, reference, reason, lines, false)?;
+        let note = insert_invoice_credit(
+            &tx,
+            company,
+            id,
+            date,
+            reference,
+            reason,
+            lines,
+            false,
+            bill_allocations,
+        )?;
         tx.commit()?;
         Ok(note)
     }

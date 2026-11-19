@@ -1,6 +1,6 @@
 use crate::{money, App};
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind, InvoiceSummary};
-use balance::invoice_credits::{CreditComponent, CreditLineDraft};
+use balance::invoice_credits::{CreditComponent, CreditLineDraft, NoteBillAllocation};
 use balance::invoice_returns::{ReturnAllocation, ReturnLineDraft};
 use balance::{parse_amount, Error, Result};
 use eframe::egui;
@@ -13,6 +13,7 @@ pub(crate) struct NoteForm {
     reason: String,
     lines: Vec<(CreditComponent, String)>,
     returns: Vec<(ReturnAllocation, String)>,
+    bills: Vec<(i64, String)>,
 }
 
 impl NoteForm {
@@ -28,6 +29,7 @@ impl NoteForm {
                 .map(|part| (part, String::new()))
                 .collect(),
             returns: Vec::new(),
+            bills: Vec::new(),
         }
     }
 
@@ -52,6 +54,19 @@ impl NoteForm {
                 Ok(CreditLineDraft {
                     ledger_id: part.ledger_id,
                     is_tax: part.is_tax,
+                    amount: parse_amount(value)?,
+                })
+            })
+            .collect()
+    }
+
+    fn bill_allocations(&self) -> Result<Vec<NoteBillAllocation>> {
+        self.bills
+            .iter()
+            .filter(|(_, value)| !value.trim().is_empty())
+            .map(|(split_id, value)| {
+                Ok(NoteBillAllocation {
+                    split_id: *split_id,
                     amount: parse_amount(value)?,
                 })
             })
@@ -103,6 +118,9 @@ impl App {
                             note.voucher_id,
                             note.reason
                         ));
+                        for (reference, amount) in &note.bill_allocations {
+                            ui.small(format!("Bill {reference} · {}", money(i128::from(*amount))));
+                        }
                         match self.store.invoice_return_lines(company, note.id) {
                             Ok(lines) => {
                                 for line in lines {
@@ -160,30 +178,35 @@ impl App {
                     .add_enabled(can_add, egui::Button::new(format!("Add partial {label}")))
                     .clicked()
                 {
-                    self.start_invoice_note(company, invoice.id, false);
+                    self.start_invoice_note(company, invoice, false);
                 }
                 if !invoice.lines.is_empty()
                     && ui
                         .add_enabled(can_add, egui::Button::new("Return invoiced items"))
                         .clicked()
                 {
-                    self.start_invoice_note(company, invoice.id, true);
+                    self.start_invoice_note(company, invoice, true);
                 }
                 self.edit_invoice_note(ui, company, invoice);
             });
     }
 
-    fn start_invoice_note(&mut self, company: i64, invoice: i64, stock: bool) {
+    fn start_invoice_note(&mut self, company: i64, invoice: &InvoiceSummary, stock: bool) {
         let result = (|| -> Result<NoteForm> {
-            let mut components = self.store.invoice_credit_components(company, invoice)?;
+            let mut components = self.store.invoice_credit_components(company, invoice.id)?;
             if stock {
                 components.retain(|part| part.is_tax);
             }
-            let mut form = NoteForm::new(invoice, None, components);
+            let mut form = NoteForm::new(invoice.id, None, components);
+            form.bills = invoice
+                .bill_splits
+                .iter()
+                .map(|bill| (bill.id, String::new()))
+                .collect();
             if stock {
                 form.returns = self
                     .store
-                    .invoice_return_allocations(company, invoice)?
+                    .invoice_return_allocations(company, invoice.id)?
                     .into_iter()
                     .map(|part| (part, String::new()))
                     .collect();
@@ -245,10 +268,12 @@ impl App {
                     }
                 }
             }
-            ui.small(format!(
-                "Unpaid balance {}. Any excess can be refunded or applied to another bill.",
-                money(invoice.outstanding)
-            ));
+            if form.bills.is_empty() {
+                ui.small(format!(
+                    "Unpaid balance {}. Any excess can be refunded or applied to another bill.",
+                    money(invoice.outstanding)
+                ));
+            }
             if !form.lines.is_empty() {
                 egui::Grid::new(("note-components", invoice.id)).show(ui, |ui| {
                     for heading in ["Component", "Remaining", "Amount"] {
@@ -267,6 +292,23 @@ impl App {
                         ui.label(money(part.remaining));
                         ui.add(egui::TextEdit::singleline(value).desired_width(90.0));
                         ui.end_row();
+                    }
+                });
+            }
+            if !form.bills.is_empty() {
+                ui.small("Enter the amount to credit on each bill. Any unallocated amount stays available for a refund or later allocation.");
+                egui::Grid::new(("note-bills", invoice.id)).show(ui, |ui| {
+                    for heading in ["Bill", "Outstanding", "Credit amount"] {
+                        ui.strong(heading);
+                    }
+                    ui.end_row();
+                    for (id, value) in &mut form.bills {
+                        if let Some(bill) = invoice.bill_splits.iter().find(|bill| bill.id == *id) {
+                            ui.label(&bill.reference);
+                            ui.label(money(bill.outstanding()));
+                            ui.add(egui::TextEdit::singleline(value).desired_width(90.0));
+                            ui.end_row();
+                        }
                     }
                 });
             }
@@ -305,7 +347,8 @@ impl App {
                     .map(|id| format!("Note reversal voucher {id} posted"))
             } else if !form.returns.is_empty() {
                 (|| {
-                    self.store.post_invoice_stock_return(
+                    let bills = form.bill_allocations()?;
+                    self.store.post_invoice_stock_return_with_bills(
                         company,
                         invoice.id,
                         &form.date,
@@ -313,19 +356,22 @@ impl App {
                         &form.reason,
                         &form.quantities()?,
                         &form.amounts()?,
+                        (!invoice.bill_splits.is_empty()).then_some(bills.as_slice()),
                     )
                 })()
                 .map(|id| format!("Invoice stock return {id} posted"))
             } else {
                 form.amounts()
                     .and_then(|lines| {
-                        self.store.post_invoice_credit(
+                        let bills = form.bill_allocations()?;
+                        self.store.post_invoice_credit_with_bills(
                             company,
                             invoice.id,
                             &form.date,
                             &form.reference,
                             &form.reason,
                             &lines,
+                            (!invoice.bill_splits.is_empty()).then_some(bills.as_slice()),
                         )
                     })
                     .map(|id| format!("Invoice note {id} posted"))

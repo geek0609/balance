@@ -4212,12 +4212,13 @@ impl App {
                     }
                     for bill in &invoice.bill_splits {
                         ui.label(format!(
-                            "Bill {} · {} · Due {} · Cash settled {} · Advances {} · Outstanding {}",
+                            "Bill {} · {} · Due {} · Cash settled {} · Advances {} · Credits {} · Outstanding {}",
                             bill.reference,
                             format_amount(bill.amount),
                             bill.due_date.as_deref().unwrap_or("—"),
                             money(bill.settled),
                             money(bill.advance_applied),
+                            money(bill.credited),
                             money(bill.outstanding())
                         ));
                     }
