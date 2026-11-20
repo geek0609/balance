@@ -737,7 +737,7 @@ impl Store {
                     format!("{}% ({})", rate, format_amount(line.discount_amount))
                 }
             };
-            let _ = write!(html, "<tr><td>{}</td><td class=\"num\">{} {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>", escape(&line.item), format_quantity(i128::from(line.quantity)), escape(&line.unit), format_amount(line.unit_price), escape(&discount), format_amount(line.amount));
+            let _ = write!(html, "<tr><td>{}</td><td class=\"num\">{} {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>", escape(&line.item), format_quantity(i128::from(line.quantity)), escape(&line.unit), escape(&line.price_label()), escape(&discount), format_amount(line.amount));
         }
         let subtotal: i128 = invoice
             .lines

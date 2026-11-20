@@ -525,6 +525,7 @@ mod tests {
             tax_calculation: None,
             adjustments: Vec::new(),
             lines: vec![InvoiceLine {
+                rate_basis: None,
                 item_id: item,
                 location_id: location,
                 batch_id: None,

@@ -1,5 +1,5 @@
 use super::{money, pick_account, App, InvoiceTaxForm};
-use balance::inventory::{discounted_line_amount, parse_quantity, InvoiceKind};
+use balance::inventory::{discounted_line_amount_with_basis, parse_quantity, InvoiceKind};
 use balance::tax_profiles::{format_tax_rate, parse_tax_rate, TaxProfileDraft, TaxRate};
 use balance::taxes::{format_source_tax_rates, InvoiceTaxRegister};
 use balance::{format_amount, parse_amount, Category, Error, Result};
@@ -359,7 +359,15 @@ impl App {
         for line in &self.invoice_lines {
             let quantity = parse_quantity(&line.quantity)?;
             let price = parse_amount(&line.price)?;
-            net += i128::from(discounted_line_amount(quantity, price, &line.discount()?)?.0);
+            net += i128::from(
+                discounted_line_amount_with_basis(
+                    quantity,
+                    price,
+                    &line.discount()?,
+                    line.rate_basis.as_ref(),
+                )?
+                .0,
+            );
         }
         for line in &self.invoice_adjustments {
             let amount = i128::from(parse_amount(&line.amount)?);

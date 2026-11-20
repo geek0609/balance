@@ -839,6 +839,7 @@ mod tests {
                 tax_calculation: None,
                 adjustments: vec![],
                 lines: vec![InvoiceLine {
+                    rate_basis: None,
                     item_id: self.item,
                     location_id: self.main,
                     batch_id: None,

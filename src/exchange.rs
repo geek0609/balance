@@ -9,14 +9,15 @@ use crate::bill_splits::BillSplitDraft;
 use crate::contacts::{insert_new_profile, LedgerProfile};
 use crate::inventory::{
     check_quantity_precision, create_stock_batch_on_connection, create_stock_item_on_connection,
-    discounted_line_amount, find_stock_batch, insert_direct_invoice,
-    insert_settlement_on_connection, insert_stock_adjustment, parse_quantity,
-    BillSettlementAllocation, BillSettlementTarget, InvoiceAdjustment, InvoiceAllocation,
-    InvoiceDiscount, InvoiceDraft, InvoiceEntryMode, InvoiceExternalReference, InvoiceKind,
-    InvoiceLine, StockInvoicePosting,
+    discounted_line_amount_with_basis, find_stock_batch, insert_direct_invoice,
+    insert_settlement_on_connection, insert_stock_adjustment, BillSettlementAllocation,
+    BillSettlementTarget, InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft,
+    InvoiceEntryMode, InvoiceExternalReference, InvoiceKind, InvoiceLine, InvoiceRateBasis,
+    StockInvoicePosting,
 };
 use crate::opening_bills::OpeningBillDraft;
 use crate::settlement_discounts::SettlementDiscount;
+use crate::stock_units::{self, CompoundUnit, UnitMeasure};
 use crate::taxes::InvoiceTaxLine;
 use crate::{
     check_new_bill_voucher, insert_voucher_draft, parse_amount, parse_date, Category, Error,
@@ -28,6 +29,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// Maximum combined input size for a single XML import preview.
 pub const MAX_XML_IMPORT_BYTES: usize = 50 * 1024 * 1024;
@@ -78,6 +80,7 @@ struct Unit {
     symbol: String,
     formal_name: String,
     decimal_places: u8,
+    compound: Option<CompoundUnit>,
     metadata: SourceMetadata,
 }
 #[derive(Debug, Clone)]
@@ -137,6 +140,7 @@ struct ImportedInvoiceLine {
     existing_trade_ledger_id: Option<i64>,
     quantity: i64,
     unit_price: i64,
+    rate_basis: Option<InvoiceRateBasis>,
     discount: InvoiceDiscount,
 }
 #[derive(Debug, Clone)]
@@ -959,26 +963,11 @@ fn xml_amount(value: &str) -> Result<i64> {
             .ok_or_else(|| Error::Validation("Amount is too large".into()))
     }
 }
-fn xml_stock_quantity(value: &str, unit: &str) -> Result<i64> {
-    let mut parts = value.split_whitespace();
-    let number = parts
-        .next()
-        .ok_or_else(|| Error::Validation("Missing stock quantity".into()))?;
-    let suffix = parts.collect::<Vec<_>>().join(" ");
-    if !suffix.is_empty() && normalized(&suffix) != normalized(unit) {
-        return Err(Error::Validation(
-            "Stock quantity uses a different unit".into(),
-        ));
-    }
-    if let Some(rest) = number.strip_prefix('-') {
-        parse_quantity(rest)?
-            .checked_neg()
-            .ok_or_else(|| Error::Validation("Quantity is too large".into()))
-    } else {
-        parse_quantity(number)
-    }
-}
-fn stock_opening_cost(node: Node<'_, '_>, quantity: i64, unit: &str) -> Result<Option<i64>> {
+fn stock_opening_cost(
+    node: Node<'_, '_>,
+    quantity: i64,
+    unit: &UnitMeasure,
+) -> Result<Option<i64>> {
     let value = direct_text(node, "OPENINGVALUE")
         .filter(|value| !value.is_empty())
         .map(|value| xml_amount(&value))
@@ -990,11 +979,7 @@ fn stock_opening_cost(node: Node<'_, '_>, quantity: i64, unit: &str) -> Result<O
             let (number, suffix) = text
                 .split_once('/')
                 .map_or((text, None), |(n, u)| (n, Some(u)));
-            if suffix.is_some_and(|suffix| normalized(suffix) != normalized(unit)) {
-                return Err(Error::Validation(
-                    "opening rate uses a different unit".into(),
-                ));
-            }
+            let factor = unit.factor_for(suffix.unwrap_or(""))?;
             let rate = Decimal::from_str(number.trim())
                 .map_err(|_| Error::Validation("opening rate is invalid".into()))?;
             if rate < Decimal::ZERO || (!rate.is_zero() && rate.scale() > 5) {
@@ -1002,10 +987,10 @@ fn stock_opening_cost(node: Node<'_, '_>, quantity: i64, unit: &str) -> Result<O
                     "opening rate must be non-negative with at most five decimal places".into(),
                 ));
             }
-            Ok(rate)
+            Ok((rate, factor))
         })
         .transpose()?;
-    if value.is_none_or(|value| value == 0) && rate.is_none_or(|rate| rate.is_zero()) {
+    if value.is_none_or(|value| value == 0) && rate.is_none_or(|(rate, _)| rate.is_zero()) {
         // Legacy files use zero fields for quantity-only openings.
         return Ok(None);
     }
@@ -1014,23 +999,27 @@ fn stock_opening_cost(node: Node<'_, '_>, quantity: i64, unit: &str) -> Result<O
             "opening valuation requires a positive quantity".into(),
         ));
     }
-    let nonzero_rate = rate.filter(|rate| !rate.is_zero());
+    let nonzero_rate = rate.filter(|(rate, _)| !rate.is_zero());
     if value.is_some_and(|value| value < 0) && nonzero_rate.is_none() {
         return Err(Error::Validation(
             "a negative opening value needs a matching positive rate".into(),
         ));
     }
     let too_large = || Error::Validation("opening value is too large".into());
-    let units = Decimal::new(quantity, 3);
+    let extended = |rate, factor| {
+        Decimal::new(quantity, 3)
+            .checked_mul(rate)
+            .and_then(|amount| amount.checked_div(factor))
+            .ok_or_else(too_large)
+    };
     if let Some(value) = value {
         let value = value.checked_abs().ok_or_else(too_large)?;
-        if let Some(rate) = nonzero_rate {
-            let calculated = units.checked_mul(rate).ok_or_else(too_large)?;
+        if let Some((rate, factor)) = nonzero_rate {
+            let calculated = extended(rate, factor)?;
             // A total may be more precise than the displayed rate. Accept only
             // amounts consistent with half a last-place rate unit plus rounding.
-            let tolerance = Decimal::new(5, rate.scale() + 1)
-                .checked_mul(units)
-                .and_then(|value| value.checked_add(Decimal::new(5, 3)))
+            let tolerance = extended(Decimal::new(5, rate.scale() + 1), factor)?
+                .checked_add(Decimal::new(5, 3))
                 .ok_or_else(too_large)?;
             if (Decimal::new(value, 2) - calculated).abs() > tolerance {
                 return Err(Error::Validation(
@@ -1040,13 +1029,11 @@ fn stock_opening_cost(node: Node<'_, '_>, quantity: i64, unit: &str) -> Result<O
         }
         return Ok(Some(value));
     }
-    let Some(rate) = nonzero_rate else {
+    let Some((rate, factor)) = nonzero_rate else {
         return Ok(None);
     };
-    let minor = units
-        .checked_mul(rate)
-        .and_then(|value| value.checked_mul(Decimal::new(100, 0)))
-        .ok_or_else(too_large)?
+    let minor_rate = rate.checked_mul(Decimal::from(100)).ok_or_else(too_large)?;
+    let minor = extended(minor_rate, factor)?
         .round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
         .to_i64()
         .ok_or_else(too_large)?;
@@ -1056,7 +1043,7 @@ fn stock_opening_cost(node: Node<'_, '_>, quantity: i64, unit: &str) -> Result<O
 fn opening_cost_or_issue(
     node: Node<'_, '_>,
     quantity: i64,
-    unit: &str,
+    unit: &UnitMeasure,
     label: &str,
     issues: &mut Vec<String>,
 ) -> Option<i64> {
@@ -1751,7 +1738,7 @@ fn parse_imported_bill_note(
     source_order: usize,
     metadata: SourceMetadata,
     ledgers: &HashMap<String, (Option<i64>, Category)>,
-    items: &HashMap<String, (Option<i64>, String, u8)>,
+    items: &InvoiceStockItems,
     locations: &HashMap<String, Option<i64>>,
     batches: &HashMap<(String, String), i64>,
     issues: &mut Vec<String>,
@@ -2043,7 +2030,7 @@ fn parse_imported_invoice(
     metadata: SourceMetadata,
     entry_mode: InvoiceEntryMode,
     ledgers: &HashMap<String, (Option<i64>, Category)>,
-    items: &HashMap<String, (Option<i64>, String, u8)>,
+    items: &InvoiceStockItems,
     locations: &HashMap<String, Option<i64>>,
     batches: &HashMap<(String, String), i64>,
     issues: &mut Vec<String>,
@@ -2455,7 +2442,7 @@ fn parse_invoice_stock(
     returning: bool,
     label: &str,
     ledgers: &HashMap<String, (Option<i64>, Category)>,
-    items: &HashMap<String, (Option<i64>, String, u8)>,
+    items: &InvoiceStockItems,
     locations: &HashMap<String, Option<i64>>,
     batches: &HashMap<(String, String), i64>,
     issues: &mut Vec<String>,
@@ -2482,11 +2469,11 @@ fn parse_invoice_stock(
             issues,
         );
         let name = invoice_field(item_node, "STOCKITEMNAME")?;
-        let (existing_item_id, unit, precision) = items
+        let (existing_item_id, unit) = items
             .get(&normalized(&name))
             .ok_or_else(|| Error::Validation(format!("stock item {name} is unavailable")))?;
-        let actual = xml_stock_quantity(&invoice_field(item_node, "ACTUALQTY")?, unit)?;
-        let billed = xml_stock_quantity(&invoice_field(item_node, "BILLEDQTY")?, unit)?;
+        let actual = unit.quantity(&invoice_field(item_node, "ACTUALQTY")?)?;
+        let billed = unit.quantity(&invoice_field(item_node, "BILLEDQTY")?)?;
         if actual != billed
             || actual == 0
             || (actual < 0 && kind == InvoiceKind::Purchase && !returning)
@@ -2498,7 +2485,7 @@ fn parse_invoice_stock(
         let quantity = actual
             .checked_abs()
             .ok_or_else(|| Error::Validation("quantity is too large".into()))?;
-        if quantity % 10_i64.pow(u32::from(3 - *precision)) != 0 {
+        if quantity % 10_i64.pow(u32::from(3 - unit.precision)) != 0 {
             return Err(Error::Validation("quantity exceeds unit precision".into()));
         }
         let source_amount = xml_amount(&invoice_field(item_node, "AMOUNT")?)?;
@@ -2532,15 +2519,23 @@ fn parse_invoice_stock(
         } else {
             InvoiceDiscount::None
         };
-        let unit_price =
+        let (unit_price, rate_basis) =
             if let Some(rate) = direct_text(item_node, "RATE").filter(|v| !v.is_empty()) {
                 let (price, rate_unit) = rate
                     .split_once('/')
                     .ok_or_else(|| Error::Validation("rate must specify the base unit".into()))?;
-                if normalized(rate_unit) != normalized(unit) {
-                    return Err(Error::Validation("rate uses another unit".into()));
-                }
-                parse_amount(price)?
+                let rate_unit = crate::required(rate_unit, "Item rate unit")?;
+                unit.factor_for(rate_unit)?;
+                let basis = if normalized(rate_unit) == normalized(unit.stock_symbol()) {
+                    None
+                } else {
+                    let quantity = unit.quantity(&format!("1 {rate_unit}"))?;
+                    Some(InvoiceRateBasis {
+                        quantity,
+                        unit: rate_unit.to_owned(),
+                    })
+                };
+                (parse_amount(price)?, basis)
             } else {
                 if posting.is_none() || !matches!(discount, InvoiceDiscount::None) {
                     return Err(Error::Validation("item rate is missing".into()));
@@ -2552,10 +2547,18 @@ fn parse_invoice_stock(
                         "An omitted item rate cannot be derived exactly in hundredths".into(),
                     ));
                 }
-                i64::try_from(numerator / quantity)
-                    .map_err(|_| Error::Validation("item rate is too large".into()))?
+                (
+                    i64::try_from(numerator / quantity)
+                        .map_err(|_| Error::Validation("item rate is too large".into()))?,
+                    None,
+                )
             };
-        let (amount, _) = discounted_line_amount(quantity, unit_price, &discount)?;
+        let (amount, _) = discounted_line_amount_with_basis(
+            quantity,
+            unit_price,
+            &discount,
+            rate_basis.as_ref(),
+        )?;
         let expected = if party_debit { -amount } else { amount };
         if source_amount != expected {
             return Err(Error::Validation(
@@ -2655,9 +2658,9 @@ fn parse_invoice_stock(
                     issues,
                 );
                 let allocated_actual =
-                    xml_stock_quantity(&invoice_field(location_node, "ACTUALQTY")?, unit)?;
+                    unit.quantity(&invoice_field(location_node, "ACTUALQTY")?)?;
                 let allocated_billed =
-                    xml_stock_quantity(&invoice_field(location_node, "BILLEDQTY")?, unit)?;
+                    unit.quantity(&invoice_field(location_node, "BILLEDQTY")?)?;
                 if allocated_actual == 0
                     || allocated_actual != allocated_billed
                     || (allocated_actual > 0) != (actual > 0)
@@ -2669,13 +2672,17 @@ fn parse_invoice_stock(
                 let allocated_quantity = allocated_actual
                     .checked_abs()
                     .ok_or_else(|| Error::Validation("quantity is too large".into()))?;
-                if allocated_quantity % 10_i64.pow(u32::from(3 - *precision)) != 0 {
+                if allocated_quantity % 10_i64.pow(u32::from(3 - unit.precision)) != 0 {
                     return Err(Error::Validation(
                         "allocation exceeds unit precision".into(),
                     ));
                 }
-                let (allocated_amount, _) =
-                    discounted_line_amount(allocated_quantity, unit_price, &discount)?;
+                let (allocated_amount, _) = discounted_line_amount_with_basis(
+                    allocated_quantity,
+                    unit_price,
+                    &discount,
+                    rate_basis.as_ref(),
+                )?;
                 let expected_amount = if party_debit {
                     -allocated_amount
                 } else {
@@ -2725,13 +2732,14 @@ fn parse_invoice_stock(
         lines.push(ImportedInvoiceLine {
             item: name,
             existing_item_id: *existing_item_id,
-            unit: unit.clone(),
-            precision: *precision,
+            unit: unit.symbol.clone(),
+            precision: unit.precision,
             allocations: stock_allocations,
             existing_trade_ledger_id: *existing_trade_ledger_id,
             trade_ledger: ledger,
             quantity,
             unit_price,
+            rate_basis,
             discount,
         });
     }
@@ -3574,10 +3582,11 @@ fn apply_stock_return(
                 batch,
                 ledger,
                 quantity: source_stock.quantity,
-                amount: discounted_line_amount(
+                amount: discounted_line_amount_with_basis(
                     source_stock.quantity,
                     line.unit_price,
                     &line.discount,
+                    line.rate_basis.as_ref(),
                 )?
                 .0,
             });
@@ -3757,6 +3766,60 @@ fn find_stock_unit(conn: &Connection, company: i64, symbol: &str) -> Result<Opti
         }
     }
     Ok(found)
+}
+
+type Measures = HashMap<String, Arc<UnitMeasure>>;
+type InvoiceStockItems = HashMap<String, (Option<i64>, Arc<UnitMeasure>)>;
+
+fn resolve_compound(
+    symbol: &str,
+    compound: &CompoundUnit,
+    known: &Measures,
+) -> Result<Option<UnitMeasure>> {
+    let (Some(primary), Some(tail)) = (
+        known.get(&normalized(&compound.primary)),
+        known.get(&normalized(&compound.tail)),
+    ) else {
+        return Ok(None);
+    };
+    UnitMeasure::compound(symbol, primary, tail, compound.factor).map(Some)
+}
+
+fn index_measure(known: &mut Measures, measure: UnitMeasure) -> Result<()> {
+    let symbol = normalized(&measure.symbol);
+    let canonical = normalized(&measure.canonical);
+    if known.contains_key(&symbol) || known.contains_key(&canonical) {
+        return Err(Error::Validation(format!(
+            "Unit {} is ambiguous",
+            measure.symbol
+        )));
+    }
+    let measure = Arc::new(measure);
+    known.insert(symbol, Arc::clone(&measure));
+    known.insert(canonical, measure);
+    Ok(())
+}
+
+fn saved_measures(units: &[crate::inventory::StockUnit]) -> Result<Measures> {
+    let mut ordered = units.iter().collect::<Vec<_>>();
+    // A compound's referenced units are inserted before the compound itself.
+    ordered.sort_by_key(|unit| unit.id);
+    let mut known = Measures::new();
+    for unit in ordered {
+        let measure = match &unit.compound {
+            None => UnitMeasure::simple(&unit.symbol, unit.decimal_places),
+            Some(compound) => resolve_compound(&unit.symbol, compound, &known)?
+                .filter(|measure| measure.precision == unit.decimal_places)
+                .ok_or_else(|| {
+                    Error::Validation(format!(
+                        "Stored unit {} has invalid components",
+                        unit.symbol
+                    ))
+                })?,
+        };
+        index_measure(&mut known, measure)?;
+    }
+    Ok(known)
 }
 fn find_stock_group(conn: &Connection, company: i64, name: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare("SELECT id, name FROM stock_groups WHERE company_id = ?1")?;
@@ -4189,39 +4252,41 @@ impl Store {
             });
         }
         let existing_units = self.stock_units(company_id)?;
-        let mut known_units = HashMap::<String, u8>::new();
-        for unit in &existing_units {
-            if known_units
-                .insert(normalized(&unit.symbol), unit.decimal_places)
-                .is_some()
-            {
-                plan.issues
-                    .push(format!("Unit {} is ambiguous", unit.symbol));
-            }
-        }
+        let mut known_units = saved_measures(&existing_units)?;
         let mut seen_units = HashSet::new();
+        let mut compounds = Vec::new();
         for node in
             nodes().filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("UNIT"))
         {
-            let Some(symbol) = object_name(node) else {
+            let kind = normalized(&direct_text(node, "ISSIMPLEUNIT").unwrap_or_default());
+            let symbol = object_name(node).unwrap_or_default();
+            let has_name = direct_text(node, "NAME").is_some_and(|name| !name.is_empty())
+                || node.attributes().any(|attribute| {
+                    attribute.name().eq_ignore_ascii_case("NAME")
+                        && !attribute.value().trim().is_empty()
+                });
+            if symbol.is_empty() && (kind != "no" || has_name) {
                 plan.issues.push("A unit has no unambiguous symbol".into());
                 continue;
+            }
+            let label = if symbol.is_empty() {
+                "Compound unit".into()
+            } else {
+                format!("Unit {symbol}")
             };
-            let label = format!("Unit {symbol}");
-            check_fields(
-                node,
-                &[
-                    "NAME",
-                    "ORIGINALNAME",
-                    "ISSIMPLEUNIT",
-                    "DECIMALPLACES",
-                    "LANGUAGENAME.LIST",
-                ],
-                &label,
-                &mut plan.issues,
-            );
+            let mut fields = vec![
+                "NAME",
+                "ORIGINALNAME",
+                "ISSIMPLEUNIT",
+                "DECIMALPLACES",
+                "LANGUAGENAME.LIST",
+            ];
+            if kind == "no" {
+                fields.extend(["BASEUNITS", "ADDITIONALUNITS", "CONVERSION"]);
+            }
+            check_fields(node, &fields, &label, &mut plan.issues);
             check_language_names(node, &symbol, &label, &mut plan.issues);
-            if !seen_units.insert(normalized(&symbol)) {
+            if !symbol.is_empty() && !seen_units.insert(normalized(&symbol)) {
                 plan.issues.push(format!("{label}: duplicate symbol"));
                 continue;
             }
@@ -4233,28 +4298,47 @@ impl Store {
                 &mut seen_metadata,
                 &mut plan.issues,
             );
-            if !direct_text(node, "ISSIMPLEUNIT").is_some_and(|s| s.eq_ignore_ascii_case("yes")) {
-                plan.issues.push(format!(
-                    "{label}: compound or unspecified units are not supported"
-                ));
+            let formal_name = direct_text(node, "ORIGINALNAME").unwrap_or_default();
+            if kind == "no" {
+                let compound = (|| -> Result<CompoundUnit> {
+                    Ok(CompoundUnit {
+                        primary: invoice_field(node, "BASEUNITS")?,
+                        tail: invoice_field(node, "ADDITIONALUNITS")?,
+                        factor: stock_units::factor(&invoice_field(node, "CONVERSION")?)?,
+                    })
+                })();
+                match compound {
+                    Ok(compound) => compounds.push((symbol, formal_name, compound, metadata)),
+                    Err(error) => plan.issues.push(format!("{label}: {error}")),
+                }
+                continue;
+            }
+            if kind != "yes" {
+                plan.issues
+                    .push(format!("{label}: expected a simple or compound unit flag"));
+                continue;
             }
             let places = match direct_text(node, "DECIMALPLACES")
-                .and_then(|s| s.parse::<u8>().ok())
-                .filter(|n| *n <= 3)
+                .filter(|value| !value.is_empty())
+                .as_deref()
+                .unwrap_or("0")
+                .parse::<u8>()
+                .ok()
+                .filter(|places| *places <= 3)
             {
-                Some(v) => v,
+                Some(places) => places,
                 None => {
                     plan.issues
                         .push(format!("{label}: decimal places must be between 0 and 3"));
                     continue;
                 }
             };
-            let formal_name = direct_text(node, "ORIGINALNAME").unwrap_or_default();
             if let Some(existing) = existing_units
                 .iter()
                 .find(|u| normalized(&u.symbol) == normalized(&symbol))
             {
-                if existing.decimal_places != places
+                if existing.compound.is_some()
+                    || existing.decimal_places != places
                     || (!formal_name.is_empty() && existing.formal_name != formal_name)
                 {
                     plan.issues
@@ -4264,14 +4348,89 @@ impl Store {
                     plan.existing_unit_metadata.push((existing.id, metadata));
                 }
             } else {
-                known_units.insert(normalized(&symbol), places);
+                if let Err(error) =
+                    index_measure(&mut known_units, UnitMeasure::simple(&symbol, places))
+                {
+                    plan.issues.push(error.to_string());
+                    continue;
+                }
                 plan.units.push(Unit {
                     symbol,
                     formal_name,
                     decimal_places: places,
+                    compound: None,
                     metadata,
                 });
             }
+        }
+        while !compounds.is_empty() {
+            let count = compounds.len();
+            let mut unresolved = Vec::new();
+            for (symbol, formal_name, mut compound, metadata) in compounds {
+                let measure = match resolve_compound(&symbol, &compound, &known_units) {
+                    Ok(Some(measure)) => measure,
+                    Ok(None) => {
+                        unresolved.push((symbol, formal_name, compound, metadata));
+                        continue;
+                    }
+                    Err(error) => {
+                        plan.issues.push(format!("Compound unit {symbol}: {error}"));
+                        continue;
+                    }
+                };
+                compound.primary = known_units[&normalized(&compound.primary)].symbol.clone();
+                compound.tail = known_units[&normalized(&compound.tail)].symbol.clone();
+                let key = normalized(&measure.symbol);
+                let existing_name = known_units
+                    .get(&key)
+                    .or_else(|| known_units.get(&normalized(&measure.canonical)));
+                if let Some(existing_name) = existing_name {
+                    let existing = existing_units
+                        .iter()
+                        .find(|entry| entry.symbol == existing_name.symbol);
+                    match existing {
+                        Some(existing)
+                            if existing.compound.as_ref() == Some(&compound)
+                                && (formal_name.is_empty()
+                                    || formal_name == existing.formal_name) =>
+                        {
+                            let existing_measure = Arc::clone(existing_name);
+                            known_units.insert(key, existing_measure);
+                            if !metadata.is_empty() {
+                                plan.existing_unit_metadata.push((existing.id, metadata));
+                            }
+                        }
+                        _ => plan.issues.push(format!(
+                            "Unit {} is duplicated or has different components",
+                            measure.symbol
+                        )),
+                    }
+                    continue;
+                }
+                let symbol = measure.symbol.clone();
+                let decimal_places = measure.precision;
+                if let Err(error) = index_measure(&mut known_units, measure) {
+                    plan.issues.push(error.to_string());
+                    continue;
+                }
+                plan.units.push(Unit {
+                    symbol,
+                    formal_name,
+                    decimal_places,
+                    compound: Some(compound),
+                    metadata,
+                });
+            }
+            if unresolved.len() == count {
+                for (symbol, _, compound, _) in unresolved {
+                    plan.issues.push(format!(
+                        "Compound unit {symbol}: components {} and {} are missing or cyclic",
+                        compound.primary, compound.tail
+                    ));
+                }
+                break;
+            }
+            compounds = unresolved;
         }
         let existing_stock_groups = self.stock_groups(company_id)?;
         let mut known_stock_groups = HashSet::<String>::new();
@@ -4523,15 +4682,13 @@ impl Store {
                 &mut seen_metadata,
                 &mut plan.issues,
             );
-            let unit = direct_text(node, "BASEUNITS").unwrap_or_default();
-            let precision = match known_units.get(&normalized(&unit)) {
-                Some(v) => *v,
-                None => {
-                    plan.issues
-                        .push(format!("{label}: unit {unit} is not available"));
-                    continue;
-                }
+            let unit_name = direct_text(node, "BASEUNITS").unwrap_or_default();
+            let Some(unit) = known_units.get(&normalized(&unit_name)) else {
+                plan.issues
+                    .push(format!("{label}: unit {unit_name} is not available"));
+                continue;
             };
+            let precision = unit.precision;
             let group = direct_text(node, "PARENT")
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "Primary".into());
@@ -4543,7 +4700,7 @@ impl Store {
                 plan.issues.push(format!("{label}: duplicate name"));
             }
             let top_opening = match direct_text(node, "OPENINGBALANCE").filter(|v| !v.is_empty()) {
-                Some(value) => match xml_stock_quantity(&value, &unit) {
+                Some(value) => match unit.quantity(&value) {
                     Ok(quantity) => Some(quantity),
                     Err(_) => {
                         plan.issues.push(format!(
@@ -4557,7 +4714,7 @@ impl Store {
             let top_cost = opening_cost_or_issue(
                 node,
                 top_opening.unwrap_or(0),
-                &unit,
+                unit,
                 &label,
                 &mut plan.issues,
             );
@@ -4669,7 +4826,7 @@ impl Store {
                 }
                 let quantity =
                     match direct_text(*allocation, "OPENINGBALANCE").filter(|v| !v.is_empty()) {
-                        Some(value) => match xml_stock_quantity(&value, &unit) {
+                        Some(value) => match unit.quantity(&value) {
                             Ok(value) => value,
                             Err(_) => {
                                 plan.issues
@@ -4687,7 +4844,7 @@ impl Store {
                 let cost = opening_cost_or_issue(
                     *allocation,
                     quantity,
-                    &unit,
+                    unit,
                     &allocation_label,
                     &mut plan.issues,
                 );
@@ -4773,7 +4930,7 @@ impl Store {
             }
             plan.items.push(Item {
                 name,
-                unit,
+                unit: unit.symbol.clone(),
                 unit_precision: precision,
                 group,
                 description: direct_text(node, "DESCRIPTION").unwrap_or_default(),
@@ -4791,7 +4948,11 @@ impl Store {
                 .iter()
                 .map(|a| (normalized(&a.name), (None, a.category))),
         );
-        let mut invoice_items = HashMap::<String, (Option<i64>, String, u8)>::new();
+        let mut invoice_items = InvoiceStockItems::new();
+        let unit_symbols: HashMap<_, _> = existing_units
+            .iter()
+            .map(|unit| (unit.id, unit.symbol.as_str()))
+            .collect();
         let mut invoice_batches = HashMap::<(String, String), i64>::new();
         for item in self.stock_items(company_id)? {
             for batch in self.stock_batches(company_id, item.id)? {
@@ -4805,17 +4966,17 @@ impl Store {
                     ));
                 }
             }
-            if let Some(precision) = known_units.get(&normalized(&item.unit)) {
+            if let Some(symbol) = unit_symbols.get(&item.unit_id) {
                 invoice_items.insert(
                     normalized(&item.name),
-                    (Some(item.id), item.unit, *precision),
+                    (Some(item.id), Arc::clone(&known_units[&normalized(symbol)])),
                 );
             }
         }
-        invoice_items.extend(plan.items.iter().map(|i| {
+        invoice_items.extend(plan.items.iter().map(|item| {
             (
-                normalized(&i.name),
-                (None, i.unit.clone(), i.unit_precision),
+                normalized(&item.name),
+                (None, Arc::clone(&known_units[&normalized(&item.unit)])),
             )
         }));
         let mut invoice_references = HashSet::<(String, String, String)>::new();
@@ -5692,14 +5853,30 @@ impl Store {
                     unit.symbol
                 )));
             }
-            tx.execute("INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) VALUES (?1, ?2, ?3, ?4)", params![plan.company_id, unit.symbol, unit.formal_name, unit.decimal_places])?;
-            save_metadata(
-                &tx,
-                plan.company_id,
-                "stockunit",
-                tx.last_insert_rowid(),
-                &unit.metadata,
-            )?;
+            let id = if let Some(compound) = &unit.compound {
+                let resolve = |symbol: &str| -> Result<i64> {
+                    find_stock_unit(&tx, plan.company_id, symbol)?
+                        .map(|(id, _)| id)
+                        .ok_or_else(|| {
+                            Error::Validation(format!(
+                                "Compound unit component {symbol} is missing"
+                            ))
+                        })
+                };
+                stock_units::insert_compound(
+                    &tx,
+                    plan.company_id,
+                    &unit.symbol,
+                    &unit.formal_name,
+                    resolve(&compound.primary)?,
+                    resolve(&compound.tail)?,
+                    compound.factor,
+                )?
+            } else {
+                tx.execute("INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) VALUES (?1, ?2, ?3, ?4)", params![plan.company_id, unit.symbol, unit.formal_name, unit.decimal_places])?;
+                tx.last_insert_rowid()
+            };
+            save_metadata(&tx, plan.company_id, "stockunit", id, &unit.metadata)?;
         }
         for group in &plan.stock_groups {
             if find_stock_group(&tx, plan.company_id, &group.name)?.is_some() {
@@ -6283,6 +6460,7 @@ impl Store {
                     discount: line.discount.clone(),
                     quantity: line.quantity,
                     unit_price: line.unit_price,
+                    rate_basis: line.rate_basis.clone(),
                 });
             }
             let draft = InvoiceDraft {
@@ -6554,6 +6732,152 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_nested_units_and_keeps_stock_and_invoice_rate_bases() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Compound stock units").unwrap();
+        store
+            .create_ledger(company, "Buyer", Category::Asset)
+            .unwrap();
+        store
+            .create_ledger(company, "Trade", Category::Income)
+            .unwrap();
+        let xml = |body: &str| {
+            format!("<ENVELOPE><BODY><DATA><MESSAGE>{body}</MESSAGE></DATA></BODY></ENVELOPE>")
+        };
+        let masters = xml(
+            r#"<UNIT><NAME>Shipping case</NAME><ISSIMPLEUNIT>No</ISSIMPLEUNIT>
+                <BASEUNITS>Case</BASEUNITS><ADDITIONALUNITS>Box of 12 pcs</ADDITIONALUNITS>
+                <CONVERSION>2</CONVERSION></UNIT>
+            <UNIT><NAME>Retail box</NAME><ISSIMPLEUNIT>No</ISSIMPLEUNIT>
+                <BASEUNITS>Box</BASEUNITS><ADDITIONALUNITS>pcs</ADDITIONALUNITS>
+                <CONVERSION>12</CONVERSION></UNIT>
+            <UNIT><NAME>Case</NAME><ISSIMPLEUNIT>Yes</ISSIMPLEUNIT></UNIT>
+            <UNIT><NAME>Box</NAME><ISSIMPLEUNIT>Yes</ISSIMPLEUNIT></UNIT>
+            <UNIT><NAME>pcs</NAME><ISSIMPLEUNIT>Yes</ISSIMPLEUNIT></UNIT>
+            <STOCKITEM><NAME>Kits</NAME><BASEUNITS>Case of 2 Box of 12 pcs</BASEUNITS>
+                <OPENINGBALANCE>1-1-2 Case</OPENINGBALANCE>
+                <OPENINGRATE>24.00/Case</OPENINGRATE>
+                <OPENINGVALUE>38.00</OPENINGVALUE></STOCKITEM>"#,
+        );
+        for (invalid, issue) in [
+            (
+                masters.replace("<CONVERSION>2", "<CONVERSION>0"),
+                "conversion must be positive",
+            ),
+            (
+                masters.replace(
+                    "<ADDITIONALUNITS>Box of 12 pcs",
+                    "<ADDITIONALUNITS>Shipping case",
+                ),
+                "missing or cyclic",
+            ),
+            (
+                masters.replace("1-1-2 Case", "1-1-2.1 Case"),
+                "exceeds unit precision",
+            ),
+        ] {
+            let preview = store
+                .preview_xml_import_with_opening_date(
+                    company,
+                    invalid.as_bytes(),
+                    Some("2026-04-01"),
+                )
+                .unwrap();
+            assert!(!preview.can_apply());
+            assert!(
+                preview.issues().iter().any(|error| error.contains(issue)),
+                "{:?}",
+                preview.issues()
+            );
+        }
+        let preview = store
+            .preview_xml_import_with_opening_date(company, masters.as_bytes(), Some("2026-04-01"))
+            .unwrap();
+        assert!(preview.can_apply(), "{:?}", preview.issues());
+        let counts = store.apply_xml_import(&preview).unwrap();
+        assert_eq!((counts.units, counts.items), (5, 1));
+        let item = store.stock_items(company).unwrap().remove(0);
+        assert_eq!(item.unit, "pcs");
+        let units = store.stock_units(company).unwrap();
+        let compound = units.iter().find(|unit| unit.id == item.unit_id).unwrap();
+        assert_eq!(compound.symbol, "Shipping case");
+        assert_eq!(compound.compound.as_ref().unwrap().tail, "Retail box");
+        let valuation = |store: &Store, date| {
+            store
+                .stock_valuation_at_average_cost(company, date)
+                .unwrap()
+                .known_value
+        };
+        assert_eq!(valuation(&store, "2026-04-01"), 3800);
+        let stock =
+            |store: &Store, date| store.stock_balances(company, Some(date)).unwrap()[0].quantity;
+        assert_eq!(stock(&store, "2026-04-01"), 38000);
+        let invoice = xml(
+            r#"<VOUCHER><DATE>20260402</DATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>INV</VOUCHERNUMBER><ISINVOICE>Yes</ISINVOICE>
+                <PARTYLEDGERNAME>Buyer</PARTYLEDGERNAME>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Buyer</LEDGERNAME><AMOUNT>-126.25</AMOUNT>
+                    <BILLALLOCATIONS.LIST><NAME>BILL</NAME><BILLTYPE>New Ref</BILLTYPE>
+                    <AMOUNT>-126.25</AMOUNT></BILLALLOCATIONS.LIST></LEDGERENTRIES.LIST>
+                <ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Kits</STOCKITEMNAME>
+                    <ACTUALQTY>1 Retail box 3 pcs</ACTUALQTY><BILLEDQTY>0-1-3 Case</BILLEDQTY>
+                    <RATE>101.00/Retail box</RATE><AMOUNT>126.25</AMOUNT>
+                    <ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Trade</LEDGERNAME>
+                        <AMOUNT>126.25</AMOUNT></ACCOUNTINGALLOCATIONS.LIST>
+                </ALLINVENTORYENTRIES.LIST>
+            </VOUCHER>"#,
+        );
+        let preview = store
+            .preview_xml_import(company, invoice.as_bytes())
+            .unwrap();
+        assert!(preview.can_apply(), "{:?}", preview.issues());
+        store.apply_xml_import(&preview).unwrap();
+        let saved = store.invoices(company).unwrap().remove(0);
+        let rate_basis = InvoiceRateBasis {
+            quantity: 12000,
+            unit: "Retail box".into(),
+        };
+        assert_eq!(saved.total, 12625);
+        assert_eq!(saved.lines[0].quantity, 15000);
+        assert_eq!(saved.lines[0].unit_price, 10100);
+        assert_eq!(saved.lines[0].rate_basis, Some(rate_basis.clone()));
+        assert_eq!(saved.lines[0].price_label(), "101.00 / Retail box");
+        assert_eq!(stock(&store, "2026-04-02"), 23000);
+        assert_eq!(valuation(&store, "2026-04-02"), 2300);
+        let mut draft = store.invoice_draft(company, saved.id).unwrap();
+        assert_eq!(draft.lines[0].rate_basis, Some(rate_basis.clone()));
+        draft.narration = "Rate survives editing other fields".into();
+        store.update_invoice(company, saved.id, &draft).unwrap();
+        let revisions = store.invoice_revisions(company, saved.id).unwrap();
+        assert_eq!(revisions[0].lines[0].rate_basis, Some(rate_basis));
+        let note = xml(
+            r#"<VOUCHER><DATE>20260403</DATE><VOUCHERTYPENAME>Credit note</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>RETURN</VOUCHERNUMBER><ISINVOICE>Yes</ISINVOICE>
+                <PARTYLEDGERNAME>Buyer</PARTYLEDGERNAME><REFERENCE>INV</REFERENCE>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Buyer</LEDGERNAME><AMOUNT>45.00</AMOUNT>
+                    <BILLALLOCATIONS.LIST><NAME>BILL</NAME><BILLTYPE>Agst Ref</BILLTYPE>
+                    <AMOUNT>45.00</AMOUNT></BILLALLOCATIONS.LIST></LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Trade</LEDGERNAME><AMOUNT>-45.00</AMOUNT></LEDGERENTRIES.LIST>
+                <ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Kits</STOCKITEMNAME>
+                    <ACTUALQTY>6 pcs</ACTUALQTY><BILLEDQTY>0.5 Box</BILLEDQTY>
+                    <RATE>90.00/Box</RATE><AMOUNT>-45.00</AMOUNT>
+                    <ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Trade</LEDGERNAME>
+                        <AMOUNT>-45.00</AMOUNT></ACCOUNTINGALLOCATIONS.LIST>
+                </ALLINVENTORYENTRIES.LIST>
+            </VOUCHER>"#,
+        );
+        let preview = store.preview_xml_import(company, note.as_bytes()).unwrap();
+        assert!(preview.can_apply(), "{:?}", preview.issues());
+        store.apply_xml_import(&preview).unwrap();
+        assert_eq!(stock(&store, "2026-04-03"), 29000);
+        assert_eq!(valuation(&store, "2026-04-03"), 2900);
+        assert_eq!(
+            store.outstanding_invoices(company, "2026-04-03").unwrap()[0].outstanding,
+            8125
+        );
+    }
 
     #[test]
     fn imports_recorded_invoice_taxes_and_mirrored_batch_locations() {
@@ -10075,6 +10399,7 @@ mod tests {
             original_postings: Vec::new(),
             metadata: SourceMetadata::default(),
             lines: vec![ImportedInvoiceLine {
+                rate_basis: None,
                 item: "Part".into(),
                 existing_item_id: Some(item),
                 unit: "Each".into(),

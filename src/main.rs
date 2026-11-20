@@ -6,10 +6,10 @@ use balance::company::CompanyProfile;
 use balance::contacts::LedgerProfile;
 use balance::exchange::{ImportPlan, MAX_XML_IMPORT_BYTES};
 use balance::inventory::{
-    discounted_line_amount, format_quantity, parse_quantity, BillSettlementAllocation,
+    discounted_line_amount_with_basis, format_quantity, parse_quantity, BillSettlementAllocation,
     BillSettlementTarget, InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft,
-    InvoiceEntryMode, InvoiceExternalReference, InvoiceKind, InvoiceLine, StockBatch, StockItem,
-    StockLocation,
+    InvoiceEntryMode, InvoiceExternalReference, InvoiceKind, InvoiceLine, InvoiceRateBasis,
+    StockBatch, StockItem, StockLocation,
 };
 use balance::pricing::PriceList;
 use balance::reorder::ReorderRule;
@@ -364,6 +364,7 @@ struct InvoiceLineForm {
     trade_ledger: Option<i64>,
     quantity: String,
     price: String,
+    rate_basis: Option<InvoiceRateBasis>,
     discount_mode: DiscountMode,
     discount_value: String,
     extra_allocations: Vec<InvoiceAllocationForm>,
@@ -389,6 +390,7 @@ impl InvoiceLineForm {
             trade_ledger: None,
             quantity: String::new(),
             price: String::new(),
+            rate_basis: None,
             discount_mode: DiscountMode::None,
             discount_value: String::new(),
             extra_allocations: Vec::new(),
@@ -2786,7 +2788,13 @@ impl App {
         }
         if let Some(item_id) = self.stock_editing {
             if let Some(item) = items.iter().find(|item| item.id == item_id) {
-                ui.label(format!("Base unit: {} (cannot be changed)", item.unit));
+                ui.label(format!("Stock quantity unit {}", item.unit));
+                if let Some(unit) = units
+                    .iter()
+                    .find(|unit| unit.id == item.unit_id && unit.compound.is_some())
+                {
+                    ui.label(format!("Compound unit {}", unit.symbol));
+                }
             }
             ui.horizontal(|ui| {
                 ui.label("Name");
@@ -3400,6 +3408,7 @@ impl App {
                         .collect(),
                     quantity: format_quantity(i128::from(line.quantity)),
                     price: format_amount(line.unit_price),
+                    rate_basis: line.rate_basis,
                     discount_mode,
                     discount_value,
                 }
@@ -3642,6 +3651,7 @@ impl App {
                     Ok(prices) => {
                         for (index, price) in prices {
                             self.invoice_lines[index].price = format_amount(price);
+                            self.invoice_lines[index].rate_basis = None;
                         }
                         self.message = "Blank item prices filled for the invoice date".into();
                     }
@@ -3765,6 +3775,9 @@ impl App {
                     let previous_item = line.item;
                     pick_stock(ui, ("invoice-item", index), "Item", &items, &mut line.item);
                     if previous_item != line.item {
+                        if line.rate_basis.take().is_some() {
+                            line.price.clear();
+                        }
                         line.batch = None;
                         for allocation in &mut line.extra_allocations {
                             allocation.batch = None;
@@ -3799,16 +3812,30 @@ impl App {
                             );
                         }
                     });
+                let quantity_hint = items
+                    .iter()
+                    .find(|item| Some(item.id) == line.item)
+                    .map_or_else(|| "Quantity".into(), |item| format!("Qty ({})", item.unit));
                 ui.add(
                     egui::TextEdit::singleline(&mut line.quantity)
-                        .hint_text("Quantity")
+                        .hint_text(quantity_hint)
                         .desired_width(90.0),
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut line.price)
-                        .hint_text("Unit price")
+                        .hint_text(line.rate_basis.as_ref().map_or_else(
+                            || "Unit price".into(),
+                            |basis| format!("Price per {}", basis.unit),
+                        ))
                         .desired_width(90.0),
                 );
+                if let Some(basis) = &line.rate_basis {
+                    ui.label(format!("per {}", basis.unit));
+                    if ui.small_button("Use stock unit").clicked() {
+                        line.rate_basis = None;
+                        line.price.clear();
+                    }
+                }
                 egui::ComboBox::from_id_salt(("invoice-discount", index))
                     .selected_text(match line.discount_mode {
                         DiscountMode::None => "No discount",
@@ -3844,7 +3871,12 @@ impl App {
                     parse_amount(&line.price),
                     line.discount(),
                 ) {
-                    if let Ok((amount, applied)) = discounted_line_amount(qty, price, &discount) {
+                    if let Ok((amount, applied)) = discounted_line_amount_with_basis(
+                        qty,
+                        price,
+                        &discount,
+                        line.rate_basis.as_ref(),
+                    ) {
                         ui.label(format!(
                             "Discount {} · Amount {}",
                             format_amount(applied),
@@ -4013,6 +4045,7 @@ impl App {
                             .collect::<balance::Result<Vec<_>>>()?,
                         quantity: parse_quantity(&line.quantity)?,
                         unit_price: parse_amount(&line.price)?,
+                        rate_basis: line.rate_basis.clone(),
                     });
                 }
                 let tax_amount = if self.invoice_tax_amount.trim().is_empty() {
@@ -4505,7 +4538,7 @@ impl App {
                             line.trade_ledger,
                             format_quantity(i128::from(line.quantity)),
                             line.unit,
-                            format_amount(line.unit_price),
+                            line.price_label(),
                             discount_description(&line.discount, line.discount_amount),
                             format_amount(line.amount)
                         ));
@@ -4653,7 +4686,7 @@ impl App {
                                                 line.trade_ledger,
                                                 format_quantity(i128::from(line.quantity)),
                                                 line.unit,
-                                                format_amount(line.unit_price),
+                                                line.price_label(),
                                                 discount_description(
                                                     &line.discount,
                                                     line.discount_amount

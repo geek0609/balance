@@ -53,12 +53,13 @@ pub mod stock_reservations;
 pub mod stock_returns;
 pub mod stock_sales;
 pub mod stock_transit;
+pub mod stock_units;
 pub mod tax_profiles;
 pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 90;
+const SCHEMA_VERSION: i64 = 91;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -406,6 +407,7 @@ impl Store {
             "invoice_revision_lines",
             "imported_record_metadata",
             "stock_units",
+            "stock_unit_compounds",
             "stock_groups",
             "stock_item_revisions",
             "stock_locations",
@@ -1043,6 +1045,11 @@ impl Store {
         if version < 90 {
             taxes::migrate_source_rates(&tx)?;
             tx.pragma_update(None, "user_version", 90)?;
+        }
+        if version < 91 {
+            stock_units::migrate(&tx)?;
+            inventory::migrate_invoice_rate_basis(&tx)?;
+            tx.pragma_update(None, "user_version", 91)?;
         }
         tx.commit()?;
         Ok(Self { conn })
