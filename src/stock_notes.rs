@@ -697,10 +697,11 @@ pub(crate) fn write_stock_note(
         ));
     }
     let mut buckets = HashSet::new();
-    for line in &draft.lines {
-        if receipt_costs.is_none() && !buckets.insert(line.bucket()) {
+    for (line, source) in draft.lines.iter().zip(order_sources) {
+        let order = source.map(|source| (source.order_id, source.expected_on));
+        if receipt_costs.is_none() && !buckets.insert((line.bucket(), order)) {
             return Err(Error::Validation(
-                "Combine lines for the same item, location and batch".into(),
+                "Combine lines with the same item, location, batch, order and delivery date".into(),
             ));
         }
         line_amount(line.quantity, line.unit_price)?;
@@ -861,9 +862,6 @@ impl Store {
         draft: &StockNoteDraft,
         expected_dates: &[Option<&str>],
     ) -> Result<i64> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !expected_dates.is_empty()
             && (expected_dates.len() != draft.lines.len()
                 || (draft.order_id.is_none() && expected_dates.iter().any(Option::is_some)))
@@ -883,7 +881,20 @@ impl Store {
                 })
             })
             .collect();
-        let note = write_stock_note(&tx, company, draft, None, &sources)?;
+        self.post_stock_note_for_orders(company, draft, &sources)
+    }
+
+    /// Record one delivery or receipt with a source order and date for each linked line.
+    pub fn post_stock_note_for_orders(
+        &mut self,
+        company: i64,
+        draft: &StockNoteDraft,
+        sources: &[Option<OrderAllocation<'_>>],
+    ) -> Result<i64> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let note = write_stock_note(&tx, company, draft, None, sources)?;
         tx.commit()?;
         Ok(note)
     }

@@ -4,7 +4,7 @@ use super::{
 };
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind};
 use balance::invoice_stock_links::StockNoteInvoiceAllocation;
-use balance::orders::OrderDetail;
+use balance::orders::{OrderAllocation, OrderDetail};
 use balance::stock_notes::{
     note_label, StockNote, StockNoteDraft, StockNoteInvoice, StockNoteLine, StockNoteLineDraft,
 };
@@ -19,12 +19,12 @@ struct NoteLineForm {
     batch: Option<i64>,
     quantity: String,
     price: String,
+    order_id: Option<i64>,
     expected_on: Option<String>,
 }
 
 struct NoteForm {
     kind: InvoiceKind,
-    order: Option<i64>,
     party: Option<i64>,
     reference: String,
     date: String,
@@ -59,7 +59,6 @@ impl Default for NoteForm {
     fn default() -> Self {
         Self {
             kind: InvoiceKind::Sale,
-            order: None,
             party: None,
             reference: String::new(),
             date: String::new(),
@@ -95,11 +94,74 @@ impl NoteForm {
             party_ledger_id: self
                 .party
                 .ok_or_else(|| Error::Validation("Select a party ledger".into()))?,
-            order_id: self.order,
+            order_id: self
+                .lines
+                .first()
+                .and_then(|line| line.order_id)
+                .filter(|&id| self.lines.iter().all(|line| line.order_id == Some(id))),
             narration: self.narration.clone(),
             lines,
         })
     }
+
+    fn order_sources(&self) -> Vec<Option<OrderAllocation<'_>>> {
+        self.lines
+            .iter()
+            .map(|line| {
+                line.order_id.map(|order_id| OrderAllocation {
+                    order_id,
+                    expected_on: line.expected_on.as_deref(),
+                })
+            })
+            .collect()
+    }
+
+    fn add_order(&mut self, detail: &OrderDetail) {
+        if let [line] = self.lines.as_slice() {
+            if line.item.is_none()
+                && line.order_id.is_none()
+                && line.quantity.trim().is_empty()
+                && line.price.trim().is_empty()
+            {
+                self.lines.clear();
+            }
+        }
+        self.lines.extend(note_lines_for_order(detail));
+    }
+}
+
+fn note_lines_for_order(detail: &OrderDetail) -> impl Iterator<Item = NoteLineForm> + '_ {
+    detail
+        .lines
+        .iter()
+        .filter(|line| line.unfulfilled() > 0)
+        .flat_map(|line| {
+            let item = Some(line.line.item_id);
+            let order_id = Some(detail.summary.id);
+            let price = format_amount(line.line.unit_price);
+            let allocations = detail.reserved_allocations(line.line.item_id);
+            if allocations.is_empty() {
+                return vec![NoteLineForm {
+                    item,
+                    order_id,
+                    price,
+                    quantity: format_quantity(line.unfulfilled().into()),
+                    ..NoteLineForm::default()
+                }];
+            }
+            allocations
+                .into_iter()
+                .map(|allocation| NoteLineForm {
+                    item,
+                    order_id,
+                    price: price.clone(),
+                    location: Some(allocation.location_id),
+                    batch: allocation.batch_id,
+                    quantity: format_quantity(allocation.quantity.into()),
+                    expected_on: None,
+                })
+                .collect()
+        })
 }
 
 #[derive(Default)]
@@ -139,37 +201,8 @@ impl App {
         let order = &detail.summary;
         self.stock_note_screen.form = NoteForm {
             kind: order.kind,
-            order: Some(order.id),
             party: Some(order.party_ledger_id),
-            lines: detail
-                .lines
-                .iter()
-                .filter(|line| line.unfulfilled() > 0)
-                .flat_map(|line| {
-                    let item = Some(line.line.item_id);
-                    let price = format_amount(line.line.unit_price);
-                    let allocations = detail.reserved_allocations(line.line.item_id);
-                    if allocations.is_empty() {
-                        return vec![NoteLineForm {
-                            item,
-                            price,
-                            quantity: format_quantity(line.unfulfilled().into()),
-                            ..NoteLineForm::default()
-                        }];
-                    }
-                    allocations
-                        .into_iter()
-                        .map(|a| NoteLineForm {
-                            item,
-                            price: price.clone(),
-                            location: Some(a.location_id),
-                            batch: a.batch_id,
-                            quantity: format_quantity(a.quantity.into()),
-                            expected_on: None,
-                        })
-                        .collect()
-                })
-                .collect(),
+            lines: note_lines_for_order(detail).collect(),
             ..NoteForm::default()
         };
         self.page = Page::StockNotes;
@@ -207,28 +240,15 @@ impl App {
             .filter(|ledger| matches!(ledger.category, Category::Asset | Category::Liability))
             .collect::<Vec<_>>();
         crate::theme::section(ui, "New stock note");
-        let order_lots = self
-            .stock_note_screen
-            .form
-            .order
-            .map(|order| {
-                self.store
-                    .order_detail(company, order)
-                    .map(|detail| detail.delivery_lots)
-            })
-            .transpose()?
-            .unwrap_or_default();
         let form = &mut self.stock_note_screen.form;
-        if let Some(order) = form.order {
-            ui.horizontal(|ui| {
-                ui.label(format!("Order {order}"));
-                if ui.button("Clear order draft").clicked() {
-                    *form = NoteForm::default();
-                }
-            });
+        if form.lines.iter().any(|line| line.order_id.is_some())
+            && ui.button("Clear order draft").clicked()
+        {
+            *form = NoteForm::default();
         }
+        let has_order = form.lines.iter().any(|line| line.order_id.is_some());
         ui.horizontal_wrapped(|ui| {
-            ui.add_enabled_ui(form.order.is_none(), |ui| {
+            ui.add_enabled_ui(!has_order, |ui| {
                 egui::ComboBox::from_id_salt("stock-note-type")
                     .selected_text(note_label(form.kind))
                     .show_ui(ui, |ui| {
@@ -257,12 +277,34 @@ impl App {
         if form.kind == InvoiceKind::Purchase {
             ui.small("The receipt price records the acquisition cost on the receipt date.");
         }
+        let mut orders =
+            crate::order_ui::draft_orders(&self.store, company, form.kind, form.party)?;
+        if let Some(order) = crate::order_ui::add_order_items(
+            ui,
+            &orders,
+            form.lines.iter().map(|line| line.order_id),
+        ) {
+            form.add_order(&self.store.order_detail(company, order)?);
+        }
+        let order_details = crate::order_ui::draft_order_details(
+            &self.store,
+            company,
+            form.lines.iter().map(|line| line.order_id),
+        )?;
+        orders.retain(|order| order_details.contains_key(&order.id));
         let mut remove = None;
         for (index, line) in form.lines.iter_mut().enumerate() {
             if line.location.is_none() {
                 line.location = default_location;
             }
             ui.horizontal_wrapped(|ui| -> Result<()> {
+                let previous_order = line.order_id;
+                crate::order_ui::pick_line_order(
+                    ui,
+                    ("stock-note-order", index),
+                    &orders,
+                    &mut line.order_id,
+                );
                 let previous_item = line.item;
                 pick_stock(
                     ui,
@@ -273,6 +315,8 @@ impl App {
                 );
                 if previous_item != line.item {
                     line.batch = None;
+                }
+                if previous_item != line.item || previous_order != line.order_id {
                     line.expected_on = None;
                 }
                 pick_location(
@@ -287,10 +331,14 @@ impl App {
                     let batches = self.store.stock_batches(company, item)?;
                     pick_batch(ui, ("stock-note-batch", index), &batches, &mut line.batch);
                 }
+                let lots = line
+                    .order_id
+                    .and_then(|order| order_details.get(&order))
+                    .map_or(&[][..], |detail| detail.delivery_lots.as_slice());
                 crate::order_ui::pick_delivery_lot(
                     ui,
                     ("stock-note-lot", index),
-                    &order_lots,
+                    lots,
                     line.item,
                     &mut line.expected_on,
                 );
@@ -315,20 +363,20 @@ impl App {
             form.lines.remove(index);
         }
         if ui.button("Add item line").clicked() {
-            form.lines.push(NoteLineForm::default());
+            form.lines.push(NoteLineForm {
+                order_id: form.lines.iter().find_map(|line| line.order_id),
+                ..NoteLineForm::default()
+            });
         }
         if ui
             .button(format!("Post {}", note_label(form.kind).to_lowercase()))
             .clicked()
         {
-            let dates: Vec<_> = form
-                .lines
-                .iter()
-                .map(|line| line.expected_on.as_deref())
-                .collect();
-            let id =
-                self.store
-                    .post_stock_note_for_delivery_dates(company, &form.draft()?, &dates)?;
+            let id = self.store.post_stock_note_for_orders(
+                company,
+                &form.draft()?,
+                &form.order_sources(),
+            )?;
             self.stock_note_screen.form = NoteForm::default();
             self.stock_note_screen.select(Some(id));
             self.message = format!("Stock note {id} posted");
@@ -1031,6 +1079,88 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_receipt_combines_purchase_orders_without_merging_their_lines() {
+        use balance::orders::{OrderDraft, OrderLine};
+
+        let mut store = balance::Store::memory().unwrap();
+        let company = store.create_company("Combined receipt").unwrap();
+        let party = store
+            .create_ledger(company, "Supplier", Category::Liability)
+            .unwrap();
+        let item = store.create_stock_item(company, "Part", "pcs").unwrap();
+        let location = store.stock_locations(company).unwrap()[0].id;
+        let first = store
+            .create_order(
+                company,
+                &OrderDraft {
+                    kind: InvoiceKind::Purchase,
+                    party_ledger_id: party,
+                    date: "2026-04-01".into(),
+                    expected_on: None,
+                    reference: "PO-A".into(),
+                    notes: String::new(),
+                    lines: vec![OrderLine {
+                        item_id: item,
+                        quantity: 1000,
+                        unit_price: 1000,
+                    }],
+                },
+            )
+            .unwrap();
+        let second = store
+            .create_order(
+                company,
+                &OrderDraft {
+                    kind: InvoiceKind::Purchase,
+                    party_ledger_id: party,
+                    date: "2026-04-01".into(),
+                    expected_on: None,
+                    reference: "PO-B".into(),
+                    notes: String::new(),
+                    lines: vec![OrderLine {
+                        item_id: item,
+                        quantity: 1000,
+                        unit_price: 2300,
+                    }],
+                },
+            )
+            .unwrap();
+        let first_detail = store.order_detail(company, first).unwrap();
+        let second_detail = store.order_detail(company, second).unwrap();
+        let mut app = App::new(store, Default::default());
+        app.prepare_order_stock_note(&first_detail);
+        let form = &mut app.stock_note_screen.form;
+        form.add_order(&second_detail);
+        form.reference = "RECEIPT".into();
+        form.date = "2026-04-02".into();
+        for line in &mut form.lines {
+            line.location = Some(location);
+        }
+        let id = app
+            .store
+            .post_stock_note_for_orders(company, &form.draft().unwrap(), &form.order_sources())
+            .unwrap();
+        let lines = app.store.stock_note_lines(company, id).unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.order_id, line.values.unit_price))
+                .collect::<Vec<_>>(),
+            [(Some(first), 1000), (Some(second), 2300)]
+        );
+        assert_eq!(
+            app.store
+                .stock_receipts(company, None)
+                .unwrap()
+                .iter()
+                .map(|row| row.cost)
+                .sum::<Option<i64>>(),
+            Some(3300)
+        );
+        assert!(app.store.vouchers(company).unwrap().is_empty());
+    }
 
     #[test]
     fn prepared_invoice_keeps_receipt_ledger_defaults() {

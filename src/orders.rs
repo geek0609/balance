@@ -670,13 +670,14 @@ pub(crate) fn validate_order_invoice_source(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct OrderAllocation<'a> {
+/// Order and optional delivery date assigned to an item line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderAllocation<'a> {
     pub order_id: i64,
     pub expected_on: Option<&'a str>,
 }
 
-pub(crate) fn attach_imported_invoice_orders(
+pub(crate) fn attach_invoice_orders(
     conn: &Connection,
     invoice: i64,
     sources: &[Option<OrderAllocation<'_>>],
@@ -732,51 +733,6 @@ pub(crate) fn attach_imported_invoice_orders(
         crate::stock_reservations::check_order_coverage(conn, order)?;
     }
     Ok(())
-}
-
-pub(crate) fn attach_order_invoice(
-    conn: &Connection,
-    order: i64,
-    invoice: i64,
-    expected_dates: Option<&[Option<&str>]>,
-) -> Result<()> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT a.id, l.item_id, a.quantity FROM invoice_line_allocations a
-         JOIN invoice_lines l ON l.id = a.line_id WHERE l.invoice_id = ?1 ORDER BY l.id, a.id",
-    )?;
-    let rows = stmt
-        .query_map([invoice], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if expected_dates.is_some_and(|dates| dates.len() != rows.len()) {
-        return Err(Error::Validation(
-            "Invoice order allocations do not reconcile".into(),
-        ));
-    }
-    let assignments = crate::order_lots::plan(
-        conn,
-        order,
-        rows.iter().enumerate().map(|(index, &(_, item, qty))| {
-            (item, qty, expected_dates.and_then(|dates| dates[index]))
-        }),
-    )?;
-    conn.execute(
-        "INSERT INTO invoice_order_links(invoice_id, order_id) VALUES (?1, ?2)",
-        params![invoice, order],
-    )?;
-    for ((allocation, _, _), slices) in rows.into_iter().zip(assignments) {
-        crate::order_lots::write(
-            conn,
-            crate::order_lots::Source::InvoiceAllocation(allocation),
-            &slices,
-        )?;
-    }
-    crate::stock_reservations::check_order_coverage(conn, order)
 }
 
 fn check_order_quantities(
@@ -1341,31 +1297,73 @@ impl Store {
                 "Invoice delivery dates require matching item lines".into(),
             ));
         }
+        if draft.lines.is_empty() {
+            return Err(Error::Validation("Add an item to fulfil this order".into()));
+        }
+        let sources = draft
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                Some(OrderAllocation {
+                    order_id: id,
+                    expected_on: dates.get(index).copied().flatten(),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.invoice_against_orders(company, draft, &sources)
+    }
+
+    /// Post one invoice from several orders. Each source applies to the whole item line.
+    pub fn invoice_against_orders(
+        &mut self,
+        company: i64,
+        draft: &InvoiceDraft,
+        sources: &[Option<OrderAllocation<'_>>],
+    ) -> Result<i64> {
+        if sources.len() != draft.lines.len() {
+            return Err(Error::Validation(
+                "Invoice order sources do not match its lines".into(),
+            ));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_fulfilment(
+        let date = parse_date(&draft.date)?;
+        let mut items_by_order = BTreeMap::<_, Vec<_>>::new();
+        for (line, source) in draft.lines.iter().zip(sources) {
+            if let Some(source) = source {
+                items_by_order
+                    .entry(source.order_id)
+                    .or_default()
+                    .push((line.item_id, line.quantity));
+            }
+        }
+        for (order, quantities) in items_by_order {
+            check_fulfilment(
+                &tx,
+                company,
+                order,
+                draft.kind,
+                draft.party_ledger_id,
+                date,
+                FulfilmentChange::NewDocument,
+                quantities,
+            )?;
+        }
+        let allocations = draft
+            .lines
+            .iter()
+            .zip(sources)
+            .flat_map(|(line, &source)| {
+                std::iter::repeat_n(source, line.extra_allocations.len() + 1)
+            })
+            .collect::<Vec<_>>();
+        let (invoice, _) = insert_direct_invoice(
             &tx,
             company,
-            id,
-            draft.kind,
-            draft.party_ledger_id,
-            parse_date(&draft.date)?,
-            FulfilmentChange::NewDocument,
-            draft.lines.iter().map(|line| (line.item_id, line.quantity)),
-        )?;
-        let (invoice, _) =
-            insert_direct_invoice(&tx, company, draft, StockInvoicePosting::Order(id))?;
-        let dates: Vec<_> = dates
-            .iter()
-            .zip(&draft.lines)
-            .flat_map(|(&date, line)| std::iter::repeat_n(date, line.extra_allocations.len() + 1))
-            .collect();
-        attach_order_invoice(
-            &tx,
-            id,
-            invoice,
-            (!dates.is_empty()).then_some(dates.as_slice()),
+            draft,
+            StockInvoicePosting::Orders(&allocations),
         )?;
         tx.commit()?;
         Ok(invoice)

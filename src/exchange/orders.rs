@@ -1350,6 +1350,172 @@ mod tests {
     }
 
     #[test]
+    fn native_notes_and_invoices_fulfil_the_selected_orders_and_lots() {
+        use crate::orders::OrderAllocation;
+        use crate::stock_notes::{StockNoteDraft, StockNoteLineDraft};
+        use crate::stock_reservations::StockReservationDraft;
+
+        let (mut store, company, party, item, location, first) = scheduled_sale();
+        let second = other_sale_order(&mut store, company);
+        for (order, quantity) in [(first, 2000), (second, 3000)] {
+            store
+                .reserve_order_stock(
+                    company,
+                    order,
+                    &StockReservationDraft {
+                        item_id: item,
+                        location_id: location,
+                        batch_id: None,
+                        quantity,
+                        reason: "Native fulfilment".into(),
+                    },
+                )
+                .unwrap();
+        }
+        let note = StockNoteDraft {
+            kind: InvoiceKind::Sale,
+            date: "2026-04-02".into(),
+            reference: "COMBINED-DISPATCH".into(),
+            party_ledger_id: party,
+            order_id: None,
+            narration: String::new(),
+            lines: vec![
+                StockNoteLineDraft {
+                    item_id: item,
+                    location_id: location,
+                    batch_id: None,
+                    quantity: 1000,
+                    unit_price: 1000,
+                };
+                3
+            ],
+        };
+        let to = |order_id, expected_on| {
+            Some(OrderAllocation {
+                order_id,
+                expected_on,
+            })
+        };
+        let sources = [to(first, Some("2026-04-12")), to(second, None), None];
+        assert!(store
+            .post_stock_note_for_orders(company, &note, &sources[..2])
+            .is_err());
+        assert!(store.stock_notes(company, None).unwrap().is_empty());
+        let note = store
+            .post_stock_note_for_orders(company, &note, &sources)
+            .unwrap();
+        assert_eq!(remaining(&store, company, first), [2000, 1000]);
+        assert_eq!(remaining(&store, company, second), [2000]);
+        let lines = store.stock_note_lines(company, note).unwrap();
+        assert_eq!(
+            lines.iter().map(|line| line.order_id).collect::<Vec<_>>(),
+            [Some(first), Some(second), None]
+        );
+
+        let trade = find_ledger(&store.conn, company, "Sales").unwrap().unwrap();
+        let item_line = |quantity| InvoiceLine {
+            item_id: item,
+            trade_ledger_id: None,
+            location_id: location,
+            batch_id: None,
+            extra_allocations: Vec::new(),
+            discount: InvoiceDiscount::None,
+            quantity,
+            billed_quantity: None,
+            unit_price: 1000,
+            rate_basis: None,
+        };
+        let mut split = item_line(2000);
+        split.extra_allocations.push(InvoiceAllocation {
+            location_id: location,
+            batch_id: None,
+            quantity: 1000,
+            billed_quantity: None,
+        });
+        let invoice = InvoiceDraft {
+            kind: InvoiceKind::Sale,
+            entry_mode: InvoiceEntryMode::Invoice,
+            reference: "COMBINED-BILL".into(),
+            date: "2026-04-03".into(),
+            external_reference: Default::default(),
+            due_date: None,
+            credit_days: None,
+            bill_reference: None,
+            bill_splits: Vec::new(),
+            narration: String::new(),
+            party_ledger_id: party,
+            trade_ledger_id: trade,
+            tax_ledger_id: None,
+            tax_amount: 0,
+            additional_taxes: Vec::new(),
+            tax_calculation: None,
+            lines: vec![split, item_line(1000), item_line(1000)],
+            adjustments: Vec::new(),
+        };
+        let wrong_party = store
+            .create_ledger(company, "Other customer", Category::Asset)
+            .unwrap();
+        let mut wrong = invoice.clone();
+        wrong.party_ledger_id = wrong_party;
+        let sources = [
+            to(second, Some("2026-04-20")),
+            to(first, Some("2026-04-05")),
+            None,
+        ];
+        assert!(store
+            .invoice_against_orders(company, &wrong, &sources)
+            .is_err());
+        assert!(store.invoices(company).unwrap().is_empty());
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            5000
+        );
+
+        let id = store
+            .invoice_against_orders(company, &invoice, &sources)
+            .unwrap();
+        let saved = store.invoices(company).unwrap().remove(0);
+        assert_eq!(saved.id, id);
+        assert_eq!(saved.order_ids, [first, second]);
+        assert_eq!(saved.total, 4000);
+        assert_eq!(remaining(&store, company, first), [1000, 1000]);
+        assert_eq!(remaining(&store, company, second), [0]);
+        for order in [first, second] {
+            assert_eq!(
+                store.order_detail(company, order).unwrap().reservations[0].remaining,
+                0
+            );
+        }
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            1000
+        );
+        store
+            .reverse_invoice(company, id, "2026-04-04", "UNDO-COMBINED", "Cancel invoice")
+            .unwrap();
+        assert_eq!(remaining(&store, company, first), [2000, 1000]);
+        assert_eq!(remaining(&store, company, second), [2000]);
+        store
+            .reverse_stock_note(company, note, "2026-04-05", "Cancel delivery")
+            .unwrap();
+        assert_eq!(remaining(&store, company, first), [2000, 2000]);
+        assert_eq!(remaining(&store, company, second), [3000]);
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            8000
+        );
+    }
+
+    #[test]
     fn one_delivery_can_supply_two_orders_and_unlinked_stock() {
         use crate::invoice_returns::StockReturnDraft;
         use crate::stock_reservations::StockReservationDraft;

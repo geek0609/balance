@@ -360,6 +360,7 @@ struct InvoiceAdjustmentForm {
 struct InvoiceLineForm {
     item: Option<i64>,
     stock_note_line: Option<(i64, String)>,
+    order_id: Option<i64>,
     order_due_on: Option<String>,
     location: Option<i64>,
     batch: Option<i64>,
@@ -397,6 +398,7 @@ impl InvoiceLineForm {
         Self {
             item: None,
             stock_note_line: None,
+            order_id: None,
             order_due_on: None,
             location: None,
             batch: None,
@@ -3491,6 +3493,7 @@ impl App {
                 InvoiceLineForm {
                     item: Some(line.item_id),
                     stock_note_line: None,
+                    order_id: None,
                     order_due_on: None,
                     location: Some(line.location_id),
                     batch: line.batch_id,
@@ -3580,20 +3583,43 @@ impl App {
         );
         let from_note = self.invoice_source == Some(InvoiceSource::StockNotes);
         let from_order = matches!(self.invoice_source, Some(InvoiceSource::Order(_)));
-        let mut order_lots = Vec::new();
-        let mut order_trade_defaults = std::collections::HashMap::new();
+        let mut orders = Vec::new();
+        let mut order_details = std::collections::BTreeMap::new();
         match self.invoice_source {
-            Some(InvoiceSource::Order(order)) => {
-                ui.label(format!(
-                    "Order {order}. Review quantities and prices before saving."
-                ));
-                match self.store.order_detail(company, order) {
-                    Ok(detail) => {
-                        order_lots = detail.delivery_lots;
-                        order_trade_defaults.extend(detail.lines.into_iter().filter_map(|line| {
-                            line.trade_ledger_id
-                                .map(|ledger| (line.line.item_id, ledger))
-                        }));
+            Some(InvoiceSource::Order(_)) => {
+                let draft_orders = (|| -> balance::Result<_> {
+                    let orders = order_ui::draft_orders(
+                        &self.store,
+                        company,
+                        self.invoice_kind,
+                        self.invoice_party,
+                    )?;
+                    if let Some(selected) = order_ui::add_order_items(
+                        ui,
+                        &orders,
+                        self.invoice_lines.iter().map(|line| line.order_id),
+                    ) {
+                        let detail = self.store.order_detail(company, selected)?;
+                        let mut lines = order_ui::invoice_lines_for_order(&detail);
+                        for line in &mut lines {
+                            if line.trade_ledger == self.invoice_trade {
+                                line.trade_ledger = None;
+                            }
+                        }
+                        self.invoice_lines.extend(lines);
+                    }
+                    let details = order_ui::draft_order_details(
+                        &self.store,
+                        company,
+                        self.invoice_lines.iter().map(|line| line.order_id),
+                    )?;
+                    Ok((orders, details))
+                })();
+                match draft_orders {
+                    Ok((mut available, details)) => {
+                        available.retain(|order| details.contains_key(&order.id));
+                        orders = available;
+                        order_details = details;
                     }
                     Err(error) => {
                         self.failure(error);
@@ -3901,6 +3927,16 @@ impl App {
                 } else {
                     ui.label(format!("{}.", index + 1));
                 }
+                let previous_order = line.order_id;
+                if from_order {
+                    order_ui::pick_line_order(
+                        ui,
+                        ("invoice-line-order", index),
+                        &orders,
+                        &mut line.order_id,
+                    );
+                }
+                let order_detail = line.order_id.and_then(|order| order_details.get(&order));
                 ui.add_enabled_ui(!from_note, |ui| {
                     let previous_item = line.item;
                     pick_stock(ui, ("invoice-item", index), "Item", &items, &mut line.item);
@@ -3910,15 +3946,22 @@ impl App {
                         }
                         line.batch = None;
                         line.order_due_on = None;
-                        if from_order {
-                            line.trade_ledger = line
-                                .item
-                                .and_then(|item| order_trade_defaults.get(&item).copied())
-                                .filter(|ledger| Some(*ledger) != document_trade);
-                        }
                         for allocation in &mut line.extra_allocations {
                             allocation.batch = None;
                         }
+                    }
+                    if from_order && (previous_item != line.item || previous_order != line.order_id)
+                    {
+                        line.order_due_on = None;
+                        line.trade_ledger = order_detail
+                            .and_then(|detail| {
+                                detail
+                                    .lines
+                                    .iter()
+                                    .find(|row| Some(row.line.item_id) == line.item)
+                            })
+                            .and_then(|row| row.trade_ledger_id)
+                            .filter(|ledger| Some(*ledger) != document_trade);
                     }
                     if let Some(batches) = line.item.and_then(|item| item_batches.get(&item)) {
                         pick_batch(ui, ("invoice-batch", index), batches, &mut line.batch);
@@ -3935,7 +3978,7 @@ impl App {
                 crate::order_ui::pick_delivery_lot(
                     ui,
                     ("invoice-order-lot", index),
-                    &order_lots,
+                    order_detail.map_or(&[], |detail| detail.delivery_lots.as_slice()),
                     line.item,
                     &mut line.order_due_on,
                 );
@@ -4118,7 +4161,11 @@ impl App {
             self.invoice_lines.remove(index);
         }
         if !from_note && ui.button("Add item line").clicked() {
-            self.invoice_lines.push(InvoiceLineForm::new());
+            let mut line = InvoiceLineForm::new();
+            if let Some(InvoiceSource::Order(order)) = self.invoice_source {
+                line.order_id = Some(order);
+            }
+            self.invoice_lines.push(line);
         }
         crate::theme::section(ui, "Services, charges and deductions");
         ui.small("Enter each amount and description manually. For an invoice without stock items, include a positive line in an income account for a sale, or an expense or asset account for a purchase. These lines do not calculate or classify tax.");
@@ -4329,14 +4376,19 @@ impl App {
                     Ok(id)
                 } else {
                     match self.invoice_source {
-                        Some(InvoiceSource::Order(order)) => {
-                            let dates: Vec<_> = self
+                        Some(InvoiceSource::Order(_)) => {
+                            let sources: Vec<_> = self
                                 .invoice_lines
                                 .iter()
-                                .map(|line| line.order_due_on.as_deref())
+                                .map(|line| {
+                                    line.order_id
+                                        .map(|order_id| balance::orders::OrderAllocation {
+                                            order_id,
+                                            expected_on: line.order_due_on.as_deref(),
+                                        })
+                                })
                                 .collect();
-                            self.store
-                                .invoice_order_for_delivery_dates(company, order, &draft, &dates)
+                            self.store.invoice_against_orders(company, &draft, &sources)
                         }
                         Some(InvoiceSource::StockNotes) => {
                             let sources = self

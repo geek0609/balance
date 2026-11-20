@@ -5,13 +5,15 @@ use super::{
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind, StockItem};
 use balance::orders::{
     OrderAmendmentDraft, OrderDeliveryLot, OrderDetail, OrderDraft, OrderLine, OrderStatus,
+    OrderSummary,
 };
 use balance::quotations::Quotation;
 use balance::stock_allocation::{StockAllocationDraft, StockAllocationPlan};
 use balance::stock_notes::note_label;
 use balance::stock_reservations::StockReservationDraft;
-use balance::{format_amount, parse_amount, Category, Error, Result};
+use balance::{format_amount, parse_amount, Category, Error, Result, Store};
 use eframe::egui;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub(super) fn pick_delivery_lot(
     ui: &mut egui::Ui,
@@ -45,7 +47,89 @@ pub(super) fn pick_delivery_lot(
             }
         });
 }
-use std::collections::HashSet;
+
+pub(super) fn draft_orders(
+    store: &Store,
+    company: i64,
+    kind: InvoiceKind,
+    party: Option<i64>,
+) -> Result<Vec<OrderSummary>> {
+    let Some(party) = party else {
+        return Ok(Vec::new());
+    };
+    let mut orders = store.orders(company)?;
+    orders.retain(|order| order.kind == kind && order.party_ledger_id == party);
+    Ok(orders)
+}
+
+pub(super) fn draft_order_details(
+    store: &Store,
+    company: i64,
+    sources: impl Iterator<Item = Option<i64>>,
+) -> Result<BTreeMap<i64, OrderDetail>> {
+    sources
+        .flatten()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|id| Ok((id, store.order_detail(company, id)?)))
+        .collect()
+}
+
+pub(super) fn add_order_items(
+    ui: &mut egui::Ui,
+    orders: &[OrderSummary],
+    used: impl Iterator<Item = Option<i64>>,
+) -> Option<i64> {
+    let used = used.flatten().collect::<HashSet<_>>();
+    let mut available = orders
+        .iter()
+        .filter(|order| order.status.has_pending() && !used.contains(&order.id))
+        .peekable();
+    available.peek()?;
+    let mut selected = None;
+    ui.menu_button("Add order items", |ui| {
+        for order in available {
+            if ui
+                .button(format!("{} · {}", order.reference, order.date))
+                .clicked()
+            {
+                selected = Some(order.id);
+                ui.close();
+            }
+        }
+    });
+    selected
+}
+
+pub(super) fn pick_line_order(
+    ui: &mut egui::Ui,
+    key: impl std::hash::Hash,
+    orders: &[OrderSummary],
+    selected: &mut Option<i64>,
+) {
+    if selected.is_none() && !orders.iter().any(|order| order.status.has_pending()) {
+        return;
+    }
+    let label = selected.map_or_else(
+        || "Unlinked".to_owned(),
+        |id| {
+            orders.iter().find(|order| order.id == id).map_or_else(
+                || format!("Order {id}"),
+                |order| format!("Order {}", order.reference),
+            )
+        },
+    );
+    egui::ComboBox::from_id_salt(key)
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(selected, None, "Unlinked");
+            for order in orders {
+                if order.status.has_pending() || *selected == Some(order.id) {
+                    ui.selectable_value(selected, Some(order.id), &order.reference);
+                }
+            }
+        });
+}
 
 #[derive(Default)]
 struct LineForm {
@@ -1301,7 +1385,10 @@ impl App {
                 );
                 if ui
                     .add_enabled(
-                        self.invoice_source != Some(InvoiceSource::Order(order.id))
+                        !self
+                            .invoice_lines
+                            .iter()
+                            .any(|line| line.order_id == Some(order.id))
                             && !self.order_screen.close_reason.trim().is_empty(),
                         egui::Button::new("Close unfulfilled quantities"),
                     )
@@ -1885,36 +1972,7 @@ impl App {
 
     fn prepare_order_invoice(&mut self, detail: &OrderDetail) {
         let order = &detail.summary;
-        let lines = detail
-            .lines
-            .iter()
-            .filter(|line| line.unfulfilled() > 0)
-            .map(|line| {
-                let mut form = InvoiceLineForm::new();
-                form.item = Some(line.line.item_id);
-                form.quantity = format_quantity(line.unfulfilled().into());
-                form.price = format_amount(line.line.unit_price);
-                form.trade_ledger = line.trade_ledger_id;
-                let allocations = detail.reserved_allocations(line.line.item_id);
-                if let Some(first) = allocations.first() {
-                    form.location = Some(first.location_id);
-                    form.batch = first.batch_id;
-                    let quantity: i128 = allocations.iter().map(|a| i128::from(a.quantity)).sum();
-                    form.quantity = format_quantity(quantity);
-                    form.extra_allocations = allocations
-                        .iter()
-                        .skip(1)
-                        .map(|a| InvoiceAllocationForm {
-                            billed_quantity: String::new(),
-                            location: Some(a.location_id),
-                            batch: a.batch_id,
-                            quantity: format_quantity(a.quantity.into()),
-                        })
-                        .collect();
-                }
-                form
-            })
-            .collect();
+        let lines = invoice_lines_for_order(detail);
         self.prepare_linked_invoice(
             InvoiceSource::Order(order.id),
             order.kind,
@@ -1922,4 +1980,38 @@ impl App {
             lines,
         );
     }
+}
+
+pub(super) fn invoice_lines_for_order(detail: &OrderDetail) -> Vec<InvoiceLineForm> {
+    detail
+        .lines
+        .iter()
+        .filter(|line| line.unfulfilled() > 0)
+        .map(|line| {
+            let mut form = InvoiceLineForm::new();
+            form.order_id = Some(detail.summary.id);
+            form.item = Some(line.line.item_id);
+            form.quantity = format_quantity(line.unfulfilled().into());
+            form.price = format_amount(line.line.unit_price);
+            form.trade_ledger = line.trade_ledger_id;
+            let allocations = detail.reserved_allocations(line.line.item_id);
+            if let Some(first) = allocations.first() {
+                form.location = Some(first.location_id);
+                form.batch = first.batch_id;
+                let quantity: i128 = allocations.iter().map(|a| i128::from(a.quantity)).sum();
+                form.quantity = format_quantity(quantity);
+                form.extra_allocations = allocations
+                    .iter()
+                    .skip(1)
+                    .map(|a| InvoiceAllocationForm {
+                        billed_quantity: String::new(),
+                        location: Some(a.location_id),
+                        batch: a.batch_id,
+                        quantity: format_quantity(a.quantity.into()),
+                    })
+                    .collect()
+            }
+            form
+        })
+        .collect()
 }

@@ -1452,7 +1452,7 @@ fn invoice_stock_allocations(
 
 pub(crate) enum StockInvoicePosting<'a> {
     Direct,
-    Order(i64),
+    Orders(&'a [Option<crate::orders::OrderAllocation<'a>>]),
     Import {
         original_postings: Option<&'a [Posting]>,
         order_allocations: Option<&'a [Option<crate::orders::OrderAllocation<'a>>]>,
@@ -1472,6 +1472,7 @@ pub(crate) fn insert_direct_invoice(
         _ => None,
     };
     let sources = match &posting {
+        StockInvoicePosting::Orders(sources) => Some(*sources),
         StockInvoicePosting::Import {
             order_allocations, ..
         } => *order_allocations,
@@ -1494,12 +1495,9 @@ pub(crate) fn insert_direct_invoice(
             if quantity == 0 {
                 continue;
             }
-            let order = match &posting {
-                StockInvoicePosting::Order(order) => Some(*order),
-                _ => sources
-                    .and_then(|sources| sources.get(index).copied().flatten())
-                    .map(|source| source.order_id),
-            };
+            let order = sources
+                .and_then(|sources| sources.get(index).copied().flatten())
+                .map(|source| source.order_id);
             if let Some(order) = order {
                 crate::stock_reservations::consume_reservations(
                     conn, order, item, location, batch, quantity, &reference,
@@ -1515,7 +1513,7 @@ pub(crate) fn insert_direct_invoice(
         }
     }
     if let Some(sources) = sources {
-        crate::orders::attach_imported_invoice_orders(conn, ids.0, sources)?;
+        crate::orders::attach_invoice_orders(conn, ids.0, sources)?;
     }
     Ok(ids)
 }
