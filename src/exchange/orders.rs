@@ -189,6 +189,7 @@ impl InvoiceOrders {
                 company,
                 order,
                 date,
+                draft,
                 std::iter::empty(),
             )?;
         }
@@ -223,17 +224,7 @@ impl InvoiceOrders {
                     .or_default()
                     .push((line.item_id, physical));
                 if let Some(due) = expected_on.filter(|_| physical == 0) {
-                    let scheduled: bool = conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM order_schedule_progress
-                         WHERE order_id = ?1 AND item_id = ?2 AND expected_on = ?3)",
-                        params![order_id, line.item_id, due],
-                        |row| row.get(0),
-                    )?;
-                    if !scheduled {
-                        return Err(Error::Validation(
-                            "Invoice due date does not match an order lot".into(),
-                        ));
-                    }
+                    crate::orders::validate_order_invoice_due(conn, order_id, line.item_id, due)?;
                 }
                 ordered.push(Some(crate::orders::OrderAllocation {
                     order_id,
@@ -247,6 +238,7 @@ impl InvoiceOrders {
                 company,
                 order,
                 date,
+                draft,
                 items.iter().map(|&(item, _)| item),
             )?;
             let physical = items
@@ -1402,19 +1394,62 @@ mod tests {
     }
 
     #[test]
-    fn manual_matching_limits_quantity_to_the_requested_due_date() {
+    fn native_order_invoice_can_bill_ahead_and_match_the_requested_due_date() {
         use crate::invoice_returns::StockReturnDraft;
         use crate::invoice_stock_links::StockNoteInvoiceAllocation;
         use crate::stock_notes::{StockNoteDraft, StockNoteLineDraft};
 
         let (mut store, company, party, item, location, order) = scheduled_sale();
-        let xml = split_sale("20260402", "BEFORE-STOCK", "", &[
-            ("<ORDERNO>SCHEDULE</ORDERNO><ORDERDUEDATE>20260412</ORDERDUEDATE><TRACKINGNUMBER>WAIT</TRACKINGNUMBER>", 3),
-        ]);
-        let plan = store.preview_xml_import(company, &envelope(&xml)).unwrap();
-        assert!(plan.can_apply(), "{:?}", plan.issues());
-        store.apply_xml_import(&plan).unwrap();
+        let trade = find_ledger(&store.conn, company, "Sales").unwrap().unwrap();
+        let draft = InvoiceDraft {
+            kind: InvoiceKind::Sale,
+            entry_mode: InvoiceEntryMode::Invoice,
+            date: "2026-04-02".into(),
+            reference: "BEFORE-STOCK".into(),
+            external_reference: Default::default(),
+            party_ledger_id: party,
+            trade_ledger_id: trade,
+            due_date: None,
+            credit_days: None,
+            narration: String::new(),
+            bill_reference: None,
+            bill_splits: Vec::new(),
+            tax_ledger_id: None,
+            tax_amount: 0,
+            additional_taxes: Vec::new(),
+            tax_calculation: None,
+            lines: vec![InvoiceLine {
+                item_id: item,
+                trade_ledger_id: None,
+                location_id: location,
+                batch_id: None,
+                extra_allocations: Vec::new(),
+                quantity: 0,
+                billed_quantity: Some(3000),
+                unit_price: 1000,
+                rate_basis: None,
+                discount: InvoiceDiscount::None,
+            }],
+            adjustments: Vec::new(),
+        };
+        assert!(store
+            .invoice_order_for_delivery_dates(company, order, &draft, &[Some("2026-04-22")])
+            .is_err());
+        assert!(store.invoices(company).unwrap().is_empty());
+        store
+            .invoice_order_for_delivery_dates(company, order, &draft, &[Some("2026-04-12")])
+            .unwrap();
         let invoice = store.invoices(company).unwrap().remove(0);
+        assert_eq!((invoice.total, invoice.lines[0].quantity), (3000, 0));
+        assert_eq!(invoice.order_ids, [order]);
+        assert_eq!(remaining(&store, company, order), [2000, 2000]);
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            8000
+        );
         let note = store
             .post_stock_note(
                 company,

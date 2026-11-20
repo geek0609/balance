@@ -649,9 +649,15 @@ pub(crate) fn validate_order_invoice_source(
     company: i64,
     order: i64,
     date: NaiveDate,
+    draft: &InvoiceDraft,
     items: impl Iterator<Item = i64>,
 ) -> Result<()> {
     let summary = order_summary(conn, company, order)?;
+    if summary.kind != draft.kind || summary.party_ledger_id != draft.party_ledger_id {
+        return Err(Error::Validation(
+            "Document type and party must match the order".into(),
+        ));
+    }
     if date < parse_date(&summary.date)? {
         return Err(Error::Validation(
             "The date cannot precede the order date".into(),
@@ -666,6 +672,26 @@ pub(crate) fn validate_order_invoice_source(
                 "Every stock item must appear on the order".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_order_invoice_due(
+    conn: &Connection,
+    order: i64,
+    item: i64,
+    due: &str,
+) -> Result<()> {
+    let scheduled: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM order_schedule_progress
+         WHERE order_id = ?1 AND item_id = ?2 AND expected_on = ?3)",
+        params![order, item, due],
+        |row| row.get(0),
+    )?;
+    if !scheduled {
+        return Err(Error::Validation(
+            "Invoice due date does not match an order lot".into(),
+        ));
     }
     Ok(())
 }
@@ -1332,7 +1358,22 @@ impl Store {
         let date = parse_date(&draft.date)?;
         let mut items_by_order = BTreeMap::<_, Vec<_>>::new();
         for (line, source) in draft.lines.iter().zip(sources) {
-            if let Some(source) = source {
+            let Some(source) = source else {
+                continue;
+            };
+            if line.quantity == 0 {
+                validate_order_invoice_source(
+                    &tx,
+                    company,
+                    source.order_id,
+                    date,
+                    draft,
+                    std::iter::once(line.item_id),
+                )?;
+                if let Some(due) = source.expected_on {
+                    validate_order_invoice_due(&tx, source.order_id, line.item_id, due)?;
+                }
+            } else {
                 items_by_order
                     .entry(source.order_id)
                     .or_default()
