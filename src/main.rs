@@ -5084,9 +5084,11 @@ impl App {
                 plan.item_count(),
                 plan.stock_opening_count()
             ));
-            if plan.stock_note_count() > 0 || plan.stock_match_count() > 0 {
+            if plan.order_count() > 0 || plan.stock_note_count() > 0 || plan.stock_match_count() > 0
+            {
                 ui.label(format!(
-                    "{} stock notes and {} tracking matches",
+                    "{} orders, {} stock notes and {} tracking matches",
+                    plan.order_count(),
                     plan.stock_note_count(),
                     plan.stock_match_count()
                 ));
@@ -5120,8 +5122,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} stock notes, {} tracking matches, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
-                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.stock_notes, counts.stock_matches, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
+                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} orders, {} stock notes, {} tracking matches, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
+                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.orders, counts.stock_notes, counts.stock_matches, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
                         );
                         self.import_preview = None;
                     }

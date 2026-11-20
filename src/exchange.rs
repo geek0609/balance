@@ -32,6 +32,7 @@ use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
+mod orders;
 mod stock_notes;
 pub(crate) use stock_notes::migrate as migrate_stock_tracking;
 
@@ -366,6 +367,7 @@ pub struct ImportPlan {
     transactions: Vec<Transaction>,
     invoices: Vec<ImportedInvoice>,
     stock_notes: Vec<stock_notes::ImportedStockNote>,
+    orders: Vec<orders::ImportedOrder>,
     stock_matches: Option<Vec<stock_notes::TrackingMatch>>,
     settlements: Vec<ImportedSettlement>,
     bill_notes: Vec<ImportedBillNote>,
@@ -390,6 +392,7 @@ impl ImportPlan {
             .map(|row| row.date.as_str())
             .chain(self.invoices.iter().map(|row| row.date.as_str()))
             .chain(self.stock_notes.iter().map(|row| row.date.as_str()))
+            .chain(self.orders.iter().map(|row| row.date.as_str()))
             .chain(self.settlements.iter().map(|row| row.date.as_str()))
             .chain(self.bill_notes.iter().map(|row| row.date.as_str()))
             .chain(self.opening_date.as_deref().filter(|_| openings));
@@ -417,6 +420,9 @@ impl ImportPlan {
     }
     pub fn stock_note_count(&self) -> usize {
         self.stock_notes.len()
+    }
+    pub fn order_count(&self) -> usize {
+        self.orders.len()
     }
     pub fn stock_match_count(&self) -> usize {
         self.stock_matches.as_ref().map_or(0, Vec::len)
@@ -557,6 +563,7 @@ impl ImportPlan {
                 || !self.transactions.is_empty()
                 || !self.invoices.is_empty()
                 || !self.stock_notes.is_empty()
+                || !self.orders.is_empty()
                 || !self.settlements.is_empty()
                 || !self.bill_notes.is_empty())
     }
@@ -571,6 +578,7 @@ pub struct ImportCounts {
     pub vouchers: usize,
     pub invoices: usize,
     pub stock_notes: usize,
+    pub orders: usize,
     pub stock_matches: usize,
     pub settlements: usize,
     pub bill_notes: usize,
@@ -4109,6 +4117,7 @@ impl Store {
             transactions: Vec::new(),
             invoices: Vec::new(),
             stock_notes: Vec::new(),
+            orders: Vec::new(),
             stock_matches: None,
             settlements: Vec::new(),
             bill_notes: Vec::new(),
@@ -5235,6 +5244,23 @@ impl Store {
             })
             .collect();
         let mut stock_note_references = HashSet::new();
+        let mut order_references = HashSet::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT o.kind, l.name, o.reference_key FROM orders o
+                 JOIN ledgers l ON l.id = o.party_ledger_id WHERE o.company_id = ?1",
+            )?;
+            let rows = stmt.query_map([company_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    normalized(&row.get::<_, String>(1)?),
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                order_references.insert(row?);
+            }
+        }
         {
             let mut stmt = self.conn.prepare(
                 "SELECT n.kind, l.name, n.reference_key FROM stock_notes n
@@ -5262,9 +5288,12 @@ impl Store {
             let metadata = source_metadata(node, &label, &mut plan.issues);
             let voucher_type = direct_text(node, "VOUCHERTYPENAME");
             let stock_kind = voucher_type.as_deref().and_then(stock_notes::kind);
+            let order_kind = voucher_type.as_deref().and_then(orders::kind);
             register_metadata(
                 if stock_kind.is_some() {
                     "stocknote"
+                } else if order_kind.is_some() {
+                    "order"
                 } else {
                     "voucher"
                 },
@@ -5273,6 +5302,30 @@ impl Store {
                 &mut seen_metadata,
                 &mut plan.issues,
             );
+            if let Some(kind) = order_kind {
+                match orders::parse(
+                    node,
+                    kind,
+                    &label,
+                    metadata,
+                    &invoice_ledgers,
+                    &invoice_items,
+                    &mut plan.issues,
+                ) {
+                    Ok(order) => {
+                        if !order_references.insert((
+                            kind.as_str().to_owned(),
+                            normalized(&order.party),
+                            normalized(&order.reference),
+                        )) {
+                            plan.issues.push(format!("{label}: an order with the same type, party and reference already exists"));
+                        }
+                        plan.orders.push(order);
+                    }
+                    Err(error) => plan.issues.push(format!("{label}: {error}")),
+                }
+                continue;
+            }
             if let Some(kind) = stock_kind {
                 match stock_notes::parse(
                     node,
@@ -6014,6 +6067,7 @@ impl Store {
             && plan.transactions.is_empty()
             && plan.invoices.is_empty()
             && plan.stock_notes.is_empty()
+            && plan.orders.is_empty()
             && plan.settlements.is_empty()
             && plan.bill_notes.is_empty()
             && plan.units.is_empty()
@@ -6035,6 +6089,7 @@ impl Store {
         }
         if plan.can_apply()
             && (!plan.stock_notes.is_empty()
+                || !plan.orders.is_empty()
                 || plan
                     .invoices
                     .iter()
@@ -6629,6 +6684,9 @@ impl Store {
                 }
             }
         }
+        for order in &plan.orders {
+            orders::write(conn, plan.company_id, order)?;
+        }
         let mut tracking = stock_notes::NewTracking::default();
         let mut note_order = plan.stock_notes.iter().collect::<Vec<_>>();
         note_order.sort_by_key(|row| (&row.date, row.kind == InvoiceKind::Sale));
@@ -6996,6 +7054,7 @@ impl Store {
                 vouchers: plan.transactions.len(),
                 invoices: plan.invoices.len(),
                 stock_notes: plan.stock_notes.len(),
+                orders: plan.orders.len(),
                 stock_matches: stock_matches.len(),
                 settlements: plan.settlement_count(),
                 bill_notes: plan.bill_note_count(),
@@ -11276,6 +11335,7 @@ mod tests {
             transactions: Vec::new(),
             invoices: vec![sale],
             stock_notes: Vec::new(),
+            orders: Vec::new(),
             stock_matches: None,
             settlements: Vec::new(),
             bill_notes: Vec::new(),

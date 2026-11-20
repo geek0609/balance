@@ -501,7 +501,7 @@ impl App {
                     ui.strong(title);
                 }
                 ui.end_row();
-                for line in rows {
+                for (index, line) in rows.into_iter().enumerate() {
                     ui.label(
                         line.expected_on
                             .map(|date| date.to_string())
@@ -515,7 +515,7 @@ impl App {
                         format_quantity(i128::from(line.remaining)),
                         line.unit
                     ));
-                    ui.push_id((line.order_id, line.item_id), |ui| {
+                    ui.push_id((line.order_id, line.item_id, index), |ui| {
                         if ui.button("View order").clicked() {
                             self.order_screen.select(line.order_id);
                         }
@@ -1118,6 +1118,30 @@ impl App {
             }
         });
         ui.label(format!("{} | {}", order.date, order.party));
+        if let Some(number) = &detail.source_voucher_number {
+            ui.small(format!("Source voucher {number}"));
+        }
+        if !detail.delivery_lots.is_empty() {
+            ui.collapsing("Delivery schedule", |ui| {
+                for lot in &detail.delivery_lots {
+                    ui.label(format!(
+                        "{} · {} · {} {} ordered · {} remaining",
+                        lot.item,
+                        lot.expected_on.as_deref().unwrap_or("Undated"),
+                        format_quantity(lot.quantity.into()),
+                        lot.unit,
+                        format_quantity(lot.remaining.into())
+                    ));
+                    if lot.source_location.is_some() || lot.source_batch.is_some() {
+                        ui.small(format!(
+                            "{} · {}",
+                            lot.source_location.as_deref().unwrap_or("No location"),
+                            lot.source_batch.as_deref().unwrap_or("No batch")
+                        ));
+                    }
+                }
+            });
+        }
         if let Some(date) = &order.expected_on {
             ui.label(format!("Expected {date}"));
         }

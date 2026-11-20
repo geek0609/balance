@@ -512,6 +512,23 @@ impl Store {
             );
         }
         let _ = write!(html, "</tbody></table><table class=\"totals\"><tr class=\"total\"><td>Order subtotal</td><td class=\"num\">{}</td></tr></table>", money(detail.total));
+        if !detail.delivery_lots.is_empty() {
+            html.push_str("<h2>Delivery schedule</h2><table><thead><tr><th>Item</th><th>Expected</th><th>Location</th><th>Batch</th><th>Ordered</th><th>Remaining</th></tr></thead><tbody>");
+            for lot in detail.delivery_lots {
+                let _ = write!(
+                    html,
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} {}</td><td>{}</td></tr>",
+                    escape(&lot.item),
+                    escape(lot.expected_on.as_deref().unwrap_or("Undated")),
+                    escape(lot.source_location.as_deref().unwrap_or("—")),
+                    escape(lot.source_batch.as_deref().unwrap_or("—")),
+                    format_quantity(lot.quantity.into()),
+                    escape(&lot.unit),
+                    format_quantity(lot.remaining.into())
+                );
+            }
+            html.push_str("</tbody></table>");
+        }
         if !order.notes.is_empty() {
             let _ = write!(
                 html,

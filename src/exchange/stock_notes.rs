@@ -11,6 +11,7 @@ pub(super) struct ImportedStockNote {
     pub kind: InvoiceKind,
     party_id: Option<i64>,
     narration: String,
+    order_reference: Option<String>,
     lines: Vec<NoteLine>,
     metadata: SourceMetadata,
 }
@@ -23,6 +24,8 @@ struct NoteLine {
     precision: u8,
     allocation: ImportedStockAllocation,
     value: Option<i64>,
+    order_reference: Option<String>,
+    order_due_on: Option<String>,
 }
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -72,6 +75,8 @@ struct NoteStock<'a> {
     items: &'a InvoiceStockItems,
     locations: &'a HashMap<String, Option<i64>>,
     batches: &'a HashMap<(String, String), i64>,
+    order_reference: Option<String>,
+    order_due_on: Option<String>,
 }
 
 impl NoteStock<'_> {
@@ -93,6 +98,7 @@ impl NoteStock<'_> {
                 "GODOWNNAME",
                 "TRACKINGNUMBER",
                 "ORDERNO",
+                "ORDERDUEDATE",
                 "BATCHALLOCATIONS.LIST",
             ],
             label,
@@ -141,16 +147,23 @@ impl NoteStock<'_> {
                         "AMOUNT",
                         "TRACKINGNUMBER",
                         "ORDERNO",
+                        "ORDERDUEDATE",
                     ],
                     label,
                     issues,
                 );
             }
-            if tracking(direct_text(node, "ORDERNO")).is_some()
-                || tracking(direct_text(entry, "ORDERNO")).is_some()
-            {
+            let order_reference = orders::source_ref(
+                direct_text(entry, "ORDERNO")
+                    .or_else(|| direct_text(node, "ORDERNO"))
+                    .or_else(|| self.order_reference.clone()),
+            );
+            let order_due_on = orders::due_date(entry)?
+                .or(orders::due_date(node)?)
+                .or_else(|| self.order_due_on.clone());
+            if order_due_on.is_some() && order_reference.is_none() {
                 return Err(Error::Validation(
-                    "Stock notes with order references require an order import".into(),
+                    "Stock note order due date requires an order reference".into(),
                 ));
             }
             let location = direct_text(entry, "GODOWNNAME")
@@ -205,6 +218,8 @@ impl NoteStock<'_> {
                     ),
                 },
                 value: stored_value(entry)?,
+                order_reference,
+                order_due_on,
             });
         }
         if planned
@@ -297,6 +312,9 @@ pub(super) fn parse(
             "ALLLEDGERENTRIES.LIST",
             "ISCANCELLED",
             "ISOPTIONAL",
+            "ORDERNO",
+            "BASICORDERREF",
+            "ORDERDUEDATE",
         ],
         label,
         issues,
@@ -325,6 +343,9 @@ pub(super) fn parse(
         items,
         locations,
         batches,
+        order_reference: direct_text(node, "ORDERNO")
+            .or_else(|| direct_text(node, "BASICORDERREF")),
+        order_due_on: orders::due_date(node)?,
     };
     let mut lines = Vec::new();
     for entry in node
@@ -359,6 +380,15 @@ pub(super) fn parse(
             "Stock note needs at least one inventory line".into(),
         ));
     }
+    let order_reference = lines[0].order_reference.clone();
+    if lines.iter().any(|line| {
+        line.order_reference.as_deref().map(normalized)
+            != order_reference.as_deref().map(normalized)
+    }) {
+        return Err(Error::Validation(
+            "A stock note can fulfil one order".into(),
+        ));
+    }
     Ok(ImportedStockNote {
         date: xml_date(&invoice_field(node, "DATE")?)?,
         reference: invoice_field(node, "VOUCHERNUMBER")?,
@@ -366,6 +396,7 @@ pub(super) fn parse(
         kind,
         party_id: *party_id,
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
+        order_reference,
         lines,
         metadata,
     })
@@ -401,6 +432,11 @@ impl NewTracking {
                 note.party
             )));
         }
+        let order_id = note
+            .order_reference
+            .as_deref()
+            .map(|reference| orders::linked_order(conn, company, party, note.kind, reference))
+            .transpose()?;
         let mut lines = Vec::with_capacity(note.lines.len());
         let mut costs = Vec::with_capacity(note.lines.len());
         for line in &note.lines {
@@ -438,10 +474,19 @@ impl NewTracking {
             date: note.date.clone(),
             reference: note.reference.clone(),
             party_ledger_id: party,
-            order_id: None,
+            order_id,
             narration: note.narration.clone(),
             lines,
         };
+        if let Some(order) = order_id {
+            orders::check_delivery_lots(
+                conn,
+                order,
+                draft.lines.iter().zip(&note.lines).map(|(line, source)| {
+                    (line.item_id, line.quantity, source.order_due_on.as_deref())
+                }),
+            )?;
+        }
         let id = crate::stock_notes::write_stock_note(conn, company, &draft, Some(&costs))?;
         save_metadata(conn, company, "stocknote", id, &note.metadata)?;
         let mut stmt =

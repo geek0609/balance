@@ -239,6 +239,18 @@ pub struct PendingOrderLine {
     pub unit: String,
     pub remaining: i64,
 }
+
+#[derive(Debug, Clone)]
+pub struct OrderDeliveryLot {
+    pub item_id: i64,
+    pub item: String,
+    pub unit: String,
+    pub expected_on: Option<String>,
+    pub quantity: i64,
+    pub remaining: i64,
+    pub source_location: Option<String>,
+    pub source_batch: Option<String>,
+}
 impl OrderLineProgress {
     pub fn unfulfilled(&self) -> i64 {
         self.line.quantity - self.fulfilled - self.preclosed
@@ -261,6 +273,45 @@ pub struct OrderDetail {
     pub line_closures: Vec<OrderLineClosure>,
     pub reservations: Vec<crate::stock_reservations::StockReservation>,
     pub total: i128,
+    pub delivery_lots: Vec<OrderDeliveryLot>,
+    pub source_voucher_number: Option<String>,
+}
+
+pub(crate) fn migrate_delivery_lots(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS order_delivery_lots(
+            id INTEGER PRIMARY KEY,
+            order_line_id INTEGER NOT NULL REFERENCES order_lines(id),
+            expected_on TEXT,
+            quantity INTEGER NOT NULL CHECK(quantity > 0),
+            source_location TEXT,
+            source_batch TEXT
+         );
+         CREATE INDEX IF NOT EXISTS order_delivery_lots_line ON order_delivery_lots(order_line_id);
+         CREATE TABLE IF NOT EXISTS imported_order_numbers(
+            order_id INTEGER PRIMARY KEY REFERENCES orders(id),
+            voucher_number TEXT NOT NULL,
+            reference_key TEXT NOT NULL
+         );
+         CREATE VIEW IF NOT EXISTS order_schedule_progress AS
+            SELECT id AS lot_id, line_id, order_id, item_id, expected_on, quantity,
+                   MIN(quantity, MAX(0, cumulative - fulfilled - preclosed)) AS remaining
+            FROM (
+                SELECT lot.id, p.id AS line_id, p.order_id, p.item_id, lot.quantity, p.fulfilled, p.preclosed,
+                       COALESCE(lot.expected_on, o.expected_on) AS expected_on,
+                       SUM(lot.quantity) OVER(PARTITION BY p.id
+                           ORDER BY COALESCE(lot.expected_on, o.expected_on) IS NULL,
+                                    COALESCE(lot.expected_on, o.expected_on), lot.id
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative
+                FROM order_line_availability p JOIN orders o ON o.id = p.order_id
+                JOIN order_delivery_lots lot ON lot.order_line_id = p.id
+            )
+            UNION ALL
+            SELECT NULL, p.id, p.order_id, p.item_id, o.expected_on, p.quantity, p.quantity - p.fulfilled - p.preclosed
+            FROM order_line_availability p JOIN orders o ON o.id = p.order_id
+            WHERE NOT EXISTS(SELECT 1 FROM order_delivery_lots lot WHERE lot.order_line_id = p.id);",
+    )?;
+    Ok(())
 }
 
 impl OrderDetail {
@@ -669,15 +720,15 @@ impl Store {
     ) -> Result<Vec<PendingOrderLine>> {
         let through = expected_through.map(parse_date).transpose()?;
         let mut stmt = self.conn.prepare(
-            "SELECT o.id, o.kind, o.reference, l.name, o.expected_on,
-                    p.item_id, s.name, s.unit, p.quantity, p.fulfilled, p.preclosed
+            "SELECT o.id, o.kind, o.reference, l.name, p.expected_on,
+                    p.item_id, s.name, s.unit, p.remaining
              FROM orders o
-             JOIN order_line_availability p ON p.order_id = o.id
+             JOIN order_schedule_progress p ON p.order_id = o.id
              JOIN ledgers l ON l.id = o.party_ledger_id AND l.company_id = o.company_id
              JOIN stock_items s ON s.id = p.item_id AND s.company_id = o.company_id
-             WHERE o.company_id = ?1 AND o.closed_at IS NULL AND p.quantity - p.fulfilled != p.preclosed
+             WHERE o.company_id = ?1 AND o.closed_at IS NULL AND p.remaining != 0
                AND (?2 IS NULL OR o.kind = ?2)
-             ORDER BY o.id, p.id",
+             ORDER BY o.id, p.line_id, p.lot_id",
         )?;
         let rows = stmt.query_map(params![company, kind.map(InvoiceKind::as_str)], |row| {
             Ok((
@@ -690,26 +741,16 @@ impl Store {
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, i64>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, i64>(10)?,
             ))
         })?;
         let mut schedule = Vec::new();
         for row in rows {
-            let (
-                order_id,
-                kind,
-                reference,
-                party,
-                date,
-                item_id,
-                item,
-                unit,
-                ordered,
-                fulfilled,
-                preclosed,
-            ) = row?;
-            let remaining = remaining_quantity(ordered, fulfilled, preclosed)?;
+            let (order_id, kind, reference, party, date, item_id, item, unit, remaining) = row?;
+            if remaining < 0 {
+                return Err(Error::Validation(
+                    "Order quantities are inconsistent".into(),
+                ));
+            }
             let expected_on = date.as_deref().map(parse_date).transpose()?;
             if through.is_some_and(|limit| expected_on.is_none_or(|date| date > limit)) {
                 continue;
@@ -781,6 +822,27 @@ impl Store {
             .iter()
             .map(|line| (line.item_id, line))
             .collect();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT l.item_id, l.quantity FROM order_lines l
+                 JOIN order_delivery_lots s ON s.order_line_id = l.id WHERE l.order_id = ?1",
+            )?;
+            let rows = stmt.query_map([id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (item, quantity) = row?;
+                if updated
+                    .get(&item)
+                    .is_none_or(|line| line.quantity != quantity)
+                {
+                    return Err(Error::Validation(
+                        "Use a new order to change a quantity with an imported delivery schedule"
+                            .into(),
+                    ));
+                }
+            }
+        }
         if reference == current.reference
             && expected_on == current.expected_on
             && notes == current.notes
@@ -944,10 +1006,38 @@ impl Store {
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let delivery_lots = {
+            let mut stmt = tx.prepare(
+                "SELECT p.item_id, i.name, i.unit, p.expected_on, p.quantity, p.remaining, l.source_location, l.source_batch
+                 FROM order_schedule_progress p JOIN stock_items i ON i.id = p.item_id
+                 JOIN order_delivery_lots l ON l.id = p.lot_id WHERE p.order_id = ?1
+                 ORDER BY p.expected_on IS NULL, p.expected_on, p.lot_id",
+            )?;
+            let rows = stmt.query_map([id], |row| {
+                Ok(OrderDeliveryLot {
+                    item_id: row.get(0)?,
+                    item: row.get(1)?,
+                    unit: row.get(2)?,
+                    expected_on: row.get(3)?,
+                    quantity: row.get(4)?,
+                    remaining: row.get(5)?,
+                    source_location: row.get(6)?,
+                    source_batch: row.get(7)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         for row in &lines {
             total += i128::from(line_amount(row.line.quantity, row.line.unit_price)?);
         }
         let reservations = crate::stock_reservations::order_reservations(&tx, company, id)?;
+        let source_voucher_number = tx
+            .query_row(
+                "SELECT voucher_number FROM imported_order_numbers WHERE order_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
         tx.commit()?;
         Ok(OrderDetail {
             summary,
@@ -956,6 +1046,8 @@ impl Store {
             line_closures,
             reservations,
             total,
+            delivery_lots,
+            source_voucher_number,
         })
     }
 
