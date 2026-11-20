@@ -6,6 +6,7 @@ use crate::{parse_date, required, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -75,6 +76,7 @@ pub struct StockReturn {
     pub reason: String,
     pub reversed_on: Option<String>,
     pub reversal_reason: Option<String>,
+    pub source_notes: i64,
     pub lines: Vec<StockReturnLine>,
 }
 
@@ -189,8 +191,10 @@ pub(crate) fn require_available(
 impl Store {
     pub fn stock_note_returns(&self, company: i64, note: i64) -> Result<Vec<StockReturn>> {
         let mut headers = self.conn.prepare(
-            "SELECT id, reference, date, reason, reversed_on, reversal_reason FROM stock_returns
-             WHERE company_id = ?1 AND note_id = ?2 ORDER BY date DESC, id DESC",
+            "SELECT r.id, r.reference, r.date, r.reason, r.reversed_on, r.reversal_reason,
+                    MAX(1, (SELECT COUNT(*) FROM imported_stock_return_parts p JOIN imported_stock_return_parts q
+                            ON q.document_id = p.document_id WHERE p.return_id = r.id))
+             FROM stock_returns r WHERE r.company_id = ?1 AND r.note_id = ?2 ORDER BY r.date DESC, r.id DESC",
         )?;
         let mut details = self.conn.prepare(
             "SELECT i.name, i.unit, loc.name, b.name, l.quantity
@@ -220,6 +224,7 @@ impl Store {
                 reason: row.get(3)?,
                 reversed_on: row.get(4)?,
                 reversal_reason: row.get(5)?,
+                source_notes: row.get(6)?,
                 lines,
             });
         }
@@ -235,49 +240,17 @@ impl Store {
         reason: &str,
         lines: &[StockReturnLineDraft],
     ) -> Result<i64> {
-        let date = parse_date(date)?;
-        let reference = required(reference, "Return reference")?;
-        let reason = required(reason, "Return reason")?;
-        if lines.is_empty() {
-            return Err(Error::Validation("Enter a quantity to return".into()));
-        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let source = stock_notes::get_note(&tx, company, note)?;
-        if source.reversed_on.is_some() || date < parse_date(&source.date)? {
-            return Err(Error::Validation(
-                "Select an active stock note and a return date on or after its date".into(),
-            ));
-        }
-        stock_notes::check_after_invoice_reversals(&tx, company, note, date, true)?;
-        check_after_returns(&tx, company, note, date, true)?;
-        let mut available = stock_notes::note_lines(&tx, company, note)?
+        let available = stock_notes::note_lines(&tx, company, note)?
             .into_iter()
             .map(|line| (line.id, line))
             .collect::<std::collections::HashMap<_, _>>();
-        if tx.execute(
-            "INSERT INTO stock_returns(company_id, note_id, date, reference, reference_key, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(note_id, reference_key) DO NOTHING",
-            params![
-                company,
-                note,
-                date.to_string(),
-                reference,
-                reference.to_lowercase(),
-                reason
-            ],
-        )? != 1
-        {
-            return Err(Error::Validation(
-                "A return with this reference already exists for the note".into(),
-            ));
-        }
-        let return_id = tx.last_insert_rowid();
-        let movement_reason = format!("Return {reference} from {}: {reason}", source.reference);
+        let mut selections = Vec::with_capacity(lines.len());
         for requested in lines {
-            let mut line = available.remove(&requested.note_line).ok_or_else(|| {
-                Error::Validation("Select each stock note line at most once".into())
+            let line = available.get(&requested.note_line).ok_or_else(|| {
+                Error::Validation("Select a line on the source stock note".into())
             })?;
             if requested.quantity <= 0 || requested.quantity > line.unbilled() {
                 return Err(Error::Validation(format!(
@@ -285,40 +258,14 @@ impl Store {
                     line.item
                 )));
             }
-            check_quantity_precision(&tx, company, line.values.item_id, requested.quantity)?;
-            let spans = stock_notes::allocate_spans(&tx, &line, requested.quantity)?;
-            line.values.quantity = requested.quantity;
-            if source.kind == InvoiceKind::Purchase {
-                require_available(&tx, company, date, &line.values)?;
-            }
-            let movement = stock_notes::insert_movement(
-                &tx,
-                company,
-                date,
-                &line.values,
-                -stock_notes::stock_direction(source.kind),
-                &movement_reason,
-            )?;
-            tx.execute(
-                "INSERT INTO stock_return_lines(return_id, note_line_id, quantity, adjustment_id) VALUES (?1, ?2, ?3, ?4)",
-                params![return_id, line.id, requested.quantity, movement],
-            )?;
-            let line_id = tx.last_insert_rowid();
-            for span in &spans {
-                tx.execute(
-                    "INSERT INTO stock_return_spans VALUES (?1, ?2, ?3)",
-                    params![line_id, span.start, span.end - span.start],
-                )?;
-            }
-            crate::order_lots::record_return(
-                &tx,
-                crate::order_lots::Source::NoteLine(line.id),
-                crate::order_lots::Return::Stock(line_id),
-                &spans,
-            )?;
+            selections.push(StockReturnSelection {
+                note_line: requested.note_line,
+                spans: stock_notes::allocate_spans(&tx, line, requested.quantity)?,
+            });
         }
+        let id = write_stock_return(&tx, company, note, date, reference, reason, &selections)?;
         tx.commit()?;
-        Ok(return_id)
+        Ok(id)
     }
 
     pub fn reverse_stock_return(
@@ -333,89 +280,217 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (note, reference, returned_on): (i64, String, String) = tx.query_row(
-            "SELECT note_id, reference, date FROM stock_returns WHERE company_id = ?1 AND id = ?2 AND reversed_on IS NULL",
-            params![company, id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional()?.ok_or_else(|| Error::Validation("Select an active stock return".into()))?;
-        if date < parse_date(&returned_on)? {
-            return Err(Error::Validation(
-                "Reversal date cannot precede the return date".into(),
-            ));
-        }
-        let source = stock_notes::get_note(&tx, company, note)?;
-        let lines = {
-            let mut stmt = tx.prepare(
-                "SELECT l.id, src.item_id, src.location_id, src.batch_id, l.quantity, src.unit_price, o.order_id
-                 FROM stock_return_lines l JOIN stock_note_lines src ON src.id = l.note_line_id
-                 LEFT JOIN stock_note_order_sources o ON o.note_line_id = src.id
-                 WHERE l.return_id = ?1 ORDER BY l.id",
+        let returns = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT r.id FROM stock_returns r
+                 LEFT JOIN imported_stock_return_parts part ON part.return_id = r.id
+                 WHERE r.company_id = ?1 AND (r.id = ?2 OR part.document_id = (
+                     SELECT document_id FROM imported_stock_return_parts WHERE return_id = ?2
+                 )) ORDER BY r.id",
             )?;
-            let result = stmt
-                .query_map([id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        StockNoteLineDraft {
-                            item_id: row.get(1)?,
-                            location_id: row.get(2)?,
-                            batch_id: row.get(3)?,
-                            quantity: row.get(4)?,
-                            unit_price: row.get(5)?,
-                        },
-                        row.get::<_, Option<i64>>(6)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            result
+            let rows = stmt.query_map(params![company, id], |row| row.get::<_, i64>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let mut orders = BTreeMap::<_, Vec<_>>::new();
-        for (_, line, order) in &lines {
-            if let Some(order) = order {
-                orders
-                    .entry(*order)
-                    .or_default()
-                    .push((line.item_id, line.quantity));
-            }
+        if returns.is_empty() {
+            return Err(Error::Validation("Select an active stock return".into()));
         }
-        for (&order, quantities) in &orders {
-            crate::orders::check_fulfilment(
-                &tx,
-                company,
-                order,
-                source.kind,
-                source.party_ledger_id,
-                date,
-                crate::orders::FulfilmentChange::ReverseReturn,
-                quantities.iter().copied(),
-            )?;
-        }
-        let movement_reason = format!("Return {reference} reversal: {reason}");
-        for (line_id, line, _) in lines {
-            if source.kind == InvoiceKind::Sale {
-                require_available(&tx, company, date, &line)?;
-            }
-            let movement = stock_notes::insert_movement(
-                &tx,
-                company,
-                date,
-                &line,
-                stock_notes::stock_direction(source.kind),
-                &movement_reason,
-            )?;
-            tx.execute(
-                "UPDATE stock_return_lines SET reversal_adjustment_id = ?1 WHERE id = ?2",
-                params![movement, line_id],
-            )?;
-        }
-        tx.execute(
-            "UPDATE stock_returns SET reversed_on = ?1, reversal_reason = ?2 WHERE id = ?3",
-            params![date.to_string(), reason, id],
-        )?;
-        for order in orders.into_keys() {
-            crate::stock_reservations::check_order_coverage(&tx, order)?;
+        for return_id in returns {
+            reverse_one_return(&tx, company, return_id, date, reason)?;
         }
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Stock positions prepared from the source note in the current transaction.
+pub(crate) struct StockReturnSelection {
+    pub note_line: i64,
+    pub spans: Vec<Range<i64>>,
+}
+
+pub(crate) fn write_stock_return(
+    conn: &Connection,
+    company: i64,
+    note: i64,
+    date: &str,
+    reference: &str,
+    reason: &str,
+    lines: &[StockReturnSelection],
+) -> Result<i64> {
+    let date = parse_date(date)?;
+    let reference = required(reference, "Return reference")?;
+    let reason = required(reason, "Return reason")?;
+    if lines.is_empty() {
+        return Err(Error::Validation("Enter a quantity to return".into()));
+    }
+    let source = stock_notes::get_note(conn, company, note)?;
+    if source.reversed_on.is_some() || date < parse_date(&source.date)? {
+        return Err(Error::Validation(
+            "Select an active stock note and a return date on or after its date".into(),
+        ));
+    }
+    stock_notes::check_after_invoice_reversals(conn, company, note, date, true)?;
+    check_after_returns(conn, company, note, date, true)?;
+    let mut available = stock_notes::note_lines(conn, company, note)?
+        .into_iter()
+        .map(|line| (line.id, line))
+        .collect::<std::collections::HashMap<_, _>>();
+    if conn.execute(
+        "INSERT INTO stock_returns(company_id, note_id, date, reference, reference_key, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(note_id, reference_key) DO NOTHING",
+        params![
+            company,
+            note,
+            date.to_string(),
+            reference,
+            reference.to_lowercase(),
+            reason
+        ],
+    )? != 1
+    {
+        return Err(Error::Validation(
+            "A return with this reference already exists for the note".into(),
+        ));
+    }
+    let return_id = conn.last_insert_rowid();
+    let movement_reason = format!("Return {reference} from {}: {reason}", source.reference);
+    for requested in lines {
+        let mut line = available
+            .remove(&requested.note_line)
+            .ok_or_else(|| Error::Validation("Select each stock note line at most once".into()))?;
+        let quantity: i64 = requested
+            .spans
+            .iter()
+            .map(|span| span.end - span.start)
+            .sum();
+        if quantity <= 0 || quantity > line.unbilled() {
+            return Err(Error::Validation(format!(
+                "Return quantity exceeds the unbilled stock for {}",
+                line.item
+            )));
+        }
+        check_quantity_precision(conn, company, line.values.item_id, quantity)?;
+        line.values.quantity = quantity;
+        if source.kind == InvoiceKind::Purchase {
+            require_available(conn, company, date, &line.values)?;
+        }
+        let movement = stock_notes::insert_movement(
+            conn,
+            company,
+            date,
+            &line.values,
+            -stock_notes::stock_direction(source.kind),
+            &movement_reason,
+        )?;
+        conn.execute(
+            "INSERT INTO stock_return_lines(return_id, note_line_id, quantity, adjustment_id) VALUES (?1, ?2, ?3, ?4)",
+            params![return_id, line.id, quantity, movement],
+        )?;
+        let line_id = conn.last_insert_rowid();
+        for span in &requested.spans {
+            conn.execute(
+                "INSERT INTO stock_return_spans VALUES (?1, ?2, ?3)",
+                params![line_id, span.start, span.end - span.start],
+            )?;
+        }
+        crate::order_lots::record_return(
+            conn,
+            crate::order_lots::Source::NoteLine(line.id),
+            crate::order_lots::Return::Stock(line_id),
+            &requested.spans,
+        )?;
+    }
+    Ok(return_id)
+}
+
+fn reverse_one_return(
+    conn: &Connection,
+    company: i64,
+    id: i64,
+    date: NaiveDate,
+    reason: &str,
+) -> Result<()> {
+    let (note, reference, returned_on): (i64, String, String) = conn.query_row(
+        "SELECT note_id, reference, date FROM stock_returns WHERE company_id = ?1 AND id = ?2 AND reversed_on IS NULL",
+        params![company, id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?.ok_or_else(|| Error::Validation("Select an active stock return".into()))?;
+    if date < parse_date(&returned_on)? {
+        return Err(Error::Validation(
+            "Reversal date cannot precede the return date".into(),
+        ));
+    }
+    let source = stock_notes::get_note(conn, company, note)?;
+    let lines = {
+        let mut stmt = conn.prepare(
+            "SELECT l.id, src.item_id, src.location_id, src.batch_id, l.quantity, src.unit_price, o.order_id
+             FROM stock_return_lines l JOIN stock_note_lines src ON src.id = l.note_line_id
+             LEFT JOIN stock_note_order_sources o ON o.note_line_id = src.id
+             WHERE l.return_id = ?1 ORDER BY l.id",
+        )?;
+        let result = stmt
+            .query_map([id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    StockNoteLineDraft {
+                        item_id: row.get(1)?,
+                        location_id: row.get(2)?,
+                        batch_id: row.get(3)?,
+                        quantity: row.get(4)?,
+                        unit_price: row.get(5)?,
+                    },
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        result
+    };
+    let mut orders = BTreeMap::<_, Vec<_>>::new();
+    for (_, line, order) in &lines {
+        if let Some(order) = order {
+            orders
+                .entry(*order)
+                .or_default()
+                .push((line.item_id, line.quantity));
+        }
+    }
+    for (&order, quantities) in &orders {
+        crate::orders::check_fulfilment(
+            conn,
+            company,
+            order,
+            source.kind,
+            source.party_ledger_id,
+            date,
+            crate::orders::FulfilmentChange::ReverseReturn,
+            quantities.iter().copied(),
+        )?;
+    }
+    let movement_reason = format!("Return {reference} reversal: {reason}");
+    for (line_id, line, _) in lines {
+        if source.kind == InvoiceKind::Sale {
+            require_available(conn, company, date, &line)?;
+        }
+        let movement = stock_notes::insert_movement(
+            conn,
+            company,
+            date,
+            &line,
+            stock_notes::stock_direction(source.kind),
+            &movement_reason,
+        )?;
+        conn.execute(
+            "UPDATE stock_return_lines SET reversal_adjustment_id = ?1 WHERE id = ?2",
+            params![movement, line_id],
+        )?;
+    }
+    conn.execute(
+        "UPDATE stock_returns SET reversed_on = ?1, reversal_reason = ?2 WHERE id = ?3",
+        params![date.to_string(), reason, id],
+    )?;
+    for order in orders.into_keys() {
+        crate::stock_reservations::check_order_coverage(conn, order)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

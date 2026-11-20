@@ -920,7 +920,13 @@ impl App {
                                 recorded.reversal_reason.as_deref().unwrap_or_default()
                             ));
                         } else if self.stock_note_screen.return_draft.is_none()
-                            && ui.button("Reverse return").clicked()
+                            && ui
+                                .button(if recorded.source_notes > 1 {
+                                    "Reverse return across all source notes"
+                                } else {
+                                    "Reverse return"
+                                })
+                                .clicked()
                         {
                             self.stock_note_screen.return_draft = Some(ReturnDraft {
                                 reversal: Some(recorded.id),

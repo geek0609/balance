@@ -9,6 +9,7 @@ pub(super) struct ImportedStockNote {
     pub reference: String,
     pub party: String,
     pub kind: InvoiceKind,
+    pub source_order: usize,
     party_id: Option<i64>,
     narration: String,
     lines: Vec<NoteLine>,
@@ -58,6 +59,31 @@ pub(super) fn tracking(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("Not Applicable"))
 }
 
+pub(super) fn tracking_field(node: Node<'_, '_>) -> Result<Option<String>> {
+    let mut reference = None;
+    for field in [
+        "TRACKINGNUMBER",
+        "TRACKINGNO",
+        "VOUCHERTRACKINGNUMBER",
+        "VOUCHERTRACKINGNO",
+        "VCHTRACKINGNO",
+    ] {
+        let Some(value) = direct_text(node, field).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if reference
+            .as_ref()
+            .is_some_and(|saved: &String| normalized(saved) != normalized(&value))
+        {
+            return Err(Error::Validation(
+                "Conflicting tracking numbers on a stock document".into(),
+            ));
+        }
+        reference = Some(value);
+    }
+    Ok(reference)
+}
+
 fn stored_value(node: Node<'_, '_>) -> Result<Option<i64>> {
     direct_text(node, "AMOUNT")
         .filter(|value| !value.is_empty())
@@ -77,6 +103,7 @@ struct NoteStock<'a> {
     order: orders::OrderFields,
     accounts: trade_defaults::SourceAccounts<'a>,
     common_ledger: Option<trade_defaults::TradeDefault>,
+    tracking: Option<String>,
 }
 
 impl NoteStock<'_> {
@@ -97,6 +124,10 @@ impl NoteStock<'_> {
                 "ISDEEMEDPOSITIVE",
                 "GODOWNNAME",
                 "TRACKINGNUMBER",
+                "TRACKINGNO",
+                "VOUCHERTRACKINGNUMBER",
+                "VOUCHERTRACKINGNO",
+                "VCHTRACKINGNO",
                 "BASICORDERREF",
                 "ORDERNO",
                 "ORDERDUEDATE",
@@ -120,7 +151,7 @@ impl NoteStock<'_> {
         let quantity = actual
             .checked_abs()
             .ok_or_else(|| Error::Validation("Stock quantity is too large".into()))?;
-        let header_tracking = direct_text(node, "TRACKINGNUMBER");
+        let header_tracking = tracking_field(node)?.or_else(|| self.tracking.clone());
         let header_location = direct_text(node, "GODOWNNAME").filter(|value| !value.is_empty());
         let batches: Vec<_> = node
             .children()
@@ -152,6 +183,10 @@ impl NoteStock<'_> {
                         "BILLEDQTY",
                         "AMOUNT",
                         "TRACKINGNUMBER",
+                        "TRACKINGNO",
+                        "VOUCHERTRACKINGNUMBER",
+                        "VOUCHERTRACKINGNO",
+                        "VCHTRACKINGNO",
                         "BASICORDERREF",
                         "ORDERNO",
                         "ORDERDUEDATE",
@@ -219,9 +254,7 @@ impl NoteStock<'_> {
                     existing_batch_id: batch_id,
                     quantity: part_quantity,
                     billed_quantity: 0,
-                    tracking: tracking(
-                        direct_text(entry, "TRACKINGNUMBER").or_else(|| header_tracking.clone()),
-                    ),
+                    tracking: tracking(tracking_field(entry)?.or_else(|| header_tracking.clone())),
                 },
                 value: stored_value(entry)?,
                 order,
@@ -293,6 +326,7 @@ impl NoteStock<'_> {
 pub(super) fn parse(
     node: Node<'_, '_>,
     kind: InvoiceKind,
+    source_order: usize,
     label: &str,
     metadata: SourceMetadata,
     ledgers: &HashMap<String, (Option<i64>, Category)>,
@@ -321,6 +355,11 @@ pub(super) fn parse(
             "ORDERNO",
             "BASICORDERREF",
             "ORDERDUEDATE",
+            "TRACKINGNUMBER",
+            "TRACKINGNO",
+            "VOUCHERTRACKINGNUMBER",
+            "VOUCHERTRACKINGNO",
+            "VCHTRACKINGNO",
         ],
         label,
         issues,
@@ -360,6 +399,7 @@ pub(super) fn parse(
         order: orders::OrderFields::read(node, &orders::OrderFields::default())?,
         accounts,
         common_ledger: voucher_defaults.common,
+        tracking: tracking_field(node)?,
     };
     let mut lines = Vec::new();
     for entry in node
@@ -403,6 +443,7 @@ pub(super) fn parse(
         reference: invoice_field(node, "VOUCHERNUMBER")?,
         party,
         kind,
+        source_order,
         party_id: *party_id,
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
         lines,
@@ -585,10 +626,12 @@ impl NewTracking {
 
     /// Match documents from this batch against the same tracking references already on file.
     pub(super) fn match_documents(
-        self,
+        &self,
         conn: &Connection,
         company: i64,
+        before_return: Option<(&str, &HashSet<String>)>,
     ) -> Result<Vec<TrackingMatch>> {
+        let before = before_return.map(|(date, _)| date);
         let mut notes = conn.prepare(
             "SELECT n.id, l.id, n.date, l.quantity - COALESCE(b.billed, 0) - COALESCE(r.returned, 0)
              FROM imported_stock_note_tracking t JOIN stock_note_lines l ON l.id = t.note_line_id
@@ -596,6 +639,7 @@ impl NewTracking {
              LEFT JOIN stock_note_billed_quantities b ON b.note_line_id = l.id
              LEFT JOIN stock_note_returned_quantities r ON r.note_line_id = l.id
              WHERE n.company_id = ?1 AND n.reversed_on IS NULL AND t.reference_key = ?2
+               AND (?3 IS NULL OR n.date <= ?3)
              ORDER BY n.date, n.id, l.id",
         )?;
         let mut demands = conn.prepare(
@@ -612,18 +656,22 @@ impl NewTracking {
              JOIN vouchers v ON v.id = i.voucher_id
              LEFT JOIN stock_note_order_sources src ON src.note_line_id = nl.id
              LEFT JOIN invoice_order_allocations dates ON dates.allocation_id = a.id
-             WHERE nl.id = ?1 AND a.quantity = 0
+             WHERE nl.id = ?1 AND a.quantity = 0 AND (?2 IS NULL OR v.date < ?2)
                AND NOT EXISTS(SELECT 1 FROM invoice_order_sources o
                               WHERE o.allocation_id = a.id AND o.order_id IS NOT src.order_id)
                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)
              ORDER BY dates.expected_on IS NULL, v.date, i.id, a.id",
         )?;
-        let mut keys = self.references.into_iter().collect::<Vec<_>>();
+        let mut keys = self
+            .references
+            .iter()
+            .filter(|key| before_return.is_none_or(|(_, tracked)| tracked.contains(key.as_str())))
+            .collect::<Vec<_>>();
         keys.sort_unstable();
         let mut matches = Vec::new();
         for reference in keys {
             let rows = notes
-                .query_map(params![company, reference], |row| {
+                .query_map(params![company, reference, before], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
@@ -637,7 +685,7 @@ impl NewTracking {
                     continue;
                 }
                 let bills = demands
-                    .query_map([note_line], |row| {
+                    .query_map(params![note_line, before], |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, i64>(1)?,
