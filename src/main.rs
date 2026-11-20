@@ -180,6 +180,7 @@ struct App {
     import_path: String,
     import_second_path: String,
     import_opening_date: String,
+    import_count_mode: Option<balance::stock_counts::StockCountMode>,
     backup_path: String,
     restore_source: String,
     restore_destination: String,
@@ -539,6 +540,7 @@ impl App {
             import_path: String::new(),
             import_second_path: String::new(),
             import_opening_date: String::new(),
+            import_count_mode: None,
             backup_path: String::new(),
             restore_source: String::new(),
             restore_destination: String::new(),
@@ -716,6 +718,7 @@ impl App {
         self.opening_clear_reference.clear();
         self.opening_clear_reason.clear();
         self.import_preview = None;
+        self.import_count_mode = None;
         self.adjustment_item = None;
         self.stock_creation_unit = None;
         self.compound_unit = CompoundUnitForm::default();
@@ -5112,6 +5115,26 @@ impl App {
                 self.import_preview = None;
             }
         });
+        ui.horizontal(|ui| {
+            use balance::stock_counts::StockCountMode;
+            ui.label("Physical stock vouchers");
+            let previous = self.import_count_mode;
+            egui::ComboBox::from_id_salt("import-physical-count-mode")
+                .selected_text(previous.map_or("Select source behavior", StockCountMode::label))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.import_count_mode,
+                        None,
+                        "Select source behavior",
+                    );
+                    for mode in [StockCountMode::Reconcile, StockCountMode::Observe] {
+                        ui.selectable_value(&mut self.import_count_mode, Some(mode), mode.label());
+                    }
+                });
+            if self.import_count_mode != previous {
+                self.import_preview = None;
+            }
+        });
         if ui.button("Preview XML").clicked() {
             self.import_preview = None;
             let result = (|| -> balance::Result<ImportPlan> {
@@ -5149,10 +5172,11 @@ impl App {
                     files.push(bytes);
                 }
                 let inputs = files.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                self.store.preview_xml_import_batch(
+                self.store.preview_xml_import_batch_with_stock_counts(
                     company,
                     &inputs,
                     Some(&self.import_opening_date),
+                    self.import_count_mode,
                 )
             })();
             match result {
@@ -5190,13 +5214,15 @@ impl App {
             if plan.order_count() > 0
                 || plan.stock_note_count() > 0
                 || plan.stock_return_count() > 0
+                || plan.stock_count_count() > 0
                 || plan.stock_match_count() > 0
             {
                 ui.label(format!(
-                    "{} orders, {} stock notes, {} stock returns and {} tracking matches",
+                    "{} orders, {} stock notes, {} stock returns, {} physical counts and {} tracking matches",
                     plan.order_count(),
                     plan.stock_note_count(),
                     plan.stock_return_count(),
+                    plan.stock_count_count(),
                     plan.stock_match_count()
                 ));
             }
@@ -5229,8 +5255,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} orders, {} stock notes, {} stock returns, {} tracking matches, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
-                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.orders, counts.stock_notes, counts.stock_returns, counts.stock_matches, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
+                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} orders, {} stock notes, {} stock returns, {} physical counts, {} tracking matches, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
+                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.orders, counts.stock_notes, counts.stock_returns, counts.stock_counts, counts.stock_matches, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
                         );
                         self.import_preview = None;
                     }

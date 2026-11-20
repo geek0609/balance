@@ -62,7 +62,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 102;
+const SCHEMA_VERSION: i64 = 103;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -1084,7 +1084,7 @@ impl Store {
             }
             tx.commit()?;
         }
-        if version < 102 {
+        if version < 103 {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let current: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
             if current < 95 {
@@ -1115,6 +1115,10 @@ impl Store {
             if current < 102 {
                 exchange::migrate_stock_rejections(&tx)?;
                 tx.pragma_update(None, "user_version", 102)?;
+            }
+            if current < 103 {
+                stock_counts::migrate_locations_and_modes(&tx)?;
+                tx.pragma_update(None, "user_version", 103)?;
             }
             tx.commit()?;
         }

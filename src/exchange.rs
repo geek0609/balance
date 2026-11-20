@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 mod orders;
+mod stock_counts;
 mod stock_notes;
 mod stock_rejections;
 mod trade_defaults;
@@ -183,6 +184,7 @@ struct ImportedInvoice {
     kind: InvoiceKind,
     entry_mode: InvoiceEntryMode,
     date: String,
+    source_order: usize,
     reference: String,
     external_reference: InvoiceExternalReference,
     bills: Vec<BillSplitDraft>,
@@ -328,6 +330,21 @@ enum BillChange {
     Settlement(usize),
     Note(usize),
 }
+
+impl BillChange {
+    fn key<'a>(&self, plan: &'a ImportPlan) -> (&'a str, usize) {
+        match *self {
+            Self::Settlement(index) => {
+                let row = &plan.settlements[index];
+                (&row.date, row.source_order)
+            }
+            Self::Note(index) => {
+                let row = &plan.bill_notes[index];
+                (&row.date, row.source_order)
+            }
+        }
+    }
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SourceMetadata {
     guid: String,
@@ -373,13 +390,20 @@ pub struct ImportPlan {
     invoices: Vec<ImportedInvoice>,
     stock_notes: Vec<stock_notes::ImportedStockNote>,
     stock_returns: Vec<stock_rejections::ImportedRejection>,
-    stock_return_matches: Option<Vec<stock_rejections::ReturnMatch>>,
+    stock_counts: Vec<stock_counts::ImportedCount>,
     orders: Vec<orders::ImportedOrder>,
-    stock_matches: Option<Vec<stock_notes::TrackingMatch>>,
+    stock_preview: Option<StockImportPreview>,
     settlements: Vec<ImportedSettlement>,
     bill_notes: Vec<ImportedBillNote>,
     issues: Vec<String>,
 }
+#[derive(Debug, Clone, Default)]
+struct StockImportPreview {
+    matches: Vec<stock_notes::TrackingMatch>,
+    returns: Vec<stock_rejections::ReturnMatch>,
+    counts: Vec<stock_counts::CountMatch>,
+}
+
 impl ImportPlan {
     fn check_period_lock(&self, conn: &Connection) -> Result<()> {
         let Some(cutoff) = crate::periods::cutoff(conn, self.company_id)? else {
@@ -400,6 +424,7 @@ impl ImportPlan {
             .chain(self.invoices.iter().map(|row| row.date.as_str()))
             .chain(self.stock_notes.iter().map(|row| row.date.as_str()))
             .chain(self.stock_returns.iter().map(|row| row.date.as_str()))
+            .chain(self.stock_counts.iter().map(|row| row.date.as_str()))
             .chain(self.orders.iter().map(|row| row.date.as_str()))
             .chain(self.settlements.iter().map(|row| row.date.as_str()))
             .chain(self.bill_notes.iter().map(|row| row.date.as_str()))
@@ -435,8 +460,13 @@ impl ImportPlan {
     pub fn stock_return_count(&self) -> usize {
         self.stock_returns.len()
     }
+    pub fn stock_count_count(&self) -> usize {
+        self.stock_counts.len()
+    }
     pub fn stock_match_count(&self) -> usize {
-        self.stock_matches.as_ref().map_or(0, Vec::len)
+        self.stock_preview
+            .as_ref()
+            .map_or(0, |preview| preview.matches.len())
     }
     pub fn settlement_count(&self) -> usize {
         self.settlements
@@ -575,6 +605,7 @@ impl ImportPlan {
                 || !self.invoices.is_empty()
                 || !self.stock_notes.is_empty()
                 || !self.stock_returns.is_empty()
+                || !self.stock_counts.is_empty()
                 || !self.orders.is_empty()
                 || !self.settlements.is_empty()
                 || !self.bill_notes.is_empty())
@@ -591,6 +622,7 @@ pub struct ImportCounts {
     pub invoices: usize,
     pub stock_notes: usize,
     pub stock_returns: usize,
+    pub stock_counts: usize,
     pub orders: usize,
     pub stock_matches: usize,
     pub settlements: usize,
@@ -2079,6 +2111,7 @@ fn xml_invoice_tax_rates(entry: Node<'_, '_>) -> Result<Vec<Decimal>> {
 /// can all be represented without dropping information.
 fn parse_imported_invoice(
     node: Node<'_, '_>,
+    source_order: usize,
     label: &str,
     metadata: SourceMetadata,
     entry_mode: InvoiceEntryMode,
@@ -2510,6 +2543,7 @@ fn parse_imported_invoice(
         order,
         kind,
         entry_mode,
+        source_order,
         date,
         reference,
         external_reference: invoice_document_reference(
@@ -4089,6 +4123,17 @@ impl Store {
         files: &[&[u8]],
         opening_date: Option<&str>,
     ) -> Result<ImportPlan> {
+        self.preview_xml_import_batch_with_stock_counts(company_id, files, opening_date, None)
+    }
+
+    /// Select whether imported physical counts adjust stock or record observations.
+    pub fn preview_xml_import_batch_with_stock_counts(
+        &self,
+        company_id: i64,
+        files: &[&[u8]],
+        opening_date: Option<&str>,
+        count_mode: Option<crate::stock_counts::StockCountMode>,
+    ) -> Result<ImportPlan> {
         if !self.companies()?.iter().any(|c| c.id == company_id) {
             return Err(Error::Validation("Select an existing company".into()));
         }
@@ -4148,9 +4193,9 @@ impl Store {
             invoices: Vec::new(),
             stock_notes: Vec::new(),
             stock_returns: Vec::new(),
-            stock_return_matches: None,
+            stock_counts: Vec::new(),
             orders: Vec::new(),
-            stock_matches: None,
+            stock_preview: None,
             settlements: Vec::new(),
             bill_notes: Vec::new(),
             issues: Vec::new(),
@@ -5322,6 +5367,7 @@ impl Store {
             let stock_kind = voucher_type.as_deref().and_then(stock_notes::kind);
             let order_kind = voucher_type.as_deref().and_then(orders::kind);
             let rejection_kind = voucher_type.as_deref().and_then(stock_rejections::kind);
+            let physical_stock = voucher_type.as_deref().is_some_and(stock_counts::kind);
             register_metadata(
                 if stock_kind.is_some() {
                     "stocknote"
@@ -5329,6 +5375,8 @@ impl Store {
                     "order"
                 } else if rejection_kind.is_some() {
                     "stockreturn"
+                } else if physical_stock {
+                    "stockcount"
                 } else {
                     "voucher"
                 },
@@ -5404,6 +5452,31 @@ impl Store {
                 }
                 continue;
             }
+            if physical_stock {
+                if let Some(mode) = count_mode {
+                    match stock_counts::parse(
+                        node,
+                        source_order,
+                        mode,
+                        &label,
+                        metadata,
+                        &invoice_items,
+                        &known_locations,
+                        &invoice_batches,
+                        &mut plan.issues,
+                    ) {
+                        Ok(count) => plan.stock_counts.push(count),
+                        Err(error) => plan.issues.push(format!("{label}: {error}")),
+                    }
+                } else {
+                    let message =
+                        "Select how physical stock vouchers should affect stock before previewing.";
+                    if !plan.issues.iter().any(|issue| issue == message) {
+                        plan.issues.push(message.into());
+                    }
+                }
+                continue;
+            }
             let has_bill_details = node
                 .children()
                 .filter(|entry| {
@@ -5467,6 +5540,7 @@ impl Store {
             if let Some(entry_mode) = entry_mode {
                 match parse_imported_invoice(
                     node,
+                    source_order,
                     &label,
                     metadata,
                     entry_mode,
@@ -6120,6 +6194,7 @@ impl Store {
             && plan.invoices.is_empty()
             && plan.stock_notes.is_empty()
             && plan.stock_returns.is_empty()
+            && plan.stock_counts.is_empty()
             && plan.orders.is_empty()
             && plan.settlements.is_empty()
             && plan.bill_notes.is_empty()
@@ -6143,6 +6218,7 @@ impl Store {
         if plan.can_apply()
             && (!plan.stock_notes.is_empty()
                 || !plan.stock_returns.is_empty()
+                || !plan.stock_counts.is_empty()
                 || !plan.orders.is_empty()
                 || plan.invoices.iter().any(|invoice| invoice.order.is_some())
                 || plan
@@ -6157,10 +6233,7 @@ impl Store {
             let rehearsal = Self::write_xml_import(&tx, &plan);
             tx.rollback()?;
             match rehearsal {
-                Ok((_, matched, returned)) => {
-                    plan.stock_matches = Some(matched);
-                    plan.stock_return_matches = Some(returned);
-                }
+                Ok((_, preview)) => plan.stock_preview = Some(preview),
                 Err(error) => plan
                     .issues
                     .push(format!("Stock import validation failed. {error}")),
@@ -6176,24 +6249,21 @@ impl Store {
             ));
         }
         let tx = self.conn.transaction()?;
-        let (counts, matches, returns) = Self::write_xml_import(&tx, plan)?;
-        if plan
-            .stock_matches
-            .as_ref()
-            .is_some_and(|preview| *preview != matches)
-        {
-            return Err(Error::Validation(
-                "Stock tracking matches changed since preview. Run the preview again.".into(),
-            ));
-        }
-        if plan
-            .stock_return_matches
-            .as_ref()
-            .is_some_and(|preview| *preview != returns)
-        {
-            return Err(Error::Validation(
-                "Stock return allocations changed since preview. Run the preview again.".into(),
-            ));
+        let (counts, actual) = Self::write_xml_import(&tx, plan)?;
+        if let Some(preview) = &plan.stock_preview {
+            if preview.matches != actual.matches {
+                return Err(Error::Validation(
+                    "Stock tracking matches changed since preview. Run the preview again.".into(),
+                ));
+            }
+            if preview.returns != actual.returns {
+                return Err(Error::Validation(
+                    "Stock return allocations changed since preview. Run the preview again.".into(),
+                ));
+            }
+            if preview.counts != actual.counts {
+                return Err(Error::Validation("Stock count book quantities or allocations changed since preview. Run the preview again.".into()));
+            }
         }
         tx.commit()?;
         Ok(counts)
@@ -6202,11 +6272,7 @@ impl Store {
     fn write_xml_import(
         conn: &Connection,
         plan: &ImportPlan,
-    ) -> Result<(
-        ImportCounts,
-        Vec<stock_notes::TrackingMatch>,
-        Vec<stock_rejections::ReturnMatch>,
-    )> {
+    ) -> Result<(ImportCounts, StockImportPreview)> {
         plan.check_period_lock(&conn)?;
         for (id, metadata) in &plan.existing_location_metadata {
             let exists: bool = conn.query_row(
@@ -6758,53 +6824,197 @@ impl Store {
         for order in &plan.orders {
             orders::write(conn, plan.company_id, order)?;
         }
+        let mut bill_changes = plan.bill_changes().into_iter().peekable();
+        let mut write_bill_changes = |before: Option<(&str, usize)>,
+                                      named_funding: &mut NamedFundingIndex|
+         -> Result<()> {
+            while let Some(change) =
+                bill_changes.next_if(|change| before.is_none_or(|cutoff| change.key(plan) < cutoff))
+            {
+                let index = match change {
+                    BillChange::Settlement(index) => index,
+                    BillChange::Note(index) => {
+                        let note = &plan.bill_notes[index];
+                        if !note.stock.is_empty() {
+                            apply_stock_return(
+                                &conn,
+                                plan.company_id,
+                                note,
+                                posted_notes[index].map(|(voucher, _)| voucher),
+                            )?;
+                            continue;
+                        }
+                        let (voucher, party) = match posted_notes[index] {
+                            Some(saved) => saved,
+                            None => post_imported_bill_note(&conn, plan.company_id, note)?,
+                        };
+                        attach_note_bill_allocations(&conn, plan.company_id, note, voucher, party)?;
+                        continue;
+                    }
+                };
+                let settlement = &plan.settlements[index];
+                let (bank_id, party_id, advance_voucher) = match advance_vouchers.get(&index) {
+                    Some(&(bank, party, voucher)) => (bank, party, Some(voucher)),
+                    None => {
+                        let (bank, party) = settlement_ledgers(settlement)?;
+                        (bank, party, None)
+                    }
+                };
+                let credit_kind = bill_note_refunds::opposite_kind(settlement.kind);
+                let date = parse_date(&settlement.date)?;
+                let mut refunds = Vec::with_capacity(settlement.refunds.len());
+                for refund in &settlement.refunds {
+                    let source = consume_previewed_funding(
+                        named_funding,
+                        credit_kind,
+                        &settlement.party,
+                        date,
+                        refund,
+                    )?;
+                    let FundingSource::Note(Some(credit_id)) = source else {
+                        return Err(Error::Validation("Refund credit was not saved".into()));
+                    };
+                    refunds.push(NoteRefundAllocation {
+                        credit_id,
+                        amount: refund.amount,
+                    });
+                }
+                let refund_total = bill_note_refunds::validate_refunds(
+                    &conn,
+                    plan.company_id,
+                    credit_kind,
+                    party_id,
+                    date,
+                    &refunds,
+                )?;
+                let voucher_id = if !settlement.bills.invoices.is_empty() {
+                    let allocations = resolve_imported_bill_allocations(
+                        &conn,
+                        plan.company_id,
+                        settlement.kind,
+                        party_id,
+                        &settlement.date,
+                        &settlement.bills.invoices,
+                    )?;
+                    insert_settlement_on_connection(
+                        &conn,
+                        plan.company_id,
+                        bank_id,
+                        &settlement.date,
+                        &settlement.reference,
+                        &allocations,
+                        &settlement.narration,
+                        advance_voucher,
+                        &settlement_discounts(settlement)?,
+                        refund_total,
+                    )?
+                    .0
+                } else if let Some(voucher) = advance_voucher {
+                    voucher
+                } else {
+                    bill_note_refunds::post_refund_voucher(
+                        &conn,
+                        plan.company_id,
+                        settlement.kind,
+                        bank_id,
+                        party_id,
+                        &settlement.date,
+                        &settlement.reference,
+                        &settlement.narration,
+                        refund_total,
+                    )?
+                };
+                bill_note_refunds::attach_refunds(&conn, voucher_id, bank_id, &refunds)?;
+                if advance_voucher.is_none() {
+                    save_metadata(
+                        &conn,
+                        plan.company_id,
+                        "voucher",
+                        voucher_id,
+                        &settlement.metadata,
+                    )?;
+                }
+            }
+            Ok(())
+        };
         let mut tracking = stock_notes::NewTracking::default();
         enum StockEvent<'a> {
             Note(&'a stock_notes::ImportedStockNote),
             Return(&'a stock_rejections::ImportedRejection),
+            Count(&'a stock_counts::ImportedCount),
         }
         impl<'a> StockEvent<'a> {
-            fn key(&self) -> (&'a str, bool, usize) {
+            fn key(&self, source_sequence: bool) -> (&'a str, bool, usize) {
                 match self {
-                    Self::Note(row) => (&row.date, row.kind == InvoiceKind::Sale, row.source_order),
-                    Self::Return(row) => {
-                        (&row.date, row.kind == InvoiceKind::Sale, row.source_order)
-                    }
+                    Self::Note(row) => (
+                        &row.date,
+                        !source_sequence && row.kind == InvoiceKind::Sale,
+                        row.source_order,
+                    ),
+                    Self::Return(row) => (
+                        &row.date,
+                        !source_sequence && row.kind == InvoiceKind::Sale,
+                        row.source_order,
+                    ),
+                    Self::Count(row) => (&row.date, false, row.source_order),
                 }
             }
         }
+        let source_sequence = !plan.stock_counts.is_empty();
         let mut by_date = plan
             .stock_notes
             .iter()
             .map(StockEvent::Note)
             .chain(plan.stock_returns.iter().map(StockEvent::Return))
+            .chain(plan.stock_counts.iter().map(StockEvent::Count))
             .collect::<Vec<_>>();
-        by_date.sort_by_key(StockEvent::key);
+        by_date.sort_by_key(|event| event.key(source_sequence));
         let mut stock_events = by_date.into_iter().peekable();
-        let mut stock_matches = Vec::new();
-        let mut return_matches = Vec::new();
-        let mut write_stock_events = |through: Option<(&str, bool)>,
+        let mut stock_preview = StockImportPreview::default();
+        let mut write_stock_events = |through: Option<(&str, bool, usize)>,
                                       tracking: &mut stock_notes::NewTracking,
-                                      created_batches: &mut HashMap<(i64, String), i64>|
+                                      created_batches: &mut HashMap<(i64, String), i64>,
+                                      named_funding: &mut NamedFundingIndex|
          -> Result<()> {
             while let Some(event) = stock_events.next_if(|event| {
-                let (date, sale, _) = event.key();
-                through.is_none_or(|through| (date, sale) <= through)
+                through.is_none_or(|through| event.key(source_sequence) <= through)
             }) {
                 match event {
                     StockEvent::Note(note) => {
                         tracking.write_note(conn, plan.company_id, note, created_batches)?
                     }
                     StockEvent::Return(returned) => {
-                        stock_matches.extend(tracking.match_documents(
+                        stock_preview.matches.extend(tracking.match_documents(
                             conn,
                             plan.company_id,
-                            Some((&returned.date, &returned.tracking_keys())),
+                            Some(stock_notes::TrackingCutoff {
+                                date: &returned.date,
+                                include_same_day_invoices: source_sequence,
+                                references: Some(&returned.tracking_keys()),
+                            }),
                         )?);
-                        return_matches.extend(stock_rejections::write(
+                        stock_preview.returns.extend(stock_rejections::write(
                             conn,
                             plan.company_id,
                             returned,
+                        )?);
+                    }
+                    StockEvent::Count(count) => {
+                        stock_preview.matches.extend(tracking.match_documents(
+                            conn,
+                            plan.company_id,
+                            Some(stock_notes::TrackingCutoff {
+                                date: &count.date,
+                                include_same_day_invoices: true,
+                                references: None,
+                            }),
+                        )?);
+                        write_bill_changes(Some((&count.date, count.source_order)), named_funding)?;
+                        stock_preview.counts.extend(stock_counts::write(
+                            conn,
+                            plan.company_id,
+                            count,
+                            created_batches,
                         )?);
                     }
                 }
@@ -6812,17 +7022,33 @@ impl Store {
             Ok(())
         };
         let mut invoice_order = plan.invoices.iter().collect::<Vec<_>>();
-        if !plan.stock_notes.is_empty()
+        if source_sequence
+            || !plan.stock_notes.is_empty()
             || !plan.stock_returns.is_empty()
             || plan.invoices.iter().any(|invoice| invoice.order.is_some())
         {
-            invoice_order.sort_by_key(|row| (&row.date, row.kind == InvoiceKind::Sale));
+            invoice_order.sort_by_key(|row| {
+                (
+                    &row.date,
+                    !source_sequence && row.kind == InvoiceKind::Sale,
+                    row.source_order,
+                )
+            });
         }
         for invoice in invoice_order {
             write_stock_events(
-                Some((&invoice.date, invoice.kind == InvoiceKind::Sale)),
+                Some((
+                    &invoice.date,
+                    !source_sequence && invoice.kind == InvoiceKind::Sale,
+                    if source_sequence {
+                        invoice.source_order
+                    } else {
+                        usize::MAX
+                    },
+                )),
                 &mut tracking,
                 &mut created_batches,
+                &mut named_funding,
             )?;
             let voucher_kind = if invoice.kind == InvoiceKind::Sale {
                 VoucherKind::Sales
@@ -7062,113 +7288,16 @@ impl Store {
                 }
             }
         }
-        write_stock_events(None, &mut tracking, &mut created_batches)?;
-        stock_matches.extend(tracking.match_documents(conn, plan.company_id, None)?);
-        for change in plan.bill_changes() {
-            let index = match change {
-                BillChange::Settlement(index) => index,
-                BillChange::Note(index) => {
-                    let note = &plan.bill_notes[index];
-                    if !note.stock.is_empty() {
-                        apply_stock_return(
-                            &conn,
-                            plan.company_id,
-                            note,
-                            posted_notes[index].map(|(voucher, _)| voucher),
-                        )?;
-                        continue;
-                    }
-                    let (voucher, party) = match posted_notes[index] {
-                        Some(saved) => saved,
-                        None => post_imported_bill_note(&conn, plan.company_id, note)?,
-                    };
-                    attach_note_bill_allocations(&conn, plan.company_id, note, voucher, party)?;
-                    continue;
-                }
-            };
-            let settlement = &plan.settlements[index];
-            let (bank_id, party_id, advance_voucher) = match advance_vouchers.get(&index) {
-                Some(&(bank, party, voucher)) => (bank, party, Some(voucher)),
-                None => {
-                    let (bank, party) = settlement_ledgers(settlement)?;
-                    (bank, party, None)
-                }
-            };
-            let credit_kind = bill_note_refunds::opposite_kind(settlement.kind);
-            let date = parse_date(&settlement.date)?;
-            let mut refunds = Vec::with_capacity(settlement.refunds.len());
-            for refund in &settlement.refunds {
-                let source = consume_previewed_funding(
-                    &mut named_funding,
-                    credit_kind,
-                    &settlement.party,
-                    date,
-                    refund,
-                )?;
-                let FundingSource::Note(Some(credit_id)) = source else {
-                    return Err(Error::Validation("Refund credit was not saved".into()));
-                };
-                refunds.push(NoteRefundAllocation {
-                    credit_id,
-                    amount: refund.amount,
-                });
-            }
-            let refund_total = bill_note_refunds::validate_refunds(
-                &conn,
-                plan.company_id,
-                credit_kind,
-                party_id,
-                date,
-                &refunds,
-            )?;
-            let voucher_id = if !settlement.bills.invoices.is_empty() {
-                let allocations = resolve_imported_bill_allocations(
-                    &conn,
-                    plan.company_id,
-                    settlement.kind,
-                    party_id,
-                    &settlement.date,
-                    &settlement.bills.invoices,
-                )?;
-                insert_settlement_on_connection(
-                    &conn,
-                    plan.company_id,
-                    bank_id,
-                    &settlement.date,
-                    &settlement.reference,
-                    &allocations,
-                    &settlement.narration,
-                    advance_voucher,
-                    &settlement_discounts(settlement)?,
-                    refund_total,
-                )?
-                .0
-            } else if let Some(voucher) = advance_voucher {
-                voucher
-            } else {
-                bill_note_refunds::post_refund_voucher(
-                    &conn,
-                    plan.company_id,
-                    settlement.kind,
-                    bank_id,
-                    party_id,
-                    &settlement.date,
-                    &settlement.reference,
-                    &settlement.narration,
-                    refund_total,
-                )?
-            };
-            bill_note_refunds::attach_refunds(&conn, voucher_id, bank_id, &refunds)?;
-            if advance_voucher.is_none() {
-                save_metadata(
-                    &conn,
-                    plan.company_id,
-                    "voucher",
-                    voucher_id,
-                    &settlement.metadata,
-                )?;
-            }
-        }
+        write_stock_events(
+            None,
+            &mut tracking,
+            &mut created_batches,
+            &mut named_funding,
+        )?;
+        stock_preview
+            .matches
+            .extend(tracking.match_documents(conn, plan.company_id, None)?);
+        write_bill_changes(None, &mut named_funding)?;
         crate::stock_policy::check_import(&conn, plan.company_id)?;
         Ok((
             ImportCounts {
@@ -7182,7 +7311,8 @@ impl Store {
                 stock_notes: plan.stock_notes.len(),
                 stock_returns: plan.stock_returns.len(),
                 orders: plan.orders.len(),
-                stock_matches: stock_matches.len(),
+                stock_matches: stock_preview.matches.len(),
+                stock_counts: plan.stock_counts.len(),
                 settlements: plan.settlement_count(),
                 bill_notes: plan.bill_note_count(),
                 advances: plan.advance_count(),
@@ -7195,8 +7325,7 @@ impl Store {
                 locations: plan.locations.len(),
                 items: plan.items.len(),
             },
-            stock_matches,
-            return_matches,
+            stock_preview,
         ))
     }
 }
@@ -11393,6 +11522,7 @@ mod tests {
             .unwrap();
         let sale = ImportedInvoice {
             order: None,
+            source_order: 0,
             kind: InvoiceKind::Sale,
             entry_mode: InvoiceEntryMode::Invoice,
             date: date.into(),
@@ -11465,9 +11595,9 @@ mod tests {
             invoices: vec![sale],
             stock_notes: Vec::new(),
             stock_returns: Vec::new(),
-            stock_return_matches: None,
+            stock_counts: Vec::new(),
             orders: Vec::new(),
-            stock_matches: None,
+            stock_preview: None,
             settlements: Vec::new(),
             bill_notes: Vec::new(),
             issues: Vec::new(),

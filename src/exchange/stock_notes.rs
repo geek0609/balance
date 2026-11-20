@@ -465,6 +465,12 @@ pub(super) struct TrackingMatch {
     quantity: i64,
 }
 
+pub(super) struct TrackingCutoff<'a> {
+    pub date: &'a str,
+    pub include_same_day_invoices: bool,
+    pub references: Option<&'a HashSet<String>>,
+}
+
 impl NewTracking {
     pub(super) fn write_note(
         &mut self,
@@ -629,9 +635,12 @@ impl NewTracking {
         &self,
         conn: &Connection,
         company: i64,
-        before_return: Option<(&str, &HashSet<String>)>,
+        cutoff: Option<TrackingCutoff<'_>>,
     ) -> Result<Vec<TrackingMatch>> {
-        let before = before_return.map(|(date, _)| date);
+        let before = cutoff.as_ref().map(|cutoff| cutoff.date);
+        let include_same_day = cutoff
+            .as_ref()
+            .is_some_and(|cutoff| cutoff.include_same_day_invoices);
         let mut notes = conn.prepare(
             "SELECT n.id, l.id, n.date, l.quantity - COALESCE(b.billed, 0) - COALESCE(r.returned, 0)
              FROM imported_stock_note_tracking t JOIN stock_note_lines l ON l.id = t.note_line_id
@@ -656,7 +665,7 @@ impl NewTracking {
              JOIN vouchers v ON v.id = i.voucher_id
              LEFT JOIN stock_note_order_sources src ON src.note_line_id = nl.id
              LEFT JOIN invoice_order_allocations dates ON dates.allocation_id = a.id
-             WHERE nl.id = ?1 AND a.quantity = 0 AND (?2 IS NULL OR v.date < ?2)
+             WHERE nl.id = ?1 AND a.quantity = 0 AND (?2 IS NULL OR v.date < ?2 OR (?3 AND v.date = ?2))
                AND NOT EXISTS(SELECT 1 FROM invoice_order_sources o
                               WHERE o.allocation_id = a.id AND o.order_id IS NOT src.order_id)
                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)
@@ -665,7 +674,12 @@ impl NewTracking {
         let mut keys = self
             .references
             .iter()
-            .filter(|key| before_return.is_none_or(|(_, tracked)| tracked.contains(key.as_str())))
+            .filter(|key| {
+                cutoff
+                    .as_ref()
+                    .and_then(|cutoff| cutoff.references)
+                    .is_none_or(|tracked| tracked.contains(key.as_str()))
+            })
             .collect::<Vec<_>>();
         keys.sort_unstable();
         let mut matches = Vec::new();
@@ -685,7 +699,7 @@ impl NewTracking {
                     continue;
                 }
                 let bills = demands
-                    .query_map(params![note_line, before], |row| {
+                    .query_map(params![note_line, before, include_same_day], |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, i64>(1)?,

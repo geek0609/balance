@@ -1,6 +1,8 @@
 use super::{pick_batch, pick_location, pick_stock, App};
 use balance::inventory::{format_quantity, parse_quantity};
-use balance::stock_counts::{CountLine, StockCountDraft, StockCountLine, StockCountPlan};
+use balance::stock_counts::{
+    CountLine, StockCountDraft, StockCountLine, StockCountMode, StockCountPlan,
+};
 use balance::{Error, Result};
 use eframe::egui;
 use std::collections::HashMap;
@@ -17,6 +19,7 @@ pub(super) struct StockCountScreen {
     date: String,
     reference: String,
     notes: String,
+    mode: StockCountMode,
     lines: Vec<CountLineForm>,
     preview: Option<StockCountPlan>,
     selected: Option<i64>,
@@ -30,6 +33,7 @@ impl Default for StockCountScreen {
             date: String::new(),
             reference: String::new(),
             notes: String::new(),
+            mode: StockCountMode::Reconcile,
             lines: vec![CountLineForm::default()],
             preview: None,
             selected: None,
@@ -138,6 +142,13 @@ impl App {
                 ui.end_row();
             }
         });
+        egui::ComboBox::from_id_salt("stock-count-mode")
+            .selected_text(form.mode.label())
+            .show_ui(ui, |ui| {
+                for mode in [StockCountMode::Reconcile, StockCountMode::Observe] {
+                    ui.selectable_value(&mut form.mode, mode, mode.label());
+                }
+            });
         ui.small("Enter each counted item and batch. Use zero for an empty bucket. Unbatched counts apply only to stock without a batch.");
         let mut remove = None;
         for (index, line) in form.lines.iter_mut().enumerate() {
@@ -167,10 +178,10 @@ impl App {
             form.lines.push(CountLineForm::default());
         }
         if ui.button("Preview count").clicked() {
-            match form
-                .draft()
-                .and_then(|draft| self.store.preview_stock_count(company, &draft))
-            {
+            match form.draft().and_then(|draft| {
+                self.store
+                    .preview_stock_count_with_mode(company, &draft, form.mode)
+            }) {
                 Ok(preview) => {
                     self.stock_count_screen.preview = Some(preview);
                     self.message.clear();
@@ -193,7 +204,10 @@ impl App {
                 preview.date()
             ),
         );
-        ui.small("Book quantities include all movements already saved through the count date. Posting records the count and adjusts quantities by the difference.");
+        ui.small(match preview.mode() {
+            StockCountMode::Reconcile => "Posting adjusts book quantities to match this count.",
+            StockCountMode::Observe => "Posting records the count and its variances for review.",
+        });
         count_table(ui, "count-preview", preview.lines(), false);
         let mut edit = false;
         let mut post = false;
@@ -252,7 +266,11 @@ impl App {
                 self.stock_count_screen.selected = if selected { None } else { Some(count.id) };
             }
             if self.stock_count_screen.selected == Some(count.id) {
-                ui.small(format!("Posted {} UTC", count.recorded_at));
+                ui.small(format!(
+                    "{} · Posted {} UTC",
+                    count.mode.label(),
+                    count.recorded_at
+                ));
                 if !count.notes.is_empty() {
                     ui.label(&count.notes);
                 }
@@ -270,7 +288,7 @@ impl App {
 
 fn count_table(ui: &mut egui::Ui, id: impl std::hash::Hash, lines: &[StockCountLine], saved: bool) {
     egui::Grid::new(id).striped(true).show(ui, |ui| {
-        for label in ["Item", "Batch", "Book", "Counted", "Variance"] {
+        for label in ["Item", "Location", "Batch", "Book", "Counted", "Variance"] {
             ui.strong(label);
         }
         if saved {
@@ -279,6 +297,7 @@ fn count_table(ui: &mut egui::Ui, id: impl std::hash::Hash, lines: &[StockCountL
         ui.end_row();
         for line in lines {
             ui.label(&line.item);
+            ui.label(&line.location);
             ui.label(line.batch.as_deref().unwrap_or("Unbatched"));
             ui.label(format!(
                 "{} {}",
