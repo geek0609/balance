@@ -549,7 +549,7 @@ fn check_order_stock_release_date(conn: &Connection, order: i64, date: NaiveDate
          JOIN invoice_reversals r ON r.invoice_id = link.invoice_id
          JOIN vouchers v ON v.id = r.reversal_voucher_id
          WHERE link.order_id = ?1
-           AND NOT EXISTS(SELECT 1 FROM stock_note_invoices n WHERE n.invoice_id = link.invoice_id)
+           AND EXISTS(SELECT 1 FROM physical_invoice_lines l WHERE l.invoice_id = link.invoice_id)
          UNION ALL
          SELECT reversed_on FROM stock_notes WHERE order_id = ?1 AND reversed_on IS NOT NULL
          UNION ALL
@@ -609,6 +609,40 @@ pub(crate) fn check_fulfilment(
         ));
     }
     check_order_quantities(conn, &order, date, items)
+}
+
+pub(crate) fn validate_order_invoice_source(
+    conn: &Connection,
+    company: i64,
+    order: i64,
+    date: NaiveDate,
+    items: impl Iterator<Item = i64>,
+) -> Result<()> {
+    let summary = order_summary(conn, company, order)?;
+    if date < parse_date(&summary.date)? {
+        return Err(Error::Validation(
+            "The date cannot precede the order date".into(),
+        ));
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM order_lines WHERE order_id = ?1 AND item_id = ?2)",
+    )?;
+    for item in items {
+        if !stmt.query_row(params![order, item], |row| row.get::<_, bool>(0))? {
+            return Err(Error::Validation(
+                "Every stock item must appear on the order".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn attach_order_invoice(conn: &Connection, order: i64, invoice: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO invoice_order_links(invoice_id, order_id) VALUES (?1, ?2)",
+        params![invoice, order],
+    )?;
+    crate::stock_reservations::check_order_coverage(conn, order)
 }
 
 fn check_order_quantities(
@@ -1166,11 +1200,7 @@ impl Store {
         )?;
         let (invoice, _) =
             insert_direct_invoice(&tx, company, draft, StockInvoicePosting::Order(id))?;
-        tx.execute(
-            "INSERT INTO invoice_order_links(invoice_id, order_id) VALUES (?1, ?2)",
-            params![invoice, id],
-        )?;
-        crate::stock_reservations::check_order_coverage(&tx, id)?;
+        attach_order_invoice(&tx, id, invoice)?;
         tx.commit()?;
         Ok(invoice)
     }

@@ -194,6 +194,7 @@ struct ImportedInvoice {
     taxes: Vec<ImportedInvoiceTax>,
     original_postings: Vec<Line>,
     metadata: SourceMetadata,
+    order: Option<orders::InvoiceOrder>,
 }
 #[derive(Debug, Clone)]
 struct ImportedFundingApplication {
@@ -2081,6 +2082,9 @@ fn parse_imported_invoice(
             "DATE",
             "VOUCHERTYPENAME",
             "VOUCHERNUMBER",
+            "BASICORDERREF",
+            "ORDERNO",
+            "ORDERDUEDATE",
             "REFERENCE",
             "REF",
             "REFERENCEDATE",
@@ -2369,6 +2373,7 @@ fn parse_imported_invoice(
             }
         }
     }
+    let order = orders::invoice_order(node, &inventory_rows)?;
     let (mut lines, subtotal) = parse_invoice_stock(
         inventory_rows,
         breakdowns,
@@ -2490,6 +2495,7 @@ fn parse_imported_invoice(
         line.existing_trade_ledger_id = existing_trade_id;
     }
     Ok(ImportedInvoice {
+        order,
         kind,
         entry_mode,
         date,
@@ -2588,12 +2594,20 @@ fn parse_invoice_stock(
                 "BILLEDQTY",
                 "TRACKINGNUMBER",
                 "GODOWNNAME",
+                "BASICORDERREF",
+                "ORDERNO",
+                "ORDERDUEDATE",
                 "ACCOUNTINGALLOCATIONS.LIST",
                 "BATCHALLOCATIONS.LIST",
             ],
             label,
             issues,
         );
+        if returning && orders::has_line_order_fields(item_node) {
+            return Err(Error::Validation(
+                "Imported returns use the order on their original invoice".into(),
+            ));
+        }
         let name = invoice_field(item_node, "STOCKITEMNAME")?;
         let (existing_item_id, unit) = items
             .get(&normalized(&name))
@@ -2791,10 +2805,18 @@ fn parse_invoice_stock(
                         "BILLEDQTY",
                         "AMOUNT",
                         "TRACKINGNUMBER",
+                        "BASICORDERREF",
+                        "ORDERNO",
+                        "ORDERDUEDATE",
                     ],
                     label,
                     issues,
                 );
+                if returning && orders::has_line_order_fields(location_node) {
+                    return Err(Error::Validation(
+                        "Imported returns use the order on their original invoice".into(),
+                    ));
+                }
                 let allocated_actual =
                     unit.quantity(&invoice_field(location_node, "ACTUALQTY")?)?;
                 let source_allocation_amount = xml_item_amount(location_node)?;
@@ -6090,6 +6112,7 @@ impl Store {
         if plan.can_apply()
             && (!plan.stock_notes.is_empty()
                 || !plan.orders.is_empty()
+                || plan.invoices.iter().any(|invoice| invoice.order.is_some())
                 || plan
                     .invoices
                     .iter()
@@ -6692,7 +6715,9 @@ impl Store {
         note_order.sort_by_key(|row| (&row.date, row.kind == InvoiceKind::Sale));
         let mut notes = note_order.into_iter().peekable();
         let mut invoice_order = plan.invoices.iter().collect::<Vec<_>>();
-        if !plan.stock_notes.is_empty() {
+        if !plan.stock_notes.is_empty()
+            || plan.invoices.iter().any(|invoice| invoice.order.is_some())
+        {
             invoice_order.sort_by_key(|row| (&row.date, row.kind == InvoiceKind::Sale));
         }
         for invoice in invoice_order {
@@ -6863,6 +6888,11 @@ impl Store {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let order_id = invoice
+                .order
+                .as_ref()
+                .map(|order| order.validate(conn, plan.company_id, &draft, invoice))
+                .transpose()?;
             let (invoice_id, voucher_id) = insert_direct_invoice(
                 &conn,
                 plan.company_id,
@@ -6870,8 +6900,12 @@ impl Store {
                 StockInvoicePosting::Import {
                     original_postings: (invoice.entry_mode == InvoiceEntryMode::Voucher)
                         .then_some(original_postings.as_slice()),
+                    order_id,
                 },
             )?;
+            if let Some(order) = order_id {
+                crate::orders::attach_order_invoice(conn, order, invoice_id)?;
+            }
             tracking.write_invoice(&conn, invoice_id, invoice)?;
             save_metadata(
                 &conn,
@@ -11264,6 +11298,7 @@ mod tests {
             .set_negative_stock_policy(company, Some(date), "Keep stock nonnegative")
             .unwrap();
         let sale = ImportedInvoice {
+            order: None,
             kind: InvoiceKind::Sale,
             entry_mode: InvoiceEntryMode::Invoice,
             date: date.into(),

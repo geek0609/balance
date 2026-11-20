@@ -1455,6 +1455,7 @@ pub(crate) enum StockInvoicePosting<'a> {
     Order(i64),
     Import {
         original_postings: Option<&'a [Posting]>,
+        order_id: Option<i64>,
     },
 }
 
@@ -1465,8 +1466,15 @@ pub(crate) fn insert_direct_invoice(
     posting: StockInvoicePosting<'_>,
 ) -> Result<(i64, i64)> {
     let original_postings = match &posting {
-        StockInvoicePosting::Import { original_postings } => *original_postings,
+        StockInvoicePosting::Import {
+            original_postings, ..
+        } => *original_postings,
         _ => None,
+    };
+    let order = match &posting {
+        StockInvoicePosting::Direct => None,
+        StockInvoicePosting::Order(order) => Some(*order),
+        StockInvoicePosting::Import { order_id, .. } => *order_id,
     };
     let ids = insert_invoice(conn, company, draft, original_postings)?;
     if draft.kind == InvoiceKind::Sale {
@@ -1474,7 +1482,7 @@ pub(crate) fn insert_direct_invoice(
         let mut buckets = HashSet::new();
         let reference = format!("Invoice {} (#{})", draft.reference.trim(), ids.0);
         for (item, location, batch, quantity) in allocations {
-            if let StockInvoicePosting::Order(order) = posting {
+            if let Some(order) = order {
                 crate::stock_reservations::consume_reservations(
                     conn, order, item, location, batch, quantity, &reference,
                 )?;
