@@ -158,6 +158,7 @@ impl NoteStock<'_> {
             } else {
                 orders::OrderFields::read(entry, &item_order)?
             };
+            order.validate_allocation()?;
             let location = direct_text(entry, "GODOWNNAME")
                 .filter(|value| !value.is_empty())
                 .or_else(|| header_location.clone())

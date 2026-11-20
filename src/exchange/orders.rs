@@ -88,28 +88,34 @@ impl OrderFields {
     pub(super) fn read(node: Node<'_, '_>, parent: &Self) -> Result<Self> {
         let number = direct_text(node, "ORDERNO").filter(|value| !value.is_empty());
         let alias = direct_text(node, "BASICORDERREF").filter(|value| !value.is_empty());
-        let mut reference = source_ref(number.clone());
-        collect_reference(&mut reference, alias.clone())?;
-        if number.is_none() && alias.is_none() {
+        let inherit_reference = number.is_none() && alias.is_none();
+        let mut reference = source_ref(number);
+        collect_reference(&mut reference, alias)?;
+        if inherit_reference {
             reference = parent.reference.clone();
         }
-        let explicit_date = due_date(node)?;
-        if reference.is_none() && explicit_date.is_some() {
-            return Err(Error::Validation(
-                "A delivery due date requires an order reference".into(),
-            ));
+        let inherit_date = inherit_reference
+            || (reference.is_some()
+                && (parent.reference.is_none()
+                    || reference.as_deref().map(normalized)
+                        == parent.reference.as_deref().map(normalized)));
+        let mut expected_on = due_date(node)?;
+        if expected_on.is_none() && inherit_date {
+            expected_on = parent.expected_on.clone();
         }
-        let expected_on = explicit_date.or_else(|| {
-            if reference.as_deref().map(normalized) == parent.reference.as_deref().map(normalized) {
-                parent.expected_on.clone()
-            } else {
-                None
-            }
-        });
         Ok(Self {
             reference,
             expected_on,
         })
+    }
+
+    pub(super) fn validate_allocation(&self) -> Result<()> {
+        if self.reference.is_none() && self.expected_on.is_some() {
+            return Err(Error::Validation(
+                "A delivery due date requires an order reference".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -118,10 +124,13 @@ pub(super) fn invoice_orders(
     inventory: &[(Node<'_, '_>, Option<usize>)],
 ) -> Result<Option<InvoiceOrders>> {
     let header = OrderFields::read(node, &OrderFields::default())?;
-    if inventory.is_empty() && header.reference.is_some() {
-        return Err(Error::Validation(
-            "An order reference requires an inventory invoice".into(),
-        ));
+    if inventory.is_empty() {
+        header.validate_allocation()?;
+        if header.reference.is_some() {
+            return Err(Error::Validation(
+                "An order reference requires an inventory invoice".into(),
+            ));
+        }
     }
     let mut lines = Vec::new();
     for &(item, _) in inventory {
@@ -136,6 +145,9 @@ pub(super) fn invoice_orders(
         }
         if allocations.is_empty() {
             allocations.push(item_fields);
+        }
+        for fields in &allocations {
+            fields.validate_allocation()?;
         }
         lines.push(allocations);
     }
@@ -1376,6 +1388,17 @@ mod tests {
         assert!(store.stock_notes(company, None).unwrap().is_empty());
         let plan = store
             .preview_xml_import(company, &envelope(delivery))
+            .unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+
+        let header_date_only = delivery
+            .replace("<BASICORDERREF>SCHEDULE</BASICORDERREF>", "")
+            .replace(
+                "<ACTUALQTY>-4 pcs</ACTUALQTY>",
+                "<ORDERNO>SCHEDULE</ORDERNO><ACTUALQTY>-4 pcs</ACTUALQTY>",
+            );
+        let plan = store
+            .preview_xml_import(company, &envelope(&header_date_only))
             .unwrap();
         assert!(plan.can_apply(), "{:?}", plan.issues());
         store.apply_xml_import(&plan).unwrap();
