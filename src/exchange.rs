@@ -32,6 +32,7 @@ use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
+mod cancelled;
 mod orders;
 mod stock_counts;
 mod stock_journals;
@@ -393,6 +394,7 @@ pub struct ImportPlan {
     stock_returns: Vec<stock_rejections::ImportedRejection>,
     stock_counts: Vec<stock_counts::ImportedCount>,
     stock_journals: Vec<stock_journals::ImportedJournal>,
+    cancelled_vouchers: Vec<cancelled::ImportedCancelled>,
     orders: Vec<orders::ImportedOrder>,
     stock_preview: Option<StockImportPreview>,
     settlements: Vec<ImportedSettlement>,
@@ -465,6 +467,9 @@ impl ImportPlan {
     }
     pub fn stock_count_count(&self) -> usize {
         self.stock_counts.len()
+    }
+    pub fn cancelled_voucher_count(&self) -> usize {
+        self.cancelled_vouchers.len()
     }
     pub fn stock_journal_count(&self) -> usize {
         self.stock_journals.len()
@@ -613,6 +618,7 @@ impl ImportPlan {
                 || !self.stock_returns.is_empty()
                 || !self.stock_counts.is_empty()
                 || !self.stock_journals.is_empty()
+                || !self.cancelled_vouchers.is_empty()
                 || !self.orders.is_empty()
                 || !self.settlements.is_empty()
                 || !self.bill_notes.is_empty())
@@ -631,6 +637,7 @@ pub struct ImportCounts {
     pub stock_returns: usize,
     pub stock_counts: usize,
     pub stock_journals: usize,
+    pub cancelled_vouchers: usize,
     pub orders: usize,
     pub stock_matches: usize,
     pub settlements: usize,
@@ -699,7 +706,8 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
     .any(|tag| local_name(node).eq_ignore_ascii_case(tag));
     for child in node.children().filter(|n| n.is_element()) {
         let tag = local_name(child);
-        let metadata = (voucher && tag.eq_ignore_ascii_case("VCHKEY"))
+        let metadata = (voucher
+            && (tag.eq_ignore_ascii_case("VCHKEY") || cancelled::status_field(tag)))
             || record
                 && ["GUID", "REMOTEID", "MASTERID", "ALTERID"]
                     .iter()
@@ -753,6 +761,7 @@ fn check_fields(node: Node<'_, '_>, allowed: &[&str], label: &str, issues: &mut 
                 && ["DATE", "VCHTYPE", "OBJVIEW", "VCHKEY"]
                     .iter()
                     .any(|a| attribute.name().eq_ignore_ascii_case(a)))
+            && !(voucher && cancelled::status_field(attribute.name()))
             && !(attribute.name().eq_ignore_ascii_case("TYPE")
                 && ["String", "Date", "Number", "Logical", "Amount"]
                     .iter()
@@ -816,7 +825,16 @@ fn register_metadata(
     issues: &mut Vec<String>,
 ) {
     for (key, value) in meta.identities() {
-        if !value.is_empty() && !seen.insert((kind.to_owned(), key.to_owned(), normalized(value))) {
+        if value.is_empty() {
+            continue;
+        }
+        let value = normalized(value);
+        if cancelled::other_status_seen(kind, key, &value, seen) {
+            issues.push(format!(
+                "{label}: a source voucher with this {key} already has a different posting status"
+            ));
+        }
+        if !seen.insert((kind.to_owned(), key.to_owned(), value)) {
             issues.push(format!("{label}: imported identifier {key} already exists"));
         }
     }
@@ -847,22 +865,52 @@ fn save_metadata(
             "Imported identifiers changed since preview".into(),
         ));
     }
-    let mut stmt = conn.prepare("SELECT guid, remote_id, master_id, voucher_key FROM imported_record_metadata WHERE company_id = ?1 AND kind = ?2")?;
-    let rows = stmt.query_map(params![company, kind], |r| {
-        Ok([
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-        ])
-    })?;
-    let identities = meta.identities().map(|(_, value)| normalized(value));
+    let mut stmt = conn.prepare_cached(
+        "SELECT kind, guid, remote_id, master_id, voucher_key FROM imported_record_metadata
+         WHERE company_id = ?1 AND (
+             kind = ?2 OR (?3 AND kind = ?4)
+             OR (?5 AND kind IN ('voucher', 'stocknote', 'order', 'stockreturn', 'stockcount', 'stockjournal'))
+         )",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            company,
+            kind,
+            cancelled::is_posted_kind(kind),
+            cancelled::KIND,
+            kind == cancelled::KIND
+        ],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                [
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ],
+            ))
+        },
+    )?;
+    let identities = meta
+        .identities()
+        .map(|(key, value)| (key, normalized(value)));
     for row in rows {
+        let (saved_kind, saved_values) = row?;
         if identities
             .iter()
-            .zip(row?)
-            .any(|(key, value)| !key.is_empty() && *key == normalized(&value))
+            .zip(saved_values)
+            .any(|((key, value), saved)| {
+                !value.is_empty()
+                    && (saved_kind == kind || *key != "master")
+                    && *value == normalized(&saved)
+            })
         {
+            if saved_kind != kind {
+                return Err(Error::Validation(
+                    "A source voucher already exists with a different posting status".into(),
+                ));
+            }
             return Err(Error::Validation(
                 "An imported identifier already exists".into(),
             ));
@@ -987,7 +1035,7 @@ fn decode(bytes: &[u8]) -> Result<String> {
         Ok(text.trim_start_matches('\u{feff}').to_owned())
     }
 }
-fn parse_kind(value: &str) -> Option<VoucherKind> {
+pub(crate) fn parse_kind(value: &str) -> Option<VoucherKind> {
     match normalized(value).as_str() {
         "journal" => Some(VoucherKind::Journal),
         "payment" => Some(VoucherKind::Payment),
@@ -4180,7 +4228,19 @@ impl Store {
             remaining_nodes -= document.descendants().len() as u32;
             documents.push(document);
         }
-        let nodes = || documents.iter().flat_map(Document::descendants);
+        // A voucher owns its contents. Nested elements cannot become independent
+        // masters or postings, including inside an archived voucher.
+        let records = documents
+            .iter()
+            .flat_map(Document::descendants)
+            .filter(|node| {
+                node.is_element()
+                    && !node.ancestors().skip(1).any(|parent| {
+                        parent.is_element() && local_name(parent).eq_ignore_ascii_case("VOUCHER")
+                    })
+            })
+            .collect::<Vec<_>>();
+        let nodes = || records.iter().copied();
         let mut plan = ImportPlan {
             company_id,
             opening_date: opening_date
@@ -4203,6 +4263,7 @@ impl Store {
             stock_returns: Vec::new(),
             stock_counts: Vec::new(),
             stock_journals: Vec::new(),
+            cancelled_vouchers: Vec::new(),
             orders: Vec::new(),
             stock_preview: None,
             settlements: Vec::new(),
@@ -5371,6 +5432,7 @@ impl Store {
             .filter_map(stock_journals::type_name)
             .map(|name| normalized(&name))
             .collect::<HashSet<_>>();
+        let mut cancelled_headers = cancelled::existing_headers(&self.conn, company_id)?;
         for (source_order, node) in nodes()
             .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("VOUCHER"))
             .enumerate()
@@ -5380,6 +5442,43 @@ impl Store {
                 direct_text(node, "VOUCHERNUMBER").unwrap_or_default()
             );
             let metadata = source_metadata(node, &label, &mut plan.issues);
+            match cancelled::status(node) {
+                Ok(cancelled::Status::Cancelled) => {
+                    match cancelled::parse(node, metadata) {
+                        Ok(record) => {
+                            register_metadata(
+                                cancelled::KIND,
+                                &label,
+                                &record.metadata,
+                                &mut seen_metadata,
+                                &mut plan.issues,
+                            );
+                            if record
+                                .header_without_id()
+                                .is_some_and(|key| !cancelled_headers.insert(key))
+                            {
+                                plan.issues.push(format!(
+                                    "{label}: this cancelled voucher already exists"
+                                ));
+                            }
+                            plan.cancelled_vouchers.push(record);
+                        }
+                        Err(error) => plan.issues.push(format!("{label}: {error}")),
+                    }
+                    continue;
+                }
+                Ok(cancelled::Status::Optional) => {
+                    plan.issues.push(format!(
+                        "{label}: optional vouchers require review before import"
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    plan.issues.push(format!("{label}: {error}"));
+                    continue;
+                }
+                Ok(cancelled::Status::Posted) => {}
+            }
             let voucher_type = direct_text(node, "VOUCHERTYPENAME");
             let stock_kind = voucher_type.as_deref().and_then(stock_notes::kind);
             let order_kind = voucher_type.as_deref().and_then(orders::kind);
@@ -6242,6 +6341,7 @@ impl Store {
             && plan.stock_returns.is_empty()
             && plan.stock_counts.is_empty()
             && plan.stock_journals.is_empty()
+            && plan.cancelled_vouchers.is_empty()
             && plan.orders.is_empty()
             && plan.settlements.is_empty()
             && plan.bill_notes.is_empty()
@@ -6322,6 +6422,9 @@ impl Store {
         plan: &ImportPlan,
     ) -> Result<(ImportCounts, StockImportPreview)> {
         plan.check_period_lock(&conn)?;
+        for record in &plan.cancelled_vouchers {
+            cancelled::write(conn, plan.company_id, record)?;
+        }
         for (id, metadata) in &plan.existing_location_metadata {
             let exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM stock_locations WHERE id = ?1 AND company_id = ?2)",
@@ -7368,6 +7471,7 @@ impl Store {
                 stock_matches: stock_preview.matches.len(),
                 stock_counts: plan.stock_counts.len(),
                 stock_journals: plan.stock_journals.len(),
+                cancelled_vouchers: plan.cancelled_vouchers.len(),
                 settlements: plan.settlement_count(),
                 bill_notes: plan.bill_note_count(),
                 advances: plan.advance_count(),
@@ -11652,6 +11756,7 @@ mod tests {
             stock_returns: Vec::new(),
             stock_counts: Vec::new(),
             stock_journals: Vec::new(),
+            cancelled_vouchers: Vec::new(),
             orders: Vec::new(),
             stock_preview: None,
             settlements: Vec::new(),

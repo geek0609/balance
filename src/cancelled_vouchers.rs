@@ -1,0 +1,96 @@
+//! Non-posting voucher history.
+use crate::{parse_date, Error, Result, Store, VoucherKind};
+
+pub(crate) fn migrate(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cancelled_vouchers(
+            id INTEGER PRIMARY KEY,
+            company_id INTEGER NOT NULL REFERENCES companies(id),
+            date TEXT NOT NULL,
+            voucher_type TEXT NOT NULL,
+            reference TEXT NOT NULL,
+            party TEXT NOT NULL,
+            narration TEXT NOT NULL,
+            type_key TEXT NOT NULL,
+            reference_key TEXT NOT NULL,
+            has_source_id INTEGER NOT NULL CHECK(has_source_id IN (0, 1))
+        );
+        CREATE INDEX IF NOT EXISTS cancelled_vouchers_company_date ON cancelled_vouchers(company_id, date, id);
+        CREATE UNIQUE INDEX IF NOT EXISTS cancelled_vouchers_without_source_id
+        ON cancelled_vouchers(company_id, date, type_key, reference_key, party, narration)
+        WHERE has_source_id = 0;",
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct CancelledVoucher {
+    pub id: i64,
+    pub date: String,
+    pub voucher_type: String,
+    pub reference: String,
+    pub party: String,
+    pub narration: String,
+}
+
+impl Store {
+    pub fn cancelled_vouchers(
+        &self,
+        company_id: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        kind: Option<VoucherKind>,
+        search: &str,
+    ) -> Result<Vec<CancelledVoucher>> {
+        let start = start.map(parse_date).transpose()?;
+        let end = end.map(parse_date).transpose()?;
+        if matches!((start, end), (Some(a), Some(b)) if a > b) {
+            return Err(Error::Validation(
+                "The start date must not be after the end date".into(),
+            ));
+        }
+        let search = search.trim().to_lowercase();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, date, voucher_type, reference, party, narration FROM cancelled_vouchers
+             WHERE company_id = ?1",
+        )?;
+        let rows = stmt.query_map([company_id], |row| {
+            Ok(CancelledVoucher {
+                id: row.get(0)?,
+                date: row.get(1)?,
+                voucher_type: row.get(2)?,
+                reference: row.get(3)?,
+                party: row.get(4)?,
+                narration: row.get(5)?,
+            })
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let voucher = row?;
+            let date = parse_date(&voucher.date)?;
+            if start.is_some_and(|from| date < from)
+                || end.is_some_and(|through| date > through)
+                || kind.is_some_and(|kind| {
+                    crate::exchange::parse_kind(&voucher.voucher_type) != Some(kind)
+                })
+            {
+                continue;
+            }
+            if search.is_empty()
+                || voucher.id.to_string().contains(&search)
+                || [
+                    &voucher.reference,
+                    &voucher.voucher_type,
+                    &voucher.party,
+                    &voucher.narration,
+                ]
+                .iter()
+                .any(|field| field.to_lowercase().contains(&search))
+            {
+                entries.push((date, voucher));
+            }
+        }
+        entries.sort_by_key(|(date, voucher)| std::cmp::Reverse((*date, voucher.id)));
+        Ok(entries.into_iter().map(|(_, voucher)| voucher).collect())
+    }
+}

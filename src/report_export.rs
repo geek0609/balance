@@ -866,6 +866,66 @@ impl Store {
         save(csv, destination)
     }
 
+    pub fn export_cancelled_vouchers_csv(
+        &self,
+        company: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        kind: Option<VoucherKind>,
+        search: &str,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let entries = self.cancelled_vouchers(company, start, end, kind, search)?;
+        let context = vec![
+            self.report_company_name(company)?,
+            optional_date(start)?,
+            optional_date(end)?,
+            kind.map(|kind| kind.as_str()).unwrap_or("All").into(),
+            text_cell(search.trim()),
+        ];
+        let mut csv = writer();
+        contextual_row(
+            &mut csv,
+            &strings(&[
+                "company",
+                "period_start",
+                "period_end",
+                "type_filter",
+                "search",
+            ]),
+            &strings(&[
+                "row_type",
+                "date",
+                "cancelled_voucher_id",
+                "type",
+                "reference",
+                "party",
+                "narration",
+            ]),
+        )?;
+        contextual_row(
+            &mut csv,
+            &context,
+            &strings(&["context", "", "", "", "", "", ""]),
+        )?;
+        for voucher in entries {
+            contextual_row(
+                &mut csv,
+                &context,
+                &[
+                    "cancelled".into(),
+                    voucher.date,
+                    voucher.id.to_string(),
+                    text_cell(&voucher.voucher_type),
+                    text_cell(&voucher.reference),
+                    text_cell(&voucher.party),
+                    text_cell(&voucher.narration),
+                ],
+            )?;
+        }
+        save(csv, destination)
+    }
+
     pub fn export_ledger_register_csv(
         &self,
         company: i64,
