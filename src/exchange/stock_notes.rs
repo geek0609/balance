@@ -600,7 +600,7 @@ impl NewTracking {
         )?;
         let mut demands = conn.prepare(
             "SELECT i.id, a.id, v.date, a.billed_quantity - COALESCE((SELECT SUM(s.quantity)
-                  FROM active_invoice_stock_links s WHERE s.invoice_allocation_id = a.id), 0)
+                  FROM active_invoice_stock_links s WHERE s.invoice_allocation_id = a.id), 0), dates.expected_on
              FROM stock_note_lines nl JOIN stock_notes n ON n.id = nl.note_id
              JOIN imported_stock_note_tracking nt ON nt.note_line_id = nl.id
              JOIN imported_invoice_tracking it ON it.reference_key = nt.reference_key
@@ -611,11 +611,12 @@ impl NewTracking {
                   AND i.kind = n.kind AND i.party_ledger_id = n.party_ledger_id
              JOIN vouchers v ON v.id = i.voucher_id
              LEFT JOIN stock_note_order_sources src ON src.note_line_id = nl.id
+             LEFT JOIN invoice_order_allocations dates ON dates.allocation_id = a.id
              WHERE nl.id = ?1 AND a.quantity = 0
                AND NOT EXISTS(SELECT 1 FROM invoice_order_sources o
                               WHERE o.allocation_id = a.id AND o.order_id IS NOT src.order_id)
                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)
-             ORDER BY v.date, i.id, a.id",
+             ORDER BY dates.expected_on IS NULL, v.date, i.id, a.id",
         )?;
         let mut keys = self.references.into_iter().collect::<Vec<_>>();
         keys.sort_unstable();
@@ -642,10 +643,12 @@ impl NewTracking {
                             row.get::<_, i64>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, i64>(3)?,
+                            row.get::<_, Option<String>>(4)?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                for (invoice, invoice_allocation_id, invoice_date, remaining) in bills {
+                let mut stock_line = None;
+                for (invoice, invoice_allocation_id, invoice_date, remaining, due) in bills {
                     if available == 0 {
                         break;
                     }
@@ -655,7 +658,23 @@ impl NewTracking {
                     {
                         continue;
                     }
-                    let quantity = remaining.min(available);
+                    let mut quantity = remaining.min(available);
+                    if let Some(due) = due {
+                        if stock_line.is_none() {
+                            stock_line = crate::stock_notes::note_lines(conn, company, note)?
+                                .into_iter()
+                                .find(|line| line.id == note_line);
+                        }
+                        let line = stock_line
+                            .as_ref()
+                            .ok_or_else(crate::stock_notes::invalid_spans)?;
+                        quantity = quantity.min(crate::stock_notes::unbilled_on_delivery_date(
+                            conn, line, &due,
+                        )?);
+                    }
+                    if quantity == 0 {
+                        continue;
+                    }
                     crate::invoice_stock_links::link_imported_stock(
                         conn,
                         company,
@@ -674,6 +693,9 @@ impl NewTracking {
                         quantity,
                     });
                     available -= quantity;
+                    if let Some(line) = &mut stock_line {
+                        line.billed += quantity;
+                    }
                 }
             }
         }

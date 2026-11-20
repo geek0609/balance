@@ -135,6 +135,7 @@ pub struct InvoiceStockDemand {
     pub billed_quantity: i64,
     pub remaining: i64,
     order_id: Option<i64>,
+    pub expected_on: Option<String>,
 }
 
 impl InvoiceStockDemand {
@@ -156,6 +157,16 @@ pub struct InvoiceAwaitingStock {
     pub date: String,
     pub reference: String,
     pub allocations: Vec<InvoiceStockDemand>,
+    available_by_pair: HashMap<(i64, i64), i64>,
+}
+
+impl InvoiceAwaitingStock {
+    pub fn available_on(&self, allocation: i64, note_line: i64) -> i64 {
+        self.available_by_pair
+            .get(&(allocation, note_line))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug)]
@@ -168,11 +179,12 @@ pub struct StockNoteInvoiceAllocation {
 fn demand(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<InvoiceStockDemand>> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, l.item_id, a.location_id, a.batch_id, a.billed_quantity,
-                a.billed_quantity - COALESCE(SUM(s.quantity), 0), src.order_id
+                a.billed_quantity - COALESCE(SUM(s.quantity), 0), src.order_id, dates.expected_on
          FROM invoices i JOIN invoice_lines l ON l.invoice_id = i.id
          JOIN invoice_line_allocations a ON a.line_id = l.id
          LEFT JOIN active_invoice_stock_links s ON s.invoice_allocation_id = a.id
          LEFT JOIN invoice_order_sources src ON src.allocation_id = a.id
+         LEFT JOIN invoice_order_allocations dates ON dates.allocation_id = a.id
          WHERE i.company_id = ?1 AND i.id = ?2 AND a.quantity = 0
            AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)
          GROUP BY a.id ORDER BY l.id, a.id",
@@ -186,6 +198,7 @@ fn demand(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<InvoiceSt
             billed_quantity: row.get(4)?,
             remaining: row.get(5)?,
             order_id: row.get(6)?,
+            expected_on: row.get(7)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -234,21 +247,37 @@ fn candidates(
     let mut choices = Vec::new();
     for row in rows {
         let (id, date, reference) = row?;
-        let allocations = demand(conn, company, id)?
+        let mut available_by_pair = HashMap::new();
+        let mut allocations = Vec::new();
+        for billed in demand(conn, company, id)?
             .into_iter()
-            .filter(|a| {
-                a.remaining > 0
-                    && lines
-                        .iter()
-                        .any(|line| line.unbilled() > 0 && a.matches(line))
-            })
-            .collect::<Vec<_>>();
+            .filter(|billed| billed.remaining > 0)
+        {
+            let mut can_match = false;
+            for line in lines
+                .iter()
+                .filter(|line| line.unbilled() > 0 && billed.matches(line))
+            {
+                let available = match &billed.expected_on {
+                    Some(due) => stock_notes::unbilled_on_delivery_date(conn, line, due)?,
+                    None => line.unbilled(),
+                };
+                if available > 0 {
+                    can_match = true;
+                    available_by_pair.insert((billed.allocation_id, line.id), available);
+                }
+            }
+            if can_match {
+                allocations.push(billed);
+            }
+        }
         if !allocations.is_empty() {
             choices.push(InvoiceAwaitingStock {
                 id,
                 date,
                 reference,
                 allocations,
+                available_by_pair,
             });
         }
     }
@@ -448,7 +477,13 @@ fn write_stock_match(
         .collect();
     let mut used = HashSet::new();
     let date = date.to_string();
-    for request in requests {
+    let mut ordered = requests.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|request| {
+        demands
+            .get(&request.invoice_allocation_id)
+            .is_none_or(|billed| billed.expected_on.is_none())
+    });
+    for request in ordered {
         let &StockNoteInvoiceAllocation {
             invoice_allocation_id,
             note_line_id,
@@ -475,7 +510,24 @@ fn write_stock_match(
         }
         check_quantity_precision(conn, company, billed.item_id, quantity)?;
         check_link_date(conn, invoice_allocation_id, note_line_id, &date)?;
-        let note_spans = stock_notes::allocate_spans(conn, line, quantity)?;
+        let note_spans = if let Some(due) = &billed.expected_on {
+            let mut spans = stock_notes::unbilled_delivery_spans(conn, line, due)?;
+            let mut remaining = quantity;
+            spans.retain_mut(|span| {
+                let used = (span.end - span.start).min(remaining);
+                span.end = span.start + used;
+                remaining -= used;
+                used > 0
+            });
+            if remaining > 0 {
+                return Err(Error::Validation(format!(
+                    "Quantity exceeds the available stock for the delivery lot on {due}"
+                )));
+            }
+            spans
+        } else {
+            stock_notes::allocate_spans(conn, line, quantity)?
+        };
         let mut stmt = conn.prepare_cached(
             "SELECT billed_start, quantity FROM active_invoice_stock_links
              WHERE invoice_allocation_id = ?1 ORDER BY billed_start",

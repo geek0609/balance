@@ -233,6 +233,59 @@ pub(crate) fn record_return(
     Ok(())
 }
 
+/// Find original stock positions assigned to the requested delivery date.
+pub(crate) fn note_delivery_spans(
+    conn: &Connection,
+    note_line: i64,
+    capacity: i64,
+    due: &str,
+) -> Result<Vec<Range<i64>>> {
+    let whole_line_date: Option<String> = conn.query_row(
+        "SELECT COALESCE(saved.expected_on, CASE WHEN NOT EXISTS(
+             SELECT 1 FROM order_lines l JOIN order_delivery_lots lot ON lot.order_line_id = l.id
+             WHERE l.order_id = src.order_id AND l.item_id = nl.item_id
+         ) THEN o.expected_on END)
+         FROM stock_note_lines nl
+         LEFT JOIN stock_note_order_sources src ON src.note_line_id = nl.id
+         LEFT JOIN stock_note_order_allocations saved ON saved.note_line_id = nl.id
+         LEFT JOIN orders o ON o.id = src.order_id
+         WHERE nl.id = ?1",
+        [note_line],
+        |row| row.get(0),
+    )?;
+    if let Some(date) = whole_line_date {
+        return Ok(if date == due {
+            std::iter::once(0..capacity).collect()
+        } else {
+            Vec::new()
+        });
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT a.start_quantity, a.quantity FROM order_lot_assignments a
+         JOIN order_delivery_lots lot ON lot.id = a.lot_id
+         JOIN order_lines l ON l.id = lot.order_line_id
+         JOIN orders o ON o.id = l.order_id
+         WHERE a.note_line_id = ?1 AND COALESCE(lot.expected_on, o.expected_on) = ?2
+         ORDER BY a.start_quantity",
+    )?;
+    let mut spans = Vec::new();
+    let mut end = 0;
+    let mut rows = stmt.query(params![note_line, due])?;
+    while let Some(row) = rows.next()? {
+        let start: i64 = row.get(0)?;
+        let quantity: i64 = row.get(1)?;
+        let next = start
+            .checked_add(quantity)
+            .ok_or_else(crate::stock_notes::invalid_spans)?;
+        if start < end || quantity <= 0 || next > capacity {
+            return Err(crate::stock_notes::invalid_spans());
+        }
+        spans.push(start..next);
+        end = next;
+    }
+    Ok(spans)
+}
+
 pub(crate) fn check_capacity(conn: &Connection, order: i64) -> Result<()> {
     let invalid: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM order_delivery_lot_balances b

@@ -1350,6 +1350,141 @@ mod tests {
     }
 
     #[test]
+    fn tracked_invoice_matches_only_the_requested_date_within_a_delivery_line() {
+        let (mut store, company, _, item, _, order) = scheduled_sale();
+        let note = |date: &str, reference: &str, quantity: i64, due: &str| {
+            format!(
+                "<VOUCHER><DATE>{date}</DATE><VOUCHERTYPENAME>Delivery Note</VOUCHERTYPENAME>
+                 <VOUCHERNUMBER>{reference}</VOUCHERNUMBER><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME>
+                 <ORDERNO>SCHEDULE</ORDERNO>{due}
+                 <INVENTORYENTRIES.LIST><STOCKITEMNAME>Part</STOCKITEMNAME><ACTUALQTY>-{quantity} pcs</ACTUALQTY>
+                   <TRACKINGNUMBER>SHARED</TRACKINGNUMBER>
+                 </INVENTORYENTRIES.LIST></VOUCHER>"
+            )
+        };
+        let xml = note("20260402", "EARLY", 1, "<ORDERDUEDATE>20260405</ORDERDUEDATE>")
+            + &note("20260403", "MIXED", 3, "")
+            + &split_sale("20260404", "LATE-BILL", "", &[
+                ("<ORDERNO>SCHEDULE</ORDERNO><ORDERDUEDATE>20260412</ORDERDUEDATE><TRACKINGNUMBER>SHARED</TRACKINGNUMBER>", 3),
+            ]);
+        let plan = store.preview_xml_import(company, &envelope(&xml)).unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        assert_eq!(plan.stock_match_count(), 1);
+        store.apply_xml_import(&plan).unwrap();
+        let invoice = store.invoices(company).unwrap().remove(0);
+        let demand = store.invoice_stock_demand(company, invoice.id).unwrap();
+        assert_eq!(
+            (demand[0].remaining, demand[0].expected_on.as_deref()),
+            (1000, Some("2026-04-12"))
+        );
+        let (start, quantity): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT note_start, quantity FROM active_invoice_stock_links WHERE invoice_id = ?1",
+                [invoice.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((start, quantity), (1000, 2000));
+        let linked = store
+            .invoice_return_sources(company, invoice.id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(linked.note_reference.as_deref(), Some("MIXED"));
+        assert_eq!(remaining(&store, company, order), [0, 0]);
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            4000
+        );
+    }
+
+    #[test]
+    fn manual_matching_limits_quantity_to_the_requested_due_date() {
+        use crate::invoice_returns::StockReturnDraft;
+        use crate::invoice_stock_links::StockNoteInvoiceAllocation;
+        use crate::stock_notes::{StockNoteDraft, StockNoteLineDraft};
+
+        let (mut store, company, party, item, location, order) = scheduled_sale();
+        let xml = split_sale("20260402", "BEFORE-STOCK", "", &[
+            ("<ORDERNO>SCHEDULE</ORDERNO><ORDERDUEDATE>20260412</ORDERDUEDATE><TRACKINGNUMBER>WAIT</TRACKINGNUMBER>", 3),
+        ]);
+        let plan = store.preview_xml_import(company, &envelope(&xml)).unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        store.apply_xml_import(&plan).unwrap();
+        let invoice = store.invoices(company).unwrap().remove(0);
+        let note = store
+            .post_stock_note(
+                company,
+                &StockNoteDraft {
+                    kind: InvoiceKind::Sale,
+                    party_ledger_id: party,
+                    order_id: Some(order),
+                    reference: "MANUAL".into(),
+                    date: "2026-04-03".into(),
+                    narration: String::new(),
+                    lines: vec![StockNoteLineDraft {
+                        item_id: item,
+                        location_id: location,
+                        batch_id: None,
+                        quantity: 4000,
+                        unit_price: 1000,
+                    }],
+                },
+            )
+            .unwrap();
+        let line = store.stock_note_lines(company, note).unwrap()[0].id;
+        let candidates = store
+            .invoices_awaiting_stock_on_note(company, note)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        let allocation = candidates[0].allocations[0].allocation_id;
+        assert_eq!(candidates[0].available_on(allocation, line), 2000);
+        let request = |quantity| StockNoteInvoiceAllocation {
+            invoice_allocation_id: allocation,
+            note_line_id: line,
+            quantity,
+        };
+        assert!(store
+            .link_invoice_stock_note(company, note, invoice.id, "2026-04-03", &[request(3000)])
+            .is_err());
+        assert_eq!(
+            store.invoice_stock_demand(company, invoice.id).unwrap()[0].remaining,
+            3000
+        );
+        store
+            .link_invoice_stock_note(company, note, invoice.id, "2026-04-03", &[request(2000)])
+            .unwrap();
+        assert!(store
+            .invoices_awaiting_stock_on_note(company, note)
+            .unwrap()
+            .is_empty());
+
+        let linked = store
+            .invoice_return_sources(company, invoice.id)
+            .unwrap()
+            .remove(0);
+        store
+            .post_stock_return_from_invoice(
+                company,
+                invoice.id,
+                "2026-04-04",
+                "RETURN-LATE",
+                "Return one unit",
+                &[StockReturnDraft {
+                    source: linked.source,
+                    quantity: 1000,
+                }],
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [0, 1000]);
+    }
+
+    #[test]
     fn native_notes_and_invoices_fulfil_the_selected_orders_and_lots() {
         use crate::orders::OrderAllocation;
         use crate::stock_notes::{StockNoteDraft, StockNoteLineDraft};

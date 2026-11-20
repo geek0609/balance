@@ -775,20 +775,24 @@ impl App {
             for allocation in invoice
                 .allocations
                 .iter()
-                .filter(|allocation| allocation.matches(line))
+                .filter(|allocation| invoice.available_on(allocation.allocation_id, line.id) > 0)
             {
                 let key = (allocation.allocation_id, line.id);
+                let available = invoice.available_on(key.0, key.1);
                 let entry = form.quantities.entry(key).or_default();
                 ui.horizontal_wrapped(|ui| {
                     if let Some(reference) = &line.order_reference {
                         ui.label(format!("Order {reference}"));
+                    }
+                    if let Some(due) = &allocation.expected_on {
+                        ui.label(format!("Due {due}"));
                     }
                     ui.label(format!(
                         "{} · {} · {} · {} available, {} billed pending (#{}), in {}",
                         line.item,
                         line.location,
                         line.batch.as_deref().unwrap_or("Unbatched"),
-                        format_quantity(i128::from(line.unbilled())),
+                        format_quantity(i128::from(available)),
                         format_quantity(i128::from(allocation.remaining)),
                         allocation.allocation_id,
                         line.unit,

@@ -471,6 +471,47 @@ pub(crate) fn allocate_spans(
     )
 }
 
+/// Intersect unbilled stock with the original positions assigned to a delivery date.
+pub(crate) fn unbilled_delivery_spans(
+    conn: &Connection,
+    line: &StockNoteLine,
+    due: &str,
+) -> Result<Vec<Range<i64>>> {
+    let eligible =
+        crate::order_lots::note_delivery_spans(conn, line.id, line.values.quantity, due)?;
+    if eligible.is_empty() {
+        return Ok(Vec::new());
+    }
+    let free = allocate_spans(conn, line, line.unbilled())?;
+    let mut free = free.into_iter().peekable();
+    let mut eligible = eligible.into_iter().peekable();
+    let mut spans = Vec::new();
+    while let (Some(open), Some(lot)) = (free.peek(), eligible.peek()) {
+        let start = open.start.max(lot.start);
+        let end = open.end.min(lot.end);
+        if start < end {
+            spans.push(start..end);
+        }
+        if open.end <= lot.end {
+            free.next();
+        } else {
+            eligible.next();
+        }
+    }
+    Ok(spans)
+}
+
+pub(crate) fn unbilled_on_delivery_date(
+    conn: &Connection,
+    line: &StockNoteLine,
+    due: &str,
+) -> Result<i64> {
+    Ok(unbilled_delivery_spans(conn, line, due)?
+        .iter()
+        .map(|span| span.end - span.start)
+        .sum())
+}
+
 pub(crate) fn reserve_spans(
     capacity: i64,
     quantity: i64,
