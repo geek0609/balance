@@ -5,7 +5,7 @@ use crate::invoice_credits::CreditLineDraft;
 use crate::stock_notes::{self, InvoiceQuantityShare, StockNoteLineDraft};
 use crate::{parse_date, required, Error, Result, Store};
 use chrono::NaiveDate;
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{BTreeMap, HashSet};
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -137,6 +137,79 @@ pub(crate) fn migrate_voucher_links(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_stock_links(conn: &Connection) -> Result<()> {
+    let migrated: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invoice_return_lines') WHERE name = 'stock_link_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if migrated {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TEMP TABLE saved_return_lines AS SELECT * FROM invoice_return_lines;
+         CREATE TEMP TABLE saved_return_spans AS SELECT * FROM invoice_return_spans;
+         DROP VIEW invoice_stock_return_history;
+         DROP VIEW invoice_returned_quantities;
+         DROP TABLE invoice_return_spans;
+         DROP TABLE invoice_return_lines;
+         CREATE TABLE invoice_return_lines(
+            id INTEGER PRIMARY KEY,
+            voucher_id INTEGER NOT NULL REFERENCES vouchers(id),
+            allocation_id INTEGER NOT NULL REFERENCES invoice_line_allocations(id),
+            quantity INTEGER NOT NULL CHECK(quantity > 0),
+            net_amount INTEGER NOT NULL CHECK(net_amount >= 0),
+            adjustment_id INTEGER NOT NULL UNIQUE REFERENCES stock_adjustments(id),
+            reversal_adjustment_id INTEGER UNIQUE REFERENCES stock_adjustments(id),
+            stock_link_id INTEGER REFERENCES invoice_stock_links(id)
+         );
+         CREATE UNIQUE INDEX invoice_return_lines_by_allocation
+            ON invoice_return_lines(voucher_id, allocation_id) WHERE stock_link_id IS NULL;
+         CREATE UNIQUE INDEX invoice_return_lines_by_match
+            ON invoice_return_lines(voucher_id, stock_link_id) WHERE stock_link_id IS NOT NULL;
+         CREATE INDEX invoice_return_lines_allocation ON invoice_return_lines(allocation_id);
+         CREATE INDEX invoice_return_lines_match ON invoice_return_lines(stock_link_id);
+         CREATE TABLE invoice_return_spans(
+            return_line_id INTEGER NOT NULL REFERENCES invoice_return_lines(id),
+            start_quantity INTEGER NOT NULL CHECK(start_quantity >= 0),
+            quantity INTEGER NOT NULL CHECK(quantity > 0),
+            PRIMARY KEY(return_line_id, start_quantity)
+         );
+         INSERT INTO invoice_return_lines(id, voucher_id, allocation_id, quantity, net_amount, adjustment_id, reversal_adjustment_id)
+            SELECT id, voucher_id, allocation_id, quantity, net_amount, adjustment_id, reversal_adjustment_id FROM saved_return_lines;
+         INSERT INTO invoice_return_spans SELECT * FROM saved_return_spans;
+         DROP TABLE saved_return_spans;
+         DROP TABLE saved_return_lines;
+         CREATE VIEW invoice_stock_return_history AS
+            SELECT ret.id, n.id AS note_id, v.company_id, i.id AS invoice_id, i.kind, a.line_id,
+                   CASE WHEN matched.id IS NULL THEN a.location_id ELSE src.location_id END AS location_id,
+                   CASE WHEN matched.id IS NULL THEN a.batch_id ELSE src.batch_id END AS batch_id,
+                   l.item_id, ret.quantity, ret.net_amount, ret.adjustment_id, ret.reversal_adjustment_id,
+                   v.date, v.id AS voucher_id, v.reference, rv.date AS reversed_on,
+                   rv.id AS reversal_voucher_id, rv.reference AS reversal_reference,
+                   COALESCE(matched.quantity, l.quantity) AS invoice_quantity, iv.date AS invoice_date,
+                   src.id AS delivery_line, src.quantity AS delivery_quantity, src.adjustment_id AS delivery_adjustment_id,
+                   physical.date AS delivery_date, a.id AS allocation_id, ret.stock_link_id,
+                   physical.reference AS source_reference
+            FROM invoice_return_lines ret JOIN vouchers v ON v.id = ret.voucher_id
+            JOIN invoice_line_allocations a ON a.id = ret.allocation_id
+            JOIN invoice_lines l ON l.id = a.line_id
+            JOIN invoices i ON i.id = l.invoice_id AND i.company_id = v.company_id
+            JOIN vouchers iv ON iv.id = i.voucher_id
+            LEFT JOIN invoice_credit_notes n ON n.voucher_id = v.id AND n.invoice_id = i.id AND n.company_id = v.company_id
+            LEFT JOIN voucher_reversals r ON r.original_voucher_id = v.id AND r.company_id = v.company_id
+            LEFT JOIN vouchers rv ON rv.id = COALESCE(n.reversal_voucher_id, r.reversal_voucher_id) AND rv.company_id = v.company_id
+            LEFT JOIN invoice_stock_links matched ON matched.id = ret.stock_link_id
+            LEFT JOIN stock_note_invoice_lines link ON link.invoice_line_id = l.id
+            LEFT JOIN stock_note_lines src ON src.id = COALESCE(matched.note_line_id, link.note_line_id)
+            LEFT JOIN stock_notes physical ON physical.id = src.note_id AND physical.company_id = v.company_id;
+         CREATE VIEW invoice_returned_quantities AS
+            SELECT line_id, delivery_line, SUM(quantity) AS returned
+            FROM invoice_stock_return_history WHERE reversed_on IS NULL GROUP BY line_id, delivery_line;",
+    )?;
+    crate::invoice_stock_links::refresh_order_progress(conn)
+}
+
 #[derive(Debug, Clone)]
 pub struct ReturnAllocation {
     pub id: i64,
@@ -147,19 +220,56 @@ pub struct ReturnAllocation {
     pub remaining: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReturnSource {
+    InvoiceAllocation(i64),
+    StockMatch(i64),
+}
+
+#[derive(Debug, Clone)]
+pub struct ReturnableStock {
+    pub source: ReturnSource,
+    pub allocation: ReturnAllocation,
+    pub note_reference: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StockReturnDraft {
+    pub source: ReturnSource,
+    pub quantity: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReturnLineDraft {
     pub allocation: i64,
     pub quantity: i64,
 }
 
+impl From<&ReturnLineDraft> for StockReturnDraft {
+    fn from(line: &ReturnLineDraft) -> Self {
+        Self {
+            source: ReturnSource::InvoiceAllocation(line.allocation),
+            quantity: line.quantity,
+        }
+    }
+}
+
 struct Allocation {
     available: ReturnAllocation,
+    source: ReturnSource,
     stock: StockNoteLineDraft,
     line_quantity: i64,
     offset: i64,
     line_net: i64,
     ledger: i64,
+    match_origin: Option<MatchOrigin>,
+}
+
+struct MatchOrigin {
+    linked_on: String,
+    note_reference: String,
+    billed_start: i64,
+    billed_quantity: i64,
 }
 
 fn allocations(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<Allocation>> {
@@ -169,7 +279,7 @@ fn allocations(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<Allo
                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
                 l.amount, COALESCE(l.trade_ledger_id, i.trade_ledger_id), l.item_id, a.location_id, a.batch_id,
                 COALESCE((SELECT SUM(ret.quantity) FROM invoice_stock_return_history ret
-                    WHERE ret.allocation_id = a.id AND ret.reversed_on IS NULL), 0),
+                    WHERE ret.allocation_id = a.id AND ret.stock_link_id IS NULL AND ret.reversed_on IS NULL), 0),
                 l.id, COALESCE(l.billed_quantity, l.quantity)
          FROM invoices i JOIN invoice_lines l ON l.invoice_id = i.id
          JOIN physical_invoice_allocations a ON a.line_id = l.id
@@ -191,6 +301,7 @@ fn allocations(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<Allo
                     batch: row.get(4)?,
                     remaining: quantity - returned,
                 },
+                source: ReturnSource::InvoiceAllocation(row.get(0)?),
                 stock: StockNoteLineDraft {
                     item_id: row.get(10)?,
                     location_id: row.get(11)?,
@@ -207,10 +318,70 @@ fn allocations(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<Allo
                     row.get(8)?,
                 )?,
                 ledger: row.get(9)?,
+                match_origin: None,
             })
         })?
         .collect::<Result<_>>()?;
     Ok(rows)
+}
+
+fn matched_allocations(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<Allocation>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id, s.id, item.name, item.unit, loc.name, batch.name, s.quantity, l.amount,
+                COALESCE(l.trade_ledger_id, i.trade_ledger_id), l.item_id, nl.location_id, nl.batch_id,
+                s.linked_on, n.reference, b.billed_offset + s.billed_start, COALESCE(l.billed_quantity, l.quantity),
+                COALESCE((SELECT SUM(r.quantity) FROM invoice_stock_return_history r
+                    WHERE r.stock_link_id = s.id AND r.reversed_on IS NULL), 0)
+         FROM active_invoice_stock_links s
+         JOIN invoices i ON i.id = s.invoice_id
+         JOIN invoice_lines l ON l.id = s.line_id
+         JOIN invoice_line_allocations a ON a.id = s.invoice_allocation_id
+         JOIN invoice_allocation_billing_offsets b ON b.allocation_id = a.id
+         JOIN stock_note_lines nl ON nl.id = s.note_line_id
+         JOIN stock_notes n ON n.id = nl.note_id AND n.company_id = i.company_id
+         JOIN stock_items item ON item.id = l.item_id
+         JOIN stock_locations loc ON loc.id = nl.location_id
+         LEFT JOIN stock_batches batch ON batch.id = nl.batch_id
+         WHERE i.company_id = ?1 AND i.id = ?2 ORDER BY l.id, n.date, n.id, s.note_start",
+    )?;
+    let rows = stmt.query_map(params![company, invoice], |row| {
+        let quantity: i64 = row.get(6)?;
+        Ok(Allocation {
+            available: ReturnAllocation {
+                id: row.get(0)?,
+                item: row.get(2)?,
+                unit: row.get(3)?,
+                location: row.get(4)?,
+                batch: row.get(5)?,
+                remaining: quantity - row.get::<_, i64>(16)?,
+            },
+            source: ReturnSource::StockMatch(row.get(1)?),
+            stock: StockNoteLineDraft {
+                item_id: row.get(9)?,
+                location_id: row.get(10)?,
+                batch_id: row.get(11)?,
+                quantity,
+                unit_price: 0,
+            },
+            line_quantity: quantity,
+            offset: 0,
+            line_net: row.get(7)?,
+            ledger: row.get(8)?,
+            match_origin: Some(MatchOrigin {
+                linked_on: row.get(12)?,
+                note_reference: row.get(13)?,
+                billed_start: row.get(14)?,
+                billed_quantity: row.get(15)?,
+            }),
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn stock_allocations(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<Allocation>> {
+    let mut available = allocations(conn, company, invoice)?;
+    available.extend(matched_allocations(conn, company, invoice)?);
+    Ok(available)
 }
 
 struct ReturnPlan {
@@ -223,30 +394,31 @@ fn plan(
     conn: &Connection,
     company: i64,
     invoice: i64,
-    lines: &[ReturnLineDraft],
+    lines: &[StockReturnDraft],
 ) -> Result<Vec<ReturnPlan>> {
     if lines.is_empty() {
         return Err(Error::Validation("Enter a quantity to return".into()));
     }
-    let available = allocations(conn, company, invoice)?;
+    let available = stock_allocations(conn, company, invoice)?;
     let mut seen = HashSet::new();
     let mut planned = Vec::new();
     let mut earlier = conn.prepare_cached(
         "SELECT s.start_quantity - ?2, s.quantity FROM invoice_return_spans s
          JOIN invoice_stock_return_history ret ON ret.id = s.return_line_id
-         WHERE ret.allocation_id = ?1 AND ret.reversed_on IS NULL ORDER BY s.start_quantity",
+         WHERE ret.allocation_id = ?1 AND ret.stock_link_id IS ?3 AND ret.reversed_on IS NULL
+         ORDER BY s.start_quantity",
     )?;
     let mut available: BTreeMap<_, _> = available
         .into_iter()
-        .map(|part| (part.available.id, part))
+        .map(|part| (part.source, part))
         .collect();
     for line in lines {
-        if !seen.insert(line.allocation) {
+        if !seen.insert(line.source) {
             return Err(Error::Validation(
                 "Return each allocation once per note".into(),
             ));
         }
-        let mut allocation = available.remove(&line.allocation).ok_or_else(|| {
+        let mut allocation = available.remove(&line.source).ok_or_else(|| {
             Error::Validation("Select an allocation from the original invoice".into())
         })?;
         if line.quantity <= 0 || line.quantity > allocation.available.remaining {
@@ -256,9 +428,14 @@ fn plan(
             )));
         }
         check_quantity_precision(conn, company, allocation.stock.item_id, line.quantity)?;
-        let rows = earlier.query_map(params![line.allocation, allocation.offset], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let rows = earlier.query_map(
+            params![
+                allocation.available.id,
+                allocation.offset,
+                allocation.source.stock_match()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         let spans = stock_notes::reserve_spans(
             allocation.stock.quantity,
             line.quantity,
@@ -269,7 +446,11 @@ fn plan(
         .map(|span| (span.start + allocation.offset)..(span.end + allocation.offset))
         .collect();
         let share = InvoiceQuantityShare::new(allocation.line_quantity, spans);
-        let net_amount = i64::try_from(share.apportion(i128::from(allocation.line_net)))
+        let attributed = match &allocation.match_origin {
+            Some(origin) => shifted_share(&share, origin.billed_quantity, origin.billed_start)?,
+            None => share.clone(),
+        };
+        let net_amount = i64::try_from(attributed.apportion(i128::from(allocation.line_net)))
             .map_err(|_| Error::Validation("Return amount is too large".into()))?;
         allocation.stock.quantity = line.quantity;
         planned.push(ReturnPlan {
@@ -279,6 +460,36 @@ fn plan(
         });
     }
     Ok(planned)
+}
+
+impl ReturnSource {
+    fn stock_match(self) -> Option<i64> {
+        match self {
+            Self::InvoiceAllocation(_) => None,
+            Self::StockMatch(id) => Some(id),
+        }
+    }
+}
+
+fn shifted_share(
+    relative: &InvoiceQuantityShare,
+    capacity: i64,
+    start: i64,
+) -> Result<InvoiceQuantityShare> {
+    let end = start
+        .checked_add(relative.quantity())
+        .ok_or_else(stock_notes::invalid_spans)?;
+    if start < 0 || end > capacity {
+        return Err(stock_notes::invalid_spans());
+    }
+    Ok(InvoiceQuantityShare::new(
+        capacity,
+        relative
+            .spans()
+            .iter()
+            .map(|span| start + span.start..start + span.end)
+            .collect(),
+    ))
 }
 
 pub(crate) fn cost_share(
@@ -295,6 +506,15 @@ pub(crate) fn cost_share(
     let share = stock_notes::read_quantity_share(&mut stmt, id, line_quantity, returned)?;
     match delivery_quantity {
         Some(quantity) => {
+            let matched_start: Option<i64> = conn.query_row(
+                "SELECT s.note_start FROM invoice_return_lines r JOIN invoice_stock_links s ON s.id = r.stock_link_id
+                 WHERE r.id = ?1",
+                [id],
+                |row| row.get(0),
+            ).optional()?;
+            if let Some(start) = matched_start {
+                return shifted_share(&share, quantity, start);
+            }
             stock_notes::invoice_quantity_share(conn, invoice_line, quantity, line_quantity)?
                 .project(&share)
         }
@@ -310,6 +530,7 @@ pub struct InvoiceReturnLine {
     pub batch: Option<String>,
     pub quantity: i64,
     pub net_amount: i64,
+    pub source_reference: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -350,7 +571,7 @@ impl Store {
     ) -> Result<Vec<ImportedStockReturnLine>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT ret.voucher_id, ret.reference, ret.date, ret.reversed_on, i.name, i.unit, loc.name, b.name,
-                    ret.quantity, ret.net_amount
+                    ret.quantity, ret.net_amount, ret.source_reference
              FROM invoice_stock_return_history ret JOIN stock_items i ON i.id = ret.item_id
              JOIN stock_locations loc ON loc.id = ret.location_id LEFT JOIN stock_batches b ON b.id = ret.batch_id
              WHERE ret.company_id = ?1 AND ret.invoice_id = ?2 AND ret.note_id IS NULL ORDER BY ret.date, ret.id",
@@ -368,6 +589,7 @@ impl Store {
                     batch: row.get(7)?,
                     quantity: row.get(8)?,
                     net_amount: row.get(9)?,
+                    source_reference: row.get(10)?,
                 },
             })
         })?;
@@ -391,6 +613,32 @@ impl Store {
         invoice: i64,
         lines: &[ReturnLineDraft],
     ) -> Result<i128> {
+        let lines = lines.iter().map(StockReturnDraft::from).collect::<Vec<_>>();
+        self.stock_return_subtotal(company, invoice, &lines)
+    }
+
+    pub fn invoice_return_sources(
+        &self,
+        company: i64,
+        invoice: i64,
+    ) -> Result<Vec<ReturnableStock>> {
+        Ok(stock_allocations(&self.conn, company, invoice)?
+            .into_iter()
+            .filter(|allocation| allocation.available.remaining > 0)
+            .map(|allocation| ReturnableStock {
+                source: allocation.source,
+                allocation: allocation.available,
+                note_reference: allocation.match_origin.map(|origin| origin.note_reference),
+            })
+            .collect())
+    }
+
+    pub fn stock_return_subtotal(
+        &self,
+        company: i64,
+        invoice: i64,
+        lines: &[StockReturnDraft],
+    ) -> Result<i128> {
         Ok(plan(&self.conn, company, invoice, lines)?
             .into_iter()
             .map(|row| i128::from(row.net_amount))
@@ -399,7 +647,7 @@ impl Store {
 
     pub fn invoice_return_lines(&self, company: i64, note: i64) -> Result<Vec<InvoiceReturnLine>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT i.name, i.unit, loc.name, b.name, ret.quantity, ret.net_amount
+            "SELECT i.name, i.unit, loc.name, b.name, ret.quantity, ret.net_amount, ret.source_reference
              FROM invoice_stock_return_history ret
              JOIN stock_items i ON i.id = ret.item_id JOIN stock_locations loc ON loc.id = ret.location_id
              LEFT JOIN stock_batches b ON b.id = ret.batch_id
@@ -414,6 +662,7 @@ impl Store {
                     batch: row.get(3)?,
                     quantity: row.get(4)?,
                     net_amount: row.get(5)?,
+                    source_reference: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -444,6 +693,30 @@ impl Store {
         reference: &str,
         reason: &str,
         lines: &[ReturnLineDraft],
+        taxes: &[CreditLineDraft],
+        bill_allocations: Option<&[crate::invoice_credits::NoteBillAllocation]>,
+    ) -> Result<i64> {
+        let lines = lines.iter().map(StockReturnDraft::from).collect::<Vec<_>>();
+        self.post_stock_return_from_invoice(
+            company,
+            invoice,
+            date,
+            reference,
+            reason,
+            &lines,
+            taxes,
+            bill_allocations,
+        )
+    }
+
+    pub fn post_stock_return_from_invoice(
+        &mut self,
+        company: i64,
+        invoice: i64,
+        date: &str,
+        reference: &str,
+        reason: &str,
+        lines: &[StockReturnDraft],
         taxes: &[CreditLineDraft],
         bill_allocations: Option<&[crate::invoice_credits::NoteBillAllocation]>,
     ) -> Result<i64> {
@@ -552,6 +825,25 @@ fn write_return_movements(
     let kind = InvoiceKind::parse(&kind)?;
     let movement_reason = format!("Invoice return {reference}: {reason}");
     for row in planned {
+        if let Some(origin) = &row.allocation.match_origin {
+            if date < parse_date(&origin.linked_on)? {
+                return Err(Error::Validation(
+                    "Return date cannot precede the stock match".into(),
+                ));
+            }
+            let conflict: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM invoice_stock_return_history
+                 WHERE stock_link_id = ?1 AND (date > ?2 OR reversed_on > ?2))",
+                params![row.allocation.source.stock_match(), date.to_string()],
+                |row| row.get(0),
+            )?;
+            if conflict {
+                return Err(Error::Validation(
+                    "Return date cannot precede another return or reversal on this stock match"
+                        .into(),
+                ));
+            }
+        }
         if kind == InvoiceKind::Purchase {
             crate::stock_returns::require_available(conn, company, date, &row.allocation.stock)?;
         }
@@ -564,8 +856,9 @@ fn write_return_movements(
             &movement_reason,
         )?;
         conn.execute(
-            "INSERT INTO invoice_return_lines(voucher_id, allocation_id, quantity, net_amount, adjustment_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![voucher, row.allocation.available.id, row.allocation.stock.quantity, row.net_amount, adjustment],
+            "INSERT INTO invoice_return_lines(voucher_id, allocation_id, quantity, net_amount, adjustment_id, stock_link_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![voucher, row.allocation.available.id, row.allocation.stock.quantity, row.net_amount, adjustment, row.allocation.source.stock_match()],
         )?;
         let id = conn.last_insert_rowid();
         for span in row.share.spans() {
@@ -622,7 +915,7 @@ pub(crate) fn prepare_imported_return(
     invoice: i64,
     allocations_from_xml: &[ImportedReturnAllocation],
 ) -> Result<PreparedImportedReturn> {
-    let original = allocations(conn, company, invoice)?;
+    let original = stock_allocations(conn, company, invoice)?;
     let mut lines = Vec::with_capacity(allocations_from_xml.len());
     for requested in allocations_from_xml {
         let mut matches = original.iter().filter(|entry| {
@@ -643,8 +936,8 @@ pub(crate) fn prepare_imported_return(
                 "Returned stock matches multiple original invoice allocations".into(),
             ));
         }
-        lines.push(ReturnLineDraft {
-            allocation: matched.available.id,
+        lines.push(StockReturnDraft {
+            source: matched.source,
             quantity: requested.quantity,
         });
     }

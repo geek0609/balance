@@ -68,8 +68,8 @@ fn reconcile(
             && reversed.is_none_or(|reversed| as_of.is_some_and(|end| reversed > end)))
     };
     let mut returns = conn.prepare(
-        "SELECT id, quantity, net_amount, date, reversed_on FROM invoice_stock_return_history
-         WHERE company_id = ?1 AND line_id = ?2",
+        "SELECT id, quantity, net_amount, date, reversed_on, line_id, invoice_quantity
+         FROM invoice_stock_return_history WHERE company_id = ?1 AND delivery_line = ?2",
     )?;
     let mut prior_bills = conn.prepare(
         "SELECT COALESCE(l.billed_quantity, l.quantity), l.amount,
@@ -110,32 +110,6 @@ fn reconcile(
             }
             quantity += i128::from(billed);
             invoice_net += i128::from(invoice.get::<_, i64>(2)?);
-            let line_id: i64 = invoice.get(0)?;
-            let mut return_rows = returns.query(rusqlite::params![company, line_id])?;
-            while let Some(returned) = return_rows.next()? {
-                let date = parse_date(&returned.get::<_, String>(3)?)?;
-                let reversed = returned.get::<_, Option<String>>(4)?;
-                if !is_effective(date, reversed.as_deref())? {
-                    continue;
-                }
-                let units: i64 = returned.get(1)?;
-                quantity -= i128::from(units);
-                returned_quantity = returned_quantity
-                    .checked_add(units)
-                    .ok_or_else(crate::stock_notes::invalid_spans)?;
-                invoice_net -= i128::from(returned.get::<_, i64>(2)?);
-                if let Some(cost) = receipt_cost {
-                    let share = crate::invoice_returns::cost_share(
-                        conn,
-                        returned.get(0)?,
-                        line_id,
-                        billed,
-                        units,
-                        Some(received_quantity),
-                    )?;
-                    allocated_cost -= share.apportion(cost);
-                }
-            }
         }
         let mut prior_bill_rows = prior_bills.query(rusqlite::params![note_line, cutoff])?;
         while let Some(bill) = prior_bill_rows.next()? {
@@ -147,6 +121,31 @@ fn reconcile(
                 let receipt_share =
                     InvoiceQuantityShare::for_range(received_quantity, bill.get(3)?, units)?;
                 allocated_cost += receipt_share.apportion(cost);
+            }
+        }
+        let mut return_rows = returns.query(rusqlite::params![company, note_line])?;
+        while let Some(returned) = return_rows.next()? {
+            let date = parse_date(&returned.get::<_, String>(3)?)?;
+            let reversed = returned.get::<_, Option<String>>(4)?;
+            if !is_effective(date, reversed.as_deref())? {
+                continue;
+            }
+            let units: i64 = returned.get(1)?;
+            quantity -= i128::from(units);
+            returned_quantity = returned_quantity
+                .checked_add(units)
+                .ok_or_else(crate::stock_notes::invalid_spans)?;
+            invoice_net -= i128::from(returned.get::<_, i64>(2)?);
+            if let Some(cost) = receipt_cost {
+                let share = crate::invoice_returns::cost_share(
+                    conn,
+                    returned.get(0)?,
+                    returned.get(5)?,
+                    returned.get(6)?,
+                    units,
+                    Some(received_quantity),
+                )?;
+                allocated_cost -= share.apportion(cost);
             }
         }
         if quantity < 0

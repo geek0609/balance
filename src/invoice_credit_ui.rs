@@ -1,7 +1,7 @@
 use crate::{money, App};
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind, InvoiceSummary};
 use balance::invoice_credits::{CreditComponent, CreditLineDraft, NoteBillAllocation};
-use balance::invoice_returns::{ReturnAllocation, ReturnLineDraft};
+use balance::invoice_returns::{ReturnableStock, StockReturnDraft};
 use balance::{parse_amount, Error, Result};
 use eframe::egui;
 
@@ -12,7 +12,7 @@ pub(crate) struct NoteForm {
     reference: String,
     reason: String,
     lines: Vec<(CreditComponent, String)>,
-    returns: Vec<(ReturnAllocation, String)>,
+    returns: Vec<(ReturnableStock, String)>,
     bills: Vec<(i64, String)>,
 }
 
@@ -33,13 +33,13 @@ impl NoteForm {
         }
     }
 
-    fn quantities(&self) -> Result<Vec<ReturnLineDraft>> {
+    fn quantities(&self) -> Result<Vec<StockReturnDraft>> {
         self.returns
             .iter()
             .filter(|(_, value)| !value.trim().is_empty())
             .map(|(part, value)| {
-                Ok(ReturnLineDraft {
-                    allocation: part.id,
+                Ok(StockReturnDraft {
+                    source: part.source,
                     quantity: parse_quantity(value)?,
                 })
             })
@@ -163,6 +163,9 @@ impl App {
                                         line.location,
                                         line.batch.as_deref().unwrap_or("Unbatched")
                                     ));
+                                    if let Some(reference) = line.source_reference {
+                                        ui.small(format!("Source note {reference}"));
+                                    }
                                 }
                             }
                             Err(e) => self.failure(e),
@@ -237,7 +240,7 @@ impl App {
             if stock {
                 form.returns = self
                     .store
-                    .invoice_return_allocations(company, invoice.id)?
+                    .invoice_return_sources(company, invoice.id)?
                     .into_iter()
                     .map(|part| (part, String::new()))
                     .collect();
@@ -266,14 +269,23 @@ impl App {
         if form.reversal.is_none() {
             if !form.returns.is_empty() {
                 egui::Grid::new(("invoice-return-items", invoice.id)).show(ui, |ui| {
-                    for title in ["Item", "Location", "Batch", "Returnable", "Return quantity"] {
+                    for title in [
+                        "Item",
+                        "Location",
+                        "Batch",
+                        "Source note",
+                        "Returnable",
+                        "Return quantity",
+                    ] {
                         ui.strong(title);
                     }
                     ui.end_row();
-                    for (part, quantity) in &mut form.returns {
+                    for (stock, quantity) in &mut form.returns {
+                        let part = &stock.allocation;
                         ui.label(&part.item);
                         ui.label(&part.location);
                         ui.label(part.batch.as_deref().unwrap_or("Unbatched"));
+                        ui.label(stock.note_reference.as_deref().unwrap_or("—"));
                         ui.label(format!(
                             "{} {}",
                             format_quantity(part.remaining.into()),
@@ -287,7 +299,7 @@ impl App {
                     if !quantities.is_empty() {
                         match self
                             .store
-                            .invoice_return_subtotal(company, invoice.id, &quantities)
+                            .stock_return_subtotal(company, invoice.id, &quantities)
                         {
                             Ok(subtotal) => {
                                 ui.label(format!("Return subtotal before tax {}", money(subtotal)));
@@ -379,7 +391,7 @@ impl App {
             } else if !form.returns.is_empty() {
                 (|| {
                     let bills = form.bill_allocations()?;
-                    self.store.post_invoice_stock_return_with_bills(
+                    self.store.post_stock_return_from_invoice(
                         company,
                         invoice.id,
                         &form.date,

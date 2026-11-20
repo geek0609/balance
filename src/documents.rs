@@ -314,10 +314,11 @@ impl Store {
             "Stock and accounting return record"
         };
         if !returned.is_empty() {
-            html.push_str("<table><thead><tr><th>Item</th><th>Location</th><th>Batch</th><th class=\"num\">Returned</th><th class=\"num\">Net item credit</th></tr></thead><tbody>");
+            html.push_str("<table><thead><tr><th>Item</th><th>Location</th><th>Batch</th><th>Source note</th><th class=\"num\">Returned</th><th class=\"num\">Net item credit</th></tr></thead><tbody>");
             for line in returned {
-                let _ = write!(html, "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{} {}</td><td class=\"num\">{}</td></tr>",
+                let _ = write!(html, "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{} {}</td><td class=\"num\">{}</td></tr>",
                     escape(&line.item), escape(&line.location), escape(line.batch.as_deref().unwrap_or("Unbatched")),
+                    escape(line.source_reference.as_deref().unwrap_or("—")),
                     format_quantity(line.quantity.into()), escape(&line.unit), format_amount(line.net_amount));
             }
             html.push_str("</tbody></table>");

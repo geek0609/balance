@@ -65,8 +65,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             SELECT invoice_id, order_id FROM invoice_order_links
             UNION
             SELECT h.invoice_id, n.order_id FROM stock_note_billing_history h
-            JOIN stock_notes n ON n.id = h.note_id WHERE n.order_id IS NOT NULL;
-        DROP VIEW order_line_progress;
+            JOIN stock_notes n ON n.id = h.note_id WHERE n.order_id IS NOT NULL;",
+    )?;
+    refresh_order_progress(conn)
+}
+
+pub(crate) fn refresh_order_progress(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP VIEW order_line_progress;
         CREATE VIEW order_line_progress AS
             SELECT ol.id, ol.order_id, ol.item_id, ol.quantity, ol.unit_price,
                    COALESCE(direct.quantity, 0) + COALESCE(notes.fulfilled, 0) AS fulfilled,
@@ -75,7 +81,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             LEFT JOIN (
                 SELECT link.order_id, il.item_id, SUM(il.quantity - COALESCE(ret.returned, 0)) AS quantity
                 FROM invoice_order_links link JOIN physical_invoice_lines il ON il.invoice_id = link.invoice_id
-                LEFT JOIN invoice_returned_quantities ret ON ret.line_id = il.id
+                LEFT JOIN invoice_returned_quantities ret ON ret.line_id = il.id AND ret.delivery_line IS NULL
                 WHERE NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id)
                 GROUP BY link.order_id, il.item_id
             ) direct ON direct.order_id = ol.order_id AND direct.item_id = ol.item_id
@@ -497,6 +503,18 @@ impl Store {
             ));
         }
         let date = date.to_string();
+        let has_returns: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM invoice_stock_return_history r
+             JOIN active_invoice_stock_links s ON s.id = r.stock_link_id
+             WHERE s.note_id = ?1 AND s.invoice_id = ?2 AND (r.reversed_on IS NULL OR r.reversed_on > ?3))",
+            params![note, invoice, date],
+            |row| row.get(0),
+        )?;
+        if has_returns {
+            return Err(Error::Validation(
+                "Reverse the returned quantities before releasing this stock match".into(),
+            ));
+        }
         {
             let mut stmt = tx.prepare(
                 "SELECT DISTINCT invoice_allocation_id, note_line_id FROM active_invoice_stock_links
@@ -532,7 +550,7 @@ mod tests {
         InvoiceAllocation, InvoiceDiscount, InvoiceDraft, InvoiceEntryMode, InvoiceKind,
         InvoiceLine,
     };
-    use crate::invoice_returns::ReturnLineDraft;
+    use crate::invoice_returns::{ReturnLineDraft, ReturnSource, StockReturnDraft};
     use crate::orders::{OrderDraft, OrderLine};
     use crate::stock_notes::{StockNoteDraft, StockNoteLineDraft};
     use crate::Category;
@@ -932,11 +950,95 @@ mod tests {
                 .known_value,
             2701
         );
+        let sources = store.invoice_return_sources(company, id).unwrap();
+        let drafts: Vec<_> = sources
+            .iter()
+            .take(2)
+            .map(|row| StockReturnDraft {
+                source: row.source,
+                quantity: 1000,
+            })
+            .collect();
+        assert!(matches!(
+            drafts[0].source,
+            ReturnSource::InvoiceAllocation(_)
+        ));
+        assert!(matches!(drafts[1].source, ReturnSource::StockMatch(_)));
+        assert_eq!(sources[1].allocation.batch.as_deref(), Some("Lot"));
+        assert_eq!(sources[1].note_reference.as_deref(), Some("RECEIPT"));
+        assert_eq!(
+            store.stock_return_subtotal(company, id, &drafts).unwrap(),
+            2001
+        );
+        let printed = store
+            .post_stock_return_from_invoice(
+                company,
+                id,
+                "2026-04-05",
+                "RETURN",
+                "Return supplied items",
+                &drafts,
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.invoice_return_lines(company, printed).unwrap()[1]
+                .batch
+                .as_deref(),
+            Some("Lot")
+        );
+        let receipt = store
+            .receipt_reconciliation(company, Some("2026-04-05"))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (
+                receipt.invoiced_quantity,
+                receipt.returned_quantity,
+                receipt.invoice_net,
+                receipt.invoiced_receipt_cost
+            ),
+            (1000, 1000, 1001, Some(850))
+        );
+        let detail = store.order_detail(company, order).unwrap();
+        assert_eq!(
+            (detail.lines[0].fulfilled, detail.lines[0].billed),
+            (1000, 1000)
+        );
+        assert_eq!(store.invoices(company).unwrap()[0].outstanding, 1001);
+        assert!(store
+            .release_invoice_stock_note(company, note, id, "2026-04-06", "Release returned lot")
+            .is_err());
+        store
+            .reverse_invoice_credit(company, printed, "2026-04-06", "UNDO", "Restore both items")
+            .unwrap();
+        let restored = store
+            .receipt_reconciliation(company, Some("2026-04-06"))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (
+                restored.invoiced_quantity,
+                restored.returned_quantity,
+                restored.invoice_net
+            ),
+            (2000, 0, 2001)
+        );
+        assert!(store
+            .release_invoice_stock_note(
+                company,
+                note,
+                id,
+                "2026-04-05",
+                "Earlier than return reversal"
+            )
+            .is_err());
         assert!(store
             .reverse_invoice(company, id, "2026-04-03", "CANCEL", "Too early")
             .is_err());
         store
-            .reverse_invoice(company, id, "2026-04-05", "CANCEL", "Cancel invoice")
+            .reverse_invoice(company, id, "2026-04-07", "CANCEL", "Cancel invoice")
             .unwrap();
         assert_eq!(
             store.stock_note_lines(company, note).unwrap()[0].unbilled(),
@@ -955,7 +1057,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .receipt_reconciliation(company, Some("2026-04-05"))
+                .receipt_reconciliation(company, Some("2026-04-07"))
                 .unwrap()[0]
                 .invoice_net,
             0
@@ -968,7 +1070,7 @@ mod tests {
             2000
         );
         store
-            .reverse_stock_note(company, note, "2026-04-06", "Cancel receipt")
+            .reverse_stock_note(company, note, "2026-04-08", "Cancel receipt")
             .unwrap();
         assert_eq!(
             store
@@ -977,5 +1079,151 @@ mod tests {
                 .closing_quantity,
             0
         );
+    }
+
+    #[test]
+    fn one_return_can_use_two_matches_on_the_same_billed_allocation() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Returns").unwrap();
+        let customer = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        let trade = store
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        let item = store.create_stock_item(company, "Part", "Each").unwrap();
+        let location = store.stock_locations(company).unwrap()[0].id;
+        let mut draft = invoice(InvoiceKind::Sale, customer, trade, item, location);
+        draft.lines[0].billed_quantity = Some(5000);
+        draft.lines[0].discount = InvoiceDiscount::Fixed(2);
+        let id = store.create_invoice(company, &draft).unwrap();
+        let allocation = store.invoice_stock_demand(company, id).unwrap()[0].allocation_id;
+        for (name, qty, cost, date) in [
+            ("Lot A", 2000, 600, "2026-04-02"),
+            ("Lot B", 3000, 2100, "2026-04-03"),
+        ] {
+            let batch = store
+                .create_stock_batch(company, item, name, None, None)
+                .unwrap();
+            let receipt = store
+                .adjust_stock_batch(company, item, location, Some(batch), date, qty, "Opening")
+                .unwrap();
+            store
+                .set_stock_receipt_cost(company, receipt, cost, "Opening cost")
+                .unwrap();
+            let delivery = store
+                .post_stock_note(
+                    company,
+                    &StockNoteDraft {
+                        kind: InvoiceKind::Sale,
+                        date: date.into(),
+                        reference: name.into(),
+                        party_ledger_id: customer,
+                        order_id: None,
+                        narration: String::new(),
+                        lines: vec![StockNoteLineDraft {
+                            item_id: item,
+                            location_id: location,
+                            batch_id: Some(batch),
+                            quantity: qty,
+                            unit_price: 0,
+                        }],
+                    },
+                )
+                .unwrap();
+            let line = store.stock_note_lines(company, delivery).unwrap()[0].id;
+            store
+                .link_invoice_stock_note(
+                    company,
+                    delivery,
+                    id,
+                    date,
+                    &[StockNoteInvoiceAllocation {
+                        invoice_allocation_id: allocation,
+                        note_line_id: line,
+                        quantity: qty,
+                    }],
+                )
+                .unwrap();
+        }
+        let lots = store.invoice_return_sources(company, id).unwrap();
+        assert_eq!(
+            lots.iter().map(|lot| lot.allocation.id).collect::<Vec<_>>(),
+            [allocation, allocation]
+        );
+        let returned: Vec<_> = lots
+            .iter()
+            .map(|part| StockReturnDraft {
+                source: part.source,
+                quantity: 1000,
+            })
+            .collect();
+        assert!(store
+            .post_stock_return_from_invoice(
+                company,
+                id,
+                "2026-04-02",
+                "RETURN",
+                "Too early",
+                &returned,
+                &[],
+                None
+            )
+            .is_err());
+        assert_eq!(store.invoices(company).unwrap()[0].outstanding, 5003);
+        let note = store
+            .post_stock_return_from_invoice(
+                company,
+                id,
+                "2026-04-04",
+                "RETURN",
+                "Return one from each shipment",
+                &returned,
+                &[],
+                None,
+            )
+            .unwrap();
+        let lines = store.invoice_return_lines(company, note).unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.batch.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("Lot A"), Some("Lot B")]
+        );
+        assert_eq!(lines[0].net_amount + lines[1].net_amount, 2002);
+        assert_eq!(store.invoices(company).unwrap()[0].outstanding, 3001);
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            2000
+        );
+        let margin = store
+            .sales_at_actual_cost(company, None, None, ActualCostMethod::Fifo)
+            .unwrap();
+        assert_eq!((margin.net_sales, margin.cost_of_sales), (3001, 1700));
+        store
+            .reverse_invoice_credit(
+                company,
+                note,
+                "2026-04-05",
+                "UNDO",
+                "Restore both deliveries",
+            )
+            .unwrap();
+        assert_eq!(store.invoices(company).unwrap()[0].outstanding, 5003);
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            0
+        );
+        let margin = store
+            .sales_at_actual_cost(company, None, None, ActualCostMethod::Fifo)
+            .unwrap();
+        assert_eq!((margin.net_sales, margin.cost_of_sales), (5003, 2700));
     }
 }

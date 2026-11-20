@@ -3557,7 +3557,8 @@ fn resolve_return_invoice(
             "SELECT i.id, v.reference, v.date, i.external_reference, i.external_reference_date
              FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
              WHERE i.company_id = ?1 AND i.party_ledger_id = ?2 AND i.kind = ?3
-               AND EXISTS(SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id AND l.quantity > 0)
+               AND (EXISTS(SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id AND l.quantity > 0)
+                    OR EXISTS(SELECT 1 FROM active_invoice_stock_links s WHERE s.invoice_id = i.id))
                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)",
         )?;
         let mut candidates = Vec::new();
@@ -5499,7 +5500,13 @@ impl Store {
                     normalized(&invoice.party),
                     normalized(&invoice.reference),
                 );
-                if invoice.lines.iter().any(|line| line.quantity > 0) && invoice.reversal.is_none()
+                let has_matched_stock = invoice.lines.iter().any(|line| {
+                    line.allocations
+                        .iter()
+                        .any(|allocation| allocation.linked_stock_quantity > 0)
+                });
+                if invoice.reversal.is_none()
+                    && (has_matched_stock || invoice.lines.iter().any(|line| line.quantity > 0))
                 {
                     index_stock_origin(
                         &mut stock_origins,
