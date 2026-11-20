@@ -58,6 +58,7 @@ pub struct SalesCostRow {
     pub net_sales: i128,
     pub unit_cost: Option<i64>,
     pub standard_cost: Option<i128>,
+    pub awaiting_stock: bool,
 }
 impl SalesCostRow {
     pub fn margin(&self) -> Option<i128> {
@@ -236,13 +237,37 @@ impl Store {
             missing_rates: 0,
         };
         for sale in crate::stock_sales::stock_sales(&tx, company, start, end)? {
-            let quantity_issued = sale.issue_quantity();
-            let unit_cost =
-                effective(&schedule, sale.item_id, sale.cost_date).filter(|_| quantity_issued > 0);
-            let standard_cost = unit_cost
-                .map(|cost| priced(quantity_issued, cost))
-                .transpose()?
-                .map(|total| sale.allocated_issue_cost(total));
+            let mut unit_cost = None;
+            let mut standard_cost = None;
+            if !sale.awaiting_stock {
+                let rate_and_cost = sale
+                    .cost_sources
+                    .iter()
+                    .map(|source| -> Result<_> {
+                        effective(&schedule, sale.item_id, source.date)
+                            .map(|rate| {
+                                priced(i128::from(source.issue_quantity), rate)
+                                    .map(|cost| (rate, source.portion(cost)))
+                            })
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if rate_and_cost.iter().all(Option::is_some) {
+                    if let Some((rate, initial)) = rate_and_cost.first().copied().flatten() {
+                        unit_cost = Some(rate);
+                        let total = rate_and_cost.into_iter().skip(1).flatten().try_fold(
+                            initial,
+                            |total, (other_rate, cost)| {
+                                if rate != other_rate {
+                                    unit_cost = None;
+                                }
+                                add(total, cost)
+                            },
+                        )?;
+                        standard_cost = Some(sale.signed_cost(total));
+                    }
+                }
+            }
             report.net_sales = add(report.net_sales, sale.net_sales)?;
             if let Some(cost) = standard_cost {
                 report.costed_net_sales = add(report.costed_net_sales, sale.net_sales)?;
@@ -264,6 +289,7 @@ impl Store {
                 net_sales: sale.net_sales,
                 unit_cost,
                 standard_cost,
+                awaiting_stock: sale.awaiting_stock,
             });
         }
         tx.commit()?;

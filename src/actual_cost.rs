@@ -58,7 +58,9 @@ impl std::fmt::Display for ActualCostIssue {
             Self::InsufficientStock { date, source } => {
                 write!(f, "{source} on {date} exceeds the available quantity")
             }
-            Self::PendingStockIssue => write!(f, "No stock has been issued on this invoice line"),
+            Self::PendingStockIssue => {
+                write!(f, "Billed quantities are still awaiting stock issue")
+            }
         }
     }
 }
@@ -730,7 +732,8 @@ fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64
     }
     {
         let mut stmt = conn.prepare(
-            "SELECT l.id, l.item_id, i.kind, v.date, l.quantity, l.amount, rv.date
+            "SELECT l.id, l.item_id, i.kind, v.date, l.quantity, l.amount, rv.date,
+                    COALESCE(l.billed_quantity, l.quantity)
              FROM physical_invoice_lines l JOIN invoices i ON i.id = l.invoice_id
              JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = i.company_id
              LEFT JOIN invoice_reversals r ON r.invoice_id = i.id AND r.company_id = i.company_id
@@ -766,7 +769,14 @@ fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64
                         retain_cost: reversal.is_some_and(|date| date <= end)
                             || retained_costs.contains(&SaleCostOrigin::Invoice(line)),
                     },
-                    InvoiceKind::Purchase => Movement::Purchase(row.get(5)?),
+                    InvoiceKind::Purchase => {
+                        Movement::Purchase(crate::invoice_stock_links::physical_net(
+                            conn,
+                            line,
+                            row.get(7)?,
+                            row.get(5)?,
+                        )?)
+                    }
                 },
             });
             if let Some(date) = reversal.filter(|date| *date <= end) {
@@ -1177,12 +1187,19 @@ impl Store {
                 .net_sales
                 .checked_add(sale.net_sales)
                 .ok_or_else(amount_too_large)?;
-            let cost = if let Some(id) = sale.counter_issue {
+            let cost = if sale.awaiting_stock {
+                None
+            } else if let Some(id) = sale.counter_issue {
                 costs.get(&SaleCostOrigin::ReturnCounter(id)).copied()
             } else {
-                costs
-                    .get(&sale.cost_origin)
-                    .map(|&amount| sale.allocated_issue_cost(amount))
+                sale.cost_sources
+                    .iter()
+                    .try_fold(0_i128, |total, source| {
+                        costs
+                            .get(&source.origin)
+                            .map(|&cost| total + source.portion(cost))
+                    })
+                    .map(|cost| sale.signed_cost(cost))
             };
             let mut issue = None;
             if let Some(cost) = cost {
@@ -1203,7 +1220,7 @@ impl Store {
                     .checked_add(margin)
                     .ok_or_else(amount_too_large)?;
             } else {
-                issue = Some(if sale.issue_quantity() == 0 {
+                issue = Some(if sale.awaiting_stock {
                     ActualCostIssue::PendingStockIssue
                 } else {
                     issues.get(&sale.item_id).cloned().ok_or_else(|| {

@@ -447,7 +447,7 @@ impl App {
                             ui.label(&row.item);
                             ui.label(format!("{} {}", format_quantity(row.quantity), row.unit));
                             ui.label(money(row.net_sales));
-                            if row.quantity == 0 {
+                            if row.awaiting_stock {
                                 ui.label("Awaiting stock issue");
                                 ui.label("—");
                             } else {

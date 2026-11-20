@@ -97,6 +97,7 @@ impl Store {
                 "This invoice has already been reversed".into(),
             ));
         }
+        crate::invoice_stock_links::check_invoice_reversal_date(&tx, invoice, date)?;
         let credits = crate::invoice_credits::state(&tx, company, invoice, None)?;
         if credits.total > 0 || credits.applied > 0 || credits.has_active_stock_returns {
             return Err(Error::Validation(

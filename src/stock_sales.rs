@@ -11,6 +11,22 @@ pub(crate) enum SaleCostOrigin {
     ReturnCounter(i64),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SaleCostSource {
+    pub origin: SaleCostOrigin,
+    pub date: NaiveDate,
+    pub issue_quantity: i64,
+    share: Option<InvoiceQuantityShare>,
+}
+
+impl SaleCostSource {
+    pub(crate) fn portion(&self, total: i128) -> i128 {
+        self.share
+            .as_ref()
+            .map_or(total, |share| share.apportion(total))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum SalesStockDocument {
     Sale,
@@ -35,10 +51,9 @@ pub struct StockSale {
     pub line_id: i64,
     pub item_id: i64,
     pub original_date: NaiveDate,
-    pub(crate) cost_date: NaiveDate,
-    pub(crate) cost_origin: SaleCostOrigin,
     pub(crate) counter_issue: Option<i64>,
-    delivery_share: Option<InvoiceQuantityShare>,
+    pub(crate) cost_sources: Vec<SaleCostSource>,
+    pub awaiting_stock: bool,
     pub invoice_id: i64,
     pub voucher_id: i64,
     pub date: NaiveDate,
@@ -53,21 +68,11 @@ pub struct StockSale {
 }
 
 impl StockSale {
-    pub(crate) fn issue_quantity(&self) -> i128 {
-        self.delivery_share
-            .as_ref()
-            .map_or(self.quantity.abs(), |share| i128::from(share.quantity()))
-    }
-
-    pub(crate) fn allocated_issue_cost(&self, total: i128) -> i128 {
-        let portion = self
-            .delivery_share
-            .as_ref()
-            .map_or(total, |share| share.apportion(total));
+    pub(crate) fn signed_cost(&self, cost: i128) -> i128 {
         if self.reversal {
-            -portion
+            -cost
         } else {
-            portion
+            cost
         }
     }
 }
@@ -120,6 +125,35 @@ pub(crate) fn stock_sales(
             .get::<_, Option<i64>>(15)?
             .map(|delivered| invoice_quantity_share(conn, line_id, delivered, quantity))
             .transpose()?;
+        let mut cost_sources = Vec::new();
+        if quantity > 0 {
+            cost_sources.push(SaleCostSource {
+                origin: cost_origin,
+                date: cost_date,
+                issue_quantity: share.as_ref().map_or(quantity, |share| share.quantity()),
+                share,
+            });
+        }
+        let deferred = crate::invoice_stock_links::deferred_quantity(conn, line_id)?;
+        let mut delivered = 0_i128;
+        if deferred > 0 {
+            let cutoff = match (end, reversal_date) {
+                (Some(end), Some(reversed)) => Some(end.min(reversed)),
+                (end, reversed) => end.or(reversed),
+            };
+            for linked in crate::invoice_stock_links::deliveries(conn, line_id, cutoff)? {
+                delivered += i128::from(linked.quantity);
+                cost_sources.push(SaleCostSource {
+                    origin: SaleCostOrigin::Delivery(linked.note_line),
+                    date: linked.date,
+                    issue_quantity: linked.share.quantity(),
+                    share: Some(linked.share),
+                });
+            }
+            if delivered > i128::from(deferred) {
+                return Err(crate::stock_notes::invalid_spans());
+            }
+        }
         let events: [Option<(i64, NaiveDate, String, i128)>; 2] = [
             Some((row.get(1)?, original_date, row.get(3)?, 1)),
             match reversal_date {
@@ -135,10 +169,9 @@ pub(crate) fn stock_sales(
                 line_id,
                 item_id: row.get(4)?,
                 original_date,
-                cost_date,
-                cost_origin,
                 counter_issue: None,
-                delivery_share: share.clone(),
+                cost_sources: cost_sources.clone(),
+                awaiting_stock: delivered < i128::from(deferred),
                 invoice_id: row.get(0)?,
                 voucher_id,
                 date,
@@ -152,7 +185,7 @@ pub(crate) fn stock_sales(
                 reversed_same_day: reversal_date == Some(original_date),
                 item: row.get(5)?,
                 unit: row.get(6)?,
-                quantity: i128::from(quantity) * direction,
+                quantity: (i128::from(quantity) + delivered) * direction,
                 net_sales: i128::from(row.get::<_, i64>(8)?) * direction,
             });
         }
@@ -196,6 +229,12 @@ pub(crate) fn stock_sales(
             quantity,
             row.get(14)?,
         )?;
+        let cost_source = SaleCostSource {
+            origin: cost_origin,
+            date: cost_date,
+            issue_quantity: share.quantity(),
+            share: Some(share),
+        };
         let events: [Option<(i64, NaiveDate, String, i128, Option<i64>)>; 2] = [
             Some((row.get(5)?, returned, row.get(7)?, -1, None)),
             match reversed {
@@ -212,10 +251,9 @@ pub(crate) fn stock_sales(
                 line_id,
                 item_id: row.get(16)?,
                 original_date,
-                cost_date,
-                cost_origin,
                 counter_issue,
-                delivery_share: Some(share.clone()),
+                cost_sources: vec![cost_source.clone()],
+                awaiting_stock: false,
                 invoice_id: row.get(1)?,
                 voucher_id,
                 date,

@@ -169,7 +169,8 @@ fn allocations(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<Allo
                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
                 l.amount, COALESCE(l.trade_ledger_id, i.trade_ledger_id), l.item_id, a.location_id, a.batch_id,
                 COALESCE((SELECT SUM(ret.quantity) FROM invoice_stock_return_history ret
-                    WHERE ret.allocation_id = a.id AND ret.reversed_on IS NULL), 0)
+                    WHERE ret.allocation_id = a.id AND ret.reversed_on IS NULL), 0),
+                l.id, COALESCE(l.billed_quantity, l.quantity)
          FROM invoices i JOIN invoice_lines l ON l.invoice_id = i.id
          JOIN physical_invoice_allocations a ON a.line_id = l.id
          JOIN stock_items item ON item.id = l.item_id AND item.company_id = i.company_id
@@ -178,7 +179,7 @@ fn allocations(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<Allo
          WHERE i.company_id = ?1 AND i.id = ?2 ORDER BY l.id, a.id",
     )?;
     let rows = stmt
-        .query_map(params![company, invoice], |row| {
+        .query_and_then(params![company, invoice], |row| -> Result<_> {
             let quantity: i64 = row.get(5)?;
             let returned: i64 = row.get(13)?;
             Ok(Allocation {
@@ -199,11 +200,16 @@ fn allocations(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<Allo
                 },
                 line_quantity: row.get(6)?,
                 offset: row.get(7)?,
-                line_net: row.get(8)?,
+                line_net: crate::invoice_stock_links::physical_net(
+                    conn,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(8)?,
+                )?,
                 ledger: row.get(9)?,
             })
         })?
-        .collect::<rusqlite::Result<_>>()?;
+        .collect::<Result<_>>()?;
     Ok(rows)
 }
 

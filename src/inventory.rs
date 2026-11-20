@@ -214,6 +214,7 @@ pub struct InvoiceAllocationDetail {
     pub batch: Option<String>,
     pub quantity: i64,
     pub billed_quantity: i64,
+    pub linked_stock_quantity: i64,
 }
 
 impl InvoiceAllocationDetail {
@@ -1132,9 +1133,12 @@ fn read_allocation_details(
     revision: bool,
 ) -> Result<Vec<InvoiceAllocationDetail>> {
     let sql = if revision {
-        "SELECT loc.name, b.name, a.quantity, COALESCE(a.billed_quantity, a.quantity) FROM invoice_revision_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.revision_line_id = ?1 ORDER BY a.id"
+        "SELECT loc.name, b.name, a.quantity, COALESCE(a.billed_quantity, a.quantity), 0 FROM invoice_revision_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.revision_line_id = ?1 ORDER BY a.id"
     } else {
-        "SELECT loc.name, b.name, a.quantity, COALESCE(a.billed_quantity, a.quantity) FROM invoice_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.line_id = ?1 ORDER BY a.id"
+        "SELECT loc.name, b.name, a.quantity, COALESCE(a.billed_quantity, a.quantity),
+                COALESCE((SELECT SUM(s.quantity) FROM active_invoice_stock_links s WHERE s.invoice_allocation_id = a.id), 0)
+         FROM invoice_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id
+         LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.line_id = ?1 ORDER BY a.id"
     };
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt
@@ -1144,6 +1148,7 @@ fn read_allocation_details(
                 batch: r.get(1)?,
                 quantity: r.get(2)?,
                 billed_quantity: r.get(3)?,
+                linked_stock_quantity: r.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1192,6 +1197,7 @@ fn attach_allocation_details(
         .is_none_or(|first| first.location != line.location || first.batch != line.batch)
         || allocations.iter().any(|allocation| {
             !valid_allocation_quantities(allocation.quantity, allocation.billed_quantity)
+                || !(0..=allocation.billed_quantity).contains(&allocation.linked_stock_quantity)
         })
         || allocations
             .iter()

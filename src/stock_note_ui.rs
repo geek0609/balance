@@ -3,9 +3,10 @@ use super::{
     InvoiceSource, Page,
 };
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind};
+use balance::invoice_stock_links::StockNoteInvoiceAllocation;
 use balance::orders::OrderDetail;
 use balance::stock_notes::{
-    note_label, StockNote, StockNoteDraft, StockNoteLine, StockNoteLineDraft,
+    note_label, StockNote, StockNoteDraft, StockNoteInvoice, StockNoteLine, StockNoteLineDraft,
 };
 use balance::stock_returns::StockReturnLineDraft;
 use balance::{format_amount, parse_amount, Category, Error, Result};
@@ -37,6 +38,20 @@ struct ReturnDraft {
     reference: String,
     reason: String,
     quantities: std::collections::HashMap<i64, String>,
+}
+
+#[derive(Default)]
+struct InvoiceMatchForm {
+    invoice: Option<i64>,
+    date: String,
+    quantities: std::collections::HashMap<(i64, i64), String>,
+}
+
+#[derive(Default)]
+struct StockMatchReleaseForm {
+    invoice: Option<i64>,
+    date: String,
+    reason: String,
 }
 
 impl Default for NoteForm {
@@ -96,6 +111,8 @@ pub(super) struct StockNoteScreen {
     document_path: String,
     reconcile_as_of: String,
     return_draft: Option<ReturnDraft>,
+    invoice_match: InvoiceMatchForm,
+    match_release: StockMatchReleaseForm,
 }
 
 impl StockNoteScreen {
@@ -105,6 +122,8 @@ impl StockNoteScreen {
         self.reverse_date.clear();
         self.reverse_reason.clear();
         self.return_draft = None;
+        self.invoice_match = InvoiceMatchForm::default();
+        self.match_release = StockMatchReleaseForm::default();
     }
 }
 
@@ -462,15 +481,26 @@ impl App {
                 }
             });
 
-        for invoice in self.store.stock_note_invoices(company, note.id)? {
+        let invoices = self.store.stock_note_invoices(company, note.id)?;
+        for invoice in &invoices {
             let mut label = format!(
                 "Invoice {} · {} · {}",
                 invoice.invoice_id, invoice.date, invoice.reference
             );
-            if let Some(reversed) = invoice.reversed_on {
+            if let Some(reversed) = &invoice.reversed_on {
                 label.push_str(&format!(" · reversed {reversed}"));
             }
+            if let Some(released) = &invoice.released_on {
+                label.push_str(&format!(" · stock match released {released}"));
+            }
             ui.label(label);
+        }
+        if invoices.iter().any(|invoice| invoice.can_release) {
+            ui.collapsing("Release a stock match", |ui| {
+                self.release_stock_match(ui, company, note, &invoices)
+            })
+            .body_returned
+            .transpose()?;
         }
 
         ui.horizontal(|ui| {
@@ -509,6 +539,11 @@ impl App {
             self.prepare_stock_notes_invoice(company, std::iter::once(note))?;
         }
         if note.reversed_on.is_none() && note.has_unbilled_stock {
+            ui.collapsing("Match stock to an existing invoice", |ui| {
+                self.match_prior_invoice(ui, company, note, &lines)
+            })
+            .body_returned
+            .transpose()?;
             let eligible: Vec<_> = notes
                 .iter()
                 .filter(|other| {
@@ -593,6 +628,151 @@ impl App {
             })
             .body_returned
             .transpose()?;
+        }
+        Ok(())
+    }
+
+    fn match_prior_invoice(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        note: &StockNote,
+        note_lines: &[StockNoteLine],
+    ) -> Result<()> {
+        let invoices = self
+            .store
+            .invoices_awaiting_stock_on_note(company, note.id)?;
+        if invoices.is_empty() {
+            ui.label("No earlier invoice has a matching billed quantity awaiting stock.");
+            return Ok(());
+        }
+        let form = &mut self.stock_note_screen.invoice_match;
+        let describe = |date: &str, reference: &str| format!("{date} · {reference}");
+        let current = invoices
+            .iter()
+            .find(|invoice| Some(invoice.id) == form.invoice);
+        let mut selected = current.map(|invoice| invoice.id);
+        egui::ComboBox::from_id_salt(("match-prior-invoice", note.id))
+            .selected_text(current.map_or_else(
+                || "Select invoice".to_string(),
+                |invoice| describe(&invoice.date, &invoice.reference),
+            ))
+            .show_ui(ui, |ui| {
+                for invoice in &invoices {
+                    ui.selectable_value(
+                        &mut selected,
+                        Some(invoice.id),
+                        describe(&invoice.date, &invoice.reference),
+                    );
+                }
+            });
+        if form.invoice != selected {
+            form.invoice = selected;
+            form.quantities.clear();
+            form.date = note.date.clone();
+        }
+        let Some(invoice) = invoices.iter().find(|invoice| Some(invoice.id) == selected) else {
+            return Ok(());
+        };
+        ui.horizontal(|ui| {
+            ui.label("Link date");
+            ui.add(egui::TextEdit::singleline(&mut form.date).hint_text("YYYY-MM-DD"));
+        });
+        let mut entries = Vec::new();
+        for line in note_lines.iter().filter(|line| line.unbilled() > 0) {
+            for allocation in invoice
+                .allocations
+                .iter()
+                .filter(|allocation| allocation.matches(line))
+            {
+                let key = (allocation.allocation_id, line.id);
+                let entry = form.quantities.entry(key).or_default();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "{} · {} · {} · {} available, {} billed pending (#{}), in {}",
+                        line.item,
+                        line.location,
+                        line.batch.as_deref().unwrap_or("Unbatched"),
+                        format_quantity(i128::from(line.unbilled())),
+                        format_quantity(i128::from(allocation.remaining)),
+                        allocation.allocation_id,
+                        line.unit,
+                    ));
+                    ui.add(
+                        egui::TextEdit::singleline(entry)
+                            .hint_text("Qty to match")
+                            .desired_width(100.0),
+                    );
+                });
+                if !entry.trim().is_empty() {
+                    entries.push((key, entry.clone()));
+                }
+            }
+        }
+        if ui.button("Save stock match").clicked() {
+            let quantities = entries
+                .into_iter()
+                .map(|((invoice_allocation_id, note_line_id), qty)| {
+                    Ok(StockNoteInvoiceAllocation {
+                        invoice_allocation_id,
+                        note_line_id,
+                        quantity: parse_quantity(&qty)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.store.link_invoice_stock_note(
+                company,
+                note.id,
+                invoice.id,
+                &form.date,
+                &quantities,
+            )?;
+            *form = InvoiceMatchForm::default();
+            self.message = format!("Stock matched to invoice {}", invoice.reference);
+        }
+        Ok(())
+    }
+
+    fn release_stock_match(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        note: &StockNote,
+        invoices: &[StockNoteInvoice],
+    ) -> Result<()> {
+        let form = &mut self.stock_note_screen.match_release;
+        let selected = invoices
+            .iter()
+            .find(|invoice| invoice.can_release && Some(invoice.invoice_id) == form.invoice);
+        egui::ComboBox::from_id_salt(("release-stock-match", note.id))
+            .selected_text(selected.map_or("Select invoice", |invoice| invoice.reference.as_str()))
+            .show_ui(ui, |ui| {
+                for invoice in invoices.iter().filter(|invoice| invoice.can_release) {
+                    ui.selectable_value(
+                        &mut form.invoice,
+                        Some(invoice.invoice_id),
+                        &invoice.reference,
+                    );
+                }
+            });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Release date");
+            ui.add(egui::TextEdit::singleline(&mut form.date).hint_text("YYYY-MM-DD"));
+            ui.label("Reason");
+            ui.text_edit_singleline(&mut form.reason);
+        });
+        if let Some(invoice) = form.invoice {
+            if ui.button("Release matched quantities").clicked() {
+                self.store.release_invoice_stock_note(
+                    company,
+                    note.id,
+                    invoice,
+                    &form.date,
+                    &form.reason,
+                )?;
+                *form = StockMatchReleaseForm::default();
+                self.message = "Matched quantities released".into();
+            }
         }
         Ok(())
     }

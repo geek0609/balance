@@ -255,13 +255,16 @@ pub struct StockNoteInvoice {
     pub reference: String,
     pub date: String,
     pub reversed_on: Option<String>,
+    pub released_on: Option<String>,
+    pub can_release: bool,
 }
 
 const NOTES: &str =
     "SELECT n.id, n.kind, n.date, n.reference, p.name, n.party_ledger_id,
             n.order_id, n.narration, n.reversed_on, n.reversal_reason,
-            EXISTS(SELECT 1 FROM stock_note_invoices link
+            EXISTS(SELECT 1 FROM stock_note_billing_history link
              WHERE link.note_id = n.id
+               AND link.released_on IS NULL
                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id)),
             EXISTS(SELECT 1 FROM stock_note_lines l
                    LEFT JOIN stock_note_billed_quantities b ON b.note_line_id = l.id
@@ -339,8 +342,9 @@ pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<V
 
 fn invoice_history(conn: &Connection, company: i64, note: i64) -> Result<Vec<StockNoteInvoice>> {
     let mut stmt = conn.prepare(
-        "SELECT i.id, v.reference, v.date, rv.date
-         FROM stock_note_invoices link JOIN stock_notes n ON n.id = link.note_id
+        "SELECT i.id, v.reference, v.date, rv.date, link.released_on,
+                link.releasable AND rv.date IS NULL AND n.reversed_on IS NULL
+         FROM stock_note_billing_history link JOIN stock_notes n ON n.id = link.note_id
          JOIN invoices i ON i.id = link.invoice_id AND i.company_id = n.company_id
          JOIN vouchers v ON v.id = i.voucher_id AND v.company_id = n.company_id
          LEFT JOIN invoice_reversals r ON r.invoice_id = i.id
@@ -355,6 +359,8 @@ fn invoice_history(conn: &Connection, company: i64, note: i64) -> Result<Vec<Sto
                 reference: row.get(1)?,
                 date: row.get(2)?,
                 reversed_on: row.get(3)?,
+                released_on: row.get(4)?,
+                can_release: row.get(5)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -369,15 +375,21 @@ pub(crate) fn check_after_invoice_reversals(
     allow_active: bool,
 ) -> Result<()> {
     for invoice in invoice_history(conn, company, note)? {
-        if allow_active && invoice.reversed_on.is_none() {
+        let inactive = invoice
+            .reversed_on
+            .as_deref()
+            .into_iter()
+            .chain(invoice.released_on.as_deref())
+            .min();
+        if allow_active && inactive.is_none() {
             continue;
         }
-        let reversed = invoice.reversed_on.ok_or_else(|| {
-            Error::Validation("Reverse the active invoice before changing this stock note".into())
+        let reversed = inactive.ok_or_else(|| {
+            Error::Validation("Reverse the active invoice or release its stock match before changing this stock note".into())
         })?;
-        if date < parse_date(&reversed)? {
+        if date < parse_date(reversed)? {
             return Err(Error::Validation(
-                "The date cannot precede an invoice reversal for this stock note".into(),
+                "The date cannot precede an invoice reversal or stock match release for this stock note".into(),
             ));
         }
     }
@@ -391,12 +403,7 @@ pub(crate) fn allocate_spans(
 ) -> Result<Vec<Range<i64>>> {
     let capacity = note_line.values.quantity;
     let mut stmt = conn.prepare(
-        "SELECT s.start_quantity, s.quantity
-         FROM stock_note_invoice_lines link
-         JOIN stock_note_invoice_spans s ON s.invoice_line_id = link.invoice_line_id
-         JOIN invoice_lines l ON l.id = link.invoice_line_id
-         WHERE link.note_line_id = ?1
-           AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = l.invoice_id)
+        "SELECT start_quantity, quantity FROM active_stock_note_invoice_spans WHERE note_line_id = ?1
          UNION ALL
          SELECT s.start_quantity, s.quantity FROM stock_return_lines l
          JOIN stock_returns r ON r.id = l.return_id AND r.reversed_on IS NULL
@@ -461,6 +468,14 @@ pub(crate) struct InvoiceQuantityShare {
 impl InvoiceQuantityShare {
     pub(crate) fn new(quantity: i64, spans: Vec<Range<i64>>) -> Self {
         Self { quantity, spans }
+    }
+
+    pub(crate) fn for_range(capacity: i64, start: i64, quantity: i64) -> Result<Self> {
+        let end = start
+            .checked_add(quantity)
+            .filter(|&end| end <= capacity && start >= 0 && quantity > 0)
+            .ok_or_else(invalid_spans)?;
+        Ok(Self::new(capacity, std::iter::once(start..end).collect()))
     }
 
     pub(crate) fn spans(&self) -> &[Range<i64>] {
@@ -564,7 +579,7 @@ pub(crate) fn linked_note(conn: &Connection, invoice: i64) -> Result<Option<i64>
 
 pub(crate) fn linked_notes(conn: &Connection, invoice: i64) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT note_id FROM stock_note_invoices WHERE invoice_id = ?1 ORDER BY note_id",
+        "SELECT note_id FROM stock_note_billing_history WHERE invoice_id = ?1 ORDER BY note_id",
     )?;
     let rows = stmt
         .query_map([invoice], |row| row.get(0))?

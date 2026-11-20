@@ -1,6 +1,6 @@
 //! Compare receipt acquisition costs with the net amounts billed by suppliers.
 
-use crate::stock_notes::invoice_quantity_share;
+use crate::stock_notes::{invoice_quantity_share, InvoiceQuantityShare};
 use crate::{parse_date, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::Connection;
@@ -71,6 +71,16 @@ fn reconcile(
         "SELECT id, quantity, net_amount, date, reversed_on FROM invoice_stock_return_history
          WHERE company_id = ?1 AND line_id = ?2",
     )?;
+    let mut prior_bills = conn.prepare(
+        "SELECT COALESCE(l.billed_quantity, l.quantity), l.amount,
+                a.billed_offset + h.billed_start, h.note_start, h.quantity
+         FROM invoice_stock_link_history h JOIN invoice_lines l ON l.id = h.line_id
+         JOIN invoice_allocation_billing_offsets a ON a.allocation_id = h.invoice_allocation_id
+         WHERE h.note_line_id = ?1 AND (?2 IS NULL OR h.linked_on <= ?2)
+           AND (h.released_on IS NULL OR (?2 IS NOT NULL AND h.released_on > ?2))
+           AND (h.invoice_reversed_on IS NULL OR (?2 IS NOT NULL AND h.invoice_reversed_on > ?2))",
+    )?;
+    let cutoff = as_of.map(|date| date.to_string());
     let mut rows = receipts.query([company])?;
     let mut report = Vec::new();
     while let Some(receipt) = rows.next()? {
@@ -125,6 +135,18 @@ fn reconcile(
                     )?;
                     allocated_cost -= share.apportion(cost);
                 }
+            }
+        }
+        let mut prior_bill_rows = prior_bills.query(rusqlite::params![note_line, cutoff])?;
+        while let Some(bill) = prior_bill_rows.next()? {
+            let units = bill.get::<_, i64>(4)?;
+            let billed_share = InvoiceQuantityShare::for_range(bill.get(0)?, bill.get(2)?, units)?;
+            invoice_net += billed_share.apportion(i128::from(bill.get::<_, i64>(1)?));
+            quantity += i128::from(units);
+            if let Some(cost) = receipt_cost {
+                let receipt_share =
+                    InvoiceQuantityShare::for_range(received_quantity, bill.get(3)?, units)?;
+                allocated_cost += receipt_share.apportion(cost);
             }
         }
         if quantity < 0

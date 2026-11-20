@@ -4689,6 +4689,16 @@ impl App {
                                 allocation.location,
                                 allocation.batch.as_deref().unwrap_or("unbatched")
                             ));
+                            if invoice.reversal.is_none() && allocation.quantity == 0 {
+                                ui.small(format!(
+                                    "    {} matched · {} awaiting stock",
+                                    format_quantity(i128::from(allocation.linked_stock_quantity)),
+                                    format_quantity(i128::from(
+                                        allocation.billed_quantity
+                                            - allocation.linked_stock_quantity
+                                    )),
+                                ));
+                            }
                         }
                     }
                     if let Some(calculated) = &invoice.tax_calculation {

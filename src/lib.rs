@@ -30,6 +30,7 @@ pub mod invoice_refunds;
 pub mod invoice_register;
 pub mod invoice_returns;
 pub mod invoice_reversals;
+pub mod invoice_stock_links;
 pub mod ledgers;
 pub mod manufacturing;
 pub mod opening;
@@ -60,7 +61,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 93;
+const SCHEMA_VERSION: i64 = 94;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -506,6 +507,7 @@ impl Store {
             "stock_note_invoices",
             "stock_note_invoice_lines",
             "stock_note_invoice_spans",
+            "invoice_stock_links",
             "opening_bills",
             "invoice_credit_notes",
             "invoice_credit_lines",
@@ -1059,6 +1061,15 @@ impl Store {
         tx.commit()?;
         if version < 93 {
             invoice_quantities::migrate(&mut conn)?;
+        }
+        if version < 94 {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let current: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if current < 94 {
+                invoice_stock_links::migrate(&tx)?;
+                tx.pragma_update(None, "user_version", 94)?;
+            }
+            tx.commit()?;
         }
         Ok(Self { conn })
     }
