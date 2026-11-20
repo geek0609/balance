@@ -582,6 +582,8 @@ impl NewTracking {
                   AND i.kind = n.kind AND i.party_ledger_id = n.party_ledger_id
              JOIN vouchers v ON v.id = i.voucher_id
              WHERE nl.id = ?1 AND a.quantity = 0
+               AND NOT EXISTS(SELECT 1 FROM invoice_order_sources o
+                              WHERE o.allocation_id = a.id AND o.order_id IS NOT n.order_id)
                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)
              ORDER BY v.date, i.id, a.id",
         )?;

@@ -207,7 +207,7 @@ pub(crate) fn migrate_stock_links(conn: &Connection) -> Result<()> {
             SELECT line_id, delivery_line, SUM(quantity) AS returned
             FROM invoice_stock_return_history WHERE reversed_on IS NULL GROUP BY line_id, delivery_line;",
     )?;
-    crate::invoice_stock_links::refresh_order_progress(conn)
+    crate::invoice_stock_links::rebuild_order_progress(conn, false)
 }
 
 #[derive(Debug, Clone)]
@@ -1031,7 +1031,7 @@ pub(crate) fn reverse_movements(
          FROM invoice_stock_return_history ret JOIN invoices i ON i.id = ret.invoice_id
          LEFT JOIN stock_note_lines src ON src.id = ret.delivery_line
          LEFT JOIN stock_notes n ON n.id = src.note_id
-         LEFT JOIN invoice_order_links link ON link.invoice_id = i.id AND ret.delivery_line IS NULL
+         LEFT JOIN invoice_order_sources link ON link.allocation_id = ret.allocation_id AND ret.delivery_line IS NULL
          WHERE ret.company_id = ?1 AND ret.voucher_id = ?2 ORDER BY ret.id",
     )?;
     let rows = stmt

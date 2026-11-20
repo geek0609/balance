@@ -1455,7 +1455,7 @@ pub(crate) enum StockInvoicePosting<'a> {
     Order(i64),
     Import {
         original_postings: Option<&'a [Posting]>,
-        order_id: Option<i64>,
+        order_allocations: Option<&'a [Option<crate::orders::InvoiceOrderSource<'a>>]>,
     },
 }
 
@@ -1471,17 +1471,35 @@ pub(crate) fn insert_direct_invoice(
         } => *original_postings,
         _ => None,
     };
-    let order = match &posting {
-        StockInvoicePosting::Direct => None,
-        StockInvoicePosting::Order(order) => Some(*order),
-        StockInvoicePosting::Import { order_id, .. } => *order_id,
+    let sources = match &posting {
+        StockInvoicePosting::Import {
+            order_allocations, ..
+        } => *order_allocations,
+        _ => None,
     };
     let ids = insert_invoice(conn, company, draft, original_postings)?;
     if draft.kind == InvoiceKind::Sale {
-        let allocations = invoice_stock_allocations(conn, ids.0)?;
+        let mut allocations = conn.prepare_cached(
+            "SELECT l.item_id, a.location_id, a.batch_id, a.quantity
+             FROM invoice_lines l JOIN invoice_line_allocations a ON a.line_id = l.id
+             WHERE l.invoice_id = ?1 ORDER BY l.id, a.id",
+        )?;
+        let rows = allocations.query_map([ids.0], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)?))
+        })?;
         let mut buckets = HashSet::new();
         let reference = format!("Invoice {} (#{})", draft.reference.trim(), ids.0);
-        for (item, location, batch, quantity) in allocations {
+        for (index, row) in rows.enumerate() {
+            let (item, location, batch, quantity) = row?;
+            if quantity == 0 {
+                continue;
+            }
+            let order = match &posting {
+                StockInvoicePosting::Order(order) => Some(*order),
+                _ => sources
+                    .and_then(|sources| sources.get(index).copied().flatten())
+                    .map(|source| source.order_id),
+            };
             if let Some(order) = order {
                 crate::stock_reservations::consume_reservations(
                     conn, order, item, location, batch, quantity, &reference,
@@ -1495,6 +1513,9 @@ pub(crate) fn insert_direct_invoice(
                 crate::stock_policy::check_bucket(conn, company, item, location, batch)?;
             }
         }
+    }
+    if let Some(sources) = sources {
+        crate::orders::attach_imported_invoice_orders(conn, ids.0, sources)?;
     }
     Ok(ids)
 }

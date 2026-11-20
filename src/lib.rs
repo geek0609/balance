@@ -62,7 +62,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 98;
+const SCHEMA_VERSION: i64 = 99;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -515,6 +515,7 @@ impl Store {
             "imported_order_numbers",
             "order_lot_assignments",
             "order_lot_returns",
+            "invoice_order_allocations",
             "opening_bills",
             "invoice_credit_notes",
             "invoice_credit_lines",
@@ -1078,7 +1079,7 @@ impl Store {
             }
             tx.commit()?;
         }
-        if version < 98 {
+        if version < 99 {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let current: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
             if current < 95 {
@@ -1093,6 +1094,10 @@ impl Store {
             if current < 98 {
                 order_lots::migrate(&tx)?;
                 tx.pragma_update(None, "user_version", 98)?;
+            }
+            if current < 99 {
+                orders::migrate_invoice_allocations(&tx)?;
+                tx.pragma_update(None, "user_version", 99)?;
             }
             tx.commit()?;
         }
@@ -2076,7 +2081,8 @@ mod tests {
     #[test]
     fn rejects_newer_database_versions_without_modifying_them() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA user_version = 99").unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
         assert!(matches!(
             Store::from_connection(conn),
             Err(Error::Validation(_))

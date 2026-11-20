@@ -67,11 +67,28 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             SELECT h.invoice_id, n.order_id FROM stock_note_billing_history h
             JOIN stock_notes n ON n.id = h.note_id WHERE n.order_id IS NOT NULL;",
     )?;
-    refresh_order_progress(conn)
+    rebuild_order_progress(conn, false)
 }
 
-pub(crate) fn refresh_order_progress(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+pub(crate) fn rebuild_order_progress(conn: &Connection, allocation_links: bool) -> Result<()> {
+    let direct = if allocation_links {
+        "SELECT link.order_id, il.item_id, SUM(a.quantity - COALESCE(ret.returned, 0)) AS quantity
+         FROM invoice_order_sources link JOIN physical_invoice_allocations a ON a.id = link.allocation_id
+         JOIN physical_invoice_lines il ON il.id = a.line_id
+         LEFT JOIN (
+            SELECT allocation_id, SUM(quantity) AS returned FROM invoice_stock_return_history
+            WHERE delivery_line IS NULL AND reversed_on IS NULL GROUP BY allocation_id
+         ) ret ON ret.allocation_id = a.id
+         WHERE NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id)
+         GROUP BY link.order_id, il.item_id"
+    } else {
+        "SELECT link.order_id, il.item_id, SUM(il.quantity - COALESCE(ret.returned, 0)) AS quantity
+         FROM invoice_order_links link JOIN physical_invoice_lines il ON il.invoice_id = link.invoice_id
+         LEFT JOIN invoice_returned_quantities ret ON ret.line_id = il.id AND ret.delivery_line IS NULL
+         WHERE NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id)
+         GROUP BY link.order_id, il.item_id"
+    };
+    conn.execute_batch(&format!(
         "DROP VIEW order_line_progress;
         CREATE VIEW order_line_progress AS
             SELECT ol.id, ol.order_id, ol.item_id, ol.quantity, ol.unit_price,
@@ -79,11 +96,7 @@ pub(crate) fn refresh_order_progress(conn: &Connection) -> Result<()> {
                    COALESCE(direct.quantity, 0) + COALESCE(notes.billed, 0) AS billed
             FROM order_lines ol
             LEFT JOIN (
-                SELECT link.order_id, il.item_id, SUM(il.quantity - COALESCE(ret.returned, 0)) AS quantity
-                FROM invoice_order_links link JOIN physical_invoice_lines il ON il.invoice_id = link.invoice_id
-                LEFT JOIN invoice_returned_quantities ret ON ret.line_id = il.id AND ret.delivery_line IS NULL
-                WHERE NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = link.invoice_id)
-                GROUP BY link.order_id, il.item_id
+                {direct}
             ) direct ON direct.order_id = ol.order_id AND direct.item_id = ol.item_id
             LEFT JOIN (
                 SELECT n.order_id, l.item_id,
@@ -98,8 +111,8 @@ pub(crate) fn refresh_order_progress(conn: &Connection) -> Result<()> {
                 ) ir ON ir.delivery_line = l.id
                 WHERE n.order_id IS NOT NULL AND n.reversed_on IS NULL
                 GROUP BY n.order_id, l.item_id
-            ) notes ON notes.order_id = ol.order_id AND notes.item_id = ol.item_id;",
-    )?;
+            ) notes ON notes.order_id = ol.order_id AND notes.item_id = ol.item_id;"
+    ))?;
     Ok(())
 }
 
@@ -139,7 +152,12 @@ pub struct StockNoteInvoiceAllocation {
     pub quantity: i64,
 }
 
-fn demand(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<InvoiceStockDemand>> {
+fn demand(
+    conn: &Connection,
+    company: i64,
+    invoice: i64,
+    note: Option<&StockNote>,
+) -> Result<Vec<InvoiceStockDemand>> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, l.item_id, a.location_id, a.batch_id, a.billed_quantity,
                 a.billed_quantity - COALESCE(SUM(s.quantity), 0)
@@ -148,9 +166,12 @@ fn demand(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<InvoiceSt
          LEFT JOIN active_invoice_stock_links s ON s.invoice_allocation_id = a.id
          WHERE i.company_id = ?1 AND i.id = ?2 AND a.quantity = 0
            AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)
+           AND (?3 = 0 OR NOT EXISTS(SELECT 1 FROM invoice_order_sources o
+                                    WHERE o.allocation_id = a.id AND o.order_id IS NOT ?4))
          GROUP BY a.id ORDER BY l.id, a.id",
     )?;
-    let rows = stmt.query_map(params![company, invoice], |row| {
+    let order = note.and_then(|note| note.order_id);
+    let rows = stmt.query_map(params![company, invoice, note.is_some(), order], |row| {
         Ok(InvoiceStockDemand {
             allocation_id: row.get(0)?,
             item_id: row.get(1)?,
@@ -183,14 +204,12 @@ fn candidates(
     let mut stmt = conn.prepare(
         "SELECT i.id, v.date, v.reference FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
          WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3 AND v.date <= ?4
-           AND (?7 IS NULL OR i.id = ?7)
+           AND (?6 IS NULL OR i.id = ?6)
            AND EXISTS(SELECT 1 FROM invoice_lines l JOIN invoice_line_allocations a ON a.line_id = l.id
                 JOIN stock_note_lines nl ON nl.note_id = ?5 AND nl.item_id = l.item_id
                      AND nl.location_id = a.location_id AND (a.batch_id IS NULL OR a.batch_id = nl.batch_id)
                 WHERE l.invoice_id = i.id AND a.quantity = 0)
            AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)
-           AND NOT EXISTS(SELECT 1 FROM invoice_order_links o
-                          WHERE o.invoice_id = i.id AND o.order_id IS NOT ?6)
          ORDER BY v.date DESC, i.id DESC",
     )?;
     let rows = stmt.query_map(
@@ -200,7 +219,6 @@ fn candidates(
             note.party_ledger_id,
             invoice_date_through,
             note.id,
-            note.order_id,
             invoice,
         ],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -209,7 +227,7 @@ fn candidates(
     let mut choices = Vec::new();
     for row in rows {
         let (id, date, reference) = row?;
-        let allocations = demand(conn, company, id)?
+        let allocations = demand(conn, company, id, Some(note))?
             .into_iter()
             .filter(|a| {
                 a.remaining > 0
@@ -490,7 +508,7 @@ impl Store {
         company: i64,
         invoice: i64,
     ) -> Result<Vec<InvoiceStockDemand>> {
-        demand(&self.conn, company, invoice)
+        demand(&self.conn, company, invoice, None)
     }
 
     /// Assign posted quantities to an invoice without posting fresh stock or ledger movements.

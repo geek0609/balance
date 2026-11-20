@@ -519,6 +519,38 @@ pub(crate) fn insert_order(conn: &Connection, company: i64, draft: &OrderDraft) 
     Ok(order)
 }
 
+pub(crate) fn migrate_invoice_allocations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS invoice_order_allocations(
+            allocation_id INTEGER PRIMARY KEY REFERENCES invoice_line_allocations(id),
+            order_id INTEGER NOT NULL REFERENCES orders(id),
+            expected_on TEXT
+         );
+         CREATE INDEX IF NOT EXISTS invoice_order_allocations_order ON invoice_order_allocations(order_id);
+         DROP VIEW IF EXISTS invoice_order_sources;
+         CREATE VIEW invoice_order_sources AS
+            SELECT source.allocation_id, l.invoice_id, source.order_id
+            FROM invoice_order_allocations source JOIN invoice_line_allocations a ON a.id = source.allocation_id
+            JOIN invoice_lines l ON l.id = a.line_id
+            UNION ALL
+            SELECT a.id, legacy.invoice_id, legacy.order_id
+            FROM invoice_order_links legacy JOIN invoice_lines l ON l.invoice_id = legacy.invoice_id
+            JOIN invoice_line_allocations a ON a.line_id = l.id
+            WHERE NOT EXISTS(SELECT 1 FROM invoice_order_allocations source WHERE source.allocation_id = a.id);
+         DROP VIEW invoice_orders;
+         CREATE VIEW invoice_orders AS
+            SELECT invoice_id, order_id FROM invoice_order_links
+            UNION
+            SELECT l.invoice_id, source.order_id FROM invoice_order_allocations source
+            JOIN invoice_line_allocations a ON a.id = source.allocation_id
+            JOIN invoice_lines l ON l.id = a.line_id
+            UNION
+            SELECT h.invoice_id, n.order_id FROM stock_note_billing_history h
+            JOIN stock_notes n ON n.id = h.note_id WHERE n.order_id IS NOT NULL;",
+    )?;
+    crate::invoice_stock_links::rebuild_order_progress(conn, true)
+}
+
 fn remove_unused_line(conn: &Connection, order: i64, item: i64) -> Result<bool> {
     let removed = conn.execute(
         "DELETE FROM order_lines AS ol WHERE ol.order_id = ?1 AND ol.item_id = ?2
@@ -529,7 +561,9 @@ fn remove_unused_line(conn: &Connection, order: i64, item: i64) -> Result<bool> 
                WHERE n.order_id = ol.order_id AND nl.item_id = ol.item_id
            )
            AND NOT EXISTS(
-               SELECT 1 FROM invoice_order_links i JOIN invoice_lines il ON il.invoice_id = i.invoice_id
+               SELECT 1 FROM invoice_order_sources i
+               JOIN invoice_line_allocations a ON a.id = i.allocation_id
+               JOIN invoice_lines il ON il.id = a.line_id
                WHERE i.order_id = ol.order_id AND il.item_id = ol.item_id
            )",
         params![order, item],
@@ -545,11 +579,12 @@ pub(crate) enum FulfilmentChange {
 
 fn check_order_stock_release_date(conn: &Connection, order: i64, date: NaiveDate) -> Result<()> {
     let mut stmt = conn.prepare_cached(
-        "SELECT v.date FROM invoice_order_links link
+        "SELECT DISTINCT v.date FROM invoice_order_sources link
+         JOIN physical_invoice_allocations a ON a.id = link.allocation_id
+         JOIN physical_invoice_lines l ON l.id = a.line_id
          JOIN invoice_reversals r ON r.invoice_id = link.invoice_id
          JOIN vouchers v ON v.id = r.reversal_voucher_id
          WHERE link.order_id = ?1
-           AND EXISTS(SELECT 1 FROM physical_invoice_lines l WHERE l.invoice_id = link.invoice_id)
          UNION ALL
          SELECT reversed_on FROM stock_notes WHERE order_id = ?1 AND reversed_on IS NOT NULL
          UNION ALL
@@ -558,7 +593,7 @@ fn check_order_stock_release_date(conn: &Connection, order: i64, date: NaiveDate
          SELECT DISTINCT r.date FROM invoice_stock_return_history r
          LEFT JOIN stock_note_lines nl ON nl.id = r.delivery_line
          LEFT JOIN stock_notes n ON n.id = nl.note_id
-         LEFT JOIN invoice_order_links i ON i.invoice_id = r.invoice_id AND r.delivery_line IS NULL
+         LEFT JOIN invoice_order_sources i ON i.allocation_id = r.allocation_id AND r.delivery_line IS NULL
          WHERE COALESCE(n.order_id, i.order_id) = ?1",
     )?;
     for row in stmt.query_map([order], |row| row.get::<_, String>(0))? {
@@ -633,6 +668,70 @@ pub(crate) fn validate_order_invoice_source(
                 "Every stock item must appear on the order".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InvoiceOrderSource<'a> {
+    pub order_id: i64,
+    pub expected_on: Option<&'a str>,
+}
+
+pub(crate) fn attach_imported_invoice_orders(
+    conn: &Connection,
+    invoice: i64,
+    sources: &[Option<InvoiceOrderSource<'_>>],
+) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT a.id, l.item_id, a.quantity FROM invoice_line_allocations a
+         JOIN invoice_lines l ON l.id = a.line_id WHERE l.invoice_id = ?1 ORDER BY l.id, a.id",
+    )?;
+    let rows = stmt
+        .query_map([invoice], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() != sources.len() {
+        return Err(Error::Validation(
+            "Invoice order allocations do not reconcile".into(),
+        ));
+    }
+    let mut by_order = BTreeMap::<_, Vec<_>>::new();
+    for ((allocation, item, quantity), source) in rows.into_iter().zip(sources) {
+        if let Some(source) = source {
+            by_order.entry(source.order_id).or_default().push((
+                allocation,
+                item,
+                quantity,
+                source.expected_on,
+            ));
+        }
+    }
+    for (order, rows) in by_order {
+        let planned = crate::order_lots::plan(
+            conn,
+            order,
+            rows.iter()
+                .map(|&(_, item, quantity, due)| (item, quantity, due)),
+        )?;
+        for ((allocation, _, _, due), slices) in rows.into_iter().zip(planned) {
+            conn.execute(
+                "INSERT INTO invoice_order_allocations(allocation_id, order_id, expected_on)
+                 VALUES (?1, ?2, ?3)",
+                params![allocation, order, due],
+            )?;
+            crate::order_lots::write(
+                conn,
+                crate::order_lots::Source::InvoiceAllocation(allocation),
+                &slices,
+            )?;
+        }
+        crate::stock_reservations::check_order_coverage(conn, order)?;
     }
     Ok(())
 }

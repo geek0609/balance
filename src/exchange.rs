@@ -194,7 +194,7 @@ struct ImportedInvoice {
     taxes: Vec<ImportedInvoiceTax>,
     original_postings: Vec<Line>,
     metadata: SourceMetadata,
-    order: Option<orders::InvoiceOrder>,
+    order: Option<orders::InvoiceOrders>,
 }
 #[derive(Debug, Clone)]
 struct ImportedFundingApplication {
@@ -2373,7 +2373,7 @@ fn parse_imported_invoice(
             }
         }
     }
-    let order = orders::invoice_order(node, &inventory_rows)?;
+    let order = orders::invoice_orders(node, &inventory_rows)?;
     let (mut lines, subtotal) = parse_invoice_stock(
         inventory_rows,
         breakdowns,
@@ -6888,10 +6888,10 @@ impl Store {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let order_id = invoice
+            let order_allocations = invoice
                 .order
                 .as_ref()
-                .map(|order| order.validate(conn, plan.company_id, &draft, invoice))
+                .map(|orders| orders.resolve(conn, plan.company_id, &draft, invoice))
                 .transpose()?;
             let (invoice_id, voucher_id) = insert_direct_invoice(
                 &conn,
@@ -6900,17 +6900,9 @@ impl Store {
                 StockInvoicePosting::Import {
                     original_postings: (invoice.entry_mode == InvoiceEntryMode::Voucher)
                         .then_some(original_postings.as_slice()),
-                    order_id,
+                    order_allocations: order_allocations.as_deref(),
                 },
             )?;
-            if let (Some(order), Some(source)) = (order_id, invoice.order.as_ref()) {
-                crate::orders::attach_order_invoice(
-                    conn,
-                    order,
-                    invoice_id,
-                    Some(&source.expected_dates()),
-                )?;
-            }
             tracking.write_invoice(&conn, invoice_id, invoice)?;
             save_metadata(
                 &conn,
