@@ -254,6 +254,7 @@ pub(crate) fn check_stock_coverage(
 
 /// Check after a change to pending quantities. It must leave room for every remaining hold.
 pub(crate) fn check_order_coverage(conn: &Connection, order: i64) -> Result<()> {
+    crate::order_lots::check_capacity(conn, order)?;
     let over_reserved: bool = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM order_line_availability p

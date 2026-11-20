@@ -6903,8 +6903,13 @@ impl Store {
                     order_id,
                 },
             )?;
-            if let Some(order) = order_id {
-                crate::orders::attach_order_invoice(conn, order, invoice_id)?;
+            if let (Some(order), Some(source)) = (order_id, invoice.order.as_ref()) {
+                crate::orders::attach_order_invoice(
+                    conn,
+                    order,
+                    invoice_id,
+                    Some(&source.expected_dates()),
+                )?;
             }
             tracking.write_invoice(&conn, invoice_id, invoice)?;
             save_metadata(

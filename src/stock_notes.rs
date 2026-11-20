@@ -623,12 +623,21 @@ pub(crate) fn write_stock_note(
     company: i64,
     draft: &StockNoteDraft,
     receipt_costs: Option<&[Option<i64>]>,
+    expected_dates: Option<&[Option<&str>]>,
 ) -> Result<i64> {
     let date = parse_date(&draft.date)?;
     let reference = required(&draft.reference, "Note reference")?;
     if draft.lines.is_empty() || receipt_costs.is_some_and(|costs| costs.len() != draft.lines.len())
     {
         return Err(Error::Validation("Add at least one stock line".into()));
+    }
+    if expected_dates.is_some_and(|dates| {
+        dates.len() != draft.lines.len()
+            || (draft.order_id.is_none() && dates.iter().any(Option::is_some))
+    }) {
+        return Err(Error::Validation(
+            "Stock note delivery dates require matching order lines".into(),
+        ));
     }
     if !matches!(
         ledger_category(conn, company, draft.party_ledger_id)?,
@@ -662,6 +671,22 @@ pub(crate) fn write_stock_note(
         check_stock_location(conn, company, line.location_id)?;
         check_stock_batch(conn, company, line.item_id, line.batch_id)?;
     }
+    let assignments = draft
+        .order_id
+        .map(|order| {
+            crate::order_lots::plan(
+                conn,
+                order,
+                draft.lines.iter().enumerate().map(|(index, line)| {
+                    (
+                        line.item_id,
+                        line.quantity,
+                        expected_dates.and_then(|dates| dates[index]),
+                    )
+                }),
+            )
+        })
+        .transpose()?;
     let inserted = conn.execute(
         "INSERT INTO stock_notes(company_id, kind, party_ledger_id, order_id, reference,
              reference_key, date, narration)
@@ -711,6 +736,13 @@ pub(crate) fn write_stock_note(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![note, line.item_id, line.location_id, line.batch_id, line.quantity, line.unit_price, movement],
         )?;
+        if let Some(assignments) = &assignments {
+            crate::order_lots::write(
+                conn,
+                crate::order_lots::Source::NoteLine(conn.last_insert_rowid()),
+                &assignments[index],
+            )?;
+        }
         if draft.kind == InvoiceKind::Purchase {
             let cost = match receipt_costs {
                 Some(costs) => costs[index],
@@ -746,10 +778,21 @@ impl Store {
 
     /// Record a physical delivery or receipt and, optionally, consume order quantities.
     pub fn post_stock_note(&mut self, company: i64, draft: &StockNoteDraft) -> Result<i64> {
+        self.post_stock_note_for_delivery_dates(company, draft, &[])
+    }
+
+    /// Post stock against the selected delivery date for each line.
+    pub fn post_stock_note_for_delivery_dates(
+        &mut self,
+        company: i64,
+        draft: &StockNoteDraft,
+        expected_dates: &[Option<&str>],
+    ) -> Result<i64> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let note = write_stock_note(&tx, company, draft, None)?;
+        let dates = (!expected_dates.is_empty()).then_some(expected_dates);
+        let note = write_stock_note(&tx, company, draft, None, dates)?;
         tx.commit()?;
         Ok(note)
     }

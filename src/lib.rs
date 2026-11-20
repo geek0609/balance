@@ -35,6 +35,7 @@ pub mod ledgers;
 pub mod manufacturing;
 pub mod opening;
 pub mod opening_bills;
+mod order_lots;
 pub mod orders;
 pub mod payroll;
 pub mod payroll_payments;
@@ -61,7 +62,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 97;
+const SCHEMA_VERSION: i64 = 98;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -512,6 +513,8 @@ impl Store {
             "imported_stock_note_tracking",
             "order_delivery_lots",
             "imported_order_numbers",
+            "order_lot_assignments",
+            "order_lot_returns",
             "opening_bills",
             "invoice_credit_notes",
             "invoice_credit_lines",
@@ -1075,7 +1078,7 @@ impl Store {
             }
             tx.commit()?;
         }
-        if version < 97 {
+        if version < 98 {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let current: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
             if current < 95 {
@@ -1086,7 +1089,10 @@ impl Store {
             }
             if current < 97 {
                 orders::migrate_delivery_lots(&tx)?;
-                tx.pragma_update(None, "user_version", 97)?;
+            }
+            if current < 98 {
+                order_lots::migrate(&tx)?;
+                tx.pragma_update(None, "user_version", 98)?;
             }
             tx.commit()?;
         }

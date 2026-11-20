@@ -478,16 +478,18 @@ impl NewTracking {
             narration: note.narration.clone(),
             lines,
         };
-        if let Some(order) = order_id {
-            orders::check_delivery_lots(
-                conn,
-                order,
-                draft.lines.iter().zip(&note.lines).map(|(line, source)| {
-                    (line.item_id, line.quantity, source.order_due_on.as_deref())
-                }),
-            )?;
-        }
-        let id = crate::stock_notes::write_stock_note(conn, company, &draft, Some(&costs))?;
+        let dates: Vec<_> = note
+            .lines
+            .iter()
+            .map(|line| line.order_due_on.as_deref())
+            .collect();
+        let id = crate::stock_notes::write_stock_note(
+            conn,
+            company,
+            &draft,
+            Some(&costs),
+            Some(&dates),
+        )?;
         save_metadata(conn, company, "stocknote", id, &note.metadata)?;
         let mut stmt =
             conn.prepare("SELECT id FROM stock_note_lines WHERE note_id = ?1 ORDER BY id")?;

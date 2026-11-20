@@ -154,6 +154,10 @@ pub(super) fn invoice_order(
 }
 
 impl InvoiceOrder {
+    pub(super) fn expected_dates(&self) -> Vec<Option<&str>> {
+        self.dates.iter().flatten().map(Option::as_deref).collect()
+    }
+
     pub(super) fn validate(
         &self,
         conn: &Connection,
@@ -182,7 +186,7 @@ impl InvoiceOrder {
             }
             for (allocation, date) in imported.allocations.iter().zip(dates) {
                 if allocation.tracking.is_none() && allocation.quantity > 0 {
-                    requested.push((line.item_id, allocation.quantity, date.as_deref()));
+                    requested.push((line.item_id, allocation.quantity));
                 } else if let Some(date) = date {
                     let scheduled: bool = conn.query_row(
                         "SELECT EXISTS(SELECT 1 FROM order_schedule_progress
@@ -215,11 +219,8 @@ impl InvoiceOrder {
                 draft.party_ledger_id,
                 date,
                 crate::orders::FulfilmentChange::NewDocument,
-                requested
-                    .iter()
-                    .map(|&(item, quantity, _)| (item, quantity)),
+                requested,
             )?;
-            check_delivery_lots(conn, order, requested.into_iter())?;
         }
         Ok(order)
     }
@@ -610,57 +611,6 @@ pub(super) fn linked_order(
     Ok(id)
 }
 
-pub(super) fn check_delivery_lots<'a>(
-    conn: &Connection,
-    order: i64,
-    lines: impl Iterator<Item = (i64, i64, Option<&'a str>)>,
-) -> Result<()> {
-    let requests: Vec<_> = lines.collect();
-    let checked: HashSet<_> = requests
-        .iter()
-        .filter_map(|(item, _, date)| date.map(|_| *item))
-        .collect();
-    if checked.is_empty() {
-        return Ok(());
-    }
-    let mut lot_queries = conn.prepare(
-        "SELECT item_id, expected_on, remaining FROM order_schedule_progress
-         WHERE order_id = ?1 AND remaining > 0 ORDER BY expected_on IS NULL, expected_on, lot_id",
-    )?;
-    let mut lots = HashMap::<i64, VecDeque<(Option<String>, i64)>>::new();
-    let mut rows = lot_queries.query([order])?;
-    while let Some(row) = rows.next()? {
-        lots.entry(row.get(0)?)
-            .or_default()
-            .push_back((row.get(1)?, row.get(2)?));
-    }
-    for (item, mut quantity, expected) in requests {
-        if !checked.contains(&item) {
-            continue;
-        }
-        let pending = lots.entry(item).or_default();
-        while quantity > 0 {
-            let Some((date, available)) = pending.front_mut() else {
-                return Err(Error::Validation(
-                    "Stock note exceeds the scheduled order quantity".into(),
-                ));
-            };
-            if expected.is_some() && expected != date.as_deref() {
-                return Err(Error::Validation(
-                    "Stock note due date does not match the next open order lot".into(),
-                ));
-            }
-            let consumed = quantity.min(*available);
-            quantity -= consumed;
-            *available -= consumed;
-            if *available == 0 {
-                pending.pop_front();
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,14 +733,14 @@ mod tests {
             <ORDERNO>CUSTOMER-17</ORDERNO><ORDERDUEDATE>20260405</ORDERDUEDATE>
             <ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Sales</LEDGERNAME><AMOUNT>20</AMOUNT></ACCOUNTINGALLOCATIONS.LIST>
           </ALLINVENTORYENTRIES.LIST></VOUCHER>"#;
-        let wrong = note.replace("20260405", "20260412");
+        let wrong = note.replace("20260405", "20260420");
         let rejected = store
             .preview_xml_import(company, &envelope(&(wrong + order)))
             .unwrap();
         assert!(rejected
             .issues()
             .iter()
-            .any(|issue| issue.contains("next open order lot")));
+            .any(|issue| issue.contains("available lot")));
         assert!(store.orders(company).unwrap().is_empty());
         let bytes = envelope(&[note, invoice, order].concat());
         let plan = store.preview_xml_import(company, &bytes).unwrap();
@@ -954,7 +904,7 @@ mod tests {
         assert!(preview
             .issues()
             .iter()
-            .any(|issue| issue.contains("next open order lot")));
+            .any(|issue| issue.contains("available lot")));
         let variants = [
             ("HEADER", "<BASICORDERREF>OPEN-ORDER</BASICORDERREF>", ""),
             (
@@ -1018,5 +968,342 @@ mod tests {
                 .closing_quantity,
             2000
         );
+    }
+
+    fn scheduled_sale() -> (Store, i64, i64, i64, i64, i64) {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Delivery lots").unwrap();
+        let party = store
+            .create_ledger(company, "Customer", Category::Asset)
+            .unwrap();
+        store
+            .create_ledger(company, "Sales", Category::Income)
+            .unwrap();
+        let item = store.create_stock_item(company, "Part", "pcs").unwrap();
+        let location = store.stock_locations(company).unwrap()[0].id;
+        let receipt = store
+            .adjust_stock_at(company, item, location, "2026-04-01", 8000, "Opening")
+            .unwrap();
+        store
+            .set_stock_receipt_cost(company, receipt, 4000, "Opening cost")
+            .unwrap();
+        let order = envelope(
+            r#"<VOUCHER><DATE>20260401</DATE><VOUCHERTYPENAME>Sales Order</VOUCHERTYPENAME>
+          <VOUCHERNUMBER>S-7</VOUCHERNUMBER><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME><ORDERNO>SCHEDULE</ORDERNO>
+          <INVENTORYENTRIES.LIST><STOCKITEMNAME>Part</STOCKITEMNAME><ACTUALQTY>4 pcs</ACTUALQTY><RATE>10/pcs</RATE>
+            <BATCHALLOCATIONS.LIST><ACTUALQTY>2 pcs</ACTUALQTY><ORDERDUEDATE>20260405</ORDERDUEDATE></BATCHALLOCATIONS.LIST>
+            <BATCHALLOCATIONS.LIST><ACTUALQTY>2 pcs</ACTUALQTY><ORDERDUEDATE>20260412</ORDERDUEDATE></BATCHALLOCATIONS.LIST>
+          </INVENTORYENTRIES.LIST></VOUCHER>"#,
+        );
+        let plan = store.preview_xml_import(company, &order).unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        store.apply_xml_import(&plan).unwrap();
+        let order = store.orders(company).unwrap()[0].id;
+        (store, company, party, item, location, order)
+    }
+
+    fn remaining(store: &Store, company: i64, order: i64) -> Vec<i64> {
+        store
+            .order_detail(company, order)
+            .unwrap()
+            .delivery_lots
+            .iter()
+            .map(|lot| lot.remaining)
+            .collect()
+    }
+
+    #[test]
+    fn stock_returns_reopen_the_selected_lot_and_reversals_respect_its_capacity() {
+        use crate::stock_notes::{StockNoteDraft, StockNoteLineDraft};
+        use crate::stock_returns::StockReturnLineDraft;
+        let (mut store, company, party, item, location, order) = scheduled_sale();
+        let draft = |reference: &str, date: &str, quantity| StockNoteDraft {
+            kind: InvoiceKind::Sale,
+            party_ledger_id: party,
+            order_id: Some(order),
+            reference: reference.into(),
+            date: date.into(),
+            narration: String::new(),
+            lines: vec![StockNoteLineDraft {
+                item_id: item,
+                location_id: location,
+                batch_id: None,
+                quantity,
+                unit_price: 1000,
+            }],
+        };
+        let later = store
+            .post_stock_note_for_delivery_dates(
+                company,
+                &draft("LATER", "2026-04-02", 2000),
+                &[Some("2026-04-12")],
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [2000, 0]);
+        store
+            .post_stock_note(company, &draft("EARLY", "2026-04-03", 1000))
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [1000, 0]);
+        let stock = store.stock_note_lines(company, later).unwrap()[0].id;
+        let returned = store
+            .post_stock_return(
+                company,
+                later,
+                "2026-04-04",
+                "RETURN",
+                "Return later lot",
+                &[StockReturnLineDraft {
+                    note_line: stock,
+                    quantity: 1000,
+                }],
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [1000, 1000]);
+        let replacement = store
+            .post_stock_note_for_delivery_dates(
+                company,
+                &draft("REPLACE", "2026-04-05", 1000),
+                &[Some("2026-04-12")],
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [1000, 0]);
+        let before = store
+            .stock_register(company, item, None, None)
+            .unwrap()
+            .closing_quantity;
+        let error = store
+            .reverse_stock_return(company, returned, "2026-04-06", "Too much for the lot")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceed an assigned delivery lot"),
+            "{error}"
+        );
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            before
+        );
+        assert_eq!(remaining(&store, company, order), [1000, 0]);
+        store
+            .reverse_stock_note(company, replacement, "2026-04-06", "Cancel replacement")
+            .unwrap();
+        store
+            .reverse_stock_return(company, returned, "2026-04-07", "Restore original delivery")
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [1000, 0]);
+        let closure = store
+            .preclose_order_line(
+                company,
+                order,
+                item,
+                "2026-04-08",
+                1000,
+                "Close remaining early stock",
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [0, 0]);
+        store
+            .post_stock_return(
+                company,
+                later,
+                "2026-04-09",
+                "RETURN-2",
+                "Reopen later quantity",
+                &[StockReturnLineDraft {
+                    note_line: stock,
+                    quantity: 1000,
+                }],
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [0, 1000]);
+        store
+            .reopen_order_line(
+                company,
+                order,
+                closure,
+                "2026-04-10",
+                "Restore planned quantity",
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [1000, 1000]);
+    }
+
+    #[test]
+    fn invoice_returns_restore_the_direct_or_tracked_lot_that_supplied_goods() {
+        use crate::invoice_returns::StockReturnDraft;
+        let (mut store, company, _, item, _, order) = scheduled_sale();
+        let xml_note = r#"<VOUCHER><DATE>20260402</DATE><VOUCHERTYPENAME>Delivery Note</VOUCHERTYPENAME>
+          <VOUCHERNUMBER>DISPATCH-B</VOUCHERNUMBER><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME>
+          <ORDERNO>SCHEDULE</ORDERNO><ORDERDUEDATE>20260412</ORDERDUEDATE>
+          <INVENTORYENTRIES.LIST><STOCKITEMNAME>Part</STOCKITEMNAME><ACTUALQTY>-2 pcs</ACTUALQTY>
+            <TRACKINGNUMBER>B</TRACKINGNUMBER></INVENTORYENTRIES.LIST></VOUCHER>"#;
+        let invoice = |reference: &str, tracking: &str, due: &str| {
+            format!(
+            "<VOUCHER><DATE>20260403</DATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+             <VOUCHERNUMBER>{reference}</VOUCHERNUMBER><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME><ISINVOICE>Yes</ISINVOICE>
+             <LEDGERENTRIES.LIST><LEDGERNAME>Customer</LEDGERNAME><AMOUNT>-20</AMOUNT>
+               <BILLALLOCATIONS.LIST><NAME>{reference}</NAME><BILLTYPE>New Ref</BILLTYPE><AMOUNT>-20</AMOUNT></BILLALLOCATIONS.LIST>
+             </LEDGERENTRIES.LIST>
+             <ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Part</STOCKITEMNAME><ACTUALQTY>2 pcs</ACTUALQTY>
+               <BILLEDQTY>2 pcs</BILLEDQTY><RATE>10/pcs</RATE><AMOUNT>20</AMOUNT>{tracking}
+               <ORDERNO>SCHEDULE</ORDERNO><ORDERDUEDATE>{due}</ORDERDUEDATE>
+               <ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Sales</LEDGERNAME><AMOUNT>20</AMOUNT></ACCOUNTINGALLOCATIONS.LIST>
+             </ALLINVENTORYENTRIES.LIST></VOUCHER>"
+        )
+        };
+        let tracked = invoice("BILL-B", "<TRACKINGNUMBER>B</TRACKINGNUMBER>", "20260412");
+        let first = store
+            .preview_xml_import(company, &envelope(&(tracked + xml_note)))
+            .unwrap();
+        assert!(first.can_apply(), "{:?}", first.issues());
+        store.apply_xml_import(&first).unwrap();
+        assert_eq!(remaining(&store, company, order), [2000, 0]);
+        let direct = store
+            .preview_xml_import(company, &envelope(&invoice("BILL-A", "", "20260405")))
+            .unwrap();
+        assert!(direct.can_apply(), "{:?}", direct.issues());
+        store.apply_xml_import(&direct).unwrap();
+        assert_eq!(remaining(&store, company, order), [0, 0]);
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            4000
+        );
+        for (bill, expected) in [("BILL-B", [0, 1000]), ("BILL-A", [1000, 0])] {
+            let invoice = store
+                .invoices(company)
+                .unwrap()
+                .into_iter()
+                .find(|invoice| invoice.reference == bill)
+                .unwrap();
+            let source = store.invoice_return_sources(company, invoice.id).unwrap()[0].source;
+            let note = store
+                .post_stock_return_from_invoice(
+                    company,
+                    invoice.id,
+                    "2026-04-04",
+                    &format!("RETURN-{bill}"),
+                    "Return one",
+                    &[StockReturnDraft {
+                        source,
+                        quantity: 1000,
+                    }],
+                    &[],
+                    None,
+                )
+                .unwrap();
+            assert_eq!(remaining(&store, company, order), expected);
+            store
+                .reverse_invoice_credit(
+                    company,
+                    note,
+                    "2026-04-04",
+                    &format!("UNDO-{bill}"),
+                    "Restore delivered stock",
+                )
+                .unwrap();
+            assert_eq!(remaining(&store, company, order), [0, 0]);
+        }
+    }
+
+    #[test]
+    fn return_of_a_partially_billed_delivery_restores_both_lot_spans() {
+        use crate::invoice_returns::ReturnLineDraft;
+        use crate::stock_notes::{StockNoteDraft, StockNoteLineDraft};
+        let (mut store, company, party, item, location, order) = scheduled_sale();
+        let trade = store
+            .ledgers(company)
+            .unwrap()
+            .into_iter()
+            .find(|ledger| ledger.name == "Sales")
+            .unwrap()
+            .id;
+        let note = store
+            .post_stock_note(
+                company,
+                &StockNoteDraft {
+                    kind: InvoiceKind::Sale,
+                    party_ledger_id: party,
+                    order_id: Some(order),
+                    reference: "BOTH-LOTS".into(),
+                    date: "2026-04-02".into(),
+                    narration: String::new(),
+                    lines: vec![StockNoteLineDraft {
+                        item_id: item,
+                        location_id: location,
+                        batch_id: None,
+                        quantity: 4000,
+                        unit_price: 1000,
+                    }],
+                },
+            )
+            .unwrap();
+        let mut draft = InvoiceDraft {
+            kind: InvoiceKind::Sale,
+            entry_mode: InvoiceEntryMode::Invoice,
+            reference: "FIRST".into(),
+            date: "2026-04-03".into(),
+            external_reference: Default::default(),
+            due_date: None,
+            credit_days: None,
+            bill_reference: None,
+            bill_splits: vec![],
+            narration: String::new(),
+            party_ledger_id: party,
+            trade_ledger_id: trade,
+            tax_ledger_id: None,
+            tax_amount: 0,
+            additional_taxes: vec![],
+            tax_calculation: None,
+            adjustments: vec![],
+            lines: vec![InvoiceLine {
+                item_id: item,
+                location_id: location,
+                batch_id: None,
+                trade_ledger_id: None,
+                quantity: 1000,
+                billed_quantity: None,
+                unit_price: 1000,
+                rate_basis: None,
+                discount: InvoiceDiscount::None,
+                extra_allocations: vec![],
+            }],
+        };
+        store.invoice_stock_note(company, note, &draft).unwrap();
+        draft.reference = "CROSS-LOT".into();
+        draft.lines[0].quantity = 2000;
+        let billed = store.invoice_stock_note(company, note, &draft).unwrap();
+        let allocation = store.invoice_return_allocations(company, billed).unwrap()[0].id;
+        let returned = store
+            .post_invoice_stock_return(
+                company,
+                billed,
+                "2026-04-04",
+                "RETURN",
+                "Return one unit from each lot",
+                &[ReturnLineDraft {
+                    allocation,
+                    quantity: 2000,
+                }],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [1000, 1000]);
+        store
+            .reverse_invoice_credit(
+                company,
+                returned,
+                "2026-04-05",
+                "UNDO",
+                "Restore the two lots",
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, order), [0, 0]);
     }
 }

@@ -360,6 +360,7 @@ struct InvoiceAdjustmentForm {
 struct InvoiceLineForm {
     item: Option<i64>,
     stock_note_line: Option<(i64, String)>,
+    order_due_on: Option<String>,
     location: Option<i64>,
     batch: Option<i64>,
     trade_ledger: Option<i64>,
@@ -396,6 +397,7 @@ impl InvoiceLineForm {
         Self {
             item: None,
             stock_note_line: None,
+            order_due_on: None,
             location: None,
             batch: None,
             trade_ledger: None,
@@ -3478,6 +3480,7 @@ impl App {
                 InvoiceLineForm {
                     item: Some(line.item_id),
                     stock_note_line: None,
+                    order_due_on: None,
                     location: Some(line.location_id),
                     batch: line.batch_id,
                     trade_ledger: line.trade_ledger_id,
@@ -3565,11 +3568,19 @@ impl App {
             },
         );
         let from_note = self.invoice_source == Some(InvoiceSource::StockNotes);
+        let mut order_lots = Vec::new();
         match self.invoice_source {
             Some(InvoiceSource::Order(order)) => {
                 ui.label(format!(
                     "Order {order}. Review quantities and prices before saving."
                 ));
+                match self.store.order_detail(company, order) {
+                    Ok(detail) => order_lots = detail.delivery_lots,
+                    Err(error) => {
+                        self.failure(error);
+                        return;
+                    }
+                }
             }
             Some(InvoiceSource::StockNotes) => {
                 ui.label("Reduce quantities or remove lines to bill selected stock notes in part. Review prices and tax before posting.");
@@ -3878,6 +3889,7 @@ impl App {
                             line.price.clear();
                         }
                         line.batch = None;
+                        line.order_due_on = None;
                         for allocation in &mut line.extra_allocations {
                             allocation.batch = None;
                         }
@@ -3894,6 +3906,13 @@ impl App {
                         false,
                     );
                 });
+                crate::order_ui::pick_delivery_lot(
+                    ui,
+                    ("invoice-order-lot", index),
+                    &order_lots,
+                    line.item,
+                    &mut line.order_due_on,
+                );
                 let trade = ledgers
                     .iter()
                     .find(|ledger| Some(ledger.id) == line.trade_ledger)
@@ -4285,7 +4304,13 @@ impl App {
                 } else {
                     match self.invoice_source {
                         Some(InvoiceSource::Order(order)) => {
-                            self.store.invoice_order(company, order, &draft)
+                            let dates: Vec<_> = self
+                                .invoice_lines
+                                .iter()
+                                .map(|line| line.order_due_on.as_deref())
+                                .collect();
+                            self.store
+                                .invoice_order_for_delivery_dates(company, order, &draft, &dates)
                         }
                         Some(InvoiceSource::StockNotes) => {
                             let sources = self

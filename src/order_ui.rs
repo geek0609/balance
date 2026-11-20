@@ -3,13 +3,48 @@ use super::{
     InvoiceAllocationForm, InvoiceLineForm, InvoiceSource,
 };
 use balance::inventory::{format_quantity, parse_quantity, InvoiceKind, StockItem};
-use balance::orders::{OrderAmendmentDraft, OrderDetail, OrderDraft, OrderLine, OrderStatus};
+use balance::orders::{
+    OrderAmendmentDraft, OrderDeliveryLot, OrderDetail, OrderDraft, OrderLine, OrderStatus,
+};
 use balance::quotations::Quotation;
 use balance::stock_allocation::{StockAllocationDraft, StockAllocationPlan};
 use balance::stock_notes::note_label;
 use balance::stock_reservations::StockReservationDraft;
 use balance::{format_amount, parse_amount, Category, Error, Result};
 use eframe::egui;
+
+pub(super) fn pick_delivery_lot(
+    ui: &mut egui::Ui,
+    key: impl std::hash::Hash,
+    lots: &[OrderDeliveryLot],
+    item: Option<i64>,
+    selected: &mut Option<String>,
+) {
+    let mut dates = std::collections::BTreeMap::<&str, i128>::new();
+    for lot in lots
+        .iter()
+        .filter(|lot| Some(lot.item_id) == item && lot.remaining > 0)
+    {
+        if let Some(date) = lot.expected_on.as_deref() {
+            *dates.entry(date).or_default() += i128::from(lot.remaining);
+        }
+    }
+    if dates.is_empty() && selected.is_none() {
+        return;
+    }
+    egui::ComboBox::from_id_salt(key)
+        .selected_text(selected.as_deref().unwrap_or("Earliest pending lot"))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(selected, None, "Earliest pending lot");
+            for (date, remaining) in dates {
+                ui.selectable_value(
+                    selected,
+                    Some(date.to_owned()),
+                    format!("{date} · {} remaining", format_quantity(remaining)),
+                );
+            }
+        });
+}
 use std::collections::HashSet;
 
 #[derive(Default)]

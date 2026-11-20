@@ -637,11 +637,48 @@ pub(crate) fn validate_order_invoice_source(
     Ok(())
 }
 
-pub(crate) fn attach_order_invoice(conn: &Connection, order: i64, invoice: i64) -> Result<()> {
+pub(crate) fn attach_order_invoice(
+    conn: &Connection,
+    order: i64,
+    invoice: i64,
+    expected_dates: Option<&[Option<&str>]>,
+) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT a.id, l.item_id, a.quantity FROM invoice_line_allocations a
+         JOIN invoice_lines l ON l.id = a.line_id WHERE l.invoice_id = ?1 ORDER BY l.id, a.id",
+    )?;
+    let rows = stmt
+        .query_map([invoice], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if expected_dates.is_some_and(|dates| dates.len() != rows.len()) {
+        return Err(Error::Validation(
+            "Invoice order allocations do not reconcile".into(),
+        ));
+    }
+    let assignments = crate::order_lots::plan(
+        conn,
+        order,
+        rows.iter().enumerate().map(|(index, &(_, item, qty))| {
+            (item, qty, expected_dates.and_then(|dates| dates[index]))
+        }),
+    )?;
     conn.execute(
         "INSERT INTO invoice_order_links(invoice_id, order_id) VALUES (?1, ?2)",
         params![invoice, order],
     )?;
+    for ((allocation, _, _), slices) in rows.into_iter().zip(assignments) {
+        crate::order_lots::write(
+            conn,
+            crate::order_lots::Source::InvoiceAllocation(allocation),
+            &slices,
+        )?;
+    }
     crate::stock_reservations::check_order_coverage(conn, order)
 }
 
@@ -1109,12 +1146,18 @@ impl Store {
         }
         check_order_quantities(&tx, &summary, date, [(item, quantity)])?;
         check_quantity_precision(&tx, company, item, quantity)?;
+        let assignments = crate::order_lots::plan(&tx, order, [(item, quantity, None)])?;
         tx.execute(
             "INSERT INTO order_line_closures(order_line_id, quantity, closed_on, reason)
              SELECT id, ?3, ?4, ?5 FROM order_lines WHERE order_id = ?1 AND item_id = ?2",
             params![order, item, quantity, date.to_string(), reason],
         )?;
         let closure = tx.last_insert_rowid();
+        crate::order_lots::write(
+            &tx,
+            crate::order_lots::Source::Closure(closure),
+            &assignments[0],
+        )?;
         crate::stock_reservations::check_order_coverage(&tx, order)?;
         tx.commit()?;
         Ok(closure)
@@ -1185,6 +1228,22 @@ impl Store {
 
     /// Post an invoice and count its stock quantities against one order atomically.
     pub fn invoice_order(&mut self, company: i64, id: i64, draft: &InvoiceDraft) -> Result<i64> {
+        self.invoice_order_for_delivery_dates(company, id, draft, &[])
+    }
+
+    /// Post the invoice against the selected delivery date for each item line.
+    pub fn invoice_order_for_delivery_dates(
+        &mut self,
+        company: i64,
+        id: i64,
+        draft: &InvoiceDraft,
+        dates: &[Option<&str>],
+    ) -> Result<i64> {
+        if !dates.is_empty() && dates.len() != draft.lines.len() {
+            return Err(Error::Validation(
+                "Invoice delivery dates require matching item lines".into(),
+            ));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1200,7 +1259,17 @@ impl Store {
         )?;
         let (invoice, _) =
             insert_direct_invoice(&tx, company, draft, StockInvoicePosting::Order(id))?;
-        attach_order_invoice(&tx, id, invoice)?;
+        let dates: Vec<_> = dates
+            .iter()
+            .zip(&draft.lines)
+            .flat_map(|(&date, line)| std::iter::repeat_n(date, line.extra_allocations.len() + 1))
+            .collect();
+        attach_order_invoice(
+            &tx,
+            id,
+            invoice,
+            (!dates.is_empty()).then_some(dates.as_slice()),
+        )?;
         tx.commit()?;
         Ok(invoice)
     }

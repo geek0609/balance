@@ -303,12 +303,18 @@ impl Store {
                 params![return_id, line.id, requested.quantity, movement],
             )?;
             let line_id = tx.last_insert_rowid();
-            for span in spans {
+            for span in &spans {
                 tx.execute(
                     "INSERT INTO stock_return_spans VALUES (?1, ?2, ?3)",
                     params![line_id, span.start, span.end - span.start],
                 )?;
             }
+            crate::order_lots::record_return(
+                &tx,
+                crate::order_lots::Source::NoteLine(line.id),
+                crate::order_lots::Return::Stock(line_id),
+                &spans,
+            )?;
         }
         tx.commit()?;
         Ok(return_id)

@@ -19,6 +19,7 @@ struct NoteLineForm {
     batch: Option<i64>,
     quantity: String,
     price: String,
+    expected_on: Option<String>,
 }
 
 struct NoteForm {
@@ -164,6 +165,7 @@ impl App {
                             location: Some(a.location_id),
                             batch: a.batch_id,
                             quantity: format_quantity(a.quantity.into()),
+                            expected_on: None,
                         })
                         .collect()
                 })
@@ -205,6 +207,17 @@ impl App {
             .filter(|ledger| matches!(ledger.category, Category::Asset | Category::Liability))
             .collect::<Vec<_>>();
         crate::theme::section(ui, "New stock note");
+        let order_lots = self
+            .stock_note_screen
+            .form
+            .order
+            .map(|order| {
+                self.store
+                    .order_detail(company, order)
+                    .map(|detail| detail.delivery_lots)
+            })
+            .transpose()?
+            .unwrap_or_default();
         let form = &mut self.stock_note_screen.form;
         if let Some(order) = form.order {
             ui.horizontal(|ui| {
@@ -260,6 +273,7 @@ impl App {
                 );
                 if previous_item != line.item {
                     line.batch = None;
+                    line.expected_on = None;
                 }
                 pick_location(
                     ui,
@@ -273,6 +287,13 @@ impl App {
                     let batches = self.store.stock_batches(company, item)?;
                     pick_batch(ui, ("stock-note-batch", index), &batches, &mut line.batch);
                 }
+                crate::order_ui::pick_delivery_lot(
+                    ui,
+                    ("stock-note-lot", index),
+                    &order_lots,
+                    line.item,
+                    &mut line.expected_on,
+                );
                 ui.add(
                     egui::TextEdit::singleline(&mut line.quantity)
                         .hint_text("Quantity")
@@ -300,7 +321,14 @@ impl App {
             .button(format!("Post {}", note_label(form.kind).to_lowercase()))
             .clicked()
         {
-            let id = self.store.post_stock_note(company, &form.draft()?)?;
+            let dates: Vec<_> = form
+                .lines
+                .iter()
+                .map(|line| line.expected_on.as_deref())
+                .collect();
+            let id =
+                self.store
+                    .post_stock_note_for_delivery_dates(company, &form.draft()?, &dates)?;
             self.stock_note_screen.form = NoteForm::default();
             self.stock_note_screen.select(Some(id));
             self.message = format!("Stock note {id} posted");

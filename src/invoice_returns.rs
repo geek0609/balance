@@ -867,6 +867,50 @@ fn write_return_movements(
                 params![id, span.start, span.end - span.start],
             )?;
         }
+        let (invoice_line, size, note_line, delivered): (i64, i64, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT line_id, invoice_quantity, delivery_line, delivery_quantity
+             FROM invoice_stock_return_history WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        if let Some(note_line) = note_line {
+            let assigned: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM order_lot_assignments WHERE note_line_id = ?1)",
+                [note_line],
+                |row| row.get(0),
+            )?;
+            if assigned {
+                let share = cost_share(
+                    conn,
+                    id,
+                    invoice_line,
+                    size,
+                    row.allocation.stock.quantity,
+                    delivered,
+                )?;
+                crate::order_lots::record_return(
+                    conn,
+                    crate::order_lots::Source::NoteLine(note_line),
+                    crate::order_lots::Return::Invoice(id),
+                    share.spans(),
+                )?;
+            }
+        } else {
+            let offset = row.allocation.offset;
+            let ranges: Vec<_> = row
+                .share
+                .spans()
+                .iter()
+                .map(|span| (span.start - offset)..(span.end - offset))
+                .collect();
+            crate::order_lots::record_return(
+                conn,
+                crate::order_lots::Source::InvoiceAllocation(row.allocation.available.id),
+                crate::order_lots::Return::Invoice(id),
+                &ranges,
+            )?;
+        }
     }
     Ok(())
 }
