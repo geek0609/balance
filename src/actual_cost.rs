@@ -706,11 +706,15 @@ fn journal_events(
              SELECT MIN(a.adjustment_id) FROM stock_journal_allocations a WHERE a.entry_id = e.id
          )
          FROM stock_journals j JOIN stock_journal_entries e ON e.journal_id = j.id
-         WHERE j.company_id = ?1 AND j.date <= ?2",
+         WHERE j.company_id = ?1",
     )?;
-    let mut rows = stmt.query(params![company, end.to_string()])?;
+    let mut rows = stmt.query([company])?;
     let mut movements = HashMap::<(i64, i64), ItemMovement>::new();
     while let Some(row) = rows.next()? {
+        let date = parse_date(&row.get::<_, String>(1)?)?;
+        if date > end {
+            continue;
+        }
         let journal = row.get(0)?;
         let item = row.get(2)?;
         let quantity = row.get::<_, i64>(3)?;
@@ -718,7 +722,7 @@ fn journal_events(
         let movement = match movements.entry((journal, item)) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => entry.insert(ItemMovement {
-                date: parse_date(&row.get::<_, String>(1)?)?,
+                date,
                 adjustment,
                 quantity: 0,
                 issued: false,

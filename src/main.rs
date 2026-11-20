@@ -58,6 +58,7 @@ use order_ui::OrderScreen;
 use payroll_ui::PayrollScreen;
 use recurring_ui::RecurringJournalScreen;
 use stock_count_ui::StockCountScreen;
+use stock_journal_ui::StockJournalScreen;
 use stock_note_ui::StockNoteScreen;
 use tax_ui::{TaxProfileScreen, TaxRegisterScreen};
 use valuation_ui::ValuationScreen;
@@ -268,7 +269,7 @@ struct App {
     invoice_source: Option<InvoiceSource>,
     order_screen: OrderScreen,
     stock_count_screen: StockCountScreen,
-    stock_journal_filter: String,
+    stock_journal_screen: StockJournalScreen,
     stock_note_screen: StockNoteScreen,
     cost_screen: CostScreen,
     valuation_screen: ValuationScreen,
@@ -629,7 +630,7 @@ impl App {
             invoice_source: None,
             order_screen: OrderScreen::default(),
             stock_count_screen: StockCountScreen::default(),
-            stock_journal_filter: String::new(),
+            stock_journal_screen: StockJournalScreen::default(),
             stock_note_screen: StockNoteScreen::default(),
             cost_screen: CostScreen::default(),
             valuation_screen: ValuationScreen::default(),
@@ -772,7 +773,7 @@ impl App {
         self.invoice_source = None;
         self.order_screen = OrderScreen::default();
         self.stock_count_screen = StockCountScreen::default();
-        self.stock_journal_filter.clear();
+        self.stock_journal_screen = StockJournalScreen::default();
         self.stock_note_screen = StockNoteScreen::default();
         self.cost_screen = CostScreen::default();
         self.valuation_screen = ValuationScreen::default();
@@ -828,6 +829,7 @@ impl App {
             || self.order_screen.amending_order()
             || self.order_screen.revising_quotation()
             || self.stock_count_screen.preview_pending()
+            || self.stock_journal_screen.has_edits()
             || self.cost_screen.has_pending_changes()
             || self.currency_screen.has_preview()
             || self.stock_editing.is_some()

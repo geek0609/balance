@@ -190,7 +190,7 @@ pub(crate) const NAV: &[NavSection] = &[
                 "â‡„",
                 "Stock journals",
                 "Stock journals",
-                "Warehouse movements and production from imported vouchers",
+                "Post and review warehouse movements, losses and production",
                 "stock journal warehouse transfer consumption production by-products import",
             ),
             nav(
