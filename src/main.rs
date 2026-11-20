@@ -3575,7 +3575,7 @@ impl App {
                 ui.label("Reduce quantities or remove lines to bill selected stock notes in part. Review prices and tax before posting.");
             }
             None => {
-                ui.label("Save an invoice to create its accounting voucher and any stock movements together. For services, remove all item lines and add a positive service / charge line. Each line rounds to two decimal places.");
+                ui.label("For services, remove the item lines and add a service or charge. For a stock-only invoice, record the quantities and enter zero in the billed fields. Each line rounds to two decimal places.");
             }
         }
         let items = match self.store.stock_items(company) {

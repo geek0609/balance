@@ -319,6 +319,11 @@ impl InvoiceSummary {
     pub fn document_type(&self) -> &'static str {
         if self.opening_bill.is_some() {
             crate::opening_bills::label(self.kind)
+        } else if self.total == 0 && !self.lines.is_empty() {
+            match self.kind {
+                InvoiceKind::Sale => "Stock-only sale",
+                InvoiceKind::Purchase => "Stock-only purchase",
+            }
         } else {
             self.entry_mode.label(self.kind)
         }
@@ -801,15 +806,24 @@ fn prepare_invoice(
             &taxes,
         )?;
     }
-    if total <= 0 {
+    let stock_only =
+        total == 0 && !draft.lines.is_empty() && draft.adjustments.is_empty() && taxes.is_empty();
+    if total <= 0 && !stock_only {
         return Err(Error::Validation(
-            "Invoice amount must be greater than zero".into(),
+            "Invoice amount must be positive unless the invoice only moves free stock".into(),
+        ));
+    }
+    if stock_only && (draft.bill_reference.is_some() || !draft.bill_splits.is_empty()) {
+        return Err(Error::Validation(
+            "A stock-only invoice cannot create bills for settlement".into(),
         ));
     }
     let total = i64::try_from(total)
         .map_err(|_| Error::Validation("Invoice amount is too large".into()))?;
     let bill_splits = crate::bill_splits::prepare(&draft.bill_splits, invoice_date, total)?;
-    let bill_references = if bill_splits.is_empty() {
+    let bill_references = if stock_only {
+        Vec::new()
+    } else if bill_splits.is_empty() {
         vec![bill_reference.as_deref().unwrap_or(&reference)]
     } else {
         bill_splits
@@ -831,10 +845,13 @@ fn prepare_invoice(
     } else {
         -1
     };
-    let mut postings = vec![Posting {
-        ledger_id: draft.party_ledger_id,
-        amount: direction * total,
-    }];
+    let mut postings = Vec::new();
+    if !stock_only {
+        postings.push(Posting {
+            ledger_id: draft.party_ledger_id,
+            amount: direction * total,
+        });
+    }
     for (ledger_id, amount) in trade_totals {
         if amount != 0 {
             let amount = i64::try_from(amount)
@@ -857,9 +874,11 @@ fn prepare_invoice(
             amount: -direction * adjustment.amount,
         });
     }
-    validate_voucher(&date, &postings)?;
-    check_ledgers(conn, company_id, &postings)?;
-    crate::opening::check_no_control_postings(conn, company_id, &postings)?;
+    if !stock_only {
+        validate_voucher(&date, &postings)?;
+        check_ledgers(conn, company_id, &postings)?;
+        crate::opening::check_no_control_postings(conn, company_id, &postings)?;
+    }
     Ok(PreparedInvoice {
         date,
         due_date,
@@ -939,7 +958,8 @@ pub(crate) fn check_invoice_references(
     excluding: Option<i64>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT v.reference, COALESCE(b.reference, i.bill_reference, v.reference)
+        "SELECT v.reference, CASE WHEN EXISTS(SELECT 1 FROM postings p WHERE p.voucher_id = v.id)
+                THEN COALESCE(b.reference, i.bill_reference, v.reference) END
          FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
          LEFT JOIN invoice_bill_splits b ON b.invoice_id = i.id
          WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3
@@ -951,7 +971,7 @@ pub(crate) fn check_invoice_references(
         .map(|reference| reference.to_lowercase())
         .collect();
     for existing in stmt.query_map(params![company_id, kind.as_str(), party, excluding], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
     })? {
         let (reference, bill_reference) = existing?;
         if reference.trim().to_lowercase() == key {
@@ -959,7 +979,7 @@ pub(crate) fn check_invoice_references(
                 "An invoice with this type, party and reference already exists".into(),
             ));
         }
-        if bill_keys.contains(&bill_reference.trim().to_lowercase()) {
+        if bill_reference.is_some_and(|bill| bill_keys.contains(&bill.trim().to_lowercase())) {
             return Err(Error::Validation(
                 "A bill with this type, party and reference already exists".into(),
             ));
@@ -1304,8 +1324,10 @@ fn insert_invoice(
 ) -> Result<(i64, i64)> {
     let prepared = prepare_invoice(conn, company_id, draft, None)?;
     let postings = if let Some(original) = original_postings {
-        validate_voucher(&prepared.date, original)?;
-        check_ledgers(conn, company_id, original)?;
+        if !original.is_empty() || !prepared.postings.is_empty() {
+            validate_voucher(&prepared.date, original)?;
+            check_ledgers(conn, company_id, original)?;
+        }
         let totals = |postings: &[Posting]| {
             let mut totals = BTreeMap::<i64, i128>::new();
             for posting in postings {
@@ -1360,6 +1382,18 @@ fn insert_invoice(
     crate::taxes::write_additional(conn, invoice_id, &draft.additional_taxes)?;
     crate::tax_profiles::write_calculation(conn, invoice_id, draft.tax_calculation)?;
     Ok((invoice_id, voucher_id))
+}
+
+pub(crate) fn is_stock_only_invoice(conn: &Connection, company: i64, invoice: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM invoices i WHERE i.company_id = ?1 AND i.id = ?2 AND i.tax_amount = 0
+         AND EXISTS(SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id)
+         AND NOT EXISTS(SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id AND l.amount != 0)
+         AND NOT EXISTS(SELECT 1 FROM invoice_adjustments a WHERE a.invoice_id = i.id)
+         AND NOT EXISTS(SELECT 1 FROM invoice_additional_taxes t WHERE t.invoice_id = i.id))",
+        params![company, invoice],
+        |row| row.get(0),
+    )?)
 }
 
 fn write_invoice_postings(

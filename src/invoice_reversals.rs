@@ -163,6 +163,11 @@ impl Store {
                         .to_vec(),
                     format!("Opening bill {invoice} clearing: {reason}"),
                 )
+            } else if crate::inventory::is_stock_only_invoice(&tx, company, invoice)? {
+                (
+                    Vec::new(),
+                    format!("Stock-only invoice {invoice} reversal: {reason}"),
+                )
             } else {
                 (
                     crate::reversals::counter_postings(&tx, company, original, &date)?,

@@ -652,10 +652,10 @@ impl Store {
             }
         }
         let document_title = match invoice.entry_mode {
-            crate::inventory::InvoiceEntryMode::Invoice => {
+            crate::inventory::InvoiceEntryMode::Invoice if invoice.total != 0 => {
                 format!("{} invoice", invoice.kind.as_str())
             }
-            crate::inventory::InvoiceEntryMode::Voucher => invoice.document_type().to_owned(),
+            _ => invoice.document_type().to_owned(),
         };
         let _ = write!(
             html,

@@ -2150,6 +2150,7 @@ fn parse_imported_invoice(
     let mut adjustments = Vec::new();
     let mut taxes = Vec::new();
     let mut tax_ledgers = HashSet::new();
+    let mut zero_trade_ledgers = HashSet::new();
     let mut original_postings = Vec::new();
     let mut breakdowns = Vec::<StockLedgerBreakdown>::new();
     let party_debit = kind == InvoiceKind::Sale;
@@ -2173,19 +2174,18 @@ fn parse_imported_invoice(
         let (existing_ledger_id, category) = ledgers
             .get(&normalized(&ledger))
             .ok_or_else(|| Error::Validation(format!("ledger {ledger} is unavailable")))?;
-        let amount = xml_amount(&invoice_field(entry, "AMOUNT")?)?;
-        if amount == 0 {
-            return Err(Error::Validation("zero ledger amount".into()));
+        let amount = xml_item_amount(entry)?;
+        if amount != 0 {
+            invoice_side(entry, "ISDEEMEDPOSITIVE", amount > 0)?;
+            invoice_side(entry, "ISLASTDEEMEDPOSITIVE", amount > 0)?;
         }
-        invoice_side(entry, "ISDEEMEDPOSITIVE", amount > 0)?;
-        invoice_side(entry, "ISLASTDEEMEDPOSITIVE", amount > 0)?;
         let named_party = header_party
             .as_ref()
             .is_some_and(|name| normalized(name) == normalized(&ledger));
         let is_party = party_flag(entry)?
             || (named_party
                 && direct_text(entry, "ISPARTYLEDGER").is_none_or(|value| value.is_empty()));
-        if entry_mode == InvoiceEntryMode::Voucher {
+        if entry_mode == InvoiceEntryMode::Voucher && amount != 0 {
             original_postings.push(Line {
                 ledger: ledger.clone(),
                 amount,
@@ -2225,7 +2225,8 @@ fn parse_imported_invoice(
             .collect();
         let source_rates = xml_invoice_tax_rates(entry)?;
         if !source_rates.is_empty() {
-            if is_party
+            if amount == 0
+                || is_party
                 || has_stock
                 || !bills.is_empty()
                 || !matches!(category, Category::Asset | Category::Liability)
@@ -2256,7 +2257,10 @@ fn parse_imported_invoice(
                     "party ledger must be an asset or liability".into(),
                 ));
             }
-            if party.is_some() || (amount > 0) != party_debit || bills.is_empty() {
+            if party.is_some()
+                || (amount == 0 && !bills.is_empty())
+                || (amount != 0 && ((amount > 0) != party_debit || bills.is_empty()))
+            {
                 return Err(Error::Validation(
                     "The document needs one party and bill allocations with the correct direction"
                         .into(),
@@ -2330,7 +2334,10 @@ fn parse_imported_invoice(
                     "additional ledger bill allocations are not supported".into(),
                 ));
             }
-            if !has_stock {
+            if !has_stock && amount == 0 && stock_item_ledger(&ledger, ledgers, kind).is_ok() {
+                zero_trade_ledgers.insert(ledger.clone());
+            }
+            if !has_stock && amount != 0 {
                 adjustments.push(ImportedInvoiceAdjustment {
                     ledger,
                     existing_ledger_id: *existing_ledger_id,
@@ -2338,13 +2345,6 @@ fn parse_imported_invoice(
                 });
             }
         }
-    }
-    let (party_name, party_amount, bills, funding_applications) =
-        party.ok_or_else(|| Error::Validation("party ledger is missing".into()))?;
-    if header_party.is_some_and(|name| normalized(&name) != normalized(&party_name)) {
-        return Err(Error::Validation(
-            "Voucher party differs from its bill ledger".into(),
-        ));
     }
     let (mut lines, subtotal) = parse_invoice_stock(
         inventory_rows,
@@ -2358,12 +2358,59 @@ fn parse_imported_invoice(
         batches,
         issues,
     )?;
+    i64::try_from(subtotal).map_err(|_| Error::Validation("invoice amount is too large".into()))?;
+    let total = subtotal
+        + adjustments
+            .iter()
+            .map(|row| i128::from(row.amount))
+            .sum::<i128>()
+        + taxes.iter().map(|tax| i128::from(tax.amount)).sum::<i128>();
+    let stock_only = total == 0 && !lines.is_empty() && adjustments.is_empty() && taxes.is_empty();
+    let (party_name, party_amount, bills, funding_applications) = match party {
+        Some(party) => party,
+        None if stock_only => {
+            let party = header_party
+                .as_ref()
+                .ok_or_else(|| Error::Validation("party ledger is missing".into()))?;
+            if !ledgers
+                .get(&normalized(party))
+                .is_some_and(|entry| matches!(entry.1, Category::Asset | Category::Liability))
+            {
+                return Err(Error::Validation(
+                    "party ledger must be an available asset or liability".into(),
+                ));
+            }
+            (party.clone(), 0, Vec::new(), Vec::new())
+        }
+        None => return Err(Error::Validation("party ledger is missing".into())),
+    };
+    if header_party.is_some_and(|name| normalized(&name) != normalized(&party_name)) {
+        return Err(Error::Validation(
+            "Voucher party differs from its bill ledger".into(),
+        ));
+    }
+    if (total <= 0 && !stock_only) || i128::from(party_amount).abs() != total {
+        return Err(Error::Validation(
+            "party amount does not equal items, taxes and ledger adjustments".into(),
+        ));
+    }
     let trade = lines
         .iter()
         .find(|line| !line.trade_ledger.is_empty())
         .map(|line| line.trade_ledger.clone());
     let trade = match trade {
         Some(trade) => trade,
+        None if stock_only => {
+            let mut choices = zero_trade_ledgers.into_iter();
+            match (choices.next(), choices.next()) {
+                (Some(ledger), None) => ledger,
+                _ => {
+                    return Err(Error::Validation(
+                        "A stock-only invoice needs an identifiable trade ledger".into(),
+                    ))
+                }
+            }
+        }
         None => adjustments
             .iter()
             .find(|adjustment| {
@@ -2387,18 +2434,6 @@ fn parse_imported_invoice(
     if tax_ledgers.contains(&normalized(&trade)) {
         return Err(Error::Validation(
             "Invoice tax ledger must differ from the trade ledger".into(),
-        ));
-    }
-    i64::try_from(subtotal).map_err(|_| Error::Validation("invoice amount is too large".into()))?;
-    let total = subtotal
-        + adjustments
-            .iter()
-            .map(|adjustment| i128::from(adjustment.amount))
-            .sum::<i128>()
-        + taxes.iter().map(|tax| i128::from(tax.amount)).sum::<i128>();
-    if total <= 0 || i128::from(party_amount).abs() != total {
-        return Err(Error::Validation(
-            "party amount does not equal items, taxes and ledger adjustments".into(),
         ));
     }
     if normalized(&party_name) == normalized(&trade) {
@@ -3341,7 +3376,8 @@ fn resolve_imported_bill_allocations(
          FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
          LEFT JOIN invoice_bill_splits b ON b.invoice_id = i.id
          LEFT JOIN opening_bills o ON o.invoice_id = i.id
-         WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3",
+         WHERE i.company_id = ?1 AND i.kind = ?2 AND i.party_ledger_id = ?3
+           AND EXISTS(SELECT 1 FROM postings p WHERE p.voucher_id = v.id)",
     )?;
     let mut existing = HashMap::<String, Vec<_>>::new();
     for row in stmt.query_map(params![company, kind.as_str(), party], |r| {
@@ -5011,7 +5047,9 @@ impl Store {
         let mut bill_references = HashSet::<(String, String, String)>::new();
         {
             let mut stmt = self.conn.prepare(
-                "SELECT i.kind, l.name, v.reference, COALESCE(b.reference, i.bill_reference, v.reference)
+                "SELECT i.kind, l.name, v.reference,
+                        CASE WHEN EXISTS(SELECT 1 FROM postings p WHERE p.voucher_id = v.id)
+                             THEN COALESCE(b.reference, i.bill_reference, v.reference) END
                  FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
                  LEFT JOIN invoice_bill_splits b ON b.invoice_id = i.id
                  JOIN ledgers l ON l.id = i.party_ledger_id WHERE i.company_id = ?1",
@@ -5021,14 +5059,16 @@ impl Store {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })? {
                 let (kind, party, reference, bill_reference) = row?;
                 let kind = normalized(&kind);
                 let party = normalized(&party);
                 invoice_references.insert((kind.clone(), party.clone(), normalized(&reference)));
-                bill_references.insert((kind, party, normalized(&bill_reference)));
+                if let Some(bill_reference) = bill_reference {
+                    bill_references.insert((kind, party, normalized(&bill_reference)));
+                }
             }
         }
         let mut pending_settlements = Vec::new();
@@ -5461,6 +5501,9 @@ impl Store {
                             existing_id: Some(invoice.id),
                         },
                     );
+                }
+                if invoice.total == 0 {
+                    continue;
                 }
                 let used = payment_references.entry(invoice_key.clone()).or_default();
                 for settlement in self.invoice_settlements(company_id, invoice.id)? {
@@ -6764,6 +6807,146 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stock_only_invoices_move_and_reverse_stock_without_financial_postings() {
+        for (kind, sign, account, trade) in [
+            ("Sales", -1_i64, Category::Asset, Category::Income),
+            ("Purchase", 1_i64, Category::Liability, Category::Expense),
+        ] {
+            let mut store = Store::memory().unwrap();
+            let company = store.create_company("Stock-only invoices").unwrap();
+            let party = store.create_ledger(company, "Party", account).unwrap();
+            store.create_ledger(company, "Trade", trade).unwrap();
+            let item = store.create_stock_item(company, "Sample", "pcs").unwrap();
+            let initial = if sign < 0 { 2000 } else { 0 };
+            if initial > 0 {
+                let receipt = store
+                    .adjust_stock(company, item, "2026-06-01", initial, "Opening")
+                    .unwrap();
+                store
+                    .set_stock_receipt_cost(company, receipt, 1600, "Opening value")
+                    .unwrap();
+            }
+            let zero_party = if sign < 0 {
+                ""
+            } else {
+                "<LEDGERENTRIES.LIST><LEDGERNAME>Party</LEDGERNAME><AMOUNT>0</AMOUNT></LEDGERENTRIES.LIST>"
+            };
+            let xml = format!(
+                r#"<ENVELOPE><BODY><DATA><MESSAGE>
+                <VOUCHER><DATE>20260602</DATE><VOUCHERTYPENAME>{kind}</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>FREE-01</VOUCHERNUMBER><ISINVOICE>Yes</ISINVOICE>
+                <PARTYLEDGERNAME>Party</PARTYLEDGERNAME>
+                {zero_party}
+                <LEDGERENTRIES.LIST><LEDGERNAME>Trade</LEDGERNAME><AMOUNT>0</AMOUNT></LEDGERENTRIES.LIST>
+                <ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Sample</STOCKITEMNAME>
+                    <ACTUALQTY>1 pcs</ACTUALQTY><BILLEDQTY>0 pcs</BILLEDQTY>
+                </ALLINVENTORYENTRIES.LIST></VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#
+            );
+            let preview = store.preview_xml_import(company, xml.as_bytes()).unwrap();
+            assert!(preview.can_apply(), "{:?}", preview.issues());
+            assert_eq!(store.apply_xml_import(&preview).unwrap().invoices, 1);
+            let invoice = store.invoices(company).unwrap().remove(0);
+            assert_eq!((invoice.total, invoice.outstanding), (0, 0));
+            assert_eq!(
+                (invoice.lines[0].quantity, invoice.lines[0].billed_quantity),
+                (1000, 0)
+            );
+            assert!(store.vouchers(company).unwrap()[0].postings.is_empty());
+            assert_eq!(
+                store.stock_balances(company, None).unwrap()[0].quantity,
+                i128::from(initial + sign * 1000)
+            );
+            assert_eq!(
+                store
+                    .stock_valuation_at_average_cost(company, "2026-06-02")
+                    .unwrap()
+                    .known_value,
+                if sign < 0 { 800 } else { 0 }
+            );
+            let mut draft = store.invoice_draft(company, invoice.id).unwrap();
+            draft.narration = "Free stock".into();
+            store.update_invoice(company, invoice.id, &draft).unwrap();
+            assert_eq!(
+                store.invoice_revisions(company, invoice.id).unwrap()[0].lines[0].billed_quantity,
+                0
+            );
+            store
+                .reverse_invoice(
+                    company,
+                    invoice.id,
+                    "2026-06-03",
+                    "FREE-REV",
+                    "Test reversal",
+                )
+                .unwrap();
+            assert_eq!(
+                store.stock_balances(company, None).unwrap()[0].quantity,
+                i128::from(initial)
+            );
+            let book = store.day_book(company, None, None, None, "FREE-").unwrap();
+            assert_eq!(book.len(), 2);
+            assert!(book
+                .iter()
+                .all(|entry| entry.debit_total == 0 && entry.credit_total == 0));
+            assert_eq!(
+                store
+                    .ledger_register(company, party, None, None)
+                    .unwrap()
+                    .closing_balance,
+                0
+            );
+            assert!(store
+                .outstanding_invoices(company, "2026-06-03")
+                .unwrap()
+                .is_empty());
+            draft.reference = "FREE-NATIVE".into();
+            draft.date = "2026-06-04".into();
+            draft.bill_reference = Some("NEW-BILL".into());
+            assert!(store.create_invoice(company, &draft).is_err());
+            draft.bill_reference = None;
+            store.create_invoice(company, &draft).unwrap();
+            assert_eq!(
+                store.stock_balances(company, None).unwrap()[0].quantity,
+                i128::from(initial + sign * 1000)
+            );
+            // A later monetary invoice can use the stock document's reference
+            // as a bill reference without making settlement ambiguous.
+            draft.reference = "MONETARY".into();
+            draft.bill_reference = Some("FREE-01".into());
+            draft.lines[0].billed_quantity = Some(1000);
+            draft.lines[0].unit_price = 1000;
+            store.create_invoice(company, &draft).unwrap();
+            store
+                .create_ledger(company, "Bank", Category::Asset)
+                .unwrap();
+            let payment_kind = if sign < 0 { "Receipt" } else { "Payment" };
+            let bank_amount = sign * 10;
+            let party_amount = -bank_amount;
+            let payment = format!(
+                r#"<ENVELOPE><BODY><DATA><MESSAGE>
+            <VOUCHER><DATE>20260605</DATE><VOUCHERTYPENAME>{payment_kind}</VOUCHERTYPENAME>
+                <VOUCHERNUMBER>SETTLE</VOUCHERNUMBER><ISINVOICE>No</ISINVOICE>
+                <PARTYLEDGERNAME>Party</PARTYLEDGERNAME>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Party</LEDGERNAME><AMOUNT>{party_amount}</AMOUNT>
+                    <BILLALLOCATIONS.LIST><NAME>FREE-01</NAME><BILLTYPE>Agst Ref</BILLTYPE>
+                    <AMOUNT>{party_amount}</AMOUNT></BILLALLOCATIONS.LIST>
+                </LEDGERENTRIES.LIST>
+                <LEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>{bank_amount}</AMOUNT></LEDGERENTRIES.LIST>
+            </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#
+            );
+            let preview = store
+                .preview_xml_import(company, payment.as_bytes())
+                .unwrap();
+            assert!(preview.can_apply(), "{:?}", preview.issues());
+            store.apply_xml_import(&preview).unwrap();
+            assert!(store
+                .outstanding_invoices(company, "2026-06-05")
+                .unwrap()
+                .is_empty());
+        }
+    }
 
     #[test]
     fn compound_aliases_resolve_without_blocking_unrelated_imports() {
