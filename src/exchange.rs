@@ -2365,7 +2365,10 @@ fn parse_imported_invoice(
             .map(|row| i128::from(row.amount))
             .sum::<i128>()
         + taxes.iter().map(|tax| i128::from(tax.amount)).sum::<i128>();
-    let stock_only = total == 0 && !lines.is_empty() && adjustments.is_empty() && taxes.is_empty();
+    let stock_only = total == 0
+        && lines.iter().any(|line| line.quantity > 0)
+        && adjustments.is_empty()
+        && taxes.is_empty();
     let (party_name, party_amount, bills, funding_applications) = match party {
         Some(party) => party,
         None if stock_only => {
@@ -2573,9 +2576,15 @@ fn parse_invoice_stock(
         let actual = unit.quantity(&invoice_field(item_node, "ACTUALQTY")?)?;
         let source_amount = xml_item_amount(item_node)?;
         let billed = xml_item_billed(item_node, unit, actual, source_amount)?;
-        if actual == 0
-            || (billed != 0 && (billed > 0) != (actual > 0))
-            || (actual < 0 && kind == InvoiceKind::Purchase && !returning)
+        let direction = if actual == 0 {
+            billed.signum()
+        } else {
+            actual.signum()
+        };
+        if direction == 0
+            || (returning && actual == 0)
+            || (billed != 0 && billed.signum() != direction)
+            || (direction < 0 && kind == InvoiceKind::Purchase && !returning)
         {
             return Err(Error::Validation(
                 "actual and billed quantities must follow the supported stock direction".into(),
@@ -2766,9 +2775,9 @@ fn parse_invoice_stock(
                     allocated_actual,
                     source_allocation_amount,
                 )?;
-                if allocated_actual == 0
-                    || (allocated_actual > 0) != (actual > 0)
-                    || (allocated_billed != 0 && (allocated_billed > 0) != (actual > 0))
+                if (allocated_actual == 0 && (allocated_billed == 0 || returning))
+                    || (allocated_actual != 0 && allocated_actual.signum() != direction)
+                    || (allocated_billed != 0 && allocated_billed.signum() != direction)
                 {
                     return Err(Error::Validation(
                         "location quantities do not match the item direction".into(),
@@ -3548,7 +3557,7 @@ fn resolve_return_invoice(
             "SELECT i.id, v.reference, v.date, i.external_reference, i.external_reference_date
              FROM invoices i JOIN vouchers v ON v.id = i.voucher_id
              WHERE i.company_id = ?1 AND i.party_ledger_id = ?2 AND i.kind = ?3
-               AND EXISTS(SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id)
+               AND EXISTS(SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id AND l.quantity > 0)
                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)",
         )?;
         let mut candidates = Vec::new();
@@ -5490,7 +5499,8 @@ impl Store {
                     normalized(&invoice.party),
                     normalized(&invoice.reference),
                 );
-                if !invoice.lines.is_empty() && invoice.reversal.is_none() {
+                if invoice.lines.iter().any(|line| line.quantity > 0) && invoice.reversal.is_none()
+                {
                     index_stock_origin(
                         &mut stock_origins,
                         invoice_key.clone(),
@@ -5579,7 +5589,7 @@ impl Store {
                     normalized(&invoice.party),
                     normalized(&invoice.reference),
                 );
-                if !invoice.lines.is_empty() {
+                if invoice.lines.iter().any(|line| line.quantity > 0) {
                     index_stock_origin(
                         &mut stock_origins,
                         invoice_key.clone(),
@@ -7175,6 +7185,180 @@ mod tests {
                 .outstanding_invoices(company, "2026-04-03")
                 .unwrap()
                 .is_empty());
+        }
+    }
+
+    #[test]
+    fn bills_items_before_stock_moves() {
+        for (kind, amount, party_category, trade_category) in [
+            ("Sales", 20_i64, Category::Asset, Category::Income),
+            ("Purchase", -20, Category::Liability, Category::Expense),
+        ] {
+            let mut store = Store::memory().unwrap();
+            let company = store
+                .create_company("Billing before stock movement")
+                .unwrap();
+            let party = store
+                .create_ledger(company, "Party", party_category)
+                .unwrap();
+            store
+                .create_ledger(company, "Trade", trade_category)
+                .unwrap();
+            let item = store.create_stock_item(company, "Item", "pcs").unwrap();
+            let east = store.create_stock_location(company, "East").unwrap();
+            let west = store.create_stock_location(company, "West").unwrap();
+            let half_amount = amount / 2;
+            let opposite = -amount;
+            let xml = format!(
+                r#"<ENVELOPE><BODY><DATA><MESSAGE>
+                   <VOUCHER><VOUCHERTYPENAME>{kind}</VOUCHERTYPENAME><ISINVOICE>Yes</ISINVOICE>
+                      <DATE>20260402</DATE><VOUCHERNUMBER>BILL-1</VOUCHERNUMBER>
+                      <PARTYLEDGERNAME>Party</PARTYLEDGERNAME>
+                      <LEDGERENTRIES.LIST><LEDGERNAME>Party</LEDGERNAME><AMOUNT>{opposite}</AMOUNT>
+                          <BILLALLOCATIONS.LIST><NAME>BILL-1</NAME><BILLTYPE>New Ref</BILLTYPE>
+                              <AMOUNT>{opposite}</AMOUNT>
+                          </BILLALLOCATIONS.LIST>
+                      </LEDGERENTRIES.LIST>
+                      <ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Item</STOCKITEMNAME>
+                          <ACTUALQTY>0 pcs</ACTUALQTY><BILLEDQTY>2 pcs</BILLEDQTY>
+                          <RATE>10.00/pcs</RATE><AMOUNT>{amount}</AMOUNT>
+                          <ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Trade</LEDGERNAME><AMOUNT>{amount}</AMOUNT></ACCOUNTINGALLOCATIONS.LIST>
+                          <BATCHALLOCATIONS.LIST>
+                              <GODOWNNAME>East</GODOWNNAME><BILLEDQTY>1 pcs</BILLEDQTY>
+                              <ACTUALQTY>0 pcs</ACTUALQTY><AMOUNT>{half_amount}</AMOUNT>
+                          </BATCHALLOCATIONS.LIST>
+                          <BATCHALLOCATIONS.LIST>
+                              <GODOWNNAME>West</GODOWNNAME><BILLEDQTY>1 pcs</BILLEDQTY>
+                              <ACTUALQTY>0 pcs</ACTUALQTY><AMOUNT>{half_amount}</AMOUNT>
+                          </BATCHALLOCATIONS.LIST>
+                      </ALLINVENTORYENTRIES.LIST>
+                   </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#
+            );
+            let plan = store.preview_xml_import(company, xml.as_bytes()).unwrap();
+            assert!(plan.can_apply(), "{:?}", plan.issues());
+            store.apply_xml_import(&plan).unwrap();
+            let invoice = store.invoices(company).unwrap().remove(0);
+            assert_eq!((invoice.total, invoice.outstanding), (2000, 2000));
+            assert_eq!(
+                (invoice.lines[0].quantity, invoice.lines[0].billed_quantity),
+                (0, 2000)
+            );
+            assert_eq!(
+                store
+                    .ledger_register(company, party, None, None)
+                    .unwrap()
+                    .closing_balance,
+                i128::from(amount) * 100
+            );
+            let movements = store.stock_register(company, item, None, None).unwrap();
+            assert!(movements.movements.is_empty());
+            assert_eq!(
+                store
+                    .stock_valuation_at_average_cost(company, "2026-04-02")
+                    .unwrap()
+                    .known_value,
+                0
+            );
+            if kind == "Sales" {
+                use crate::actual_cost::{ActualCostIssue, ActualCostMethod};
+                store
+                    .record_standard_stock_cost(company, item, "2026-04-01", 500, "Fixture rate")
+                    .unwrap();
+                let standard = store.sales_at_standard_cost(company, None, None).unwrap();
+                assert_eq!((standard.net_sales, standard.costed_net_sales), (2000, 0));
+                assert_eq!(standard.rows[0].margin(), None);
+                for method in ActualCostMethod::ALL {
+                    let actual = store
+                        .sales_at_actual_cost(company, None, None, method)
+                        .unwrap();
+                    assert_eq!((actual.net_sales, actual.costed_net_sales), (2000, 0));
+                    assert!(matches!(
+                        actual.rows[0].issue,
+                        Some(ActualCostIssue::PendingStockIssue)
+                    ));
+                }
+            }
+
+            let mut draft = store.invoice_draft(company, invoice.id).unwrap();
+            draft.narration = "Billing before physical movement".into();
+            store.update_invoice(company, invoice.id, &draft).unwrap();
+            let revision = store
+                .invoice_revisions(company, invoice.id)
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                (
+                    revision.lines[0].quantity,
+                    revision.lines[0].billed_quantity
+                ),
+                (0, 2000)
+            );
+            assert_eq!(
+                (
+                    revision.lines[0].allocations[1].quantity,
+                    revision.lines[0].allocations[1].billed_quantity
+                ),
+                (0, 1000)
+            );
+            store
+                .reverse_invoice(
+                    company,
+                    invoice.id,
+                    "2026-04-03",
+                    "REVERSE",
+                    "Test reversal",
+                )
+                .unwrap();
+            assert!(store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .movements
+                .is_empty());
+            assert_eq!(
+                store
+                    .ledger_register(company, party, None, None)
+                    .unwrap()
+                    .closing_balance,
+                0
+            );
+
+            // A second invoice has one shipment and a second allocation billed in advance.
+            if kind == "Sales" {
+                store
+                    .adjust_stock_at(company, item, east, "2026-04-01", 1000, "Opening stock")
+                    .unwrap();
+            }
+            draft.date = "2026-04-04".into();
+            draft.reference = "BILL-2".into();
+            draft.lines[0].quantity = 1000;
+            let mixed_id = store.create_invoice(company, &draft).unwrap();
+            for (location, expected) in [(east, 1), (west, 0)] {
+                let register = store
+                    .stock_register_at(company, item, Some(location), Some("2026-04-04"), None)
+                    .unwrap();
+                assert_eq!(register.movements.len(), expected);
+            }
+            store
+                .reverse_invoice(
+                    company,
+                    mixed_id,
+                    "2026-04-05",
+                    "REVERSE-2",
+                    "Test reversal",
+                )
+                .unwrap();
+            assert!(store
+                .stock_register_at(company, item, Some(west), None, None)
+                .unwrap()
+                .movements
+                .is_empty());
+            assert_eq!(
+                store
+                    .stock_register(company, item, None, None)
+                    .unwrap()
+                    .closing_quantity,
+                if kind == "Sales" { 1000 } else { 0 }
+            );
         }
     }
 

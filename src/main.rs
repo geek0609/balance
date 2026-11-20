@@ -3920,7 +3920,8 @@ impl App {
                     egui::TextEdit::singleline(&mut line.quantity)
                         .hint_text(quantity_hint)
                         .desired_width(90.0),
-                );
+                )
+                .on_hover_text("Enter 0 when billing ahead of delivery or receipt.");
                 ui.add(
                     egui::TextEdit::singleline(&mut line.billed_quantity)
                         .hint_text("Billed qty")

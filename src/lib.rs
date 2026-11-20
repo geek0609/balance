@@ -25,6 +25,7 @@ pub mod grouped_reports;
 pub mod inventory;
 pub mod invoice_credit_allocations;
 pub mod invoice_credits;
+mod invoice_quantities;
 pub mod invoice_refunds;
 pub mod invoice_register;
 pub mod invoice_returns;
@@ -59,7 +60,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 92;
+const SCHEMA_VERSION: i64 = 93;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -1056,6 +1057,9 @@ impl Store {
             tx.pragma_update(None, "user_version", 92)?;
         }
         tx.commit()?;
+        if version < 93 {
+            invoice_quantities::migrate(&mut conn)?;
+        }
         Ok(Self { conn })
     }
     pub fn create_company(&self, name: &str) -> Result<i64> {

@@ -14,7 +14,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             reason TEXT NOT NULL,
             changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE INDEX negative_stock_policy_changes_company ON negative_stock_policy_changes(company_id, id);
+        CREATE INDEX negative_stock_policy_changes_company ON negative_stock_policy_changes(company_id, id);",
+    )?;
+    refresh_stock_movements(conn)
+}
+
+pub(crate) fn refresh_stock_movements(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP VIEW IF EXISTS warehouse_stock_movements;
         CREATE VIEW warehouse_stock_movements AS
             SELECT company_id, item_id, location_id, batch_id, date, quantity, 0 AS location_only
             FROM stock_adjustments
@@ -23,6 +30,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                    CASE i.kind WHEN 'Purchase' THEN a.quantity ELSE -a.quantity END, 0
             FROM invoice_line_allocations a JOIN physical_invoice_lines l ON l.id = a.line_id
             JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id
+            WHERE a.quantity > 0
             UNION ALL
             SELECT company_id, item_id, location_id, batch_id, date, quantity, 1
             FROM stock_transfer_location_movements;",

@@ -236,9 +236,11 @@ impl Store {
             missing_rates: 0,
         };
         for sale in crate::stock_sales::stock_sales(&tx, company, start, end)? {
-            let unit_cost = effective(&schedule, sale.item_id, sale.cost_date);
+            let quantity_issued = sale.issue_quantity();
+            let unit_cost =
+                effective(&schedule, sale.item_id, sale.cost_date).filter(|_| quantity_issued > 0);
             let standard_cost = unit_cost
-                .map(|cost| priced(sale.issue_quantity(), cost))
+                .map(|cost| priced(quantity_issued, cost))
                 .transpose()?
                 .map(|total| sale.allocated_issue_cost(total));
             report.net_sales = add(report.net_sales, sale.net_sales)?;

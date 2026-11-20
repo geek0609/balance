@@ -187,7 +187,7 @@ impl Store {
         {
             let mut stmt = tx.prepare(
                 "SELECT a.id, l.item_id, a.location_id, a.batch_id, a.quantity
-                 FROM physical_invoice_lines l JOIN invoice_line_allocations a ON a.line_id = l.id
+                 FROM physical_invoice_lines l JOIN physical_invoice_allocations a ON a.line_id = l.id
                  WHERE l.invoice_id = ?1 ORDER BY l.id, a.id",
             )?;
             let mut rows = stmt.query([invoice])?;

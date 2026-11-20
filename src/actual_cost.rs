@@ -44,6 +44,7 @@ pub struct ReceiptCostEntry {
 pub enum ActualCostIssue {
     MissingReceiptCost { date: NaiveDate, receipt_id: i64 },
     InsufficientStock { date: NaiveDate, source: String },
+    PendingStockIssue,
 }
 impl std::fmt::Display for ActualCostIssue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -57,6 +58,7 @@ impl std::fmt::Display for ActualCostIssue {
             Self::InsufficientStock { date, source } => {
                 write!(f, "{source} on {date} exceeds the available quantity")
             }
+            Self::PendingStockIssue => write!(f, "No stock has been issued on this invoice line"),
         }
     }
 }
@@ -1201,13 +1203,16 @@ impl Store {
                     .checked_add(margin)
                     .ok_or_else(amount_too_large)?;
             } else {
-                let problem = issues.get(&sale.item_id).ok_or_else(|| {
-                    Error::Validation(format!(
-                        "Sale line {} has no matching cost event",
-                        sale.line_id
-                    ))
-                })?;
-                issue = Some(problem.clone());
+                issue = Some(if sale.issue_quantity() == 0 {
+                    ActualCostIssue::PendingStockIssue
+                } else {
+                    issues.get(&sale.item_id).cloned().ok_or_else(|| {
+                        Error::Validation(format!(
+                            "Sale line {} has no matching cost event",
+                            sale.line_id
+                        ))
+                    })?
+                });
                 report.unavailable_lines += 1;
             }
             report.rows.push(ActualSalesCostRow { sale, cost, issue });

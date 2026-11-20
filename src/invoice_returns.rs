@@ -171,7 +171,7 @@ fn allocations(conn: &Connection, company: i64, invoice: i64) -> Result<Vec<Allo
                 COALESCE((SELECT SUM(ret.quantity) FROM invoice_stock_return_history ret
                     WHERE ret.allocation_id = a.id AND ret.reversed_on IS NULL), 0)
          FROM invoices i JOIN invoice_lines l ON l.invoice_id = i.id
-         JOIN invoice_line_allocations a ON a.line_id = l.id
+         JOIN physical_invoice_allocations a ON a.line_id = l.id
          JOIN stock_items item ON item.id = l.item_id AND item.company_id = i.company_id
          JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = i.company_id
          LEFT JOIN stock_batches batch ON batch.id = a.batch_id

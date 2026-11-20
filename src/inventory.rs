@@ -712,11 +712,8 @@ fn prepare_invoice(
             check_quantity_precision(conn, company_id, line.item_id, billed_quantity)?;
         }
         for allocation in &line.extra_allocations {
-            if allocation.quantity <= 0 {
-                return Err(Error::Validation(
-                    "Allocation quantity must be positive".into(),
-                ));
-            }
+            let billed = allocation.billed_quantity.unwrap_or(allocation.quantity);
+            check_allocation_quantities(allocation.quantity, billed)?;
             let exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM stock_locations WHERE id = ?1 AND company_id = ?2)",
                 params![allocation.location_id, company_id],
@@ -729,12 +726,6 @@ fn prepare_invoice(
             }
             check_stock_batch(conn, company_id, line.item_id, allocation.batch_id)?;
             check_quantity_precision(conn, company_id, line.item_id, allocation.quantity)?;
-            let billed = allocation.billed_quantity.unwrap_or(allocation.quantity);
-            if billed < 0 {
-                return Err(Error::Validation(
-                    "Allocation billed quantity must be non-negative".into(),
-                ));
-            }
             if billed != allocation.quantity {
                 check_quantity_precision(conn, company_id, line.item_id, billed)?;
             }
@@ -806,8 +797,10 @@ fn prepare_invoice(
             &taxes,
         )?;
     }
-    let stock_only =
-        total == 0 && !draft.lines.is_empty() && draft.adjustments.is_empty() && taxes.is_empty();
+    let stock_only = total == 0
+        && draft.lines.iter().any(|line| line.quantity > 0)
+        && draft.adjustments.is_empty()
+        && taxes.is_empty();
     if total <= 0 && !stock_only {
         return Err(Error::Validation(
             "Invoice amount must be positive unless the invoice only moves free stock".into(),
@@ -997,6 +990,20 @@ pub(crate) fn write_postings(conn: &Connection, voucher: i64, postings: &[Postin
     }
     Ok(())
 }
+fn valid_allocation_quantities(quantity: i64, billed: i64) -> bool {
+    quantity >= 0 && billed >= 0 && (quantity > 0 || billed > 0)
+}
+
+fn check_allocation_quantities(quantity: i64, billed: i64) -> Result<()> {
+    if !valid_allocation_quantities(quantity, billed) {
+        return Err(Error::Validation(
+            "An allocation needs a positive stock or billed quantity and no negative quantities"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn primary_invoice_allocation(line: &InvoiceLine) -> Result<InvoiceAllocation> {
     let extra_quantity: i128 = line
         .extra_allocations
@@ -1008,9 +1015,8 @@ fn primary_invoice_allocation(line: &InvoiceLine) -> Result<InvoiceAllocation> {
         .iter()
         .map(|a| i128::from(a.billed_quantity.unwrap_or(a.quantity)))
         .sum();
-    let quantity = i64::try_from(i128::from(line.quantity) - extra_quantity).ok()
-        .filter(|quantity| *quantity > 0)
-        .ok_or_else(|| Error::Validation("Additional allocations must leave a positive stock quantity for the first location".into()))?;
+    let quantity = i64::try_from(i128::from(line.quantity) - extra_quantity)
+        .map_err(|_| Error::Validation("Stock allocations exceed the line quantity".into()))?;
     let billed_quantity =
         i64::try_from(i128::from(line.billed_quantity.unwrap_or(line.quantity)) - extra_billed)
             .ok()
@@ -1020,6 +1026,7 @@ fn primary_invoice_allocation(line: &InvoiceLine) -> Result<InvoiceAllocation> {
                     "Billed allocations exceed the invoice line billed quantity".into(),
                 )
             })?;
+    check_allocation_quantities(quantity, billed_quantity)?;
     Ok(InvoiceAllocation {
         location_id: line.location_id,
         batch_id: line.batch_id,
@@ -1097,8 +1104,10 @@ fn check_line_allocations(
         .first()
         .is_none_or(|first| first.location_id != location || first.batch_id != batch)
         || allocations.iter().any(|allocation| {
-            allocation.quantity <= 0
-                || allocation.billed_quantity.unwrap_or(allocation.quantity) < 0
+            !valid_allocation_quantities(
+                allocation.quantity,
+                allocation.billed_quantity.unwrap_or(allocation.quantity),
+            )
         })
         || allocations
             .iter()
@@ -1181,9 +1190,9 @@ fn attach_allocation_details(
     if allocations
         .first()
         .is_none_or(|first| first.location != line.location || first.batch != line.batch)
-        || allocations
-            .iter()
-            .any(|allocation| allocation.quantity <= 0 || allocation.billed_quantity < 0)
+        || allocations.iter().any(|allocation| {
+            !valid_allocation_quantities(allocation.quantity, allocation.billed_quantity)
+        })
         || allocations
             .iter()
             .map(|allocation| i128::from(allocation.quantity))
@@ -1387,7 +1396,7 @@ fn insert_invoice(
 pub(crate) fn is_stock_only_invoice(conn: &Connection, company: i64, invoice: i64) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM invoices i WHERE i.company_id = ?1 AND i.id = ?2 AND i.tax_amount = 0
-         AND EXISTS(SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id)
+         AND EXISTS(SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id AND l.quantity > 0)
          AND NOT EXISTS(SELECT 1 FROM invoice_lines l WHERE l.invoice_id = i.id AND l.amount != 0)
          AND NOT EXISTS(SELECT 1 FROM invoice_adjustments a WHERE a.invoice_id = i.id)
          AND NOT EXISTS(SELECT 1 FROM invoice_additional_taxes t WHERE t.invoice_id = i.id))",
@@ -1422,7 +1431,7 @@ fn invoice_stock_allocations(
 ) -> Result<Vec<(i64, i64, Option<i64>, i64)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT l.item_id, a.location_id, a.batch_id, a.quantity
-         FROM physical_invoice_lines l JOIN invoice_line_allocations a ON a.line_id = l.id
+         FROM physical_invoice_lines l JOIN physical_invoice_allocations a ON a.line_id = l.id
          WHERE l.invoice_id = ?1",
     )?;
     let rows = stmt.query_map([invoice], |r| {
@@ -2898,7 +2907,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "{STOCK_LOCATION_BRANCH}
              SELECT a.id, v.date, i.kind, v.reference, a.quantity, loc.name, b.name
-             FROM invoice_line_allocations a JOIN physical_invoice_lines l ON l.id = a.line_id
+             FROM physical_invoice_allocations a JOIN physical_invoice_lines l ON l.id = a.line_id
              JOIN invoices i ON i.id = l.invoice_id JOIN vouchers v ON v.id = i.voucher_id
              JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = i.company_id
              LEFT JOIN stock_batches b ON b.id = a.batch_id

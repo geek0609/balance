@@ -447,8 +447,13 @@ impl App {
                             ui.label(&row.item);
                             ui.label(format!("{} {}", format_quantity(row.quantity), row.unit));
                             ui.label(money(row.net_sales));
-                            optional_cost(ui, row.standard_cost);
-                            optional_cost(ui, row.margin());
+                            if row.quantity == 0 {
+                                ui.label("Awaiting stock issue");
+                                ui.label("—");
+                            } else {
+                                optional_cost(ui, row.standard_cost);
+                                optional_cost(ui, row.margin());
+                            }
                             ui.end_row();
                         }
                     });
