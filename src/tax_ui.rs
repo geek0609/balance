@@ -357,8 +357,11 @@ impl App {
     fn invoice_net_before_tax(&self) -> Result<i64> {
         let mut net = 0_i128;
         for line in &self.invoice_lines {
-            let quantity = parse_quantity(&line.quantity)?;
-            let price = parse_amount(&line.price)?;
+            let quantity = match super::parse_optional_quantity(&line.billed_quantity)? {
+                Some(quantity) => quantity,
+                None => parse_quantity(&line.quantity)?,
+            };
+            let price = line.price_amount()?;
             net += i128::from(
                 discounted_line_amount_with_basis(
                     quantity,

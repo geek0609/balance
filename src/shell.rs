@@ -576,6 +576,7 @@ impl App {
                 || self.invoice_lines.iter().any(|line| {
                     line.item.is_some()
                         || !line.quantity.trim().is_empty()
+                        || !line.billed_quantity.trim().is_empty()
                         || !line.price.trim().is_empty()
                 })
             {

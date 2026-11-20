@@ -363,6 +363,7 @@ struct InvoiceLineForm {
     batch: Option<i64>,
     trade_ledger: Option<i64>,
     quantity: String,
+    billed_quantity: String,
     price: String,
     rate_basis: Option<InvoiceRateBasis>,
     discount_mode: DiscountMode,
@@ -379,6 +380,7 @@ struct InvoiceAllocationForm {
     location: Option<i64>,
     batch: Option<i64>,
     quantity: String,
+    billed_quantity: String,
 }
 impl InvoiceLineForm {
     fn new() -> Self {
@@ -389,6 +391,7 @@ impl InvoiceLineForm {
             batch: None,
             trade_ledger: None,
             quantity: String::new(),
+            billed_quantity: String::new(),
             price: String::new(),
             rate_basis: None,
             discount_mode: DiscountMode::None,
@@ -396,6 +399,16 @@ impl InvoiceLineForm {
             extra_allocations: Vec::new(),
         }
     }
+    fn price_amount(&self) -> balance::Result<i64> {
+        if self.price.trim().is_empty()
+            && parse_optional_quantity(&self.billed_quantity)? == Some(0)
+        {
+            Ok(0)
+        } else {
+            parse_amount(&self.price)
+        }
+    }
+
     fn discount(&self) -> balance::Result<InvoiceDiscount> {
         match self.discount_mode {
             DiscountMode::None => Ok(InvoiceDiscount::None),
@@ -406,6 +419,12 @@ impl InvoiceLineForm {
         }
     }
 }
+fn parse_optional_quantity(value: &str) -> balance::Result<Option<i64>> {
+    (!value.trim().is_empty())
+        .then(|| parse_quantity(value))
+        .transpose()
+}
+
 struct VoucherLine {
     ledger: Option<i64>,
     debit: bool,
@@ -3404,9 +3423,17 @@ impl App {
                             location: Some(allocation.location_id),
                             batch: allocation.batch_id,
                             quantity: format_quantity(i128::from(allocation.quantity)),
+                            billed_quantity: allocation
+                                .billed_quantity
+                                .map(|qty| format_quantity(qty.into()))
+                                .unwrap_or_default(),
                         })
                         .collect(),
                     quantity: format_quantity(i128::from(line.quantity)),
+                    billed_quantity: line
+                        .billed_quantity
+                        .map(|qty| format_quantity(qty.into()))
+                        .unwrap_or_default(),
                     price: format_amount(line.unit_price),
                     rate_basis: line.rate_basis,
                     discount_mode,
@@ -3815,12 +3842,21 @@ impl App {
                 let quantity_hint = items
                     .iter()
                     .find(|item| Some(item.id) == line.item)
-                    .map_or_else(|| "Quantity".into(), |item| format!("Qty ({})", item.unit));
+                    .map_or_else(
+                        || "Quantity".into(),
+                        |item| format!("Stock qty ({})", item.unit),
+                    );
                 ui.add(
                     egui::TextEdit::singleline(&mut line.quantity)
                         .hint_text(quantity_hint)
                         .desired_width(90.0),
                 );
+                ui.add(
+                    egui::TextEdit::singleline(&mut line.billed_quantity)
+                        .hint_text("Billed qty")
+                        .desired_width(78.0),
+                )
+                .on_hover_text("Leave blank to bill the stock quantity. Enter 0 for free stock.");
                 ui.add(
                     egui::TextEdit::singleline(&mut line.price)
                         .hint_text(line.rate_basis.as_ref().map_or_else(
@@ -3867,8 +3903,11 @@ impl App {
                     );
                 }
                 if let (Ok(qty), Ok(price), Ok(discount)) = (
-                    parse_quantity(&line.quantity),
-                    parse_amount(&line.price),
+                    parse_optional_quantity(&line.billed_quantity).and_then(|qty| match qty {
+                        Some(qty) => Ok(qty),
+                        None => parse_quantity(&line.quantity),
+                    }),
+                    line.price_amount(),
                     line.discount(),
                 ) {
                     if let Ok((amount, applied)) = discounted_line_amount_with_basis(
@@ -3913,6 +3952,11 @@ impl App {
                             .hint_text("Quantity")
                             .desired_width(90.0),
                     );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut allocation.billed_quantity)
+                            .hint_text("Billed qty")
+                            .desired_width(78.0),
+                    );
                     if ui.button("Remove allocation").clicked() {
                         remove_allocation = Some(allocation_index);
                     }
@@ -3922,13 +3966,14 @@ impl App {
                 line.extra_allocations.remove(allocation_index);
             }
             if !line.extra_allocations.is_empty() {
-                ui.small("The first location receives the remaining quantity.");
+                ui.small("The first location receives the remaining stock and billed quantities.");
             }
             if !from_note && ui.button("Add location or batch allocation").clicked() {
                 line.extra_allocations.push(InvoiceAllocationForm {
                     location: main_location,
                     batch: None,
                     quantity: String::new(),
+                    billed_quantity: String::new(),
                 });
             }
         }
@@ -4040,11 +4085,15 @@ impl App {
                                     })?,
                                     batch_id: allocation.batch,
                                     quantity: parse_quantity(&allocation.quantity)?,
+                                    billed_quantity: parse_optional_quantity(
+                                        &allocation.billed_quantity,
+                                    )?,
                                 })
                             })
                             .collect::<balance::Result<Vec<_>>>()?,
                         quantity: parse_quantity(&line.quantity)?,
-                        unit_price: parse_amount(&line.price)?,
+                        billed_quantity: parse_optional_quantity(&line.billed_quantity)?,
+                        unit_price: line.price_amount()?,
                         rate_basis: line.rate_basis.clone(),
                     });
                 }
@@ -4533,20 +4582,18 @@ impl App {
                     }
                     for line in invoice.lines {
                         ui.label(format!(
-                            "  {} — ledger {}: {} {} × {} · {} · net {}",
+                            "  {} — ledger {}: {} · {} · {} · net {}",
                             line.item,
                             line.trade_ledger,
-                            format_quantity(i128::from(line.quantity)),
-                            line.unit,
+                            line.quantity_label(),
                             line.price_label(),
                             discount_description(&line.discount, line.discount_amount),
                             format_amount(line.amount)
                         ));
                         for allocation in line.allocations {
                             ui.label(format!(
-                                "    {} {} at {}, batch {}",
-                                format_quantity(i128::from(allocation.quantity)),
-                                line.unit,
+                                "    {} at {}, batch {}",
+                                allocation.quantity_label(&line.unit),
                                 allocation.location,
                                 allocation.batch.as_deref().unwrap_or("unbatched")
                             ));
@@ -4681,11 +4728,10 @@ impl App {
                                         }
                                         for line in revision.lines {
                                             ui.label(format!(
-                                                "  {} — ledger {}: {} {} × {} · {} · net {}",
+                                                "  {} — ledger {}: {} · {} · {} · net {}",
                                                 line.item,
                                                 line.trade_ledger,
-                                                format_quantity(i128::from(line.quantity)),
-                                                line.unit,
+                                                line.quantity_label(),
                                                 line.price_label(),
                                                 discount_description(
                                                     &line.discount,
@@ -4695,11 +4741,8 @@ impl App {
                                             ));
                                             for allocation in line.allocations {
                                                 ui.label(format!(
-                                                    "    {} {} at {}, batch {}",
-                                                    format_quantity(i128::from(
-                                                        allocation.quantity
-                                                    )),
-                                                    line.unit,
+                                                    "    {} at {}, batch {}",
+                                                    allocation.quantity_label(&line.unit),
                                                     allocation.location,
                                                     allocation
                                                         .batch

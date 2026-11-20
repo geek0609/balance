@@ -839,6 +839,7 @@ mod tests {
                 tax_calculation: None,
                 adjustments: vec![],
                 lines: vec![InvoiceLine {
+                    billed_quantity: None,
                     rate_basis: None,
                     item_id: self.item,
                     location_id: self.main,
@@ -1012,6 +1013,7 @@ mod tests {
         draft.tax_amount = 300;
         draft.lines[0].discount = InvoiceDiscount::Fixed(100);
         draft.lines[0].extra_allocations.push(InvoiceAllocation {
+            billed_quantity: None,
             location_id: overflow,
             batch_id: None,
             quantity: 1000,

@@ -515,6 +515,7 @@ mod tests {
         let location = store.stock_locations(company).unwrap()[0].id;
         let mut draft = invoice(InvoiceKind::Purchase, supplier, purchases);
         draft.lines.push(InvoiceLine {
+            billed_quantity: None,
             rate_basis: None,
             item_id: item,
             location_id: location,

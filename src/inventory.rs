@@ -180,7 +180,10 @@ pub struct InvoiceLine {
     pub trade_ledger_id: Option<i64>,
     /// Additional locations or batches; the first location receives the remainder.
     pub extra_allocations: Vec<InvoiceAllocation>,
+    /// Quantity shipped or received, in thousandths.
     pub quantity: i64,
+    /// Defaults to the stock quantity. Zero records free stock.
+    pub billed_quantity: Option<i64>,
     pub unit_price: i64,
     pub rate_basis: Option<InvoiceRateBasis>,
     pub discount: InvoiceDiscount,
@@ -203,12 +206,20 @@ pub struct InvoiceAllocation {
     pub location_id: i64,
     pub batch_id: Option<i64>,
     pub quantity: i64,
+    pub billed_quantity: Option<i64>,
 }
 #[derive(Debug, Clone)]
 pub struct InvoiceAllocationDetail {
     pub location: String,
     pub batch: Option<String>,
     pub quantity: i64,
+    pub billed_quantity: i64,
+}
+
+impl InvoiceAllocationDetail {
+    pub fn quantity_label(&self, unit: &str) -> String {
+        invoice_quantity_label(self.quantity, self.billed_quantity, unit)
+    }
 }
 #[derive(Debug, Clone)]
 pub struct InvoiceAdjustment {
@@ -410,6 +421,7 @@ pub struct InvoiceDetailLine {
     pub trade_ledger: String,
     pub allocations: Vec<InvoiceAllocationDetail>,
     pub quantity: i64,
+    pub billed_quantity: i64,
     pub unit_price: i64,
     pub rate_basis: Option<InvoiceRateBasis>,
     pub amount: i64,
@@ -418,12 +430,26 @@ pub struct InvoiceDetailLine {
 }
 
 impl InvoiceDetailLine {
+    pub fn quantity_label(&self) -> String {
+        invoice_quantity_label(self.quantity, self.billed_quantity, &self.unit)
+    }
+
     pub fn price_label(&self) -> String {
         let price = crate::format_amount(self.unit_price);
         match &self.rate_basis {
             Some(basis) => format!("{price} / {}", basis.unit),
             None => price,
         }
+    }
+}
+
+fn invoice_quantity_label(quantity: i64, billed_quantity: i64, unit: &str) -> String {
+    let stock = format_quantity(quantity.into());
+    if billed_quantity == quantity {
+        format!("{stock} {unit}")
+    } else {
+        let billed = format_quantity(billed_quantity.into());
+        format!("{stock} {unit} stock · {billed} billed")
     }
 }
 
@@ -454,6 +480,11 @@ pub fn format_quantity(quantity: i128) -> String {
 /// Multiply a positive quantity in thousandths by a unit price in hundredths,
 /// rounding half up to one hundredth per line.
 pub fn line_amount(quantity: i64, unit_price: i64) -> Result<i64> {
+    if quantity <= 0 {
+        return Err(Error::Validation(
+            "Each line needs a positive quantity".into(),
+        ));
+    }
     line_amount_with_basis(quantity, unit_price, None)
 }
 
@@ -462,9 +493,9 @@ fn line_amount_with_basis(
     unit_price: i64,
     rate_basis: Option<&InvoiceRateBasis>,
 ) -> Result<i64> {
-    if quantity <= 0 || unit_price < 0 {
+    if quantity < 0 || unit_price < 0 {
         return Err(Error::Validation(
-            "Each line needs a positive quantity and non-negative price".into(),
+            "Billed quantity and price must be non-negative".into(),
         ));
     }
     let basis = match rate_basis {
@@ -487,6 +518,11 @@ pub fn discounted_line_amount(
     unit_price: i64,
     discount: &InvoiceDiscount,
 ) -> Result<(i64, i64)> {
+    if quantity <= 0 {
+        return Err(Error::Validation(
+            "Each line needs a positive quantity".into(),
+        ));
+    }
     discounted_line_amount_with_basis(quantity, unit_price, discount, None)
 }
 
@@ -666,7 +702,10 @@ fn prepare_invoice(
         }
         check_stock_batch(conn, company_id, line.item_id, line.batch_id)?;
         check_quantity_precision(conn, company_id, line.item_id, line.quantity)?;
-        let mut extra_quantity = 0_i128;
+        let billed_quantity = line.billed_quantity.unwrap_or(line.quantity);
+        if billed_quantity != line.quantity {
+            check_quantity_precision(conn, company_id, line.item_id, billed_quantity)?;
+        }
         for allocation in &line.extra_allocations {
             if allocation.quantity <= 0 {
                 return Err(Error::Validation(
@@ -685,14 +724,17 @@ fn prepare_invoice(
             }
             check_stock_batch(conn, company_id, line.item_id, allocation.batch_id)?;
             check_quantity_precision(conn, company_id, line.item_id, allocation.quantity)?;
-            extra_quantity += i128::from(allocation.quantity);
+            let billed = allocation.billed_quantity.unwrap_or(allocation.quantity);
+            if billed < 0 {
+                return Err(Error::Validation(
+                    "Allocation billed quantity must be non-negative".into(),
+                ));
+            }
+            if billed != allocation.quantity {
+                check_quantity_precision(conn, company_id, line.item_id, billed)?;
+            }
         }
-        if extra_quantity >= i128::from(line.quantity) {
-            return Err(Error::Validation(
-                "Additional allocations must leave a positive quantity for the first location"
-                    .into(),
-            ));
-        }
+        primary_invoice_allocation(line)?;
         let trade_id = line.trade_ledger_id.unwrap_or(draft.trade_ledger_id);
         if trade_id == draft.party_ledger_id || tax_ledgers.contains(&trade_id) {
             return Err(Error::Validation(
@@ -709,7 +751,7 @@ fn prepare_invoice(
             ));
         }
         let (amount, discount) = discounted_line_amount_with_basis(
-            line.quantity,
+            billed_quantity,
             line.unit_price,
             &line.discount,
             line.rate_basis.as_ref(),
@@ -851,6 +893,28 @@ pub(crate) fn migrate_invoice_rate_basis(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_invoice_billed_quantities(conn: &Connection) -> Result<()> {
+    for table in [
+        "invoice_lines",
+        "invoice_revision_lines",
+        "invoice_line_allocations",
+        "invoice_revision_line_allocations",
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'billed_quantity')",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN billed_quantity INTEGER CHECK(billed_quantity >= 0)"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn read_invoice_rate_basis(
     row: &rusqlite::Row<'_>,
     quantity: usize,
@@ -913,6 +977,37 @@ pub(crate) fn write_postings(conn: &Connection, voucher: i64, postings: &[Postin
     }
     Ok(())
 }
+fn primary_invoice_allocation(line: &InvoiceLine) -> Result<InvoiceAllocation> {
+    let extra_quantity: i128 = line
+        .extra_allocations
+        .iter()
+        .map(|a| i128::from(a.quantity))
+        .sum();
+    let extra_billed: i128 = line
+        .extra_allocations
+        .iter()
+        .map(|a| i128::from(a.billed_quantity.unwrap_or(a.quantity)))
+        .sum();
+    let quantity = i64::try_from(i128::from(line.quantity) - extra_quantity).ok()
+        .filter(|quantity| *quantity > 0)
+        .ok_or_else(|| Error::Validation("Additional allocations must leave a positive stock quantity for the first location".into()))?;
+    let billed_quantity =
+        i64::try_from(i128::from(line.billed_quantity.unwrap_or(line.quantity)) - extra_billed)
+            .ok()
+            .filter(|quantity| *quantity >= 0)
+            .ok_or_else(|| {
+                Error::Validation(
+                    "Billed allocations exceed the invoice line billed quantity".into(),
+                )
+            })?;
+    Ok(InvoiceAllocation {
+        location_id: line.location_id,
+        batch_id: line.batch_id,
+        quantity,
+        billed_quantity: (billed_quantity != quantity).then_some(billed_quantity),
+    })
+}
+
 fn write_invoice_lines(
     conn: &Connection,
     invoice: i64,
@@ -930,23 +1025,20 @@ fn write_invoice_lines(
         conn.execute(
             "INSERT INTO invoice_lines(invoice_id, item_id, quantity, unit_price, amount,
                 location_id, batch_id, trade_ledger_id, discount_kind, discount_value, discount_amount,
-                rate_basis_quantity, rate_basis_unit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rate_basis_quantity, rate_basis_unit, billed_quantity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![invoice, line.item_id, line.quantity, line.unit_price, amount, line.location_id,
                 line.batch_id, line.trade_ledger_id, discount_kind, discount_value, discount,
                 line.rate_basis.as_ref().map(|basis| basis.quantity),
-                line.rate_basis.as_ref().map(|basis| basis.unit.as_str())],
+                line.rate_basis.as_ref().map(|basis| basis.unit.as_str()), line.billed_quantity],
         )?;
         let line_id = conn.last_insert_rowid();
-        let extras: i128 = line
-            .extra_allocations
-            .iter()
-            .map(|allocation| i128::from(allocation.quantity))
-            .sum();
-        let primary = i64::try_from(i128::from(line.quantity) - extras)
-            .map_err(|_| Error::Validation("Allocation quantity is too large".into()))?;
-        conn.execute("INSERT INTO invoice_line_allocations(line_id, location_id, batch_id, quantity) VALUES (?1, ?2, ?3, ?4)", params![line_id, line.location_id, line.batch_id, primary])?;
-        for allocation in &line.extra_allocations {
-            conn.execute("INSERT INTO invoice_line_allocations(line_id, location_id, batch_id, quantity) VALUES (?1, ?2, ?3, ?4)", params![line_id, allocation.location_id, allocation.batch_id, allocation.quantity])?;
+        let primary = primary_invoice_allocation(line)?;
+        for allocation in std::iter::once(&primary).chain(&line.extra_allocations) {
+            conn.execute(
+                "INSERT INTO invoice_line_allocations(line_id, location_id, batch_id, quantity, billed_quantity)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![line_id, allocation.location_id, allocation.batch_id, allocation.quantity, allocation.billed_quantity],
+            )?;
         }
     }
     Ok(())
@@ -957,9 +1049,9 @@ fn read_line_allocations(
     revision: bool,
 ) -> Result<Vec<InvoiceAllocation>> {
     let sql = if revision {
-        "SELECT location_id, batch_id, quantity FROM invoice_revision_line_allocations WHERE revision_line_id = ?1 ORDER BY id"
+        "SELECT location_id, batch_id, quantity, billed_quantity FROM invoice_revision_line_allocations WHERE revision_line_id = ?1 ORDER BY id"
     } else {
-        "SELECT location_id, batch_id, quantity FROM invoice_line_allocations WHERE line_id = ?1 ORDER BY id"
+        "SELECT location_id, batch_id, quantity, billed_quantity FROM invoice_line_allocations WHERE line_id = ?1 ORDER BY id"
     };
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt
@@ -968,6 +1060,7 @@ fn read_line_allocations(
                 location_id: r.get(0)?,
                 batch_id: r.get(1)?,
                 quantity: r.get(2)?,
+                billed_quantity: r.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -976,20 +1069,27 @@ fn read_line_allocations(
 fn check_line_allocations(
     allocations: &[InvoiceAllocation],
     quantity: i64,
+    billed_quantity: i64,
     location: i64,
     batch: Option<i64>,
 ) -> Result<()> {
     if allocations
         .first()
         .is_none_or(|first| first.location_id != location || first.batch_id != batch)
-        || allocations
-            .iter()
-            .any(|allocation| allocation.quantity <= 0)
+        || allocations.iter().any(|allocation| {
+            allocation.quantity <= 0
+                || allocation.billed_quantity.unwrap_or(allocation.quantity) < 0
+        })
         || allocations
             .iter()
             .map(|allocation| i128::from(allocation.quantity))
             .sum::<i128>()
             != i128::from(quantity)
+        || allocations
+            .iter()
+            .map(|a| i128::from(a.billed_quantity.unwrap_or(a.quantity)))
+            .sum::<i128>()
+            != i128::from(billed_quantity)
     {
         return Err(Error::Validation(
             "Invoice stock allocations are inconsistent".into(),
@@ -1003,9 +1103,9 @@ fn read_allocation_details(
     revision: bool,
 ) -> Result<Vec<InvoiceAllocationDetail>> {
     let sql = if revision {
-        "SELECT loc.name, b.name, a.quantity FROM invoice_revision_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.revision_line_id = ?1 ORDER BY a.id"
+        "SELECT loc.name, b.name, a.quantity, COALESCE(a.billed_quantity, a.quantity) FROM invoice_revision_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.revision_line_id = ?1 ORDER BY a.id"
     } else {
-        "SELECT loc.name, b.name, a.quantity FROM invoice_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.line_id = ?1 ORDER BY a.id"
+        "SELECT loc.name, b.name, a.quantity, COALESCE(a.billed_quantity, a.quantity) FROM invoice_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.line_id = ?1 ORDER BY a.id"
     };
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt
@@ -1014,6 +1114,7 @@ fn read_allocation_details(
                 location: r.get(0)?,
                 batch: r.get(1)?,
                 quantity: r.get(2)?,
+                billed_quantity: r.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1026,22 +1127,23 @@ fn attach_allocation_details(
     mut line: InvoiceDetailLine,
 ) -> Result<InvoiceDetailLine> {
     let sql = if revision {
-        "SELECT discount_kind, discount_value, discount_amount, rate_basis_quantity, rate_basis_unit FROM invoice_revision_lines WHERE id = ?1"
+        "SELECT discount_kind, discount_value, discount_amount, rate_basis_quantity, rate_basis_unit, COALESCE(billed_quantity, quantity) FROM invoice_revision_lines WHERE id = ?1"
     } else {
-        "SELECT discount_kind, discount_value, discount_amount, rate_basis_quantity, rate_basis_unit FROM invoice_lines WHERE id = ?1"
+        "SELECT discount_kind, discount_value, discount_amount, rate_basis_quantity, rate_basis_unit, COALESCE(billed_quantity, quantity) FROM invoice_lines WHERE id = ?1"
     };
-    let (kind, value, saved_amount, rate_basis): (String, String, i64, _) =
+    let (kind, value, saved_amount, rate_basis, billed_quantity): (String, String, i64, _, i64) =
         conn.query_row(sql, [id], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
                 r.get(2)?,
                 read_invoice_rate_basis(r, 3, 4)?,
+                r.get(5)?,
             ))
         })?;
     let discount = parse_discount(&kind, &value)?;
     if discounted_line_amount_with_basis(
-        line.quantity,
+        billed_quantity,
         line.unit_price,
         &discount,
         rate_basis.as_ref(),
@@ -1051,6 +1153,7 @@ fn attach_allocation_details(
             "Invoice discount calculation is inconsistent".into(),
         ));
     }
+    line.billed_quantity = billed_quantity;
     line.rate_basis = rate_basis;
     line.discount = discount;
     line.discount_amount = saved_amount;
@@ -1060,12 +1163,17 @@ fn attach_allocation_details(
         .is_none_or(|first| first.location != line.location || first.batch != line.batch)
         || allocations
             .iter()
-            .any(|allocation| allocation.quantity <= 0)
+            .any(|allocation| allocation.quantity <= 0 || allocation.billed_quantity < 0)
         || allocations
             .iter()
             .map(|allocation| i128::from(allocation.quantity))
             .sum::<i128>()
             != i128::from(line.quantity)
+        || allocations
+            .iter()
+            .map(|a| i128::from(a.billed_quantity))
+            .sum::<i128>()
+            != i128::from(billed_quantity)
     {
         return Err(Error::Validation(
             "Invoice stock allocations are inconsistent".into(),
@@ -1075,7 +1183,7 @@ fn attach_allocation_details(
     Ok(line)
 }
 fn copy_invoice_line_revisions(conn: &Connection, invoice: i64, revision: i64) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id, discount_kind, discount_value, discount_amount, rate_basis_quantity, rate_basis_unit FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+    let mut stmt = conn.prepare("SELECT id, item_id, quantity, unit_price, amount, location_id, batch_id, trade_ledger_id, discount_kind, discount_value, discount_amount, rate_basis_quantity, rate_basis_unit, billed_quantity FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
     let lines = stmt
         .query_map([invoice], |r| {
             Ok((
@@ -1091,6 +1199,7 @@ fn copy_invoice_line_revisions(conn: &Connection, invoice: i64, revision: i64) -
                 r.get::<_, String>(9)?,
                 r.get::<_, i64>(10)?,
                 read_invoice_rate_basis(r, 11, 12)?,
+                r.get::<_, Option<i64>>(13)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1108,13 +1217,24 @@ fn copy_invoice_line_revisions(conn: &Connection, invoice: i64, revision: i64) -
         discount_value,
         discount_amount,
         rate_basis,
+        billed_quantity,
     ) in lines
     {
         let allocations = read_line_allocations(conn, id, false)?;
-        check_line_allocations(&allocations, quantity, location, batch)?;
+        check_line_allocations(
+            &allocations,
+            quantity,
+            billed_quantity.unwrap_or(quantity),
+            location,
+            batch,
+        )?;
         let discount = parse_discount(&discount_kind, &discount_value)?;
-        if discounted_line_amount_with_basis(quantity, unit_price, &discount, rate_basis.as_ref())?
-            != (amount, discount_amount)
+        if discounted_line_amount_with_basis(
+            billed_quantity.unwrap_or(quantity),
+            unit_price,
+            &discount,
+            rate_basis.as_ref(),
+        )? != (amount, discount_amount)
         {
             return Err(Error::Validation(
                 "Invoice discount calculation is inconsistent".into(),
@@ -1122,15 +1242,15 @@ fn copy_invoice_line_revisions(conn: &Connection, invoice: i64, revision: i64) -
         }
         conn.execute(
             "INSERT INTO invoice_revision_lines(revision_id, item_id, quantity, unit_price, amount, location_id,
-                batch_id, trade_ledger_id, discount_kind, discount_value, discount_amount, rate_basis_quantity, rate_basis_unit)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                batch_id, trade_ledger_id, discount_kind, discount_value, discount_amount, rate_basis_quantity, rate_basis_unit, billed_quantity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![revision, item, quantity, unit_price, amount, location, batch, trade, discount_kind,
                 discount_value, discount_amount, rate_basis.as_ref().map(|basis| basis.quantity),
-                rate_basis.as_ref().map(|basis| basis.unit.as_str())],
+                rate_basis.as_ref().map(|basis| basis.unit.as_str()), billed_quantity],
         )?;
         let revision_line = conn.last_insert_rowid();
         for allocation in allocations {
-            conn.execute("INSERT INTO invoice_revision_line_allocations(revision_line_id, location_id, batch_id, quantity) VALUES (?1, ?2, ?3, ?4)", params![revision_line, allocation.location_id, allocation.batch_id, allocation.quantity])?;
+            conn.execute("INSERT INTO invoice_revision_line_allocations(revision_line_id, location_id, batch_id, quantity, billed_quantity) VALUES (?1, ?2, ?3, ?4, ?5)", params![revision_line, allocation.location_id, allocation.batch_id, allocation.quantity, allocation.billed_quantity])?;
         }
     }
     Ok(())
@@ -2897,7 +3017,7 @@ impl Store {
             }
             other => Error::Database(other),
         })?;
-        let mut stmt = self.conn.prepare("SELECT id, item_id, quantity, unit_price, location_id, batch_id, trade_ledger_id, discount_kind, discount_value, amount, discount_amount, rate_basis_quantity, rate_basis_unit FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
+        let mut stmt = self.conn.prepare("SELECT id, item_id, quantity, unit_price, location_id, batch_id, trade_ledger_id, discount_kind, discount_value, amount, discount_amount, rate_basis_quantity, rate_basis_unit, billed_quantity FROM invoice_lines WHERE invoice_id = ?1 ORDER BY id")?;
         let raw_lines = stmt
             .query_map([invoice_id], |r| {
                 Ok((
@@ -2913,6 +3033,7 @@ impl Store {
                     r.get::<_, i64>(9)?,
                     r.get::<_, i64>(10)?,
                     read_invoice_rate_basis(r, 11, 12)?,
+                    r.get::<_, Option<i64>>(13)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2930,13 +3051,20 @@ impl Store {
             amount,
             discount_amount,
             rate_basis,
+            billed_quantity,
         ) in raw_lines
         {
             let allocations = read_line_allocations(&self.conn, id, false)?;
-            check_line_allocations(&allocations, quantity, location_id, batch_id)?;
+            check_line_allocations(
+                &allocations,
+                quantity,
+                billed_quantity.unwrap_or(quantity),
+                location_id,
+                batch_id,
+            )?;
             let discount = parse_discount(&discount_kind, &discount_value)?;
             if discounted_line_amount_with_basis(
-                quantity,
+                billed_quantity.unwrap_or(quantity),
                 unit_price,
                 &discount,
                 rate_basis.as_ref(),
@@ -2951,6 +3079,7 @@ impl Store {
                 quantity,
                 unit_price,
                 rate_basis,
+                billed_quantity,
                 location_id,
                 batch_id,
                 trade_ledger_id,
@@ -3256,6 +3385,7 @@ impl Store {
                             allocations: Vec::new(),
                             discount: InvoiceDiscount::None,
                             discount_amount: 0,
+                            billed_quantity: 0,
                             rate_basis: None,
                         },
                     ))
@@ -3355,6 +3485,7 @@ impl Store {
                         allocations: Vec::new(),
                         discount: InvoiceDiscount::None,
                         discount_amount: 0,
+                        billed_quantity: 0,
                         rate_basis: None,
                     },
                 ))

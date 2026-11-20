@@ -278,6 +278,7 @@ impl OrderDetail {
         quantities
             .into_iter()
             .map(|((location_id, batch_id), quantity)| InvoiceAllocation {
+                billed_quantity: None,
                 location_id,
                 batch_id,
                 quantity,

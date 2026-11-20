@@ -139,6 +139,7 @@ struct ImportedInvoiceLine {
     trade_ledger: String,
     existing_trade_ledger_id: Option<i64>,
     quantity: i64,
+    billed_quantity: i64,
     unit_price: i64,
     rate_basis: Option<InvoiceRateBasis>,
     discount: InvoiceDiscount,
@@ -150,6 +151,7 @@ struct ImportedStockAllocation {
     batch: Option<String>,
     existing_batch_id: Option<i64>,
     quantity: i64,
+    billed_quantity: i64,
 }
 #[derive(Debug, Clone)]
 struct ImportedInvoiceAdjustment {
@@ -1932,7 +1934,7 @@ fn parse_imported_bill_note(
     {
         return Err(Error::Validation("note postings do not balance".into()));
     }
-    let (stock, stock_total) = parse_invoice_stock(
+    let (mut stock, stock_total) = parse_invoice_stock(
         inventory_rows,
         breakdowns,
         kind,
@@ -1944,6 +1946,19 @@ fn parse_imported_bill_note(
         batches,
         issues,
     )?;
+    if stock.iter().any(|line| line.trade_ledger.is_empty()) {
+        let trade = stock
+            .iter()
+            .find(|line| !line.trade_ledger.is_empty())
+            .map(|line| (line.trade_ledger.clone(), line.existing_trade_ledger_id))
+            .ok_or_else(|| {
+                Error::Validation("A zero-value return item needs an accounting ledger".into())
+            })?;
+        for line in stock.iter_mut().filter(|line| line.trade_ledger.is_empty()) {
+            line.trade_ledger.clone_from(&trade.0);
+            line.existing_trade_ledger_id = trade.1;
+        }
+    }
     let original_invoice = original_return_invoice(node)?;
     if stock.is_empty() && original_invoice.is_some() {
         return Err(Error::Validation(
@@ -2329,7 +2344,7 @@ fn parse_imported_invoice(
             "Voucher party differs from its bill ledger".into(),
         ));
     }
-    let (lines, subtotal) = parse_invoice_stock(
+    let (mut lines, subtotal) = parse_invoice_stock(
         inventory_rows,
         breakdowns,
         kind,
@@ -2341,7 +2356,10 @@ fn parse_imported_invoice(
         batches,
         issues,
     )?;
-    let trade = lines.first().map(|line| line.trade_ledger.clone());
+    let trade = lines
+        .iter()
+        .find(|line| !line.trade_ledger.is_empty())
+        .map(|line| line.trade_ledger.clone());
     let trade = match trade {
         Some(trade) => trade,
         None => adjustments
@@ -2404,6 +2422,10 @@ fn parse_imported_invoice(
     }
     let existing_party_id = ledgers[&normalized(&party_name)].0;
     let existing_trade_id = ledgers[&normalized(&trade)].0;
+    for line in lines.iter_mut().filter(|line| line.trade_ledger.is_empty()) {
+        line.trade_ledger = trade.clone();
+        line.existing_trade_ledger_id = existing_trade_id;
+    }
     Ok(ImportedInvoice {
         kind,
         entry_mode,
@@ -2433,6 +2455,45 @@ struct StockLedgerBreakdown {
     ledger: String,
     posting_amount: i64,
     stock_amount: i128,
+}
+
+fn xml_item_amount(node: Node<'_, '_>) -> Result<i64> {
+    direct_text(node, "AMOUNT")
+        .filter(|value| !value.is_empty())
+        .map_or(Ok(0), |value| xml_amount(&value))
+}
+
+fn xml_item_billed(
+    node: Node<'_, '_>,
+    unit: &UnitMeasure,
+    actual: i64,
+    amount: i64,
+) -> Result<i64> {
+    direct_text(node, "BILLEDQTY")
+        .filter(|value| !value.is_empty())
+        .map_or(Ok(if amount == 0 { 0 } else { actual }), |value| {
+            unit.quantity(&value)
+        })
+}
+
+fn stock_item_ledger(
+    ledger: &str,
+    ledgers: &HashMap<String, (Option<i64>, Category)>,
+    kind: InvoiceKind,
+) -> Result<Option<i64>> {
+    let (id, category) = ledgers
+        .get(&normalized(ledger))
+        .ok_or_else(|| Error::Validation(format!("ledger {ledger} is unavailable")))?;
+    let compatible = match kind {
+        InvoiceKind::Sale => *category == Category::Income,
+        InvoiceKind::Purchase => matches!(category, Category::Expense | Category::Asset),
+    };
+    if !compatible {
+        return Err(Error::Validation(
+            "item accounting ledger has an incompatible category".into(),
+        ));
+    }
+    Ok(*id)
 }
 
 fn parse_invoice_stock(
@@ -2473,22 +2534,26 @@ fn parse_invoice_stock(
             .get(&normalized(&name))
             .ok_or_else(|| Error::Validation(format!("stock item {name} is unavailable")))?;
         let actual = unit.quantity(&invoice_field(item_node, "ACTUALQTY")?)?;
-        let billed = unit.quantity(&invoice_field(item_node, "BILLEDQTY")?)?;
-        if actual != billed
-            || actual == 0
+        let source_amount = xml_item_amount(item_node)?;
+        let billed = xml_item_billed(item_node, unit, actual, source_amount)?;
+        if actual == 0
+            || (billed != 0 && (billed > 0) != (actual > 0))
             || (actual < 0 && kind == InvoiceKind::Purchase && !returning)
         {
             return Err(Error::Validation(
-                "actual and billed quantities must match the supported stock direction".into(),
+                "actual and billed quantities must follow the supported stock direction".into(),
             ));
         }
         let quantity = actual
             .checked_abs()
             .ok_or_else(|| Error::Validation("quantity is too large".into()))?;
-        if quantity % 10_i64.pow(u32::from(3 - unit.precision)) != 0 {
+        let billed_quantity = billed
+            .checked_abs()
+            .ok_or_else(|| Error::Validation("billed quantity is too large".into()))?;
+        let step = 10_i64.pow(u32::from(3 - unit.precision));
+        if quantity % step != 0 || billed_quantity % step != 0 {
             return Err(Error::Validation("quantity exceeds unit precision".into()));
         }
-        let source_amount = xml_amount(&invoice_field(item_node, "AMOUNT")?)?;
         if source_amount != 0 && (source_amount > 0) == party_debit {
             return Err(Error::Validation(
                 "item amount direction is inconsistent".into(),
@@ -2536,13 +2601,15 @@ fn parse_invoice_stock(
                     })
                 };
                 (parse_amount(price)?, basis)
+            } else if source_amount == 0 {
+                (0, None)
             } else {
                 if posting.is_none() || !matches!(discount, InvoiceDiscount::None) {
                     return Err(Error::Validation("item rate is missing".into()));
                 }
                 let numerator = i128::from(source_amount).abs() * 1000;
-                let quantity = i128::from(quantity);
-                if numerator % quantity != 0 {
+                let quantity = i128::from(billed_quantity);
+                if quantity == 0 || numerator % quantity != 0 {
                     return Err(Error::Validation(
                         "An omitted item rate cannot be derived exactly in hundredths".into(),
                     ));
@@ -2554,7 +2621,7 @@ fn parse_invoice_stock(
                 )
             };
         let (amount, _) = discounted_line_amount_with_basis(
-            quantity,
+            billed_quantity,
             unit_price,
             &discount,
             rate_basis.as_ref(),
@@ -2565,7 +2632,9 @@ fn parse_invoice_stock(
                 "item amount differs from quantity and rate".into(),
             ));
         }
-        invoice_side(item_node, "ISDEEMEDPOSITIVE", !party_debit)?;
+        if expected != 0 {
+            invoice_side(item_node, "ISDEEMEDPOSITIVE", !party_debit)?;
+        }
         let allocations: Vec<_> = item_node
             .children()
             .filter(|n| {
@@ -2582,6 +2651,12 @@ fn parse_invoice_stock(
             let breakdown = &mut breakdowns[index];
             breakdown.stock_amount += i128::from(expected);
             breakdown.ledger.clone()
+        } else if expected == 0
+            && allocations
+                .iter()
+                .all(|allocation| !meaningful(*allocation))
+        {
+            String::new()
         } else {
             if allocations.len() != 1 {
                 return Err(Error::Validation(
@@ -2595,25 +2670,21 @@ fn parse_invoice_stock(
                 label,
                 issues,
             );
-            if xml_amount(&invoice_field(allocation, "AMOUNT")?)? != expected {
+            if xml_item_amount(allocation)? != expected {
                 return Err(Error::Validation(
                     "item accounting allocation differs from the item amount".into(),
                 ));
             }
-            invoice_side(allocation, "ISDEEMEDPOSITIVE", !party_debit)?;
+            if expected != 0 {
+                invoice_side(allocation, "ISDEEMEDPOSITIVE", !party_debit)?;
+            }
             invoice_field(allocation, "LEDGERNAME")?
         };
-        let (existing_trade_ledger_id, category) = ledgers
-            .get(&normalized(&ledger))
-            .ok_or_else(|| Error::Validation(format!("ledger {ledger} is unavailable")))?;
-        if (kind == InvoiceKind::Sale && *category != Category::Income)
-            || (kind == InvoiceKind::Purchase
-                && !matches!(category, Category::Expense | Category::Asset))
-        {
-            return Err(Error::Validation(
-                "item accounting ledger has an incompatible category".into(),
-            ));
-        }
+        let existing_trade_ledger_id = if ledger.is_empty() {
+            None
+        } else {
+            stock_item_ledger(&ledger, ledgers, kind)?
+        };
         let locations_in_line: Vec<_> = item_node
             .children()
             .filter(|n| {
@@ -2634,6 +2705,7 @@ fn parse_invoice_stock(
                 batch: None,
                 existing_batch_id: None,
                 quantity,
+                billed_quantity,
             });
         } else {
             if locations_in_line.len() > 1 && matches!(discount, InvoiceDiscount::Fixed(_)) {
@@ -2643,6 +2715,7 @@ fn parse_invoice_stock(
             }
             let mut total_quantity = 0_i128;
             let mut total_amount = 0_i128;
+            let mut total_billed = 0_i128;
             for location_node in locations_in_line {
                 invoice_list_fields(
                     location_node,
@@ -2659,11 +2732,16 @@ fn parse_invoice_stock(
                 );
                 let allocated_actual =
                     unit.quantity(&invoice_field(location_node, "ACTUALQTY")?)?;
-                let allocated_billed =
-                    unit.quantity(&invoice_field(location_node, "BILLEDQTY")?)?;
+                let source_allocation_amount = xml_item_amount(location_node)?;
+                let allocated_billed = xml_item_billed(
+                    location_node,
+                    unit,
+                    allocated_actual,
+                    source_allocation_amount,
+                )?;
                 if allocated_actual == 0
-                    || allocated_actual != allocated_billed
                     || (allocated_actual > 0) != (actual > 0)
+                    || (allocated_billed != 0 && (allocated_billed > 0) != (actual > 0))
                 {
                     return Err(Error::Validation(
                         "location quantities do not match the item direction".into(),
@@ -2672,13 +2750,16 @@ fn parse_invoice_stock(
                 let allocated_quantity = allocated_actual
                     .checked_abs()
                     .ok_or_else(|| Error::Validation("quantity is too large".into()))?;
-                if allocated_quantity % 10_i64.pow(u32::from(3 - unit.precision)) != 0 {
+                let allocated_billed = allocated_billed
+                    .checked_abs()
+                    .ok_or_else(|| Error::Validation("billed quantity is too large".into()))?;
+                if allocated_quantity % step != 0 || allocated_billed % step != 0 {
                     return Err(Error::Validation(
                         "allocation exceeds unit precision".into(),
                     ));
                 }
                 let (allocated_amount, _) = discounted_line_amount_with_basis(
-                    allocated_quantity,
+                    allocated_billed,
                     unit_price,
                     &discount,
                     rate_basis.as_ref(),
@@ -2688,7 +2769,7 @@ fn parse_invoice_stock(
                 } else {
                     allocated_amount
                 };
-                if xml_amount(&invoice_field(location_node, "AMOUNT")?)? != expected_amount {
+                if source_allocation_amount != expected_amount {
                     return Err(Error::Validation(
                         "allocation amount differs from quantity and rate".into(),
                     ));
@@ -2714,15 +2795,20 @@ fn parse_invoice_stock(
                 });
                 total_quantity += i128::from(allocated_quantity);
                 total_amount += i128::from(allocated_amount);
+                total_billed += i128::from(allocated_billed);
                 stock_allocations.push(ImportedStockAllocation {
                     location,
                     existing_location_id,
                     batch,
                     existing_batch_id,
                     quantity: allocated_quantity,
+                    billed_quantity: allocated_billed,
                 });
             }
-            if total_quantity != i128::from(quantity) || total_amount != i128::from(amount) {
+            if total_quantity != i128::from(quantity)
+                || total_billed != i128::from(billed_quantity)
+                || total_amount != i128::from(amount)
+            {
                 return Err(Error::Validation(
                     "location allocations do not match the item totals".into(),
                 ));
@@ -2735,9 +2821,10 @@ fn parse_invoice_stock(
             unit: unit.symbol.clone(),
             precision: unit.precision,
             allocations: stock_allocations,
-            existing_trade_ledger_id: *existing_trade_ledger_id,
+            existing_trade_ledger_id,
             trade_ledger: ledger,
             quantity,
+            billed_quantity,
             unit_price,
             rate_basis,
             discount,
@@ -3583,7 +3670,7 @@ fn apply_stock_return(
                 ledger,
                 quantity: source_stock.quantity,
                 amount: discounted_line_amount_with_basis(
-                    source_stock.quantity,
+                    source_stock.billed_quantity,
                     line.unit_price,
                     &line.discount,
                     line.rate_basis.as_ref(),
@@ -6442,6 +6529,8 @@ impl Store {
                         location_id,
                         batch_id,
                         quantity: allocation.quantity,
+                        billed_quantity: (allocation.billed_quantity != allocation.quantity)
+                            .then_some(allocation.billed_quantity),
                     });
                 }
                 let mut allocations = allocations.into_iter();
@@ -6459,6 +6548,8 @@ impl Store {
                     extra_allocations: allocations.collect(),
                     discount: line.discount.clone(),
                     quantity: line.quantity,
+                    billed_quantity: (line.billed_quantity != line.quantity)
+                        .then_some(line.billed_quantity),
                     unit_price: line.unit_price,
                     rate_basis: line.rate_basis.clone(),
                 });
@@ -6732,6 +6823,192 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_billed_quantities_independently_of_stock_movements() {
+        for (kind, sign, party_category, trade_category) in [
+            ("Sales", 1_i64, Category::Asset, Category::Income),
+            ("Purchase", -1, Category::Liability, Category::Expense),
+        ] {
+            let mut store = Store::memory().unwrap();
+            let company = store
+                .create_company("Actual and billed quantities")
+                .unwrap();
+            let party = store
+                .create_ledger(company, "Party", party_category)
+                .unwrap();
+            store
+                .create_ledger(company, "Trade", trade_category)
+                .unwrap();
+            let widget = store.create_stock_item(company, "Widget", "pcs").unwrap();
+            let gift = store.create_stock_item(company, "Gift", "pcs").unwrap();
+            let north = store.create_stock_location(company, "North").unwrap();
+            let south = store.create_stock_location(company, "South").unwrap();
+            let main = store
+                .stock_locations(company)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.name == "Main")
+                .unwrap()
+                .id;
+            if sign > 0 {
+                for (item, location, qty) in [
+                    (widget, north, 20000),
+                    (widget, south, 30000),
+                    (gift, main, 2000),
+                ] {
+                    let receipt = store
+                        .adjust_stock_at(company, item, location, "2026-04-01", qty, "Opening")
+                        .unwrap();
+                    store
+                        .set_stock_receipt_cost(company, receipt, qty / 10, "Opening cost")
+                        .unwrap();
+                }
+            }
+            let allocation = |location, actual, billed: i64| {
+                format!(
+                "<BATCHALLOCATIONS.LIST><GODOWNNAME>{location}</GODOWNNAME><ACTUALQTY>{actual} pcs</ACTUALQTY><BILLEDQTY>{billed} pcs</BILLEDQTY><AMOUNT>{}</AMOUNT></BATCHALLOCATIONS.LIST>",
+                sign * 10 * billed,
+            )
+            };
+            let north_row = allocation("North", 10, 10);
+            let south_row = allocation("South", 15, 14);
+            let free = if sign > 0 {
+                "<ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Gift</STOCKITEMNAME><ACTUALQTY>1 pcs</ACTUALQTY><BILLEDQTY>0 pcs</BILLEDQTY></ALLINVENTORYENTRIES.LIST>"
+            } else {
+                ""
+            };
+            let item_amount = sign * 240;
+            let party_amount = -item_amount;
+            let xml = format!(
+                r#"<ENVELOPE><BODY><DATA><MESSAGE>
+                <VOUCHER><DATE>20260402</DATE><VOUCHERTYPENAME>{kind}</VOUCHERTYPENAME>
+                    <VOUCHERNUMBER>INV</VOUCHERNUMBER><ISINVOICE>Yes</ISINVOICE><PARTYLEDGERNAME>Party</PARTYLEDGERNAME>
+                    <LEDGERENTRIES.LIST><LEDGERNAME>Party</LEDGERNAME><AMOUNT>{party_amount}</AMOUNT>
+                        <BILLALLOCATIONS.LIST><NAME>BILL</NAME><BILLTYPE>New Ref</BILLTYPE>
+                            <AMOUNT>{party_amount}</AMOUNT>
+                        </BILLALLOCATIONS.LIST>
+                    </LEDGERENTRIES.LIST>
+                    <ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>Widget</STOCKITEMNAME>
+                        <ACTUALQTY>25 pcs</ACTUALQTY><BILLEDQTY>24 pcs</BILLEDQTY>
+                        <RATE>10.00/pcs</RATE><AMOUNT>{item_amount}</AMOUNT>
+                        <ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Trade</LEDGERNAME>
+                            <AMOUNT>{item_amount}</AMOUNT>
+                        </ACCOUNTINGALLOCATIONS.LIST>
+                        {north_row}{south_row}
+                    </ALLINVENTORYENTRIES.LIST>
+                    {free}
+                </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#
+            );
+            let unbalanced = xml.replace(&south_row, &allocation("South", 15, 15));
+            let preview = store
+                .preview_xml_import(company, unbalanced.as_bytes())
+                .unwrap();
+            assert!(!preview.can_apply());
+            assert!(preview
+                .issues()
+                .iter()
+                .any(|issue| issue.contains("location allocations do not match")));
+            let preview = store.preview_xml_import(company, xml.as_bytes()).unwrap();
+            assert!(preview.can_apply(), "{:?}", preview.issues());
+            store.apply_xml_import(&preview).unwrap();
+            let invoice = store.invoices(company).unwrap().remove(0);
+            assert_eq!((invoice.total, invoice.outstanding), (24000, 24000));
+            let line = invoice
+                .lines
+                .iter()
+                .find(|line| line.item == "Widget")
+                .unwrap();
+            assert_eq!(
+                (line.quantity, line.billed_quantity, line.amount),
+                (25000, 24000, 24000)
+            );
+            assert_eq!(
+                (
+                    line.allocations[1].quantity,
+                    line.allocations[1].billed_quantity
+                ),
+                (15000, 14000)
+            );
+            let balance = store
+                .ledger_register(company, party, None, None)
+                .unwrap()
+                .closing_balance;
+            assert_eq!(balance, i128::from(sign) * 24000);
+            let valued = store
+                .stock_valuation_at_average_cost(company, "2026-04-02")
+                .unwrap();
+            assert_eq!(valued.known_value, if sign > 0 { 2600 } else { 24000 });
+            let stock = store.stock_balances(company, None).unwrap();
+            assert_eq!(
+                stock
+                    .iter()
+                    .find(|row| row.item.id == widget)
+                    .unwrap()
+                    .quantity,
+                25000
+            );
+            if sign > 0 {
+                let gift_line = invoice
+                    .lines
+                    .iter()
+                    .find(|line| line.item == "Gift")
+                    .unwrap();
+                assert_eq!(
+                    (
+                        gift_line.quantity,
+                        gift_line.billed_quantity,
+                        gift_line.amount
+                    ),
+                    (1000, 0, 0)
+                );
+                assert_eq!(
+                    stock
+                        .iter()
+                        .find(|row| row.item.id == gift)
+                        .unwrap()
+                        .quantity,
+                    1000
+                );
+            }
+            let mut draft = store.invoice_draft(company, invoice.id).unwrap();
+            assert_eq!(draft.lines[0].billed_quantity, Some(24000));
+            assert_eq!(
+                draft.lines[0].extra_allocations[0].billed_quantity,
+                Some(14000)
+            );
+            draft.narration = "Verified counted and billed quantities".into();
+            store.update_invoice(company, invoice.id, &draft).unwrap();
+            let revision = store
+                .invoice_revisions(company, invoice.id)
+                .unwrap()
+                .remove(0);
+            assert_eq!(revision.lines[0].billed_quantity, 24000);
+            assert_eq!(revision.lines[0].allocations[1].billed_quantity, 14000);
+            store
+                .reverse_invoice(
+                    company,
+                    invoice.id,
+                    "2026-04-03",
+                    "REVERSE",
+                    "Test reversal",
+                )
+                .unwrap();
+            let stock = store.stock_balances(company, None).unwrap();
+            assert_eq!(
+                stock
+                    .iter()
+                    .find(|row| row.item.id == widget)
+                    .unwrap()
+                    .quantity,
+                if sign > 0 { 50000 } else { 0 }
+            );
+            assert!(store
+                .outstanding_invoices(company, "2026-04-03")
+                .unwrap()
+                .is_empty());
+        }
+    }
 
     #[test]
     fn imports_nested_units_and_keeps_stock_and_invoice_rate_bases() {
@@ -10407,6 +10684,7 @@ mod tests {
                 trade_ledger: "Sales".into(),
                 existing_trade_ledger_id: Some(sales),
                 quantity: 3000,
+                billed_quantity: 3000,
                 unit_price: 1000,
                 discount: InvoiceDiscount::None,
                 allocations: vec![ImportedStockAllocation {
@@ -10415,6 +10693,7 @@ mod tests {
                     batch: None,
                     existing_batch_id: None,
                     quantity: 3000,
+                    billed_quantity: 3000,
                 }],
             }],
         };

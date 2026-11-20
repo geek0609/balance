@@ -1026,6 +1026,7 @@ mod combined_billing_tests {
             lines: [1000, 3000]
                 .into_iter()
                 .map(|quantity| InvoiceLine {
+                    billed_quantity: None,
                     rate_basis: None,
                     item_id: item,
                     location_id: location,

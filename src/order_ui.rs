@@ -1845,6 +1845,7 @@ impl App {
                         .iter()
                         .skip(1)
                         .map(|a| InvoiceAllocationForm {
+                            billed_quantity: String::new(),
                             location: Some(a.location_id),
                             batch: a.batch_id,
                             quantity: format_quantity(a.quantity.into()),

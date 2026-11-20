@@ -603,6 +603,7 @@ mod tests {
             tax_calculation: None,
             adjustments: Vec::new(),
             lines: vec![InvoiceLine {
+                billed_quantity: None,
                 rate_basis: None,
                 item_id: line.item_id,
                 location_id: line.location_id,
@@ -753,6 +754,7 @@ mod tests {
             .is_err());
         direct.reference = "INV-02".into();
         direct.lines[0].extra_allocations.push(InvoiceAllocation {
+            billed_quantity: None,
             location_id: other_location,
             batch_id: None,
             quantity: 1000,

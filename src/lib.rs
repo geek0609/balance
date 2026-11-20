@@ -59,7 +59,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 91;
+const SCHEMA_VERSION: i64 = 92;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -1050,6 +1050,10 @@ impl Store {
             stock_units::migrate(&tx)?;
             inventory::migrate_invoice_rate_basis(&tx)?;
             tx.pragma_update(None, "user_version", 91)?;
+        }
+        if version < 92 {
+            inventory::migrate_invoice_billed_quantities(&tx)?;
+            tx.pragma_update(None, "user_version", 92)?;
         }
         tx.commit()?;
         Ok(Self { conn })
