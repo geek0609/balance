@@ -26,6 +26,7 @@ struct OrderItem {
     unit_price: i64,
     amount: i128,
     lots: Vec<DeliveryLot>,
+    trade_default: Option<trade_defaults::TradeDefault>,
 }
 
 #[derive(Debug, Clone)]
@@ -358,21 +359,20 @@ pub(super) fn parse(
     }
     let mut reference = source_ref(direct_text(node, "ORDERNO"));
     collect_reference(&mut reference, direct_text(node, "BASICORDERREF"))?;
+    let accounts = trade_defaults::SourceAccounts {
+        kind,
+        party: &party,
+        ledgers,
+        label,
+        strict: false,
+    };
+    let voucher_defaults = accounts.voucher(node, issues)?;
     let mut items = BTreeMap::<String, OrderItem>::new();
     for entry in node
         .children()
         .filter(|row| row.is_element() && meaningful(*row))
     {
         match local_name(entry).to_ascii_uppercase().as_str() {
-            "LEDGERENTRIES.LIST" | "ALLLEDGERENTRIES.LIST" => {
-                invoice_list_fields(
-                    entry,
-                    &["LEDGERNAME", "AMOUNT", "ISDEEMEDPOSITIVE", "ISPARTYLEDGER"],
-                    label,
-                    issues,
-                );
-                xml_item_amount(entry)?;
-            }
             "ALLINVENTORYENTRIES.LIST" | "INVENTORYENTRIES.LIST" => {
                 invoice_list_fields(
                     entry,
@@ -418,19 +418,8 @@ pub(super) fn parse(
                         "Order amount differs from its quantity and rate".into(),
                     ));
                 }
-                for account in entry.children().filter(|c| {
-                    c.is_element()
-                        && local_name(*c).eq_ignore_ascii_case("ACCOUNTINGALLOCATIONS.LIST")
-                        && meaningful(*c)
-                }) {
-                    invoice_list_fields(
-                        account,
-                        &["LEDGERNAME", "AMOUNT", "ISDEEMEDPOSITIVE"],
-                        label,
-                        issues,
-                    );
-                    xml_item_amount(account)?;
-                }
+                let trade_default =
+                    accounts.item(entry, voucher_defaults.common.as_ref(), issues)?;
                 collect_reference(&mut reference, direct_text(entry, "ORDERNO"))?;
                 let item_date = due_date(entry)?;
                 let mut lots = Vec::new();
@@ -503,7 +492,16 @@ pub(super) fn parse(
                     unit_price: price,
                     amount: 0,
                     lots: Vec::new(),
+                    trade_default: trade_default.clone(),
                 });
+                if let Some(saved) = &order_item.trade_default {
+                    if trade_default
+                        .as_ref()
+                        .is_none_or(|current| !saved.same_ledger(current))
+                    {
+                        order_item.trade_default = None;
+                    }
+                }
                 if order_item.unit_price != price {
                     return Err(Error::Validation(
                         "Several prices for the same order item require separate order lines"
@@ -594,12 +592,12 @@ pub(super) fn write(conn: &Connection, company: i64, order: &ImportedOrder) -> R
     )?;
     save_metadata(conn, company, "order", id, &order.metadata)?;
     for (line, item) in lines.into_iter().zip(&order.items) {
-        if item.lots.len() == 1
-            && item
+        let has_schedule = item.lots.len() != 1
+            || item
                 .lots
                 .iter()
-                .all(|lot| lot.date.is_none() && lot.location.is_none() && lot.batch.is_none())
-        {
+                .any(|lot| lot.date.is_some() || lot.location.is_some() || lot.batch.is_some());
+        if !has_schedule && item.trade_default.is_none() {
             continue;
         }
         let line_id: i64 = conn.query_row(
@@ -607,6 +605,15 @@ pub(super) fn write(conn: &Connection, company: i64, order: &ImportedOrder) -> R
             params![id, line.item_id],
             |row| row.get(0),
         )?;
+        if let Some(account) = &item.trade_default {
+            conn.execute(
+                "INSERT INTO order_line_trade_defaults(order_line_id, ledger_id) VALUES (?1, ?2)",
+                params![line_id, account.resolve(conn, company, party, order.kind)?],
+            )?;
+        }
+        if !has_schedule {
+            continue;
+        }
         for lot in &item.lots {
             if lot.date.as_ref().is_some_and(|due| due < &order.date) {
                 return Err(Error::Validation(

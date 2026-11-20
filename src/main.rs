@@ -3358,13 +3358,24 @@ impl App {
         source: InvoiceSource,
         kind: InvoiceKind,
         party: i64,
-        lines: Vec<InvoiceLineForm>,
+        mut lines: Vec<InvoiceLineForm>,
     ) {
+        let default = lines
+            .first()
+            .and_then(|line| line.trade_ledger)
+            .filter(|_| lines.iter().all(|line| line.trade_ledger.is_some()));
+        if let Some(default) = default {
+            for line in &mut lines {
+                if line.trade_ledger == Some(default) {
+                    line.trade_ledger = None;
+                }
+            }
+        }
         self.invoice_source = Some(source);
         self.invoice_kind = kind;
         self.invoice_entry_mode = InvoiceEntryMode::Invoice;
         self.invoice_party = Some(party);
-        self.invoice_trade = None;
+        self.invoice_trade = default;
         self.invoice_date.clear();
         self.invoice_reference.clear();
         self.invoice_external_number.clear();
@@ -3568,14 +3579,22 @@ impl App {
             },
         );
         let from_note = self.invoice_source == Some(InvoiceSource::StockNotes);
+        let from_order = matches!(self.invoice_source, Some(InvoiceSource::Order(_)));
         let mut order_lots = Vec::new();
+        let mut order_trade_defaults = std::collections::HashMap::new();
         match self.invoice_source {
             Some(InvoiceSource::Order(order)) => {
                 ui.label(format!(
                     "Order {order}. Review quantities and prices before saving."
                 ));
                 match self.store.order_detail(company, order) {
-                    Ok(detail) => order_lots = detail.delivery_lots,
+                    Ok(detail) => {
+                        order_lots = detail.delivery_lots;
+                        order_trade_defaults.extend(detail.lines.into_iter().filter_map(|line| {
+                            line.trade_ledger_id
+                                .map(|ledger| (line.line.item_id, ledger))
+                        }));
+                    }
                     Err(error) => {
                         self.failure(error);
                         return;
@@ -3874,6 +3893,7 @@ impl App {
         });
         ui.small("Review the tax amounts before saving. Percentage discounts apply to the rounded gross line amount.");
         let mut remove = None;
+        let document_trade = self.invoice_trade;
         for (index, line) in self.invoice_lines.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 if let Some((_, reference)) = &line.stock_note_line {
@@ -3890,6 +3910,12 @@ impl App {
                         }
                         line.batch = None;
                         line.order_due_on = None;
+                        if from_order {
+                            line.trade_ledger = line
+                                .item
+                                .and_then(|item| order_trade_defaults.get(&item).copied())
+                                .filter(|ledger| Some(*ledger) != document_trade);
+                        }
                         for allocation in &mut line.extra_allocations {
                             allocation.batch = None;
                         }

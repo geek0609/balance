@@ -278,6 +278,8 @@ pub struct StockNoteLine {
     pub source_tracking: Option<String>,
     pub order_id: Option<i64>,
     pub order_reference: Option<String>,
+    pub trade_ledger_id: Option<i64>,
+    pub trade_ledger: Option<String>,
 }
 
 impl StockNoteLine {
@@ -345,7 +347,7 @@ pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<V
         "SELECT l.id, l.item_id, l.location_id, l.batch_id, l.quantity, l.unit_price,
                 i.name, i.unit, loc.name, b.name, COALESCE(q.billed, 0), COALESCE(ret.returned, 0),
                 COALESCE((SELECT SUM(rq.returned) FROM invoice_returned_quantities rq WHERE rq.delivery_line = l.id), 0),
-                t.reference, src.order_id, o.reference
+                t.reference, src.order_id, o.reference, trade.ledger_id, ledger.name
          FROM stock_note_lines l JOIN stock_notes n ON n.id = l.note_id
          JOIN stock_items i ON i.id = l.item_id AND i.company_id = n.company_id
          JOIN stock_locations loc ON loc.id = l.location_id AND loc.company_id = n.company_id
@@ -355,6 +357,8 @@ pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<V
          LEFT JOIN imported_stock_note_tracking t ON t.note_line_id = l.id
          LEFT JOIN stock_note_order_sources src ON src.note_line_id = l.id
          LEFT JOIN orders o ON o.id = src.order_id
+         LEFT JOIN stock_note_trade_defaults trade ON trade.note_line_id = l.id
+         LEFT JOIN ledgers ledger ON ledger.id = trade.ledger_id
          WHERE n.company_id = ?1 AND n.id = ?2 ORDER BY l.id",
     )?;
     let rows = stmt
@@ -378,6 +382,8 @@ pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<V
                 source_tracking: row.get(13)?,
                 order_id: row.get(14)?,
                 order_reference: row.get(15)?,
+                trade_ledger_id: row.get(16)?,
+                trade_ledger: row.get(17)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -799,6 +805,13 @@ pub(crate) fn write_stock_note(
                 conn,
                 crate::order_lots::Source::NoteLine(note_line),
                 &assignments[index],
+            )?;
+            conn.execute(
+                "INSERT INTO stock_note_trade_defaults(note_line_id, ledger_id)
+                 SELECT ?1, trade.ledger_id FROM order_lines l
+                 JOIN order_line_trade_defaults trade ON trade.order_line_id = l.id
+                 WHERE l.order_id = ?2 AND l.item_id = ?3",
+                params![note_line, source.order_id, line.item_id],
             )?;
         }
         if draft.kind == InvoiceKind::Purchase {

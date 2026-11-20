@@ -24,6 +24,7 @@ struct NoteLine {
     allocation: ImportedStockAllocation,
     value: Option<i64>,
     order: orders::OrderFields,
+    trade_default: Option<trade_defaults::TradeDefault>,
 }
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -74,6 +75,8 @@ struct NoteStock<'a> {
     locations: &'a HashMap<String, Option<i64>>,
     batches: &'a HashMap<(String, String), i64>,
     order: orders::OrderFields,
+    accounts: trade_defaults::SourceAccounts<'a>,
+    common_ledger: Option<trade_defaults::TradeDefault>,
 }
 
 impl NoteStock<'_> {
@@ -98,6 +101,7 @@ impl NoteStock<'_> {
                 "ORDERNO",
                 "ORDERDUEDATE",
                 "BATCHALLOCATIONS.LIST",
+                "ACCOUNTINGALLOCATIONS.LIST",
             ],
             label,
             issues,
@@ -132,6 +136,9 @@ impl NoteStock<'_> {
             batches
         };
         let item_order = orders::OrderFields::read(node, &self.order)?;
+        let trade_default = self
+            .accounts
+            .item(node, self.common_ledger.as_ref(), issues)?;
         let mut planned = Vec::new();
         for entry in rows {
             if entry != node {
@@ -148,6 +155,7 @@ impl NoteStock<'_> {
                         "BASICORDERREF",
                         "ORDERNO",
                         "ORDERDUEDATE",
+                        "ACCOUNTINGALLOCATIONS.LIST",
                     ],
                     label,
                     issues,
@@ -159,6 +167,11 @@ impl NoteStock<'_> {
                 orders::OrderFields::read(entry, &item_order)?
             };
             order.validate_allocation()?;
+            let allocation_default = if entry == node {
+                trade_default.clone()
+            } else {
+                self.accounts.item(entry, trade_default.as_ref(), issues)?
+            };
             let location = direct_text(entry, "GODOWNNAME")
                 .filter(|value| !value.is_empty())
                 .or_else(|| header_location.clone())
@@ -212,6 +225,7 @@ impl NoteStock<'_> {
                 },
                 value: stored_value(entry)?,
                 order,
+                trade_default: allocation_default,
             });
         }
         if planned
@@ -330,12 +344,22 @@ pub(super) fn parse(
             "Stock note party is not an asset or liability ledger".into(),
         ));
     }
+    let accounts = trade_defaults::SourceAccounts {
+        kind,
+        party: &party,
+        ledgers,
+        label,
+        strict: true,
+    };
+    let voucher_defaults = accounts.voucher(node, issues)?;
     let stock = NoteStock {
         kind,
         items,
         locations,
         batches,
         order: orders::OrderFields::read(node, &orders::OrderFields::default())?,
+        accounts,
+        common_ledger: voucher_defaults.common,
     };
     let mut lines = Vec::new();
     for entry in node
@@ -345,21 +369,6 @@ pub(super) fn parse(
         let entry_type = local_name(entry).to_ascii_uppercase();
         if matches!(
             entry_type.as_str(),
-            "LEDGERENTRIES.LIST" | "ALLLEDGERENTRIES.LIST"
-        ) {
-            invoice_list_fields(
-                entry,
-                &["LEDGERNAME", "AMOUNT", "ISDEEMEDPOSITIVE", "ISPARTYLEDGER"],
-                label,
-                issues,
-            );
-            if xml_item_amount(entry)? != 0 {
-                return Err(Error::Validation(
-                    "Stock notes with ledger postings are unsupported".into(),
-                ));
-            }
-        } else if matches!(
-            entry_type.as_str(),
             "ALLINVENTORYENTRIES.LIST" | "INVENTORYENTRIES.LIST"
         ) {
             lines.extend(stock.allocations(entry, label, issues)?);
@@ -368,6 +377,25 @@ pub(super) fn parse(
     if lines.is_empty() {
         return Err(Error::Validation(
             "Stock note needs at least one inventory line".into(),
+        ));
+    }
+    if voucher_defaults.requires_line_accounts
+        && lines.iter().any(|line| line.trade_default.is_none())
+    {
+        return Err(Error::Validation(
+            "Stock note ledger amounts require a clear trade ledger for each stock allocation"
+                .into(),
+        ));
+    }
+    if voucher_defaults.valued_accounts.iter().any(|account| {
+        !lines.iter().any(|line| {
+            line.trade_default
+                .as_ref()
+                .is_some_and(|trade| trade.same_ledger(account))
+        })
+    }) {
+        return Err(Error::Validation(
+            "Stock note has a ledger amount with no corresponding stock allocation".into(),
         ));
     }
     Ok(ImportedStockNote {
@@ -495,6 +523,14 @@ impl NewTracking {
             ));
         }
         for (id, line) in ids.into_iter().zip(&note.lines) {
+            if let Some(account) = &line.trade_default {
+                let ledger = account.resolve(conn, company, party, note.kind)?;
+                conn.execute(
+                    "INSERT INTO stock_note_trade_defaults(note_line_id, ledger_id)
+                     VALUES (?1, ?2) ON CONFLICT(note_line_id) DO UPDATE SET ledger_id = excluded.ledger_id",
+                    params![id, ledger],
+                )?;
+            }
             if let Some(reference) = &line.allocation.tracking {
                 let key = normalized(reference);
                 conn.execute(
@@ -701,6 +737,191 @@ mod tests {
              </ALLINVENTORYENTRIES.LIST>",
             opposite = -amount
         ))
+    }
+
+    #[test]
+    fn order_and_delivery_ledger_defaults_survive_until_the_invoice() {
+        let (mut store, company, item, location) = fixture(InvoiceKind::Sale);
+        let wholesale = store
+            .create_ledger(company, "Wholesale", Category::Income)
+            .unwrap();
+        let retail = store
+            .create_ledger(company, "Retail", Category::Income)
+            .unwrap();
+        let trade = find_ledger(&store.conn, company, "Trade").unwrap().unwrap();
+        let party = find_ledger(&store.conn, company, "Party").unwrap().unwrap();
+        store
+            .adjust_stock_at(company, item, location, "2026-04-01", 5000, "Opening")
+            .unwrap();
+        let order = voucher(
+            "Sales Order",
+            "20260401",
+            "ORDER",
+            r#"
+            <INVENTORYENTRIES.LIST><STOCKITEMNAME>Part</STOCKITEMNAME>
+              <ACTUALQTY>2 pcs</ACTUALQTY><RATE>10/pcs</RATE><AMOUNT>20</AMOUNT>
+              <ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Wholesale</LEDGERNAME><AMOUNT>20</AMOUNT>
+              </ACCOUNTINGALLOCATIONS.LIST>
+            </INVENTORYENTRIES.LIST>"#,
+        );
+        let inherited = voucher(
+            "Delivery Note",
+            "20260402",
+            "INHERITED",
+            r#"
+            <ORDERNO>ORDER</ORDERNO>
+            <INVENTORYENTRIES.LIST><STOCKITEMNAME>Part</STOCKITEMNAME>
+              <ACTUALQTY>-1 pcs</ACTUALQTY><AMOUNT>10</AMOUNT>
+            </INVENTORYENTRIES.LIST>"#,
+        );
+        let override_note = voucher(
+            "Delivery Note",
+            "20260403",
+            "OVERRIDE",
+            r#"
+            <ALLLEDGERENTRIES.LIST><LEDGERNAME>Party</LEDGERNAME><ISPARTYLEDGER>Yes</ISPARTYLEDGER>
+              <AMOUNT>-30</AMOUNT></ALLLEDGERENTRIES.LIST>
+            <ALLLEDGERENTRIES.LIST><LEDGERNAME>Trade</LEDGERNAME><AMOUNT>20</AMOUNT>
+              </ALLLEDGERENTRIES.LIST>
+            <INVENTORYENTRIES.LIST><STOCKITEMNAME>Part</STOCKITEMNAME>
+              <ACTUALQTY>-3 pcs</ACTUALQTY><AMOUNT>30</AMOUNT>
+              <BATCHALLOCATIONS.LIST><GODOWNNAME>Main</GODOWNNAME><ACTUALQTY>-2 pcs</ACTUALQTY>
+                <AMOUNT>20</AMOUNT>
+              </BATCHALLOCATIONS.LIST>
+              <BATCHALLOCATIONS.LIST><GODOWNNAME>Main</GODOWNNAME><ACTUALQTY>-1 pcs</ACTUALQTY>
+                <AMOUNT>10</AMOUNT><ORDERNO>ORDER</ORDERNO>
+                <ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Retail</LEDGERNAME>
+                  <AMOUNT>10</AMOUNT></ACCOUNTINGALLOCATIONS.LIST>
+              </BATCHALLOCATIONS.LIST>
+            </INVENTORYENTRIES.LIST>"#,
+        );
+        let plan = store
+            .preview_xml_import(company, &envelope(&(order + &inherited + &override_note)))
+            .unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        store.apply_xml_import(&plan).unwrap();
+        assert!(store.vouchers(company).unwrap().is_empty());
+        let order = store.orders(company).unwrap().remove(0);
+        assert_eq!(
+            store.order_detail(company, order.id).unwrap().lines[0].trade_ledger_id,
+            Some(wholesale)
+        );
+
+        let notes = store.stock_notes(company, None).unwrap();
+        let read_lines = |reference: &str| {
+            let note = notes
+                .iter()
+                .find(|note| note.reference == reference)
+                .unwrap();
+            store.stock_note_lines(company, note.id).unwrap()
+        };
+        let inherited = read_lines("INHERITED").remove(0);
+        let overridden = read_lines("OVERRIDE");
+        assert_eq!(inherited.trade_ledger.as_deref(), Some("Wholesale"));
+        assert_eq!(
+            overridden
+                .iter()
+                .map(|line| line.trade_ledger_id)
+                .collect::<Vec<_>>(),
+            [Some(trade), Some(retail)]
+        );
+        assert_eq!(overridden[1].order_id, Some(order.id));
+
+        let sources = [inherited, overridden[1].clone()];
+        let invoice = InvoiceDraft {
+            kind: InvoiceKind::Sale,
+            entry_mode: InvoiceEntryMode::Invoice,
+            date: "2026-04-04".into(),
+            reference: "STOCK-BILL".into(),
+            external_reference: Default::default(),
+            due_date: None,
+            credit_days: None,
+            bill_reference: None,
+            bill_splits: Vec::new(),
+            narration: String::new(),
+            party_ledger_id: party,
+            trade_ledger_id: trade,
+            tax_ledger_id: None,
+            tax_amount: 0,
+            additional_taxes: Vec::new(),
+            tax_calculation: None,
+            lines: sources
+                .iter()
+                .map(|line| InvoiceLine {
+                    item_id: item,
+                    trade_ledger_id: line.trade_ledger_id,
+                    location_id: location,
+                    batch_id: None,
+                    extra_allocations: Vec::new(),
+                    discount: InvoiceDiscount::None,
+                    quantity: line.values.quantity,
+                    billed_quantity: None,
+                    unit_price: line.values.unit_price,
+                    rate_basis: None,
+                })
+                .collect(),
+            adjustments: Vec::new(),
+        };
+        let ids = sources.map(|line| line.id);
+        store.invoice_stock_notes(company, &ids, &invoice).unwrap();
+        let posted = store.invoices(company).unwrap().remove(0);
+        assert_eq!(posted.total, 2000);
+        assert_eq!(
+            posted
+                .lines
+                .iter()
+                .map(|line| line.trade_ledger.as_str())
+                .collect::<Vec<_>>(),
+            ["Wholesale", "Retail"]
+        );
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            1000
+        );
+    }
+
+    #[test]
+    fn receipt_ledger_annotations_leave_stock_costs_and_accounts_independent() {
+        let (mut store, company, _, _) = fixture(InvoiceKind::Purchase);
+        let capital = store
+            .create_ledger(company, "Equipment", Category::Asset)
+            .unwrap();
+        let receipt = voucher(
+            "Receipt Note",
+            "20260401",
+            "RECEIPT",
+            r#"
+            <LEDGERENTRIES.LIST><LEDGERNAME>Party</LEDGERNAME><AMOUNT>30</AMOUNT></LEDGERENTRIES.LIST>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Equipment</LEDGERNAME><AMOUNT>-30</AMOUNT></LEDGERENTRIES.LIST>
+            <INVENTORYENTRIES.LIST><STOCKITEMNAME>Part</STOCKITEMNAME><ACTUALQTY>3 pcs</ACTUALQTY>
+              <AMOUNT>-24</AMOUNT><RATE>8/pcs</RATE>
+            </INVENTORYENTRIES.LIST>"#,
+        );
+        let unsupported = receipt.replace(
+            "<LEDGERNAME>Equipment</LEDGERNAME>",
+            "<LEDGERNAME>Unavailable</LEDGERNAME>",
+        );
+        let plan = store
+            .preview_xml_import(company, &envelope(&unsupported))
+            .unwrap();
+        assert!(!plan.can_apply());
+        assert!(store.stock_notes(company, None).unwrap().is_empty());
+        let plan = store
+            .preview_xml_import(company, &envelope(&receipt))
+            .unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        store.apply_xml_import(&plan).unwrap();
+        let note = store.stock_notes(company, None).unwrap().remove(0);
+        let line = store.stock_note_lines(company, note.id).unwrap().remove(0);
+        assert_eq!(line.trade_ledger_id, Some(capital));
+        assert_eq!(line.values.unit_price, 800);
+        assert!(store.vouchers(company).unwrap().is_empty());
+        let stock = store.stock_receipts(company, None).unwrap();
+        assert_eq!(stock.len(), 1);
+        assert_eq!((stock[0].quantity, stock[0].cost), (3000, Some(2400)));
     }
 
     #[test]

@@ -189,6 +189,7 @@ pub struct OrderLineProgress {
     pub fulfilled: i64,
     pub billed: i64,
     pub preclosed: i64,
+    pub trade_ledger_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -403,8 +404,10 @@ fn order_summary(conn: &Connection, company: i64, order: i64) -> Result<OrderSum
 
 fn order_lines(conn: &Connection, order: i64) -> Result<Vec<OrderLineProgress>> {
     let mut stmt = conn.prepare(
-        "SELECT p.item_id, p.quantity, p.unit_price, s.name, s.unit, p.fulfilled, p.billed, p.preclosed
+        "SELECT p.item_id, p.quantity, p.unit_price, s.name, s.unit, p.fulfilled, p.billed, p.preclosed,
+                trade.ledger_id
          FROM order_line_availability p JOIN stock_items s ON s.id = p.item_id
+         LEFT JOIN order_line_trade_defaults trade ON trade.order_line_id = p.id
          WHERE p.order_id = ?1 ORDER BY p.id",
     )?;
     let rows = stmt.query_map([order], |row| {
@@ -419,6 +422,7 @@ fn order_lines(conn: &Connection, order: i64) -> Result<Vec<OrderLineProgress>> 
             fulfilled: row.get(5)?,
             billed: row.get(6)?,
             preclosed: row.get(7)?,
+            trade_ledger_id: row.get(8)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;

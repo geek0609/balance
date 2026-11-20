@@ -1894,6 +1894,7 @@ impl App {
                 form.item = Some(line.line.item_id);
                 form.quantity = format_quantity(line.unfulfilled().into());
                 form.price = format_amount(line.line.unit_price);
+                form.trade_ledger = line.trade_ledger_id;
                 let allocations = detail.reserved_allocations(line.line.item_id);
                 if let Some(first) = allocations.first() {
                     form.location = Some(first.location_id);

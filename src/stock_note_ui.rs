@@ -462,6 +462,7 @@ impl App {
 
         let lines = self.store.stock_note_lines(company, note.id)?;
         let has_orders = lines.iter().any(|line| line.order_id.is_some());
+        let has_trade_defaults = lines.iter().any(|line| line.trade_ledger_id.is_some());
         egui::Grid::new(("stock-note-lines", note.id))
             .striped(true)
             .show(ui, |ui| {
@@ -479,6 +480,9 @@ impl App {
                 }
                 if has_orders {
                     ui.strong("Order");
+                }
+                if has_trade_defaults {
+                    ui.strong("Invoice ledger");
                 }
                 ui.end_row();
                 for line in &lines {
@@ -513,6 +517,9 @@ impl App {
                         }
                     } else if has_orders {
                         ui.label("—");
+                    }
+                    if has_trade_defaults {
+                        ui.label(line.trade_ledger.as_deref().unwrap_or("—"));
                     }
                     ui.end_row();
                 }
@@ -1007,6 +1014,7 @@ impl App {
                 form.batch = line.values.batch_id;
                 form.quantity = format_quantity(i128::from(line.unbilled()));
                 form.price = format_amount(line.values.unit_price);
+                form.trade_ledger = line.trade_ledger_id;
                 lines.push(form);
             }
         }
@@ -1017,5 +1025,53 @@ impl App {
             lines,
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_invoice_keeps_receipt_ledger_defaults() {
+        let mut store = balance::Store::memory().unwrap();
+        let company = store.create_company("Stock note invoice").unwrap();
+        store
+            .create_ledger(company, "Supplier", Category::Liability)
+            .unwrap();
+        let purchases = store
+            .create_ledger(company, "Purchases", Category::Expense)
+            .unwrap();
+        let assets = store
+            .create_ledger(company, "Equipment", Category::Asset)
+            .unwrap();
+        store.create_stock_item(company, "Part", "pcs").unwrap();
+        let xml = br#"<ENVELOPE><BODY><DATA><MESSAGE><VOUCHER>
+            <DATE>20260401</DATE><VOUCHERTYPENAME>Receipt Note</VOUCHERTYPENAME>
+            <VOUCHERNUMBER>RN1</VOUCHERNUMBER><PARTYLEDGERNAME>Supplier</PARTYLEDGERNAME>
+            <LEDGERENTRIES.LIST><LEDGERNAME>Purchases</LEDGERNAME></LEDGERENTRIES.LIST>
+            <INVENTORYENTRIES.LIST><STOCKITEMNAME>Part</STOCKITEMNAME><ACTUALQTY>2 pcs</ACTUALQTY><RATE>10/pcs</RATE>
+                <BATCHALLOCATIONS.LIST><GODOWNNAME>Main</GODOWNNAME><ACTUALQTY>1 pcs</ACTUALQTY></BATCHALLOCATIONS.LIST>
+                <BATCHALLOCATIONS.LIST><GODOWNNAME>Main</GODOWNNAME><ACTUALQTY>1 pcs</ACTUALQTY>
+                    <ACCOUNTINGALLOCATIONS.LIST><LEDGERNAME>Equipment</LEDGERNAME></ACCOUNTINGALLOCATIONS.LIST>
+                </BATCHALLOCATIONS.LIST>
+            </INVENTORYENTRIES.LIST>
+            </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let plan = store.preview_xml_import(company, xml).unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        store.apply_xml_import(&plan).unwrap();
+        let note = store.stock_notes(company, None).unwrap().remove(0);
+        let mut app = App::new(store, Default::default());
+        app.prepare_stock_notes_invoice(company, std::iter::once(&note))
+            .unwrap();
+        assert_eq!(app.invoice_trade, Some(purchases));
+        assert_eq!(
+            app.invoice_lines
+                .iter()
+                .map(|line| line.trade_ledger)
+                .collect::<Vec<_>>(),
+            [None, Some(assets)]
+        );
+        assert!(app.invoice_source == Some(InvoiceSource::StockNotes));
     }
 }

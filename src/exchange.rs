@@ -34,7 +34,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 mod orders;
 mod stock_notes;
+mod trade_defaults;
 pub(crate) use stock_notes::migrate as migrate_stock_tracking;
+pub(crate) use trade_defaults::migrate as migrate_trade_defaults;
 
 /// Maximum combined input size for a single XML import preview.
 pub const MAX_XML_IMPORT_BYTES: usize = 50 * 1024 * 1024;
@@ -2553,11 +2555,7 @@ fn stock_item_ledger(
     let (id, category) = ledgers
         .get(&normalized(ledger))
         .ok_or_else(|| Error::Validation(format!("ledger {ledger} is unavailable")))?;
-    let compatible = match kind {
-        InvoiceKind::Sale => *category == Category::Income,
-        InvoiceKind::Purchase => matches!(category, Category::Expense | Category::Asset),
-    };
-    if !compatible {
+    if !trade_defaults::compatible(kind, *category) {
         return Err(Error::Validation(
             "item accounting ledger has an incompatible category".into(),
         ));
