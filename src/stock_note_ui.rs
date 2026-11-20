@@ -457,7 +457,10 @@ impl App {
                 }
                 ui.end_row();
                 for line in &lines {
-                    ui.label(&line.item);
+                    let item = ui.label(&line.item);
+                    if let Some(tracking) = &line.source_tracking {
+                        item.on_hover_text(format!("Tracking {tracking}"));
+                    }
                     ui.label(&line.location);
                     ui.label(line.batch.as_deref().unwrap_or("Unbatched"));
                     ui.label(format!(

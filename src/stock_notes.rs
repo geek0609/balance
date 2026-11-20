@@ -241,6 +241,7 @@ pub struct StockNoteLine {
     pub billed: i64,
     pub returned: i64,
     pub returned_after_invoice: i64,
+    pub source_tracking: Option<String>,
 }
 
 impl StockNoteLine {
@@ -307,13 +308,15 @@ pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<V
     let mut stmt = conn.prepare(
         "SELECT l.id, l.item_id, l.location_id, l.batch_id, l.quantity, l.unit_price,
                 i.name, i.unit, loc.name, b.name, COALESCE(q.billed, 0), COALESCE(ret.returned, 0),
-                COALESCE((SELECT SUM(rq.returned) FROM invoice_returned_quantities rq WHERE rq.delivery_line = l.id), 0)
+                COALESCE((SELECT SUM(rq.returned) FROM invoice_returned_quantities rq WHERE rq.delivery_line = l.id), 0),
+                t.reference
          FROM stock_note_lines l JOIN stock_notes n ON n.id = l.note_id
          JOIN stock_items i ON i.id = l.item_id AND i.company_id = n.company_id
          JOIN stock_locations loc ON loc.id = l.location_id AND loc.company_id = n.company_id
          LEFT JOIN stock_batches b ON b.id = l.batch_id
          LEFT JOIN stock_note_billed_quantities q ON q.note_line_id = l.id
          LEFT JOIN stock_note_returned_quantities ret ON ret.note_line_id = l.id
+         LEFT JOIN imported_stock_note_tracking t ON t.note_line_id = l.id
          WHERE n.company_id = ?1 AND n.id = ?2 ORDER BY l.id",
     )?;
     let rows = stmt
@@ -334,6 +337,7 @@ pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<V
                 billed: row.get(10)?,
                 returned: row.get(11)?,
                 returned_after_invoice: row.get(12)?,
+                source_tracking: row.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -614,6 +618,115 @@ pub(crate) fn stock_direction(kind: InvoiceKind) -> i64 {
     }
 }
 
+pub(crate) fn write_stock_note(
+    conn: &Connection,
+    company: i64,
+    draft: &StockNoteDraft,
+    receipt_costs: Option<&[Option<i64>]>,
+) -> Result<i64> {
+    let date = parse_date(&draft.date)?;
+    let reference = required(&draft.reference, "Note reference")?;
+    if draft.lines.is_empty() || receipt_costs.is_some_and(|costs| costs.len() != draft.lines.len())
+    {
+        return Err(Error::Validation("Add at least one stock line".into()));
+    }
+    if !matches!(
+        ledger_category(conn, company, draft.party_ledger_id)?,
+        Category::Asset | Category::Liability
+    ) {
+        return Err(Error::Validation(
+            "The party must be an asset or liability ledger".into(),
+        ));
+    }
+    if let Some(order) = draft.order_id {
+        crate::orders::check_fulfilment(
+            conn,
+            company,
+            order,
+            draft.kind,
+            draft.party_ledger_id,
+            date,
+            crate::orders::FulfilmentChange::NewDocument,
+            draft.lines.iter().map(|line| (line.item_id, line.quantity)),
+        )?;
+    }
+    let mut buckets = HashSet::new();
+    for line in &draft.lines {
+        if receipt_costs.is_none() && !buckets.insert(line.bucket()) {
+            return Err(Error::Validation(
+                "Combine lines for the same item, location and batch".into(),
+            ));
+        }
+        line_amount(line.quantity, line.unit_price)?;
+        check_quantity_precision(conn, company, line.item_id, line.quantity)?;
+        check_stock_location(conn, company, line.location_id)?;
+        check_stock_batch(conn, company, line.item_id, line.batch_id)?;
+    }
+    let inserted = conn.execute(
+        "INSERT INTO stock_notes(company_id, kind, party_ledger_id, order_id, reference,
+             reference_key, date, narration)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(company_id, kind, party_ledger_id, reference_key) DO NOTHING",
+        params![
+            company,
+            draft.kind.as_str(),
+            draft.party_ledger_id,
+            draft.order_id,
+            reference,
+            reference.to_lowercase(),
+            date.to_string(),
+            draft.narration.trim()
+        ],
+    )?;
+    if inserted != 1 {
+        return Err(Error::Validation(
+            "A note with this type, party and reference already exists".into(),
+        ));
+    }
+
+    let note = conn.last_insert_rowid();
+    let reason = format!("{} {} (#{note})", note_label(draft.kind), reference);
+    for (index, line) in draft.lines.iter().enumerate() {
+        if let Some(order) = draft.order_id.filter(|_| draft.kind == InvoiceKind::Sale) {
+            crate::stock_reservations::consume_reservations(
+                conn,
+                order,
+                line.item_id,
+                line.location_id,
+                line.batch_id,
+                line.quantity,
+                &reason,
+            )?;
+        }
+        let movement = insert_movement(
+            conn,
+            company,
+            date,
+            line,
+            stock_direction(draft.kind),
+            &reason,
+        )?;
+        conn.execute(
+            "INSERT INTO stock_note_lines(note_id, item_id, location_id, batch_id, quantity, unit_price, adjustment_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![note, line.item_id, line.location_id, line.batch_id, line.quantity, line.unit_price, movement],
+        )?;
+        if draft.kind == InvoiceKind::Purchase {
+            let cost = match receipt_costs {
+                Some(costs) => costs[index],
+                None => Some(line_amount(line.quantity, line.unit_price)?),
+            };
+            if let Some(cost) = cost {
+                crate::actual_cost::insert_receipt_cost(conn, movement, cost, &reason)?;
+            }
+        }
+    }
+    if let Some(order) = draft.order_id {
+        crate::stock_reservations::check_order_coverage(conn, order)?;
+    }
+    Ok(note)
+}
+
 impl Store {
     pub fn stock_notes(&self, company: i64, order: Option<i64>) -> Result<Vec<StockNote>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -633,107 +746,10 @@ impl Store {
 
     /// Record a physical delivery or receipt and, optionally, consume order quantities.
     pub fn post_stock_note(&mut self, company: i64, draft: &StockNoteDraft) -> Result<i64> {
-        let date = parse_date(&draft.date)?;
-        let reference = required(&draft.reference, "Note reference")?;
-        if draft.lines.is_empty() {
-            return Err(Error::Validation("Add at least one stock line".into()));
-        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !matches!(
-            ledger_category(&tx, company, draft.party_ledger_id)?,
-            Category::Asset | Category::Liability
-        ) {
-            return Err(Error::Validation(
-                "The party must be an asset or liability ledger".into(),
-            ));
-        }
-        if let Some(order) = draft.order_id {
-            crate::orders::check_fulfilment(
-                &tx,
-                company,
-                order,
-                draft.kind,
-                draft.party_ledger_id,
-                date,
-                crate::orders::FulfilmentChange::NewDocument,
-                draft.lines.iter().map(|line| (line.item_id, line.quantity)),
-            )?;
-        }
-        let mut buckets = HashSet::new();
-        for line in &draft.lines {
-            if !buckets.insert(line.bucket()) {
-                return Err(Error::Validation(
-                    "Combine lines for the same item, location and batch".into(),
-                ));
-            }
-            line_amount(line.quantity, line.unit_price)?;
-            check_quantity_precision(&tx, company, line.item_id, line.quantity)?;
-            check_stock_location(&tx, company, line.location_id)?;
-            check_stock_batch(&tx, company, line.item_id, line.batch_id)?;
-        }
-        let inserted = tx.execute(
-            "INSERT INTO stock_notes(company_id, kind, party_ledger_id, order_id, reference,
-                 reference_key, date, narration)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(company_id, kind, party_ledger_id, reference_key) DO NOTHING",
-            params![
-                company,
-                draft.kind.as_str(),
-                draft.party_ledger_id,
-                draft.order_id,
-                reference,
-                reference.to_lowercase(),
-                date.to_string(),
-                draft.narration.trim()
-            ],
-        )?;
-        if inserted != 1 {
-            return Err(Error::Validation(
-                "A note with this type, party and reference already exists".into(),
-            ));
-        }
-
-        let note = tx.last_insert_rowid();
-        let reason = format!("{} {} (#{note})", note_label(draft.kind), reference);
-        for line in &draft.lines {
-            if let Some(order) = draft.order_id.filter(|_| draft.kind == InvoiceKind::Sale) {
-                crate::stock_reservations::consume_reservations(
-                    &tx,
-                    order,
-                    line.item_id,
-                    line.location_id,
-                    line.batch_id,
-                    line.quantity,
-                    &reason,
-                )?;
-            }
-            let movement = insert_movement(
-                &tx,
-                company,
-                date,
-                line,
-                stock_direction(draft.kind),
-                &reason,
-            )?;
-            tx.execute(
-                "INSERT INTO stock_note_lines(note_id, item_id, location_id, batch_id, quantity, unit_price, adjustment_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![note, line.item_id, line.location_id, line.batch_id, line.quantity, line.unit_price, movement],
-            )?;
-            if draft.kind == InvoiceKind::Purchase {
-                crate::actual_cost::insert_receipt_cost(
-                    &tx,
-                    movement,
-                    line_amount(line.quantity, line.unit_price)?,
-                    &reason,
-                )?;
-            }
-        }
-        if let Some(order) = draft.order_id {
-            crate::stock_reservations::check_order_coverage(&tx, order)?;
-        }
+        let note = write_stock_note(&tx, company, draft, None)?;
         tx.commit()?;
         Ok(note)
     }

@@ -32,6 +32,8 @@ use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
+mod stock_notes;
+pub(crate) use stock_notes::migrate as migrate_stock_tracking;
 
 /// Maximum combined input size for a single XML import preview.
 pub const MAX_XML_IMPORT_BYTES: usize = 50 * 1024 * 1024;
@@ -154,6 +156,7 @@ struct ImportedStockAllocation {
     existing_batch_id: Option<i64>,
     quantity: i64,
     billed_quantity: i64,
+    tracking: Option<String>,
 }
 #[derive(Debug, Clone)]
 struct ImportedInvoiceAdjustment {
@@ -362,6 +365,8 @@ pub struct ImportPlan {
     items: Vec<Item>,
     transactions: Vec<Transaction>,
     invoices: Vec<ImportedInvoice>,
+    stock_notes: Vec<stock_notes::ImportedStockNote>,
+    stock_matches: Option<Vec<stock_notes::TrackingMatch>>,
     settlements: Vec<ImportedSettlement>,
     bill_notes: Vec<ImportedBillNote>,
     issues: Vec<String>,
@@ -384,6 +389,7 @@ impl ImportPlan {
             .iter()
             .map(|row| row.date.as_str())
             .chain(self.invoices.iter().map(|row| row.date.as_str()))
+            .chain(self.stock_notes.iter().map(|row| row.date.as_str()))
             .chain(self.settlements.iter().map(|row| row.date.as_str()))
             .chain(self.bill_notes.iter().map(|row| row.date.as_str()))
             .chain(self.opening_date.as_deref().filter(|_| openings));
@@ -408,6 +414,12 @@ impl ImportPlan {
     }
     pub fn invoice_count(&self) -> usize {
         self.invoices.len()
+    }
+    pub fn stock_note_count(&self) -> usize {
+        self.stock_notes.len()
+    }
+    pub fn stock_match_count(&self) -> usize {
+        self.stock_matches.as_ref().map_or(0, Vec::len)
     }
     pub fn settlement_count(&self) -> usize {
         self.settlements
@@ -544,6 +556,7 @@ impl ImportPlan {
                 || !self.accounts.is_empty()
                 || !self.transactions.is_empty()
                 || !self.invoices.is_empty()
+                || !self.stock_notes.is_empty()
                 || !self.settlements.is_empty()
                 || !self.bill_notes.is_empty())
     }
@@ -557,6 +570,8 @@ pub struct ImportCounts {
     pub opening_on_account: usize,
     pub vouchers: usize,
     pub invoices: usize,
+    pub stock_notes: usize,
+    pub stock_matches: usize,
     pub settlements: usize,
     pub bill_notes: usize,
     pub advances: usize,
@@ -2563,6 +2578,8 @@ fn parse_invoice_stock(
                 "AMOUNT",
                 "ACTUALQTY",
                 "BILLEDQTY",
+                "TRACKINGNUMBER",
+                "GODOWNNAME",
                 "ACCOUNTINGALLOCATIONS.LIST",
                 "BATCHALLOCATIONS.LIST",
             ],
@@ -2730,8 +2747,10 @@ fn parse_invoice_stock(
             })
             .collect();
         let mut stock_allocations = Vec::new();
+        let item_tracking = direct_text(item_node, "TRACKINGNUMBER");
+        let item_location = direct_text(item_node, "GODOWNNAME").filter(|name| !name.is_empty());
         if locations_in_line.is_empty() {
-            let location = "Main".to_owned();
+            let location = item_location.unwrap_or_else(|| "Main".into());
             let existing_location_id = *locations
                 .get(&normalized(&location))
                 .ok_or_else(|| Error::Validation("default stock location is unavailable".into()))?;
@@ -2742,6 +2761,7 @@ fn parse_invoice_stock(
                 existing_batch_id: None,
                 quantity,
                 billed_quantity,
+                tracking: stock_notes::tracking(item_tracking),
             });
         } else {
             if locations_in_line.len() > 1 && matches!(discount, InvoiceDiscount::Fixed(_)) {
@@ -2762,6 +2782,7 @@ fn parse_invoice_stock(
                         "ACTUALQTY",
                         "BILLEDQTY",
                         "AMOUNT",
+                        "TRACKINGNUMBER",
                     ],
                     label,
                     issues,
@@ -2810,7 +2831,10 @@ fn parse_invoice_stock(
                         "allocation amount differs from quantity and rate".into(),
                     ));
                 }
-                let location = invoice_field(location_node, "GODOWNNAME")?;
+                let location = direct_text(location_node, "GODOWNNAME")
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| item_location.clone())
+                    .ok_or_else(|| Error::Validation("Missing GODOWNNAME".into()))?;
                 if direct_text(location_node, "DESTINATIONGODOWNNAME").is_some_and(|destination| {
                     !destination.is_empty() && normalized(&destination) != normalized(&location)
                 }) {
@@ -2839,6 +2863,10 @@ fn parse_invoice_stock(
                     existing_batch_id,
                     quantity: allocated_quantity,
                     billed_quantity: allocated_billed,
+                    tracking: stock_notes::tracking(
+                        direct_text(location_node, "TRACKINGNUMBER")
+                            .or_else(|| item_tracking.clone()),
+                    ),
                 });
             }
             if total_quantity != i128::from(quantity)
@@ -2849,6 +2877,15 @@ fn parse_invoice_stock(
                     "location allocations do not match the item totals".into(),
                 ));
             }
+        }
+        if !returning
+            && stock_allocations
+                .iter()
+                .any(|allocation| allocation.tracking.is_some() && allocation.billed_quantity == 0)
+        {
+            return Err(Error::Validation(
+                "A tracked invoice allocation needs a positive billed quantity".into(),
+            ));
         }
         subtotal += i128::from(amount);
         lines.push(ImportedInvoiceLine {
@@ -3893,6 +3930,86 @@ fn find_stock_unit(conn: &Connection, company: i64, symbol: &str) -> Result<Opti
     Ok(found)
 }
 
+fn resolve_imported_item(
+    conn: &Connection,
+    company: i64,
+    name: &str,
+    expected_id: Option<i64>,
+    source_unit: &str,
+    source_precision: u8,
+) -> Result<i64> {
+    let item_id = find_stock_item(conn, company, name)?
+        .ok_or_else(|| Error::Validation(format!("Stock item {} is missing", name)))?;
+    if expected_id.is_some_and(|previous| previous != item_id) {
+        return Err(Error::Validation(format!(
+            "Stock item {} changed since preview",
+            name
+        )));
+    }
+    let (unit, precision): (String, u8) = conn.query_row("SELECT u.symbol, u.decimal_places FROM stock_items i JOIN stock_units u ON u.id = i.unit_id AND u.company_id = i.company_id WHERE i.id = ?1 AND i.company_id = ?2", params![item_id, company], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if normalized(&unit) != normalized(source_unit) || precision != source_precision {
+        return Err(Error::Validation(format!(
+            "Unit for {} changed since preview",
+            name
+        )));
+    }
+    Ok(item_id)
+}
+
+fn resolve_imported_allocation(
+    conn: &Connection,
+    company: i64,
+    item_id: i64,
+    allocation: &ImportedStockAllocation,
+    created_batches: &mut HashMap<(i64, String), i64>,
+) -> Result<(i64, Option<i64>)> {
+    let location_id =
+        find_stock_location(conn, company, &allocation.location)?.ok_or_else(|| {
+            Error::Validation(format!("Stock location {} is missing", allocation.location))
+        })?;
+    if allocation
+        .existing_location_id
+        .is_some_and(|previous| previous != location_id)
+    {
+        return Err(Error::Validation(format!(
+            "Stock location {} changed since preview",
+            allocation.location
+        )));
+    }
+    let batch_id = if let Some(name) = &allocation.batch {
+        let key = (item_id, normalized(name));
+        let existing = find_stock_batch(conn, company, item_id, name)?;
+        let id = if let Some(expected) = allocation.existing_batch_id {
+            if existing != Some(expected) {
+                return Err(Error::Validation(format!(
+                    "Batch {name} changed since preview"
+                )));
+            }
+            expected
+        } else if let Some(created) = created_batches.get(&key) {
+            if existing != Some(*created) {
+                return Err(Error::Validation(format!(
+                    "Batch {name} changed since preview"
+                )));
+            }
+            *created
+        } else {
+            if existing.is_some() {
+                return Err(Error::Validation(format!(
+                    "Batch {name} appeared since preview"
+                )));
+            }
+            let id = create_stock_batch_on_connection(conn, company, item_id, name, None, None)?;
+            created_batches.insert(key, id);
+            id
+        };
+        Some(id)
+    } else {
+        None
+    };
+    Ok((location_id, batch_id))
+}
+
 type InvoiceStockItems = HashMap<String, (Option<i64>, Arc<UnitMeasure>)>;
 
 fn find_stock_group(conn: &Connection, company: i64, name: &str) -> Result<Option<i64>> {
@@ -3991,6 +4108,8 @@ impl Store {
             items: Vec::new(),
             transactions: Vec::new(),
             invoices: Vec::new(),
+            stock_notes: Vec::new(),
+            stock_matches: None,
             settlements: Vec::new(),
             bill_notes: Vec::new(),
             issues: Vec::new(),
@@ -5115,6 +5234,23 @@ impl Store {
                 )
             })
             .collect();
+        let mut stock_note_references = HashSet::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT n.kind, l.name, n.reference_key FROM stock_notes n
+                 JOIN ledgers l ON l.id = n.party_ledger_id WHERE n.company_id = ?1",
+            )?;
+            let rows = stmt.query_map([company_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    normalized(&row.get::<_, String>(1)?),
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                stock_note_references.insert(row?);
+            }
+        }
         for (source_order, node) in nodes()
             .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("VOUCHER"))
             .enumerate()
@@ -5124,13 +5260,45 @@ impl Store {
                 direct_text(node, "VOUCHERNUMBER").unwrap_or_default()
             );
             let metadata = source_metadata(node, &label, &mut plan.issues);
+            let voucher_type = direct_text(node, "VOUCHERTYPENAME");
+            let stock_kind = voucher_type.as_deref().and_then(stock_notes::kind);
             register_metadata(
-                "voucher",
+                if stock_kind.is_some() {
+                    "stocknote"
+                } else {
+                    "voucher"
+                },
                 &label,
                 &metadata,
                 &mut seen_metadata,
                 &mut plan.issues,
             );
+            if let Some(kind) = stock_kind {
+                match stock_notes::parse(
+                    node,
+                    kind,
+                    &label,
+                    metadata,
+                    &invoice_ledgers,
+                    &invoice_items,
+                    &known_locations,
+                    &invoice_batches,
+                    &mut plan.issues,
+                ) {
+                    Ok(note) => {
+                        if !stock_note_references.insert((
+                            kind.as_str().to_owned(),
+                            normalized(&note.party),
+                            normalized(&note.reference),
+                        )) {
+                            plan.issues.push(format!("{label}: a stock note with the same type, party and reference already exists"));
+                        }
+                        plan.stock_notes.push(note);
+                    }
+                    Err(error) => plan.issues.push(format!("{label}: {error}")),
+                }
+                continue;
+            }
             let has_bill_details = node
                 .children()
                 .filter(|entry| {
@@ -5146,7 +5314,7 @@ impl Store {
                             && meaningful(bill)
                     })
                 });
-            let kind = direct_text(node, "VOUCHERTYPENAME").and_then(|value| parse_kind(&value));
+            let kind = voucher_type.as_deref().and_then(parse_kind);
             if has_bill_details
                 && matches!(kind, Some(VoucherKind::CreditNote | VoucherKind::DebitNote))
             {
@@ -5501,9 +5669,11 @@ impl Store {
                     normalized(&invoice.reference),
                 );
                 let has_matched_stock = invoice.lines.iter().any(|line| {
-                    line.allocations
-                        .iter()
-                        .any(|allocation| allocation.linked_stock_quantity > 0)
+                    line.allocations.iter().any(|allocation| {
+                        allocation.linked_stock_quantity > 0
+                            || (!plan.stock_notes.is_empty()
+                                && allocation.source_tracking.is_some())
+                    })
                 });
                 if invoice.reversal.is_none()
                     && (has_matched_stock || invoice.lines.iter().any(|line| line.quantity > 0))
@@ -5596,7 +5766,13 @@ impl Store {
                     normalized(&invoice.party),
                     normalized(&invoice.reference),
                 );
-                if invoice.lines.iter().any(|line| line.quantity > 0) {
+                if invoice.lines.iter().any(|line| {
+                    line.quantity > 0
+                        || line
+                            .allocations
+                            .iter()
+                            .any(|allocation| allocation.tracking.is_some())
+                }) {
                     index_stock_origin(
                         &mut stock_origins,
                         invoice_key.clone(),
@@ -5837,6 +6013,7 @@ impl Store {
             && plan.accounts.is_empty()
             && plan.transactions.is_empty()
             && plan.invoices.is_empty()
+            && plan.stock_notes.is_empty()
             && plan.settlements.is_empty()
             && plan.bill_notes.is_empty()
             && plan.units.is_empty()
@@ -5856,6 +6033,26 @@ impl Store {
             Err(Error::Validation(message)) => plan.issues.push(message),
             Err(error) => return Err(error),
         }
+        if plan.can_apply()
+            && (!plan.stock_notes.is_empty()
+                || plan
+                    .invoices
+                    .iter()
+                    .flat_map(|invoice| &invoice.lines)
+                    .flat_map(|line| &line.allocations)
+                    .any(|allocation| allocation.tracking.is_some()))
+        {
+            // Exercise the same stock and ledger checks without persisting the preview.
+            let tx = self.conn.unchecked_transaction()?;
+            let rehearsal = Self::write_xml_import(&tx, &plan);
+            tx.rollback()?;
+            match rehearsal {
+                Ok((_, matches)) => plan.stock_matches = Some(matches),
+                Err(error) => plan
+                    .issues
+                    .push(format!("Stock import validation failed. {error}")),
+            }
+        }
         Ok(plan)
     }
     /// Apply the exact preview atomically. No records are written on any error.
@@ -5866,9 +6063,27 @@ impl Store {
             ));
         }
         let tx = self.conn.transaction()?;
-        plan.check_period_lock(&tx)?;
+        let (counts, matches) = Self::write_xml_import(&tx, plan)?;
+        if plan
+            .stock_matches
+            .as_ref()
+            .is_some_and(|preview| *preview != matches)
+        {
+            return Err(Error::Validation(
+                "Stock tracking matches changed since preview. Run the preview again.".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(counts)
+    }
+
+    fn write_xml_import(
+        conn: &Connection,
+        plan: &ImportPlan,
+    ) -> Result<(ImportCounts, Vec<stock_notes::TrackingMatch>)> {
+        plan.check_period_lock(&conn)?;
         for (id, metadata) in &plan.existing_location_metadata {
-            let exists: bool = tx.query_row(
+            let exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM stock_locations WHERE id = ?1 AND company_id = ?2)",
                 params![id, plan.company_id],
                 |r| r.get(0),
@@ -5878,10 +6093,10 @@ impl Store {
                     "A stock location changed since preview".into(),
                 ));
             }
-            save_metadata(&tx, plan.company_id, "stocklocation", *id, metadata)?;
+            save_metadata(&conn, plan.company_id, "stocklocation", *id, metadata)?;
         }
         for location in &plan.locations {
-            if find_stock_location(&tx, plan.company_id, &location.name)?.is_some() {
+            if find_stock_location(&conn, plan.company_id, &location.name)?.is_some() {
                 return Err(Error::Validation(format!(
                     "Stock location {} already exists",
                     location.name
@@ -5889,7 +6104,7 @@ impl Store {
             }
             let parent_id = match location.parent.as_deref() {
                 Some(parent) => Some(
-                    find_stock_location(&tx, plan.company_id, parent)?.ok_or_else(|| {
+                    find_stock_location(&conn, plan.company_id, parent)?.ok_or_else(|| {
                         Error::Validation(format!(
                             "Stock location {}: parent {parent} is unavailable",
                             location.name
@@ -5898,20 +6113,20 @@ impl Store {
                 ),
                 None => None,
             };
-            tx.execute(
+            conn.execute(
                 "INSERT INTO stock_locations(company_id, name, parent_id) VALUES (?1, ?2, ?3)",
                 params![plan.company_id, location.name, parent_id],
             )?;
             save_metadata(
-                &tx,
+                &conn,
                 plan.company_id,
                 "stocklocation",
-                tx.last_insert_rowid(),
+                conn.last_insert_rowid(),
                 &location.metadata,
             )?;
         }
         for (id, metadata) in &plan.existing_unit_metadata {
-            let exists: bool = tx.query_row(
+            let exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM stock_units WHERE company_id = ?1 AND id = ?2)",
                 params![plan.company_id, id],
                 |r| r.get(0),
@@ -5919,10 +6134,10 @@ impl Store {
             if !exists {
                 return Err(Error::Validation("A unit changed since preview".into()));
             }
-            save_metadata(&tx, plan.company_id, "stockunit", *id, metadata)?;
+            save_metadata(&conn, plan.company_id, "stockunit", *id, metadata)?;
         }
         for (id, metadata) in &plan.existing_stock_group_metadata {
-            let exists: bool = tx.query_row(
+            let exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM stock_groups WHERE company_id = ?1 AND id = ?2)",
                 params![plan.company_id, id],
                 |r| r.get(0),
@@ -5932,10 +6147,10 @@ impl Store {
                     "A stock group changed since preview".into(),
                 ));
             }
-            save_metadata(&tx, plan.company_id, "stockgroup", *id, metadata)?;
+            save_metadata(&conn, plan.company_id, "stockgroup", *id, metadata)?;
         }
         for unit in &plan.units {
-            if find_stock_unit(&tx, plan.company_id, &unit.symbol)?.is_some() {
+            if find_stock_unit(&conn, plan.company_id, &unit.symbol)?.is_some() {
                 return Err(Error::Validation(format!(
                     "Unit {} already exists",
                     unit.symbol
@@ -5943,7 +6158,7 @@ impl Store {
             }
             let id = if let Some(compound) = &unit.compound {
                 let resolve = |symbol: &str| -> Result<i64> {
-                    find_stock_unit(&tx, plan.company_id, symbol)?
+                    find_stock_unit(&conn, plan.company_id, symbol)?
                         .map(|(id, _)| id)
                         .ok_or_else(|| {
                             Error::Validation(format!(
@@ -5952,7 +6167,7 @@ impl Store {
                         })
                 };
                 stock_units::insert_compound(
-                    &tx,
+                    &conn,
                     plan.company_id,
                     &unit.symbol,
                     &unit.formal_name,
@@ -5961,36 +6176,36 @@ impl Store {
                     compound.factor,
                 )?
             } else {
-                tx.execute("INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) VALUES (?1, ?2, ?3, ?4)", params![plan.company_id, unit.symbol, unit.formal_name, unit.decimal_places])?;
-                tx.last_insert_rowid()
+                conn.execute("INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) VALUES (?1, ?2, ?3, ?4)", params![plan.company_id, unit.symbol, unit.formal_name, unit.decimal_places])?;
+                conn.last_insert_rowid()
             };
-            save_metadata(&tx, plan.company_id, "stockunit", id, &unit.metadata)?;
+            save_metadata(&conn, plan.company_id, "stockunit", id, &unit.metadata)?;
         }
         for group in &plan.stock_groups {
-            if find_stock_group(&tx, plan.company_id, &group.name)?.is_some() {
+            if find_stock_group(&conn, plan.company_id, &group.name)?.is_some() {
                 return Err(Error::Validation(format!(
                     "Stock group {} already exists",
                     group.name
                 )));
             }
             let parent =
-                find_stock_group(&tx, plan.company_id, &group.parent)?.ok_or_else(|| {
+                find_stock_group(&conn, plan.company_id, &group.parent)?.ok_or_else(|| {
                     Error::Validation(format!("Stock group {} is missing", group.parent))
                 })?;
-            tx.execute(
+            conn.execute(
                 "INSERT INTO stock_groups(company_id, name, parent_id) VALUES (?1, ?2, ?3)",
                 params![plan.company_id, group.name, parent],
             )?;
             save_metadata(
-                &tx,
+                &conn,
                 plan.company_id,
                 "stockgroup",
-                tx.last_insert_rowid(),
+                conn.last_insert_rowid(),
                 &group.metadata,
             )?;
         }
         for (id, metadata) in &plan.existing_group_metadata {
-            let exists: bool = tx.query_row(
+            let exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM account_groups WHERE company_id = ?1 AND id = ?2)",
                 params![plan.company_id, id],
                 |r| r.get(0),
@@ -6000,16 +6215,16 @@ impl Store {
                     "An account group changed since preview".into(),
                 ));
             }
-            save_metadata(&tx, plan.company_id, "group", *id, metadata)?;
+            save_metadata(&conn, plan.company_id, "group", *id, metadata)?;
         }
         for group in &plan.groups {
-            if find_group(&tx, plan.company_id, &group.name)?.is_some() {
+            if find_group(&conn, plan.company_id, &group.name)?.is_some() {
                 return Err(Error::Validation(format!(
                     "Group {} already exists",
                     group.name
                 )));
             }
-            let (parent, parent_category) = find_group(&tx, plan.company_id, &group.parent)?
+            let (parent, parent_category) = find_group(&conn, plan.company_id, &group.parent)?
                 .ok_or_else(|| Error::Validation(format!("Group {} is missing", group.parent)))?;
             if parent_category != group.category {
                 return Err(Error::Validation(format!(
@@ -6017,12 +6232,12 @@ impl Store {
                     group.parent
                 )));
             }
-            tx.execute("INSERT INTO account_groups(company_id, name, category, parent_id) VALUES (?1, ?2, ?3, ?4)", params![plan.company_id, group.name, group.category.as_str(), parent])?;
+            conn.execute("INSERT INTO account_groups(company_id, name, category, parent_id) VALUES (?1, ?2, ?3, ?4)", params![plan.company_id, group.name, group.category.as_str(), parent])?;
             save_metadata(
-                &tx,
+                &conn,
                 plan.company_id,
                 "group",
-                tx.last_insert_rowid(),
+                conn.last_insert_rowid(),
                 &group.metadata,
             )?;
         }
@@ -6032,13 +6247,13 @@ impl Store {
                     "A ledger name is reserved for opening balances".into(),
                 ));
             }
-            if find_ledger(&tx, plan.company_id, &account.name)?.is_some() {
+            if find_ledger(&conn, plan.company_id, &account.name)?.is_some() {
                 return Err(Error::Validation(format!(
                     "Ledger {} already exists",
                     account.name
                 )));
             }
-            let (group_id, category) = find_group(&tx, plan.company_id, &account.group)?
+            let (group_id, category) = find_group(&conn, plan.company_id, &account.group)?
                 .ok_or_else(|| Error::Validation(format!("Group {} is missing", account.group)))?;
             if category != account.category {
                 return Err(Error::Validation(format!(
@@ -6046,15 +6261,21 @@ impl Store {
                     account.group
                 )));
             }
-            tx.execute(
+            conn.execute(
                 "INSERT INTO ledgers(company_id, name, category, group_id) VALUES (?1, ?2, ?3, ?4)",
                 params![plan.company_id, account.name, category.as_str(), group_id],
             )?;
-            let ledger_id = tx.last_insert_rowid();
-            save_metadata(&tx, plan.company_id, "ledger", ledger_id, &account.metadata)?;
-            insert_new_profile(&tx, plan.company_id, ledger_id, &account.profile)?;
+            let ledger_id = conn.last_insert_rowid();
+            save_metadata(
+                &conn,
+                plan.company_id,
+                "ledger",
+                ledger_id,
+                &account.metadata,
+            )?;
+            insert_new_profile(&conn, plan.company_id, ledger_id, &account.profile)?;
             if let Some(days) = account.credit_days {
-                tx.execute(
+                conn.execute(
                     "INSERT INTO ledger_terms(company_id, ledger_id, credit_days) VALUES (?1, ?2, ?3)",
                     params![plan.company_id, ledger_id, days],
                 )?;
@@ -6066,9 +6287,9 @@ impl Store {
                     .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
                 for bill in &account.opening_references {
                     if let Some(kind) = bill.advance_type {
-                        let control = crate::opening::ensure_control(&tx, plan.company_id)?;
+                        let control = crate::opening::ensure_control(&conn, plan.company_id)?;
                         crate::advances::insert_opening_party_advance(
-                            &tx,
+                            &conn,
                             plan.company_id,
                             &AdvanceDraft {
                                 kind: bill.kind,
@@ -6090,7 +6311,7 @@ impl Store {
                         continue;
                     }
                     crate::opening_bills::insert_opening_bill(
-                        &tx,
+                        &conn,
                         plan.company_id,
                         &OpeningBillDraft {
                             kind: bill.kind,
@@ -6111,7 +6332,7 @@ impl Store {
                     .as_deref()
                     .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
                 crate::opening::save_opening_in_transaction(
-                    &tx,
+                    &conn,
                     plan.company_id,
                     ledger_id,
                     date,
@@ -6122,7 +6343,7 @@ impl Store {
         }
         let mut created_batches = HashMap::<(i64, String), i64>::new();
         for item in &plan.items {
-            let (unit_id, precision) = find_stock_unit(&tx, plan.company_id, &item.unit)?
+            let (unit_id, precision) = find_stock_unit(&conn, plan.company_id, &item.unit)?
                 .ok_or_else(|| Error::Validation(format!("Unit {} is missing", item.unit)))?;
             if precision != item.unit_precision {
                 return Err(Error::Validation(format!(
@@ -6131,20 +6352,20 @@ impl Store {
                 )));
             }
             let group_id =
-                find_stock_group(&tx, plan.company_id, &item.group)?.ok_or_else(|| {
+                find_stock_group(&conn, plan.company_id, &item.group)?.ok_or_else(|| {
                     Error::Validation(format!("Stock group {} is missing", item.group))
                 })?;
             let item_id = create_stock_item_on_connection(
-                &tx,
+                &conn,
                 plan.company_id,
                 &item.name,
                 unit_id,
                 group_id,
                 &item.description,
             )?;
-            save_metadata(&tx, plan.company_id, "stockitem", item_id, &item.metadata)?;
+            save_metadata(&conn, plan.company_id, "stockitem", item_id, &item.metadata)?;
             for opening in &item.openings {
-                let location = find_stock_location(&tx, plan.company_id, &opening.location)?
+                let location = find_stock_location(&conn, plan.company_id, &opening.location)?
                     .ok_or_else(|| {
                         Error::Validation(format!("Stock location {} is missing", opening.location))
                     })?;
@@ -6163,7 +6384,7 @@ impl Store {
                         *id
                     } else {
                         let id = create_stock_batch_on_connection(
-                            &tx,
+                            &conn,
                             plan.company_id,
                             item_id,
                             name,
@@ -6178,13 +6399,13 @@ impl Store {
                     None
                 };
                 if opening.quantity != 0 {
-                    check_quantity_precision(&tx, plan.company_id, item_id, opening.quantity)?;
+                    check_quantity_precision(&conn, plan.company_id, item_id, opening.quantity)?;
                     let date = plan
                         .opening_date
                         .as_deref()
                         .ok_or_else(|| Error::Validation("Opening date is required".into()))?;
                     let adjustment = insert_stock_adjustment(
-                        &tx,
+                        &conn,
                         plan.company_id,
                         item_id,
                         location,
@@ -6195,7 +6416,7 @@ impl Store {
                     )?;
                     if opening.quantity < 0 {
                         crate::stock_reservations::check_stock_coverage(
-                            &tx,
+                            &conn,
                             plan.company_id,
                             item_id,
                             location,
@@ -6204,7 +6425,7 @@ impl Store {
                     }
                     if let Some(cost) = opening.cost {
                         crate::actual_cost::insert_receipt_cost(
-                            &tx,
+                            &conn,
                             adjustment,
                             cost,
                             "Imported stock opening cost",
@@ -6215,7 +6436,7 @@ impl Store {
         }
         for voucher in &plan.transactions {
             let mut stmt =
-                tx.prepare("SELECT kind, date, reference FROM vouchers WHERE company_id = ?1")?;
+                conn.prepare("SELECT kind, date, reference FROM vouchers WHERE company_id = ?1")?;
             let rows = stmt.query_map([plan.company_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -6245,7 +6466,7 @@ impl Store {
             let mut party_lines = Vec::new();
             for (index, line) in voucher.lines.iter().enumerate() {
                 let ledger_id =
-                    find_ledger(&tx, plan.company_id, &line.ledger)?.ok_or_else(|| {
+                    find_ledger(&conn, plan.company_id, &line.ledger)?.ok_or_else(|| {
                         Error::Validation(format!("Ledger {} is missing", line.ledger))
                     })?;
                 postings.push(Posting {
@@ -6257,7 +6478,7 @@ impl Store {
                 }
             }
             let id = insert_voucher_draft(
-                &tx,
+                &conn,
                 plan.company_id,
                 VoucherDraft {
                     kind: voucher.kind,
@@ -6268,7 +6489,7 @@ impl Store {
                     party_lines: &party_lines,
                 },
             )?;
-            save_metadata(&tx, plan.company_id, "voucher", id, &voucher.metadata)?;
+            save_metadata(&conn, plan.company_id, "voucher", id, &voucher.metadata)?;
         }
         let settlement_ledgers = |settlement: &ImportedSettlement| -> Result<(i64, i64)> {
             let kind = if settlement.kind == InvoiceKind::Sale {
@@ -6277,20 +6498,20 @@ impl Store {
                 VoucherKind::Payment
             };
             check_new_bill_voucher(
-                &tx,
+                &conn,
                 plan.company_id,
                 kind,
                 &settlement.date,
                 &settlement.reference,
             )?;
             let bank_id = import_ledger(
-                &tx,
+                &conn,
                 plan.company_id,
                 &settlement.bank,
                 settlement.existing_bank_id,
             )?;
             let party_id = import_ledger(
-                &tx,
+                &conn,
                 plan.company_id,
                 &settlement.party,
                 settlement.existing_party_id,
@@ -6303,7 +6524,7 @@ impl Store {
                     .discounts
                     .iter()
                     .map(|discount| {
-                        let ledger_id = find_ledger(&tx, plan.company_id, &discount.ledger)?
+                        let ledger_id = find_ledger(&conn, plan.company_id, &discount.ledger)?
                             .ok_or_else(|| {
                                 Error::Validation(format!("Ledger {} is missing", discount.ledger))
                             })?;
@@ -6343,7 +6564,7 @@ impl Store {
             )
             .map_err(|_| Error::Validation("Advance total is too large".into()))?;
             let (_, voucher_id) = insert_party_advance_parts(
-                &tx,
+                &conn,
                 plan.company_id,
                 &AdvanceDraft {
                     kind: settlement.kind,
@@ -6369,7 +6590,7 @@ impl Store {
             )?;
             advance_vouchers.insert(index, (bank_id, party_id, voucher_id));
             save_metadata(
-                &tx,
+                &conn,
                 plan.company_id,
                 "voucher",
                 voucher_id,
@@ -6379,7 +6600,7 @@ impl Store {
         let mut posted_notes = vec![None; plan.bill_notes.len()];
         for (index, note) in plan.bill_notes.iter().enumerate() {
             if !note.credits.is_empty() {
-                posted_notes[index] = Some(post_imported_bill_note(&tx, plan.company_id, note)?);
+                posted_notes[index] = Some(post_imported_bill_note(&conn, plan.company_id, note)?);
             }
         }
         let mut named_funding = if plan.note_credit_count() > 0
@@ -6389,7 +6610,7 @@ impl Store {
                 .iter()
                 .any(|invoice| !invoice.funding_applications.is_empty())
         {
-            read_named_funding(&tx, plan.company_id)?
+            read_named_funding(&conn, plan.company_id)?
         } else {
             HashMap::new()
         };
@@ -6408,14 +6629,28 @@ impl Store {
                 }
             }
         }
-        for invoice in &plan.invoices {
+        let mut tracking = stock_notes::NewTracking::default();
+        let mut note_order = plan.stock_notes.iter().collect::<Vec<_>>();
+        note_order.sort_by_key(|row| (&row.date, row.kind == InvoiceKind::Sale));
+        let mut notes = note_order.into_iter().peekable();
+        let mut invoice_order = plan.invoices.iter().collect::<Vec<_>>();
+        if !plan.stock_notes.is_empty() {
+            invoice_order.sort_by_key(|row| (&row.date, row.kind == InvoiceKind::Sale));
+        }
+        for invoice in invoice_order {
+            while let Some(note) = notes.next_if(|note| {
+                (&note.date, note.kind == InvoiceKind::Sale)
+                    <= (&invoice.date, invoice.kind == InvoiceKind::Sale)
+            }) {
+                tracking.write_note(&conn, plan.company_id, note, &mut created_batches)?;
+            }
             let voucher_kind = if invoice.kind == InvoiceKind::Sale {
                 VoucherKind::Sales
             } else {
                 VoucherKind::Purchase
             };
             let mut stmt =
-                tx.prepare("SELECT kind, date, reference FROM vouchers WHERE company_id = ?1")?;
+                conn.prepare("SELECT kind, date, reference FROM vouchers WHERE company_id = ?1")?;
             for row in stmt.query_map([plan.company_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -6436,7 +6671,7 @@ impl Store {
             }
             drop(stmt);
             let resolve_ledger = |name: &str, expected: Option<i64>| -> Result<i64> {
-                let id = find_ledger(&tx, plan.company_id, name)?
+                let id = find_ledger(&conn, plan.company_id, name)?
                     .ok_or_else(|| Error::Validation(format!("Ledger {name} is missing")))?;
                 if expected.is_some_and(|previous| previous != id) {
                     return Err(Error::Validation(format!(
@@ -6449,91 +6684,40 @@ impl Store {
             let trade_id = resolve_ledger(&invoice.trade, invoice.existing_trade_id)?;
             let mut lines = Vec::with_capacity(invoice.lines.len());
             for line in &invoice.lines {
-                let item_id =
-                    find_stock_item(&tx, plan.company_id, &line.item)?.ok_or_else(|| {
-                        Error::Validation(format!("Stock item {} is missing", line.item))
-                    })?;
-                if line
-                    .existing_item_id
-                    .is_some_and(|previous| previous != item_id)
-                {
-                    return Err(Error::Validation(format!(
-                        "Stock item {} changed since preview",
-                        line.item
-                    )));
-                }
-                let (unit, precision): (String, u8) = tx.query_row("SELECT u.symbol, u.decimal_places FROM stock_items i JOIN stock_units u ON u.id = i.unit_id AND u.company_id = i.company_id WHERE i.id = ?1 AND i.company_id = ?2", params![item_id, plan.company_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                if normalized(&unit) != normalized(&line.unit) || precision != line.precision {
-                    return Err(Error::Validation(format!(
-                        "Unit for {} changed since preview",
-                        line.item
-                    )));
-                }
+                let item_id = resolve_imported_item(
+                    &conn,
+                    plan.company_id,
+                    &line.item,
+                    line.existing_item_id,
+                    &line.unit,
+                    line.precision,
+                )?;
                 let mut allocations = Vec::with_capacity(line.allocations.len());
                 for allocation in &line.allocations {
-                    let location_id =
-                        find_stock_location(&tx, plan.company_id, &allocation.location)?
-                            .ok_or_else(|| {
-                                Error::Validation(format!(
-                                    "Stock location {} is missing",
-                                    allocation.location
-                                ))
-                            })?;
-                    if allocation
-                        .existing_location_id
-                        .is_some_and(|previous| previous != location_id)
-                    {
-                        return Err(Error::Validation(format!(
-                            "Stock location {} changed since preview",
-                            allocation.location
-                        )));
-                    }
-                    let batch_id = if let Some(name) = &allocation.batch {
-                        let key = (item_id, normalized(name));
-                        let existing = find_stock_batch(&tx, plan.company_id, item_id, name)?;
-                        let id = if let Some(expected) = allocation.existing_batch_id {
-                            if existing != Some(expected) {
-                                return Err(Error::Validation(format!(
-                                    "Batch {name} changed since preview"
-                                )));
-                            }
-                            expected
-                        } else if let Some(created) = created_batches.get(&key) {
-                            if existing != Some(*created) {
-                                return Err(Error::Validation(format!(
-                                    "Batch {name} changed since preview"
-                                )));
-                            }
-                            *created
-                        } else {
-                            if existing.is_some() {
-                                return Err(Error::Validation(format!(
-                                    "Batch {name} appeared since preview"
-                                )));
-                            }
-                            let id = create_stock_batch_on_connection(
-                                &tx,
-                                plan.company_id,
-                                item_id,
-                                name,
-                                None,
-                                None,
-                            )?;
-                            created_batches.insert(key, id);
-                            id
-                        };
-                        Some(id)
+                    let (location_id, batch_id) = resolve_imported_allocation(
+                        &conn,
+                        plan.company_id,
+                        item_id,
+                        allocation,
+                        &mut created_batches,
+                    )?;
+                    let quantity = if allocation.tracking.is_some() {
+                        0
                     } else {
-                        None
+                        allocation.quantity
                     };
                     allocations.push(InvoiceAllocation {
                         location_id,
                         batch_id,
-                        quantity: allocation.quantity,
-                        billed_quantity: (allocation.billed_quantity != allocation.quantity)
+                        quantity,
+                        billed_quantity: (allocation.billed_quantity != quantity)
                             .then_some(allocation.billed_quantity),
                     });
                 }
+                let physical_quantity = allocations
+                    .iter()
+                    .map(|allocation| allocation.quantity)
+                    .sum();
                 let mut allocations = allocations.into_iter();
                 let primary = allocations
                     .next()
@@ -6548,8 +6732,8 @@ impl Store {
                     batch_id: primary.batch_id,
                     extra_allocations: allocations.collect(),
                     discount: line.discount.clone(),
-                    quantity: line.quantity,
-                    billed_quantity: (line.billed_quantity != line.quantity)
+                    quantity: physical_quantity,
+                    billed_quantity: (line.billed_quantity != physical_quantity)
                         .then_some(line.billed_quantity),
                     unit_price: line.unit_price,
                     rate_basis: line.rate_basis.clone(),
@@ -6622,7 +6806,7 @@ impl Store {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let (invoice_id, voucher_id) = insert_direct_invoice(
-                &tx,
+                &conn,
                 plan.company_id,
                 &draft,
                 StockInvoicePosting::Import {
@@ -6630,8 +6814,9 @@ impl Store {
                         .then_some(original_postings.as_slice()),
                 },
             )?;
+            tracking.write_invoice(&conn, invoice_id, invoice)?;
             save_metadata(
-                &tx,
+                &conn,
                 plan.company_id,
                 "voucher",
                 voucher_id,
@@ -6642,7 +6827,7 @@ impl Store {
                     None
                 } else {
                     Some(
-                        crate::bill_splits::read(&tx, invoice_id, None)?
+                        crate::bill_splits::read(&conn, invoice_id, None)?
                             .into_iter()
                             .find(|bill| &bill.reference == reference)
                             .ok_or_else(|| Error::Validation("Funded bill is missing".into()))?
@@ -6664,7 +6849,7 @@ impl Store {
                     )?;
                     match source {
                         FundingSource::Advance(Some(advance_id)) => insert_advance_allocation(
-                            &tx,
+                            &conn,
                             plan.company_id,
                             advance_id,
                             target,
@@ -6674,7 +6859,7 @@ impl Store {
                         )?,
                         FundingSource::Note(Some(credit_id)) => {
                             crate::bill_note_credits::insert_application(
-                                &tx,
+                                &conn,
                                 plan.company_id,
                                 credit_id,
                                 target,
@@ -6691,6 +6876,10 @@ impl Store {
                 }
             }
         }
+        for note in notes {
+            tracking.write_note(&conn, plan.company_id, note, &mut created_batches)?;
+        }
+        let stock_matches = tracking.match_documents(&conn, plan.company_id)?;
         for change in plan.bill_changes() {
             let index = match change {
                 BillChange::Settlement(index) => index,
@@ -6698,7 +6887,7 @@ impl Store {
                     let note = &plan.bill_notes[index];
                     if !note.stock.is_empty() {
                         apply_stock_return(
-                            &tx,
+                            &conn,
                             plan.company_id,
                             note,
                             posted_notes[index].map(|(voucher, _)| voucher),
@@ -6707,9 +6896,9 @@ impl Store {
                     }
                     let (voucher, party) = match posted_notes[index] {
                         Some(saved) => saved,
-                        None => post_imported_bill_note(&tx, plan.company_id, note)?,
+                        None => post_imported_bill_note(&conn, plan.company_id, note)?,
                     };
-                    attach_note_bill_allocations(&tx, plan.company_id, note, voucher, party)?;
+                    attach_note_bill_allocations(&conn, plan.company_id, note, voucher, party)?;
                     continue;
                 }
             };
@@ -6741,7 +6930,7 @@ impl Store {
                 });
             }
             let refund_total = bill_note_refunds::validate_refunds(
-                &tx,
+                &conn,
                 plan.company_id,
                 credit_kind,
                 party_id,
@@ -6750,7 +6939,7 @@ impl Store {
             )?;
             let voucher_id = if !settlement.bills.invoices.is_empty() {
                 let allocations = resolve_imported_bill_allocations(
-                    &tx,
+                    &conn,
                     plan.company_id,
                     settlement.kind,
                     party_id,
@@ -6758,7 +6947,7 @@ impl Store {
                     &settlement.bills.invoices,
                 )?;
                 insert_settlement_on_connection(
-                    &tx,
+                    &conn,
                     plan.company_id,
                     bank_id,
                     &settlement.date,
@@ -6774,7 +6963,7 @@ impl Store {
                 voucher
             } else {
                 bill_note_refunds::post_refund_voucher(
-                    &tx,
+                    &conn,
                     plan.company_id,
                     settlement.kind,
                     bank_id,
@@ -6785,10 +6974,10 @@ impl Store {
                     refund_total,
                 )?
             };
-            bill_note_refunds::attach_refunds(&tx, voucher_id, bank_id, &refunds)?;
+            bill_note_refunds::attach_refunds(&conn, voucher_id, bank_id, &refunds)?;
             if advance_voucher.is_none() {
                 save_metadata(
-                    &tx,
+                    &conn,
                     plan.company_id,
                     "voucher",
                     voucher_id,
@@ -6796,28 +6985,32 @@ impl Store {
                 )?;
             }
         }
-        crate::stock_policy::check_import(&tx, plan.company_id)?;
-        tx.commit()?;
-        Ok(ImportCounts {
-            groups: plan.groups.len(),
-            ledgers: plan.accounts.len(),
-            opening_bills: plan.opening_bill_count(),
-            opening_advances: plan.opening_advance_count(),
-            opening_on_account: plan.opening_on_account_count(),
-            vouchers: plan.transactions.len(),
-            invoices: plan.invoices.len(),
-            settlements: plan.settlement_count(),
-            bill_notes: plan.bill_note_count(),
-            advances: plan.advance_count(),
-            advance_applications: plan.advance_application_count(),
-            note_credits: plan.note_credit_count(),
-            credit_applications: plan.credit_application_count(),
-            note_refunds: plan.note_refund_count(),
-            units: plan.units.len(),
-            stock_groups: plan.stock_groups.len(),
-            locations: plan.locations.len(),
-            items: plan.items.len(),
-        })
+        crate::stock_policy::check_import(&conn, plan.company_id)?;
+        Ok((
+            ImportCounts {
+                groups: plan.groups.len(),
+                ledgers: plan.accounts.len(),
+                opening_bills: plan.opening_bill_count(),
+                opening_advances: plan.opening_advance_count(),
+                opening_on_account: plan.opening_on_account_count(),
+                vouchers: plan.transactions.len(),
+                invoices: plan.invoices.len(),
+                stock_notes: plan.stock_notes.len(),
+                stock_matches: stock_matches.len(),
+                settlements: plan.settlement_count(),
+                bill_notes: plan.bill_note_count(),
+                advances: plan.advance_count(),
+                advance_applications: plan.advance_application_count(),
+                note_credits: plan.note_credit_count(),
+                credit_applications: plan.credit_application_count(),
+                note_refunds: plan.note_refund_count(),
+                units: plan.units.len(),
+                stock_groups: plan.stock_groups.len(),
+                locations: plan.locations.len(),
+                items: plan.items.len(),
+            },
+            stock_matches,
+        ))
     }
 }
 
@@ -11053,6 +11246,7 @@ mod tests {
                     existing_batch_id: None,
                     quantity: 3000,
                     billed_quantity: 3000,
+                    tracking: None,
                 }],
             }],
         };
@@ -11081,6 +11275,8 @@ mod tests {
             items: Vec::new(),
             transactions: Vec::new(),
             invoices: vec![sale],
+            stock_notes: Vec::new(),
+            stock_matches: None,
             settlements: Vec::new(),
             bill_notes: Vec::new(),
             issues: Vec::new(),

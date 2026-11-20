@@ -215,6 +215,7 @@ pub struct InvoiceAllocationDetail {
     pub quantity: i64,
     pub billed_quantity: i64,
     pub linked_stock_quantity: i64,
+    pub source_tracking: Option<String>,
 }
 
 impl InvoiceAllocationDetail {
@@ -1133,12 +1134,14 @@ fn read_allocation_details(
     revision: bool,
 ) -> Result<Vec<InvoiceAllocationDetail>> {
     let sql = if revision {
-        "SELECT loc.name, b.name, a.quantity, COALESCE(a.billed_quantity, a.quantity), 0 FROM invoice_revision_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.revision_line_id = ?1 ORDER BY a.id"
+        "SELECT loc.name, b.name, a.quantity, COALESCE(a.billed_quantity, a.quantity), 0, NULL FROM invoice_revision_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.revision_line_id = ?1 ORDER BY a.id"
     } else {
         "SELECT loc.name, b.name, a.quantity, COALESCE(a.billed_quantity, a.quantity),
-                COALESCE((SELECT SUM(s.quantity) FROM active_invoice_stock_links s WHERE s.invoice_allocation_id = a.id), 0)
+                COALESCE((SELECT SUM(s.quantity) FROM active_invoice_stock_links s WHERE s.invoice_allocation_id = a.id), 0),
+                t.reference
          FROM invoice_line_allocations a JOIN stock_locations loc ON loc.id = a.location_id
-         LEFT JOIN stock_batches b ON b.id = a.batch_id WHERE a.line_id = ?1 ORDER BY a.id"
+         LEFT JOIN stock_batches b ON b.id = a.batch_id
+         LEFT JOIN imported_invoice_tracking t ON t.allocation_id = a.id WHERE a.line_id = ?1 ORDER BY a.id"
     };
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt
@@ -1149,6 +1152,7 @@ fn read_allocation_details(
                 quantity: r.get(2)?,
                 billed_quantity: r.get(3)?,
                 linked_stock_quantity: r.get(4)?,
+                source_tracking: r.get(5)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3225,6 +3229,17 @@ impl Store {
         if crate::stock_notes::linked_note(&tx, invoice_id)?.is_some() {
             return Err(Error::Validation(
                 "An invoice linked to a stock note cannot be edited. Reverse it and create a replacement.".into(),
+            ));
+        }
+        if tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM imported_invoice_tracking t
+             JOIN invoice_line_allocations a ON a.id = t.allocation_id
+             JOIN invoice_lines l ON l.id = a.line_id WHERE l.invoice_id = ?1)",
+            [invoice_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Err(Error::Validation(
+                "An invoice with imported stock tracking references cannot be edited".into(),
             ));
         }
         if crate::advances::invoice_allocation_state(&tx, company_id, invoice_id, None)?.has_history

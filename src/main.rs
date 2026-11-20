@@ -4615,6 +4615,9 @@ impl App {
                                 && invoice.reversal.is_none()
                                 && invoice.order_id.is_none()
                                 && invoice.stock_note_id.is_none()
+                                && invoice.lines.iter().all(|line| {
+                                    line.allocations.iter().all(|a| a.source_tracking.is_none())
+                                })
                                 && invoice.opening_bill.is_none()
                                 && !self.invoice_draft_in_use(),
                             egui::Button::new("Edit invoice"),
@@ -4698,6 +4701,9 @@ impl App {
                                             - allocation.linked_stock_quantity
                                     )),
                                 ));
+                            }
+                            if let Some(tracking) = allocation.source_tracking {
+                                ui.small(format!("    Tracking {tracking}"));
                             }
                         }
                     }
@@ -5078,6 +5084,13 @@ impl App {
                 plan.item_count(),
                 plan.stock_opening_count()
             ));
+            if plan.stock_note_count() > 0 || plan.stock_match_count() > 0 {
+                ui.label(format!(
+                    "{} stock notes and {} tracking matches",
+                    plan.stock_note_count(),
+                    plan.stock_match_count()
+                ));
+            }
             let (valued_openings, value) = plan.opening_stock_value();
             if valued_openings > 0 {
                 ui.label(format!(
@@ -5107,8 +5120,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
-                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
+                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} stock notes, {} tracking matches, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
+                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.stock_notes, counts.stock_matches, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
                         );
                         self.import_preview = None;
                     }

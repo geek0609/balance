@@ -175,6 +175,7 @@ fn candidates(
     company: i64,
     note: &StockNote,
     invoice: Option<i64>,
+    invoice_date_through: &str,
 ) -> Result<Vec<InvoiceAwaitingStock>> {
     if note.reversed_on.is_some() || !note.has_unbilled_stock {
         return Ok(Vec::new());
@@ -197,7 +198,7 @@ fn candidates(
             company,
             note.kind.as_str(),
             note.party_ledger_id,
-            note.date,
+            invoice_date_through,
             note.id,
             note.order_id,
             invoice,
@@ -365,6 +366,115 @@ pub(crate) fn deliveries(
     Ok(deliveries)
 }
 
+pub(crate) fn link_imported_stock(
+    conn: &Connection,
+    company: i64,
+    note: i64,
+    invoice: i64,
+    date: &str,
+    requests: &[StockNoteInvoiceAllocation],
+) -> Result<()> {
+    write_stock_match(conn, company, note, invoice, date, requests, true)
+}
+
+fn write_stock_match(
+    conn: &Connection,
+    company: i64,
+    note: i64,
+    invoice: i64,
+    linked_on: &str,
+    requests: &[StockNoteInvoiceAllocation],
+    allow_prior_note: bool,
+) -> Result<()> {
+    let date = parse_date(linked_on)?;
+    if requests.is_empty() {
+        return Err(Error::Validation("Enter a quantity to match".into()));
+    }
+    let note = stock_notes::get_note(conn, company, note)?;
+    if date < parse_date(&note.date)? {
+        return Err(Error::Validation(
+            "Link date cannot precede the stock note date".into(),
+        ));
+    }
+    if crate::periods::cutoff(conn, company)?.is_some_and(|locked| date <= locked) {
+        return Err(Error::Validation(
+            crate::periods::LOCKED_PERIOD_MESSAGE.into(),
+        ));
+    }
+    stock_notes::check_after_invoice_reversals(conn, company, note.id, date, true)?;
+    crate::stock_returns::check_after_returns(conn, company, note.id, date, true)?;
+    let through = if allow_prior_note {
+        linked_on.to_owned()
+    } else {
+        note.date.clone()
+    };
+    let candidate = candidates(conn, company, &note, Some(invoice), &through)?
+        .into_iter()
+        .find(|entry| entry.id == invoice)
+        .ok_or_else(|| Error::Validation("No billed allocations match this stock note".into()))?;
+    let mut demands: HashMap<_, _> = candidate
+        .allocations
+        .into_iter()
+        .map(|a| (a.allocation_id, a))
+        .collect();
+    let mut lines: HashMap<_, _> = stock_notes::note_lines(conn, company, note.id)?
+        .into_iter()
+        .map(|l| (l.id, l))
+        .collect();
+    let mut used = HashSet::new();
+    let date = date.to_string();
+    for request in requests {
+        let &StockNoteInvoiceAllocation {
+            invoice_allocation_id,
+            note_line_id,
+            quantity,
+        } = request;
+        if !used.insert((invoice_allocation_id, note_line_id)) {
+            return Err(Error::Validation(
+                "Combine quantities for each pair of matching allocations".into(),
+            ));
+        }
+        let line = lines
+            .get_mut(&note_line_id)
+            .ok_or_else(|| Error::Validation("Choose a line on the selected stock note".into()))?;
+        let billed = demands
+            .get_mut(&invoice_allocation_id)
+            .filter(|a| a.matches(line))
+            .ok_or_else(|| {
+                Error::Validation("Choose a matching billed item and location".into())
+            })?;
+        if quantity <= 0 || quantity > line.unbilled() || quantity > billed.remaining {
+            return Err(Error::Validation(
+                "Quantity exceeds the available stock or billed quantity".into(),
+            ));
+        }
+        check_quantity_precision(conn, company, billed.item_id, quantity)?;
+        check_link_date(conn, invoice_allocation_id, note_line_id, &date)?;
+        let note_spans = stock_notes::allocate_spans(conn, line, quantity)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT billed_start, quantity FROM active_invoice_stock_links
+             WHERE invoice_allocation_id = ?1 ORDER BY billed_start",
+        )?;
+        let invoice_spans = stock_notes::reserve_spans(
+            billed.billed_quantity,
+            quantity,
+            billed.billed_quantity - billed.remaining,
+            stmt.query_map([invoice_allocation_id], |r| Ok((r.get(0)?, r.get(1)?)))?,
+        )?;
+        attach_spans(
+            conn,
+            invoice_allocation_id,
+            note_line_id,
+            &date,
+            invoice_spans,
+            note_spans,
+        )?;
+        billed.remaining -= quantity;
+        line.billed += quantity;
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn invoices_awaiting_stock_on_note(
         &self,
@@ -372,7 +482,7 @@ impl Store {
         note: i64,
     ) -> Result<Vec<InvoiceAwaitingStock>> {
         let note = stock_notes::get_note(&self.conn, company, note)?;
-        candidates(&self.conn, company, &note, None)
+        candidates(&self.conn, company, &note, None, &note.date)
     }
 
     pub fn invoice_stock_demand(
@@ -392,92 +502,10 @@ impl Store {
         linked_on: &str,
         requests: &[StockNoteInvoiceAllocation],
     ) -> Result<()> {
-        let date = parse_date(linked_on)?;
-        if requests.is_empty() {
-            return Err(Error::Validation("Enter a quantity to match".into()));
-        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let note = stock_notes::get_note(&tx, company, note)?;
-        if date < parse_date(&note.date)? {
-            return Err(Error::Validation(
-                "Link date cannot precede the stock note date".into(),
-            ));
-        }
-        if crate::periods::cutoff(&tx, company)?.is_some_and(|locked| date <= locked) {
-            return Err(Error::Validation(
-                crate::periods::LOCKED_PERIOD_MESSAGE.into(),
-            ));
-        }
-        stock_notes::check_after_invoice_reversals(&tx, company, note.id, date, true)?;
-        crate::stock_returns::check_after_returns(&tx, company, note.id, date, true)?;
-        let candidate = candidates(&tx, company, &note, Some(invoice))?
-            .into_iter()
-            .find(|entry| entry.id == invoice)
-            .ok_or_else(|| {
-                Error::Validation("No billed allocations match this stock note".into())
-            })?;
-        let mut demands: HashMap<_, _> = candidate
-            .allocations
-            .into_iter()
-            .map(|a| (a.allocation_id, a))
-            .collect();
-        let mut lines: HashMap<_, _> = stock_notes::note_lines(&tx, company, note.id)?
-            .into_iter()
-            .map(|l| (l.id, l))
-            .collect();
-        let mut used = HashSet::new();
-        let date = date.to_string();
-        for request in requests {
-            let &StockNoteInvoiceAllocation {
-                invoice_allocation_id,
-                note_line_id,
-                quantity,
-            } = request;
-            if !used.insert((invoice_allocation_id, note_line_id)) {
-                return Err(Error::Validation(
-                    "Combine quantities for each pair of matching allocations".into(),
-                ));
-            }
-            let line = lines.get_mut(&note_line_id).ok_or_else(|| {
-                Error::Validation("Choose a line on the selected stock note".into())
-            })?;
-            let billed = demands
-                .get_mut(&invoice_allocation_id)
-                .filter(|a| a.matches(line))
-                .ok_or_else(|| {
-                    Error::Validation("Choose a matching billed item and location".into())
-                })?;
-            if quantity <= 0 || quantity > line.unbilled() || quantity > billed.remaining {
-                return Err(Error::Validation(
-                    "Quantity exceeds the available stock or billed quantity".into(),
-                ));
-            }
-            check_quantity_precision(&tx, company, billed.item_id, quantity)?;
-            check_link_date(&tx, invoice_allocation_id, note_line_id, &date)?;
-            let note_spans = stock_notes::allocate_spans(&tx, line, quantity)?;
-            let mut stmt = tx.prepare_cached(
-                "SELECT billed_start, quantity FROM active_invoice_stock_links
-                 WHERE invoice_allocation_id = ?1 ORDER BY billed_start",
-            )?;
-            let invoice_spans = stock_notes::reserve_spans(
-                billed.billed_quantity,
-                quantity,
-                billed.billed_quantity - billed.remaining,
-                stmt.query_map([invoice_allocation_id], |r| Ok((r.get(0)?, r.get(1)?)))?,
-            )?;
-            attach_spans(
-                &tx,
-                invoice_allocation_id,
-                note_line_id,
-                &date,
-                invoice_spans,
-                note_spans,
-            )?;
-            billed.remaining -= quantity;
-            line.billed += quantity;
-        }
+        write_stock_match(&tx, company, note, invoice, linked_on, requests, false)?;
         tx.commit()?;
         Ok(())
     }
