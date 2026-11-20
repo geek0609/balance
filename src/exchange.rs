@@ -18,7 +18,7 @@ use crate::inventory::{
 use crate::opening_bills::OpeningBillDraft;
 use crate::settlement_discounts::SettlementDiscount;
 use crate::stock_units::{
-    self, index_measure, resolve_compound, saved_measures, CompoundUnit, UnitMeasure,
+    self, index_measure, resolve_compound, saved_measures, unit_key, CompoundUnit, UnitMeasure,
 };
 use crate::taxes::InvoiceTaxLine;
 use crate::{
@@ -2591,17 +2591,7 @@ fn parse_invoice_stock(
                 let (price, rate_unit) = rate
                     .split_once('/')
                     .ok_or_else(|| Error::Validation("rate must specify the base unit".into()))?;
-                let rate_unit = crate::required(rate_unit, "Item rate unit")?;
-                unit.factor_for(rate_unit)?;
-                let basis = if normalized(rate_unit) == normalized(unit.stock_symbol()) {
-                    None
-                } else {
-                    let quantity = unit.quantity(&format!("1 {rate_unit}"))?;
-                    Some(InvoiceRateBasis {
-                        quantity,
-                        unit: rate_unit.to_owned(),
-                    })
-                };
+                let basis = unit.rate_basis(rate_unit)?;
                 (parse_amount(price)?, basis)
             } else if source_amount == 0 {
                 (0, None)
@@ -3847,7 +3837,7 @@ fn find_stock_unit(conn: &Connection, company: i64, symbol: &str) -> Result<Opti
         ))
     })? {
         let (id, name, places) = row?;
-        if normalized(&name) == normalized(symbol) {
+        if unit_key(&name) == unit_key(symbol) {
             if found.is_some() {
                 return Err(Error::Validation(format!("Unit {symbol} is ambiguous")));
             }
@@ -4324,7 +4314,7 @@ impl Store {
             }
             check_fields(node, &fields, &label, &mut plan.issues);
             check_language_names(node, &symbol, &label, &mut plan.issues);
-            if !symbol.is_empty() && !seen_units.insert(normalized(&symbol)) {
+            if !symbol.is_empty() && !seen_units.insert(unit_key(&symbol)) {
                 plan.issues.push(format!("{label}: duplicate symbol"));
                 continue;
             }
@@ -4373,7 +4363,7 @@ impl Store {
             };
             if let Some(existing) = existing_units
                 .iter()
-                .find(|u| normalized(&u.symbol) == normalized(&symbol))
+                .find(|u| unit_key(&u.symbol) == unit_key(&symbol))
             {
                 if existing.compound.is_some()
                     || existing.decimal_places != places
@@ -4416,12 +4406,12 @@ impl Store {
                         continue;
                     }
                 };
-                compound.primary = known_units[&normalized(&compound.primary)].symbol.clone();
-                compound.tail = known_units[&normalized(&compound.tail)].symbol.clone();
-                let key = normalized(&measure.symbol);
+                compound.primary = known_units[&unit_key(&compound.primary)].symbol.clone();
+                compound.tail = known_units[&unit_key(&compound.tail)].symbol.clone();
+                let key = unit_key(&measure.symbol);
                 let existing_name = known_units
                     .get(&key)
-                    .or_else(|| known_units.get(&normalized(&measure.canonical)));
+                    .or_else(|| known_units.get(&unit_key(&measure.canonical)));
                 if let Some(existing_name) = existing_name {
                     let existing = existing_units
                         .iter()
@@ -4721,7 +4711,7 @@ impl Store {
                 &mut plan.issues,
             );
             let unit_name = direct_text(node, "BASEUNITS").unwrap_or_default();
-            let Some(unit) = known_units.get(&normalized(&unit_name)) else {
+            let Some(unit) = known_units.get(&unit_key(&unit_name)) else {
                 plan.issues
                     .push(format!("{label}: unit {unit_name} is not available"));
                 continue;
@@ -5007,14 +4997,14 @@ impl Store {
             if let Some(symbol) = unit_symbols.get(&item.unit_id) {
                 invoice_items.insert(
                     normalized(&item.name),
-                    (Some(item.id), Arc::clone(&known_units[&normalized(symbol)])),
+                    (Some(item.id), Arc::clone(&known_units[&unit_key(symbol)])),
                 );
             }
         }
         invoice_items.extend(plan.items.iter().map(|item| {
             (
                 normalized(&item.name),
-                (None, Arc::clone(&known_units[&normalized(&item.unit)])),
+                (None, Arc::clone(&known_units[&unit_key(&item.unit)])),
             )
         }));
         let mut invoice_references = HashSet::<(String, String, String)>::new();

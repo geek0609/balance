@@ -9,7 +9,7 @@ use balance::inventory::{
     discounted_line_amount_with_basis, format_quantity, parse_quantity, BillSettlementAllocation,
     BillSettlementTarget, InvoiceAdjustment, InvoiceAllocation, InvoiceDiscount, InvoiceDraft,
     InvoiceEntryMode, InvoiceExternalReference, InvoiceKind, InvoiceLine, InvoiceRateBasis,
-    StockBatch, StockItem, StockLocation,
+    StockBatch, StockItem, StockLocation, StockUnit,
 };
 use balance::pricing::PriceList;
 use balance::reorder::ReorderRule;
@@ -196,6 +196,7 @@ struct App {
     unit_symbol: String,
     unit_formal_name: String,
     unit_decimals: u8,
+    compound_unit: CompoundUnitForm,
     stock_group_name: String,
     stock_group_parent: Option<i64>,
     stock_location_name: String,
@@ -370,6 +371,14 @@ struct InvoiceLineForm {
     discount_value: String,
     extra_allocations: Vec<InvoiceAllocationForm>,
 }
+
+#[derive(Default)]
+struct CompoundUnitForm {
+    primary: Option<i64>,
+    tail: Option<i64>,
+    conversion: String,
+    symbol: String,
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiscountMode {
     None,
@@ -542,6 +551,7 @@ impl App {
             unit_symbol: String::new(),
             unit_formal_name: String::new(),
             unit_decimals: 0,
+            compound_unit: CompoundUnitForm::default(),
             stock_group_name: String::new(),
             stock_group_parent: None,
             stock_location_name: String::new(),
@@ -704,6 +714,7 @@ impl App {
         self.import_preview = None;
         self.adjustment_item = None;
         self.stock_creation_unit = None;
+        self.compound_unit = CompoundUnitForm::default();
         self.stock_creation_group = None;
         self.stock_edit_selection = None;
         self.stock_editing = None;
@@ -2352,6 +2363,60 @@ impl App {
                 }
             }
         });
+        egui::CollapsingHeader::new("Create compound unit").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                pick_unit(
+                    ui,
+                    "compound-outer-unit",
+                    "Outer unit",
+                    &units,
+                    true,
+                    &mut self.compound_unit.primary,
+                );
+                pick_unit(
+                    ui,
+                    "compound-inner-unit",
+                    "Contained unit",
+                    &units,
+                    false,
+                    &mut self.compound_unit.tail,
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Contained units per outer unit");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.compound_unit.conversion)
+                        .desired_width(80.0),
+                );
+                ui.label("Unit symbol");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.compound_unit.symbol)
+                        .hint_text("Generate automatically"),
+                );
+                if ui.button("Create compound unit").clicked() {
+                    let result = match (self.compound_unit.primary, self.compound_unit.tail) {
+                        (Some(primary), Some(tail)) => self.store.create_compound_stock_unit(
+                            company,
+                            &self.compound_unit.symbol,
+                            primary,
+                            tail,
+                            &self.compound_unit.conversion,
+                        ),
+                        _ => Err(balance::Error::Validation(
+                            "Select both units for the conversion".into(),
+                        )),
+                    };
+                    match result {
+                        Ok(id) => {
+                            self.stock_creation_unit = Some(id);
+                            self.compound_unit = CompoundUnitForm::default();
+                            self.message = "Compound unit created".into();
+                        }
+                        Err(error) => self.failure(error),
+                    }
+                }
+            });
+        });
         ui.horizontal(|ui| {
             ui.label("Stock group");
             ui.text_edit_singleline(&mut self.stock_group_name);
@@ -3510,13 +3575,20 @@ impl App {
                 ui.label("Reduce quantities or remove lines to bill selected stock notes in part. Review prices and tax before posting.");
             }
             None => {
-                ui.label("Save an invoice to create its accounting voucher and any stock movements together. For services, remove all item lines and add a positive service / charge line. Item prices are per unit; each line rounds to two decimal places.");
+                ui.label("Save an invoice to create its accounting voucher and any stock movements together. For services, remove all item lines and add a positive service / charge line. Each line rounds to two decimal places.");
             }
         }
         let items = match self.store.stock_items(company) {
             Ok(v) => v,
             Err(e) => {
                 self.failure(e);
+                return;
+            }
+        };
+        let price_units = match self.store.invoice_price_units(company) {
+            Ok(units) => units,
+            Err(error) => {
+                self.failure(error);
                 return;
             }
         };
@@ -3839,13 +3911,11 @@ impl App {
                             );
                         }
                     });
-                let quantity_hint = items
-                    .iter()
-                    .find(|item| Some(item.id) == line.item)
-                    .map_or_else(
-                        || "Quantity".into(),
-                        |item| format!("Stock qty ({})", item.unit),
-                    );
+                let stock_item = items.iter().find(|item| Some(item.id) == line.item);
+                let quantity_hint = stock_item.map_or_else(
+                    || "Quantity".into(),
+                    |item| format!("Stock qty ({})", item.unit),
+                );
                 ui.add(
                     egui::TextEdit::singleline(&mut line.quantity)
                         .hint_text(quantity_hint)
@@ -3865,11 +3935,32 @@ impl App {
                         ))
                         .desired_width(90.0),
                 );
-                if let Some(basis) = &line.rate_basis {
-                    ui.label(format!("per {}", basis.unit));
-                    if ui.small_button("Use stock unit").clicked() {
-                        line.rate_basis = None;
-                        line.price.clear();
+                if let Some(item) = stock_item {
+                    let choices = price_units.get(&item.unit_id);
+                    if choices.is_some() || line.rate_basis.is_some() {
+                        let previous = line.rate_basis.clone();
+                        let unit = previous
+                            .as_ref()
+                            .map_or(item.unit.as_str(), |basis| basis.unit.as_str());
+                        egui::ComboBox::from_id_salt(("invoice-price-unit", index))
+                            .selected_text(format!("per {unit}"))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut line.rate_basis,
+                                    None,
+                                    format!("per {}", item.unit),
+                                );
+                                for basis in choices.into_iter().flatten() {
+                                    ui.selectable_value(
+                                        &mut line.rate_basis,
+                                        Some(basis.clone()),
+                                        format!("per {}", basis.unit),
+                                    );
+                                }
+                            });
+                        if previous != line.rate_basis {
+                            line.price.clear();
+                        }
                     }
                 }
                 egui::ComboBox::from_id_salt(("invoice-discount", index))
@@ -6141,6 +6232,31 @@ fn pick_location(
             }
         });
 }
+fn pick_unit(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    units: &[StockUnit],
+    simple_only: bool,
+    selected: &mut Option<i64>,
+) {
+    ui.label(label);
+    let choices = units
+        .iter()
+        .filter(|unit| !simple_only || unit.compound.is_none());
+    let text = choices
+        .clone()
+        .find(|unit| Some(unit.id) == *selected)
+        .map_or("Select unit", |unit| unit.symbol.as_str());
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            for unit in choices {
+                ui.selectable_value(selected, Some(unit.id), &unit.symbol);
+            }
+        });
+}
+
 fn pick_stock(
     ui: &mut egui::Ui,
     id: impl std::hash::Hash,
