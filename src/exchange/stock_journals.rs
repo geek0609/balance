@@ -329,6 +329,7 @@ pub(super) fn write(
             reference: &source.reference,
             narration: &source.narration,
             entries,
+            enforce_negative_stock: false,
         },
     )?;
     save_metadata(conn, company, "stockjournal", saved, &source.metadata)

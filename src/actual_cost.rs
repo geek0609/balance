@@ -364,6 +364,7 @@ mod ageing_tests {
 enum IssueOrigin {
     Sale(SaleCostOrigin),
     SupplierReturn(i64),
+    StockJournal(i64),
 }
 
 #[derive(Debug)]
@@ -385,6 +386,7 @@ enum Movement {
         share: crate::stock_notes::InvoiceQuantityShare,
     },
     PurchaseReversal,
+    JournalReceiptReversal(i64),
     AdjustmentOut,
 }
 struct Event {
@@ -416,11 +418,16 @@ impl Event {
                 ..
             } => 3,
             Movement::PurchaseReversal
+            | Movement::JournalReceiptReversal(_)
             | Movement::Issue {
                 origin: IssueOrigin::SupplierReturn(_),
                 ..
             } => 4,
-            Movement::AdjustmentOut => 5,
+            Movement::AdjustmentOut
+            | Movement::Issue {
+                origin: IssueOrigin::StockJournal(_),
+                ..
+            } => 5,
         };
         (self.date, priority, self.source_id, false, 0)
     }
@@ -612,6 +619,15 @@ fn calculate(
                         Movement::PurchaseReversal => {
                             format!("Purchase reversal for line {}", event.source_id)
                         }
+                        Movement::Issue {
+                            origin: IssueOrigin::StockJournal(journal),
+                            ..
+                        } => {
+                            format!("Stock journal {journal}")
+                        }
+                        Movement::JournalReceiptReversal(journal) => {
+                            format!("Stock journal reversal {journal}")
+                        }
                         Movement::AdjustmentOut => format!("Stock adjustment {}", event.source_id),
                         _ => unreachable!("only stock issue events reach this branch"),
                     };
@@ -696,6 +712,7 @@ fn journal_events(
     struct ItemMovement {
         date: NaiveDate,
         adjustment: i64,
+        reversal: Option<(i64, NaiveDate)>,
         quantity: i128,
         issued: bool,
         receipt_cost: Option<i128>,
@@ -704,15 +721,27 @@ fn journal_events(
     let mut stmt = conn.prepare(
         "SELECT j.id, j.date, e.item_id, e.quantity, e.amount, (
              SELECT MIN(a.adjustment_id) FROM stock_journal_allocations a WHERE a.entry_id = e.id
-         )
+         ), undo.id, undo.date
          FROM stock_journals j JOIN stock_journal_entries e ON e.journal_id = j.id
-         WHERE j.company_id = ?1",
+         LEFT JOIN stock_journal_reversals r ON r.original_id = j.id
+         LEFT JOIN stock_journals undo ON undo.id = r.reversal_id
+         WHERE j.company_id = ?1
+           AND NOT EXISTS(SELECT 1 FROM stock_journal_reversals back WHERE back.reversal_id = j.id)",
     )?;
     let mut rows = stmt.query([company])?;
     let mut movements = HashMap::<(i64, i64), ItemMovement>::new();
     while let Some(row) = rows.next()? {
         let date = parse_date(&row.get::<_, String>(1)?)?;
         if date > end {
+            continue;
+        }
+        let reversal = if let Some(id) = row.get::<_, Option<i64>>(6)? {
+            let reversed_on = parse_date(&row.get::<_, String>(7)?)?;
+            (reversed_on <= end).then_some((id, reversed_on))
+        } else {
+            None
+        };
+        if reversal.is_some_and(|(_, reversed_on)| reversed_on == date) {
             continue;
         }
         let journal = row.get(0)?;
@@ -724,6 +753,7 @@ fn journal_events(
             std::collections::hash_map::Entry::Vacant(entry) => entry.insert(ItemMovement {
                 date,
                 adjustment,
+                reversal,
                 quantity: 0,
                 issued: false,
                 receipt_cost: Some(0),
@@ -744,7 +774,10 @@ fn journal_events(
     for ((journal_id, item), saved) in movements {
         let movement = match saved.quantity.cmp(&0) {
             std::cmp::Ordering::Equal => continue,
-            std::cmp::Ordering::Less => Movement::AdjustmentOut,
+            std::cmp::Ordering::Less => Movement::Issue {
+                origin: IssueOrigin::StockJournal(journal_id),
+                retain_cost: saved.reversal.is_some(),
+            },
             std::cmp::Ordering::Greater => Movement::JournalReceipt {
                 journal_id,
                 amount: if saved.issued {
@@ -754,12 +787,26 @@ fn journal_events(
                 },
             },
         };
-        events.entry(item).or_default().push(Event {
+        let item_events = events.entry(item).or_default();
+        item_events.push(Event {
             date: saved.date,
             source_id: saved.adjustment,
             quantity: saved.quantity.abs(),
             movement,
         });
+        if let Some((reversal_id, date)) = saved.reversal {
+            let movement = if saved.quantity < 0 {
+                Movement::IssueReversal(IssueOrigin::StockJournal(journal_id))
+            } else {
+                Movement::JournalReceiptReversal(reversal_id)
+            };
+            item_events.push(Event {
+                date,
+                source_id: reversal_id,
+                quantity: saved.quantity.abs(),
+                movement,
+            });
+        }
     }
     Ok(())
 }

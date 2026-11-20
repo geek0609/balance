@@ -4,8 +4,8 @@ use crate::inventory::{
 };
 use crate::{parse_date, required, Error, Result, Store};
 use chrono::NaiveDate;
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
-use std::collections::{BTreeMap, BTreeSet};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use std::collections::BTreeMap;
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -45,6 +45,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     crate::periods::protect_dated_table(conn, "stock_journals")
 }
 
+pub(crate) fn migrate_reversals(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS stock_journal_reversals (
+            original_id INTEGER PRIMARY KEY REFERENCES stock_journals(id),
+            reversal_id INTEGER NOT NULL UNIQUE REFERENCES stock_journals(id),
+            CHECK(original_id != reversal_id)
+        );",
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct StockJournal {
     pub id: i64,
@@ -52,6 +63,15 @@ pub struct StockJournal {
     pub voucher_type: String,
     pub reference: String,
     pub narration: String,
+    pub reversal: Option<StockJournalLink>,
+    pub reverses: Option<StockJournalLink>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StockJournalLink {
+    pub id: i64,
+    pub date: String,
+    pub reference: String,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +189,9 @@ pub(crate) struct JournalInput<'a> {
     pub reference: &'a str,
     pub narration: &'a str,
     pub entries: Vec<EntryInput<'a>>,
+    /// Individual journals check the negative-stock policy after all their lines.
+    /// Imports check it after the complete batch.
+    pub enforce_negative_stock: bool,
 }
 
 pub(crate) struct EntryInput<'a> {
@@ -211,7 +234,7 @@ pub(crate) fn write(conn: &Connection, company: i64, journal: JournalInput<'_>) 
     }
     let journal_id = conn.last_insert_rowid();
     let reason = format!("{} {}", journal.voucher_type, journal.reference);
-    let mut outgoing = BTreeSet::new();
+    let mut changes = BTreeMap::<_, (i128, bool)>::new();
     for entry in journal.entries {
         conn.execute(
             "INSERT INTO stock_journal_entries(journal_id, item_id, quantity, rate, amount)
@@ -241,15 +264,31 @@ pub(crate) fn write(conn: &Connection, company: i64, journal: JournalInput<'_>) 
                  VALUES (?1, ?2, ?3, ?4)",
                 params![entry_id, adjustment, allocation.rate, allocation.amount],
             )?;
-            if allocation.quantity < 0 {
-                outgoing.insert((entry.item, allocation.location, allocation.batch));
-            }
+            let (quantity, has_issue) = changes
+                .entry((entry.item, allocation.location, allocation.batch))
+                .or_default();
+            *quantity += i128::from(allocation.quantity);
+            *has_issue |= allocation.quantity < 0;
         }
     }
-    for (item, location, batch) in outgoing {
-        crate::stock_reservations::check_stock_coverage(conn, company, item, location, batch)?;
+    for ((item, location, batch), (quantity, has_issue)) in changes {
+        if has_issue {
+            crate::stock_reservations::check_stock_coverage(conn, company, item, location, batch)?;
+        }
+        if journal.enforce_negative_stock && quantity < 0 {
+            crate::stock_policy::check_bucket(conn, company, item, location, batch)?;
+        }
     }
     Ok(journal_id)
+}
+
+fn check_journal_date(conn: &Connection, company: i64, date: NaiveDate) -> Result<()> {
+    if crate::periods::cutoff(conn, company)?.is_some_and(|cutoff| date <= cutoff) {
+        return Err(Error::Validation(
+            crate::periods::LOCKED_PERIOD_MESSAGE.into(),
+        ));
+    }
+    Ok(())
 }
 
 fn read_draft_balances(
@@ -261,11 +300,7 @@ fn read_draft_balances(
     if draft.lines.is_empty() {
         return Err(Error::Validation("Add a source or destination line".into()));
     }
-    if crate::periods::cutoff(conn, company)?.is_some_and(|cutoff| date <= cutoff) {
-        return Err(Error::Validation(
-            crate::periods::LOCKED_PERIOD_MESSAGE.into(),
-        ));
-    }
+    check_journal_date(conn, company, date)?;
     let mut movements = BTreeMap::<(i64, i64, Option<i64>), (i128, i128)>::new();
     for line in &draft.lines {
         if line.quantity <= 0 {
@@ -325,12 +360,7 @@ fn read_draft_balances(
         .collect()
 }
 
-fn write_draft(
-    conn: &Connection,
-    company: i64,
-    draft: &StockJournalDraft,
-    balances: &[StockJournalBalance],
-) -> Result<i64> {
+fn write_draft(conn: &Connection, company: i64, draft: &StockJournalDraft) -> Result<i64> {
     let entries = draft
         .lines
         .iter()
@@ -354,7 +384,7 @@ fn write_draft(
             }
         })
         .collect();
-    let id = write(
+    write(
         conn,
         company,
         JournalInput {
@@ -363,18 +393,65 @@ fn write_draft(
             reference: &draft.reference,
             narration: &draft.narration,
             entries,
+            enforce_negative_stock: true,
         },
+    )
+}
+
+fn reversed_entries(conn: &Connection, journal: i64) -> Result<Vec<EntryInput<'static>>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, item_id, -quantity FROM stock_journal_entries
+         WHERE journal_id = ?1 ORDER BY id",
     )?;
-    for row in balances.iter().filter(|row| row.issued > row.received) {
-        crate::stock_policy::check_bucket(
-            conn,
-            company,
-            row.item_id,
-            row.location_id,
-            row.batch_id,
-        )?;
-    }
-    Ok(id)
+    let entries = stmt.query_map([journal], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            EntryInput {
+                item: row.get(1)?,
+                quantity: row.get(2)?,
+                rate: None,
+                amount: None,
+                allocations: Vec::new(),
+            },
+        ))
+    })?;
+    let mut allocations = conn.prepare(
+        "SELECT a.location_id, a.batch_id, -a.quantity
+         FROM stock_journal_allocations s JOIN stock_adjustments a ON a.id = s.adjustment_id
+         WHERE s.entry_id = ?1 ORDER BY s.id",
+    )?;
+    entries
+        .map(|entry| {
+            let (id, mut entry) = entry?;
+            entry.allocations = allocations
+                .query_map([id], |row| {
+                    Ok(AllocationInput {
+                        location: row.get(0)?,
+                        batch: row.get(1)?,
+                        quantity: row.get(2)?,
+                        rate: None,
+                        amount: None,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(entry)
+        })
+        .collect()
+}
+
+fn read_journal_link(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<StockJournalLink>> {
+    row.get::<_, Option<i64>>(column)?
+        .map(|id| {
+            Ok(StockJournalLink {
+                id,
+                date: row.get(column + 1)?,
+                reference: row.get(column + 2)?,
+            })
+        })
+        .transpose()
 }
 
 impl Store {
@@ -391,7 +468,7 @@ impl Store {
         draft.narration = draft.narration.trim().to_owned();
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let balances = read_draft_balances(&tx, company, date, &draft)?;
-        write_draft(&tx, company, &draft, &balances)?;
+        write_draft(&tx, company, &draft)?;
         tx.rollback()?;
         Ok(StockJournalPreview {
             company,
@@ -420,15 +497,80 @@ impl Store {
                 "Book quantities or stock details changed. Preview the journal again.".into(),
             ));
         }
-        let id = write_draft(&tx, company, &preview.draft, &balances)?;
+        let id = write_draft(&tx, company, &preview.draft)?;
         tx.commit()?;
         Ok(id)
     }
 
+    /// Post one dated reversal and retain both journal records in inventory history.
+    pub fn reverse_stock_journal(
+        &mut self,
+        company: i64,
+        original: i64,
+        date: &str,
+        reference: &str,
+        reason: &str,
+    ) -> Result<i64> {
+        let date = parse_date(date)?;
+        let reference = required(reference, "Reversal reference")?;
+        let reason = required(reason, "Reversal reason")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (original_date, voucher_type, linked): (String, String, bool) = tx.query_row(
+            "SELECT j.date, j.voucher_type,
+                    EXISTS(SELECT 1 FROM stock_journal_reversals r WHERE r.original_id = j.id OR r.reversal_id = j.id)
+             FROM stock_journals j WHERE j.company_id = ?1 AND j.id = ?2",
+            params![company, original],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?.ok_or_else(|| Error::Validation("Stock journal not found in the selected company".into()))?;
+        if linked {
+            return Err(Error::Validation(
+                "This stock journal is already linked to a reversal".into(),
+            ));
+        }
+        if date < parse_date(&original_date)? {
+            return Err(Error::Validation(
+                "Reversal date cannot precede the stock journal date".into(),
+            ));
+        }
+        check_journal_date(&tx, company, date)?;
+        let entries = reversed_entries(&tx, original)?;
+        if entries.is_empty() {
+            return Err(Error::Validation(
+                "This stock journal has no stock lines".into(),
+            ));
+        }
+        let reversal = write(
+            &tx,
+            company,
+            JournalInput {
+                date: &date.to_string(),
+                voucher_type: &voucher_type,
+                reference,
+                narration: reason,
+                entries,
+                enforce_negative_stock: true,
+            },
+        )?;
+        tx.execute(
+            "INSERT INTO stock_journal_reversals(original_id, reversal_id) VALUES (?1, ?2)",
+            params![original, reversal],
+        )?;
+        tx.commit()?;
+        Ok(reversal)
+    }
+
     pub fn stock_journals(&self, company: i64) -> Result<Vec<StockJournal>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, date, voucher_type, reference, narration FROM stock_journals
-             WHERE company_id = ?1 ORDER BY date DESC, id DESC",
+            "SELECT j.id, j.date, j.voucher_type, j.reference, j.narration,
+                    undo.id, undo.date, undo.reference, original.id, original.date, original.reference
+             FROM stock_journals j
+             LEFT JOIN stock_journal_reversals f ON f.original_id = j.id
+             LEFT JOIN stock_journals undo ON undo.id = f.reversal_id
+             LEFT JOIN stock_journal_reversals b ON b.reversal_id = j.id
+             LEFT JOIN stock_journals original ON original.id = b.original_id
+             WHERE j.company_id = ?1 ORDER BY j.date DESC, j.id DESC",
         )?;
         let rows = stmt.query_map([company], |row| {
             Ok(StockJournal {
@@ -437,6 +579,8 @@ impl Store {
                 voucher_type: row.get(2)?,
                 reference: row.get(3)?,
                 narration: row.get(4)?,
+                reversal: read_journal_link(row, 5)?,
+                reverses: read_journal_link(row, 8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -719,6 +863,205 @@ mod tests {
                 .unwrap()
                 .closing_quantity,
             0
+        );
+    }
+
+    #[test]
+    fn reverses_imported_allocations_and_restores_original_issue_costs() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Production").unwrap();
+        let other = store.create_company("Other").unwrap();
+        let main = store.stock_locations(company).unwrap()[0].id;
+        let west = store.create_stock_location(company, "West").unwrap();
+        let raw = store.create_stock_item(company, "Raw", "pcs").unwrap();
+        let product = store.create_stock_item(company, "Product", "pcs").unwrap();
+        let lot_a = store
+            .create_stock_batch(company, raw, "A", None, None)
+            .unwrap();
+        let lot_b = store
+            .create_stock_batch(company, raw, "B", None, None)
+            .unwrap();
+        for (day, lot, qty, amount) in [
+            ("2026-04-01", lot_a, 1000, 200),
+            ("2026-04-02", lot_b, 3000, 1500),
+            ("2026-04-04", lot_b, 1000, 1000),
+        ] {
+            let receipt = store
+                .adjust_stock_batch(company, raw, main, Some(lot), day, qty, "Raw stock")
+                .unwrap();
+            store
+                .set_stock_receipt_cost(company, receipt, amount, "Receipt value")
+                .unwrap();
+        }
+        let xml = br#"<ENVELOPE><BODY><DATA><MESSAGE>
+          <VOUCHER><VOUCHERTYPENAME>Manufacturing Journal</VOUCHERTYPENAME>
+            <DATE>20260403</DATE><VOUCHERNUMBER>PROD-1</VOUCHERNUMBER>
+            <INVENTORYENTRIESOUT.LIST><STOCKITEMNAME>Raw</STOCKITEMNAME><ACTUALQTY>2 pcs</ACTUALQTY>
+              <BATCHALLOCATIONS.LIST><GODOWNNAME>Main</GODOWNNAME><BATCHNAME>A</BATCHNAME>
+                <ACTUALQTY>1 pcs</ACTUALQTY>
+              </BATCHALLOCATIONS.LIST>
+              <BATCHALLOCATIONS.LIST><GODOWNNAME>Main</GODOWNNAME><BATCHNAME>B</BATCHNAME>
+                <ACTUALQTY>1 pcs</ACTUALQTY>
+              </BATCHALLOCATIONS.LIST>
+            </INVENTORYENTRIESOUT.LIST>
+            <INVENTORYENTRIESIN.LIST><STOCKITEMNAME>Product</STOCKITEMNAME>
+              <ACTUALQTY>1 pcs</ACTUALQTY><GODOWNNAME>West</GODOWNNAME><AMOUNT>12.00</AMOUNT>
+            </INVENTORYENTRIESIN.LIST>
+          </VOUCHER>
+        </MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let preview = store.preview_xml_import(company, xml).unwrap();
+        assert!(preview.can_apply(), "{:?}", preview.issues());
+        store.apply_xml_import(&preview).unwrap();
+        let original = store.stock_journals(company).unwrap().remove(0).id;
+        store
+            .adjust_stock_batch(
+                company,
+                raw,
+                main,
+                Some(lot_b),
+                "2026-04-05",
+                -1000,
+                "Other material issue",
+            )
+            .unwrap();
+        store
+            .adjust_stock_at(
+                company,
+                product,
+                west,
+                "2026-04-07",
+                -1000,
+                "Future stock issue",
+            )
+            .unwrap();
+        store
+            .set_negative_stock_policy(company, Some("2026-04-01"), "Stock policy")
+            .unwrap();
+        assert!(store
+            .reverse_stock_journal(other, original, "2026-04-06", "REV-1", "Correction")
+            .is_err());
+        let error = store
+            .reverse_stock_journal(company, original, "2026-04-02", "REV-1", "Correction")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot precede"), "{error}");
+        let error = store
+            .reverse_stock_journal(company, original, "2026-04-06", "REV-1", "Correction")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Negative stock is blocked"), "{error}");
+        assert_eq!(store.stock_journals(company).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .stock_register_at(company, raw, Some(main), None, Some("2026-04-06"))
+                .unwrap()
+                .closing_quantity,
+            2000
+        );
+        store
+            .adjust_stock_at(
+                company,
+                product,
+                west,
+                "2026-04-07",
+                1000,
+                "Replacement stock",
+            )
+            .unwrap();
+        store
+            .set_period_lock(company, Some("2026-04-03"), "Closed production period")
+            .unwrap();
+        let error = store
+            .reverse_stock_journal(company, original, "2026-04-03", "REV-1", "Correction")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("locked period"), "{error}");
+        let reversal = store
+            .reverse_stock_journal(company, original, "2026-04-06", "REV-1", "Correction")
+            .unwrap();
+        let history = store.stock_journals(company).unwrap();
+        assert_eq!(history[0].reference, "REV-1");
+        assert_eq!(history[0].narration, "Correction");
+        assert_eq!(history[0].reverses.as_ref().unwrap().id, original);
+        assert_eq!(history[1].reference, "PROD-1");
+        assert_eq!(history[1].reversal.as_ref().unwrap().id, reversal);
+        let entries = store.stock_journal_entries(company, reversal).unwrap();
+        assert_eq!(entries[0].quantity, 2000);
+        assert_eq!(entries[0].allocations[0].batch.as_deref(), Some("A"));
+        assert_eq!(entries[0].allocations[1].batch.as_deref(), Some("B"));
+        assert_eq!(entries[1].quantity, -1000);
+        assert_eq!(entries[1].allocations[0].location, "West");
+        assert!(store
+            .reverse_stock_journal(company, original, "2026-04-07", "REV-2", "Again")
+            .is_err());
+        assert!(store
+            .reverse_stock_journal(company, reversal, "2026-04-07", "REV-3", "Again")
+            .is_err());
+        for (method, value_before, value_after) in [
+            (ActualCostMethod::Fifo, 2700, 2200),
+            (ActualCostMethod::WeightedAverage, 2433, 2083),
+        ] {
+            let before = store
+                .stock_valuation_at_actual_cost(company, "2026-04-05", method)
+                .unwrap();
+            assert_eq!((before.known_value, before.unavailable), (value_before, 0));
+            let after = store
+                .stock_valuation_at_actual_cost(company, "2026-04-06", method)
+                .unwrap();
+            assert_eq!((after.known_value, after.unavailable), (value_after, 0));
+            let raw = after.rows.iter().find(|row| row.item.id == raw).unwrap();
+            assert_eq!((raw.quantity, raw.value), (4000, Some(value_after)));
+        }
+    }
+
+    #[test]
+    fn same_day_reversal_cancels_even_an_uncosted_receipt() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Receipts").unwrap();
+        let item = store.create_stock_item(company, "Part", "pcs").unwrap();
+        let location = store.stock_locations(company).unwrap()[0].id;
+        let opening = store
+            .adjust_stock_at(company, item, location, "2026-04-01", 2000, "Opening")
+            .unwrap();
+        store
+            .set_stock_receipt_cost(company, opening, 300, "Opening value")
+            .unwrap();
+        let date = "2026-04-02";
+        let draft = StockJournalDraft {
+            kind: StockJournalKind::Stock,
+            date: date.into(),
+            reference: "RX-1".into(),
+            narration: String::new(),
+            lines: vec![StockJournalLineDraft {
+                side: StockJournalSide::Destination,
+                item_id: item,
+                location_id: location,
+                batch_id: None,
+                quantity: 1000,
+                amount: None,
+            }],
+        };
+        let preview = store.preview_stock_journal(company, &draft).unwrap();
+        let journal = store.post_stock_journal(company, &preview).unwrap();
+        let before = store
+            .stock_valuation_at_actual_cost(company, date, ActualCostMethod::Fifo)
+            .unwrap();
+        assert_eq!(before.unavailable, 1);
+        store
+            .reverse_stock_journal(company, journal, date, "RX-REV", "Entry cancelled")
+            .unwrap();
+        let after = store
+            .stock_valuation_at_actual_cost(company, date, ActualCostMethod::Fifo)
+            .unwrap();
+        assert_eq!(
+            (after.rows[0].quantity, after.known_value, after.unavailable),
+            (2000, 300, 0)
+        );
+        let report = store.stock_ageing(company, date, [30, 60, 90]).unwrap();
+        assert_eq!(report.rows[0].quantity, 2000);
+        assert_eq!(
+            report.rows[0].breakdown.as_ref().unwrap().fifo_value,
+            Some(300)
         );
     }
 }

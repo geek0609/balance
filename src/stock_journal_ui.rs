@@ -1,7 +1,7 @@
 use crate::{egui, pick_batch, pick_location, pick_stock, App};
 use balance::inventory::{format_quantity, parse_quantity};
 use balance::stock_journals::{
-    StockJournalDraft, StockJournalEntry, StockJournalKind, StockJournalLineDraft,
+    StockJournal, StockJournalDraft, StockJournalEntry, StockJournalKind, StockJournalLineDraft,
     StockJournalPreview, StockJournalSide,
 };
 use balance::{format_amount, parse_amount, Error, Result};
@@ -17,6 +17,14 @@ pub(super) struct StockJournalScreen {
     preview: Option<StockJournalPreview>,
     filter: String,
     posted: Option<i64>,
+    reversal: Option<JournalReversalForm>,
+}
+
+struct JournalReversalForm {
+    journal_id: i64,
+    date: String,
+    reference: String,
+    reason: String,
 }
 
 struct JournalLineForm {
@@ -48,6 +56,7 @@ impl StockJournalScreen {
             || !self.reference.is_empty()
             || !self.narration.is_empty()
             || self.kind != StockJournalKind::default()
+            || self.reversal.is_some()
     }
 
     fn draft(&self) -> Result<StockJournalDraft> {
@@ -319,10 +328,23 @@ impl App {
                 return;
             }
         };
+        let active_reversal = self
+            .stock_journal_screen
+            .reversal
+            .as_ref()
+            .map(|form| form.journal_id);
+        if active_reversal.is_some_and(|id| {
+            !journals.iter().any(|journal| {
+                journal.id == id && journal.reversal.is_none() && journal.reverses.is_none()
+            })
+        }) {
+            self.stock_journal_screen.reversal = None;
+        }
         let filter = self.stock_journal_screen.filter.trim().to_lowercase();
         let mut found = false;
         for journal in journals.into_iter().filter(|journal| {
-            journal.date.contains(&filter)
+            active_reversal == Some(journal.id)
+                || journal.date.contains(&filter)
                 || journal.reference.to_lowercase().contains(&filter)
                 || journal.voucher_type.to_lowercase().contains(&filter)
         }) {
@@ -334,6 +356,15 @@ impl App {
             .id_salt(("stock-journal", company, journal.id))
             .default_open(self.stock_journal_screen.posted == Some(journal.id))
             .show(ui, |ui| {
+                if let Some(link) = &journal.reversal {
+                    ui.label(format!("Reversed by {} on {}", link.reference, link.date));
+                }
+                if let Some(link) = &journal.reverses {
+                    ui.label(format!(
+                        "Reversal of {} dated {}",
+                        link.reference, link.date
+                    ));
+                }
                 if !journal.narration.is_empty() {
                     ui.label(&journal.narration);
                 }
@@ -345,10 +376,85 @@ impl App {
                     }
                     Err(error) => self.failure(error),
                 }
+                if journal.reversal.is_none() && journal.reverses.is_none() {
+                    self.stock_journal_reversal_form(ui, company, &journal);
+                }
             });
         }
         if !found {
             ui.label("No matching stock journals.");
+        }
+    }
+
+    fn stock_journal_reversal_form(
+        &mut self,
+        ui: &mut egui::Ui,
+        company: i64,
+        journal: &StockJournal,
+    ) {
+        let another_reversal = self
+            .stock_journal_screen
+            .reversal
+            .as_ref()
+            .is_some_and(|form| form.journal_id != journal.id);
+        let Some(form) = self
+            .stock_journal_screen
+            .reversal
+            .as_mut()
+            .filter(|form| form.journal_id == journal.id)
+        else {
+            if ui
+                .add_enabled(!another_reversal, egui::Button::new("Reverse journal"))
+                .clicked()
+            {
+                self.stock_journal_screen.reversal = Some(JournalReversalForm {
+                    journal_id: journal.id,
+                    date: journal.date.clone(),
+                    reference: format!("{}-REV", journal.reference),
+                    reason: String::new(),
+                });
+            }
+            return;
+        };
+        ui.separator();
+        ui.small(
+            "Restore source quantities and remove destination quantities on the reversal date.",
+        );
+        egui::Grid::new(("journal-reversal-fields", journal.id)).show(ui, |ui| {
+            for (label, field) in [
+                ("Reversal date (YYYY-MM-DD)", &mut form.date),
+                ("Reversal reference", &mut form.reference),
+                ("Reason", &mut form.reason),
+            ] {
+                ui.label(label);
+                ui.text_edit_singleline(field);
+                ui.end_row();
+            }
+        });
+        let mut post = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            post = ui.button("Post reversal").clicked();
+            cancel = ui.button("Cancel").clicked();
+        });
+        if cancel {
+            self.stock_journal_screen.reversal = None;
+        } else if post {
+            match self.store.reverse_stock_journal(
+                company,
+                journal.id,
+                &form.date,
+                &form.reference,
+                &form.reason,
+            ) {
+                Ok(id) => {
+                    self.message = format!("Stock journal {} reversed", journal.reference);
+                    self.stock_journal_screen.reversal = None;
+                    self.stock_journal_screen.filter.clear();
+                    self.stock_journal_screen.posted = Some(id);
+                }
+                Err(error) => self.failure(error),
+            }
         }
     }
 }
