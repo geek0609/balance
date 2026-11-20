@@ -2,6 +2,7 @@
 use super::*;
 
 pub(super) const KIND: &str = "cancelledvoucher";
+pub(super) const OPTIONAL_KIND: &str = "optionalvoucher";
 const POSTED_KINDS: &[&str] = &[
     "voucher",
     "stocknote",
@@ -15,6 +16,10 @@ pub(super) fn is_posted_kind(kind: &str) -> bool {
     POSTED_KINDS.contains(&kind)
 }
 
+pub(super) fn is_inactive_kind(kind: &str) -> bool {
+    matches!(kind, KIND | OPTIONAL_KIND)
+}
+
 pub(super) fn other_status_seen(
     kind: &str,
     key: &str,
@@ -26,10 +31,11 @@ pub(super) fn other_status_seen(
     }
     let seen_kind =
         |kind: &str| seen.contains(&(kind.to_owned(), key.to_owned(), value.to_owned()));
-    if kind == KIND {
-        POSTED_KINDS.iter().any(|kind| seen_kind(kind))
+    if is_inactive_kind(kind) {
+        let other = if kind == KIND { OPTIONAL_KIND } else { KIND };
+        seen_kind(other) || POSTED_KINDS.iter().any(|kind| seen_kind(kind))
     } else {
-        is_posted_kind(kind) && seen_kind(KIND)
+        is_posted_kind(kind) && (seen_kind(KIND) || seen_kind(OPTIONAL_KIND))
     }
 }
 
@@ -164,11 +170,11 @@ pub(super) fn parse(node: Node<'_, '_>, metadata: SourceMetadata) -> Result<Impo
         return Err(Error::Validation("Only new records can be imported".into()));
     }
     let date = read_scalar(node, "DATE", Some("DATE"), xml_date)?
-        .ok_or_else(|| Error::Validation("Missing cancellation voucher date".into()))?;
+        .ok_or_else(|| Error::Validation("Missing voucher date".into()))?;
     let type_key = read_scalar(node, "VOUCHERTYPENAME", Some("VCHTYPE"), |value| {
         Ok(normalized(value))
     })?
-    .ok_or_else(|| Error::Validation("Missing cancellation voucher type".into()))?;
+    .ok_or_else(|| Error::Validation("Missing voucher type".into()))?;
     let voucher_type = direct_text(node, "VOUCHERTYPENAME")
         .filter(|value| !value.is_empty())
         .or_else(|| {
@@ -213,6 +219,69 @@ pub(super) fn write(conn: &Connection, company: i64, record: &ImportedCancelled)
         conn.last_insert_rowid(),
         &record.metadata,
     )
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ImportedOptional {
+    pub header: ImportedCancelled,
+    pub payload: String,
+}
+
+impl ImportedOptional {
+    pub(super) fn parse(node: Node<'_, '_>, metadata: SourceMetadata) -> Result<Self> {
+        use std::fmt::Write;
+        let header = parse(node, metadata)?;
+        let mut payload = String::from("<ENVELOPE");
+        for namespace in node.namespaces() {
+            let uri = namespace
+                .uri()
+                .replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('<', "&lt;");
+            if let Some(name) = namespace.name() {
+                write!(payload, " xmlns:{name}=\"{uri}\"").unwrap();
+            } else {
+                write!(payload, " xmlns=\"{uri}\"").unwrap();
+            }
+        }
+        payload.push_str("><BODY><DATA><MESSAGE>");
+        payload.push_str(&node.document().input_text()[node.range()]);
+        payload.push_str("</MESSAGE></DATA></BODY></ENVELOPE>");
+        Ok(Self { header, payload })
+    }
+
+    pub(super) fn unkeyed(&self) -> bool {
+        !self.header.has_source_id()
+    }
+
+    pub(super) fn duplicate(&self, conn: &Connection, company: i64) -> Result<bool> {
+        Ok(self.unkeyed() && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM optional_vouchers WHERE company_id = ?1 AND has_source_id = 0 AND payload = ?2)",
+            params![company, self.payload],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
+
+    pub(super) fn write(&self, conn: &Connection, company: i64) -> Result<()> {
+        if self.duplicate(conn, company)? {
+            return Err(Error::Validation(
+                "This optional voucher already exists".into(),
+            ));
+        }
+        let header = &self.header;
+        conn.execute(
+            "INSERT INTO optional_vouchers(company_id, date, voucher_type, reference, party, narration, payload, has_source_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![company, header.date, header.voucher_type, header.reference, header.party, header.narration, self.payload, !self.unkeyed()],
+        )?;
+        save_metadata(
+            conn,
+            company,
+            OPTIONAL_KIND,
+            conn.last_insert_rowid(),
+            &header.metadata,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -387,13 +456,6 @@ mod tests {
                 ),
                 "occurs more than once",
             ),
-            (
-                xml.replace(
-                    "Yes</ISCANCELLED>",
-                    "No</ISCANCELLED><ISOPTIONAL>Yes</ISOPTIONAL>",
-                ),
-                "optional vouchers require review",
-            ),
         ] {
             let preview = store
                 .preview_xml_import(company, invalid.as_bytes())
@@ -415,5 +477,64 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn retains_optional_payloads_alongside_posted_records() {
+        let (mut store, company) = company();
+        let xml = format!(
+            r#"<ENVELOPE xmlns:x="urn:test"><BODY><DATA><MESSAGE>
+            <VOUCHER DATE="20260401" VCHTYPE="Custom pending"><ISOPTIONAL>Yes</ISOPTIONAL>
+              <VOUCHERNUMBER>J-1</VOUCHERNUMBER><GUID>pending-1</GUID>
+              <PARTYLEDGERNAME>Pending party</PARTYLEDGERNAME>
+              <x:DETAIL><AMOUNT>42.50</AMOUNT></x:DETAIL>
+            </VOUCHER>{}
+            <VOUCHER DATE="20260402" VCHTYPE="Journal"><ISOPTIONAL>Yes</ISOPTIONAL>
+                <VOUCHERNUMBER>J-2</VOUCHERNUMBER><NARRATION>Pending without source ID</NARRATION>
+            </VOUCHER></MESSAGE></DATA></BODY></ENVELOPE>"#,
+            journal("posted-1")
+        );
+        store
+            .set_period_lock(company, Some("2026-04-01"), "Earlier period")
+            .unwrap();
+        let plan = store.preview_xml_import(company, xml.as_bytes()).unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        let counts = store.apply_xml_import(&plan).unwrap();
+        assert_eq!((counts.vouchers, counts.optional_vouchers), (1, 2));
+        assert_eq!(store.vouchers(company).unwrap().len(), 1);
+        let pending = store
+            .optional_vouchers(company, None, None, None, "pending party")
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        let payload = store
+            .optional_voucher_xml(company, pending[0].id)
+            .unwrap()
+            .unwrap();
+        let document = Document::parse(&payload).unwrap();
+        let detail = document
+            .descendants()
+            .find(|node| node.has_tag_name(("urn:test", "DETAIL")))
+            .unwrap();
+        assert_eq!(detail.first_element_child().unwrap().text(), Some("42.50"));
+        let conflict = envelope(&journal("pending-1"));
+        let plan = store
+            .preview_xml_import(company, conflict.as_bytes())
+            .unwrap();
+        assert!(plan
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("different posting status")));
+        let unkeyed = store
+            .optional_vouchers(company, None, None, None, "without source ID")
+            .unwrap();
+        let saved = store
+            .optional_voucher_xml(company, unkeyed[0].id)
+            .unwrap()
+            .unwrap();
+        let plan = store.preview_xml_import(company, saved.as_bytes()).unwrap();
+        assert!(plan
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("optional voucher already exists")));
     }
 }

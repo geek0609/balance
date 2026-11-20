@@ -5235,6 +5235,12 @@ impl App {
                     plan.stock_match_count()
                 ));
             }
+            if plan.optional_voucher_count() > 0 {
+                ui.label(format!(
+                    "{} optional vouchers for history",
+                    plan.optional_voucher_count()
+                ));
+            }
             let (valued_openings, value) = plan.opening_stock_value();
             if plan.cancelled_voucher_count() > 0 {
                 ui.label(format!(
@@ -5270,8 +5276,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} cancelled vouchers, {} invoices, {} orders, {} stock notes, {} stock returns, {} physical counts, {} stock journals, {} tracking matches, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
-                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.cancelled_vouchers, counts.invoices, counts.orders, counts.stock_notes, counts.stock_returns, counts.stock_counts, counts.stock_journals, counts.stock_matches, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
+                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} cancelled vouchers, {} optional vouchers, {} invoices, {} orders, {} stock notes, {} stock returns, {} physical counts, {} stock journals, {} tracking matches, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
+                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.cancelled_vouchers, counts.optional_vouchers, counts.invoices, counts.orders, counts.stock_notes, counts.stock_returns, counts.stock_counts, counts.stock_journals, counts.stock_matches, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
                         );
                         self.import_preview = None;
                     }
@@ -6284,27 +6290,32 @@ impl App {
             }
         }
         egui::CollapsingHeader::new("Cancelled vouchers")
-            .show(ui, |ui| self.cancelled_voucher_history(ui, company));
+            .show(ui, |ui| self.inactive_voucher_history(ui, company, false));
+        egui::CollapsingHeader::new("Optional vouchers")
+            .show(ui, |ui| self.inactive_voucher_history(ui, company, true));
     }
-    fn cancelled_voucher_history(&mut self, ui: &mut egui::Ui, company: i64) {
+    fn inactive_voucher_history(&mut self, ui: &mut egui::Ui, company: i64, optional: bool) {
         let from = (!self.day_from.trim().is_empty()).then(|| self.day_from.trim());
         let to = (!self.day_to.trim().is_empty()).then(|| self.day_to.trim());
-        let entries =
-            match self
-                .store
+        let entries = if optional {
+            self.store
+                .optional_vouchers(company, from, to, self.day_kind, &self.day_search)
+        } else {
+            self.store
                 .cancelled_vouchers(company, from, to, self.day_kind, &self.day_search)
-            {
-                Ok(entries) => entries,
-                Err(error) => {
-                    ui.colored_label(ui.visuals().error_fg_color, error.to_string());
-                    return;
-                }
-            };
+        };
+        let entries = match entries {
+            Ok(entries) => entries,
+            Err(error) => {
+                ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+                return;
+            }
+        };
         if entries.is_empty() {
-            ui.label("No cancelled vouchers match these filters.");
+            ui.label("No vouchers match these filters.");
             return;
         }
-        if ui.button("Export cancelled vouchers as CSV").clicked() {
+        if !optional && ui.button("Export cancelled vouchers as CSV").clicked() {
             match self.store.export_cancelled_vouchers_csv(
                 company,
                 from,
@@ -6317,11 +6328,14 @@ impl App {
                 Err(error) => self.failure(error),
             }
         }
-        egui::Grid::new("cancelled-day-book")
+        egui::Grid::new(("inactive-day-book", optional))
             .striped(true)
             .show(ui, |ui| {
                 for heading in ["Date", "ID", "Type", "Reference", "Party", "Narration"] {
                     ui.strong(heading);
+                }
+                if optional {
+                    ui.strong("Voucher XML");
                 }
                 ui.end_row();
                 for row in entries {
@@ -6331,6 +6345,18 @@ impl App {
                     ui.label(row.reference);
                     ui.label(row.party);
                     ui.label(row.narration);
+                    if optional && ui.button("Copy XML").clicked() {
+                        match self.store.optional_voucher_xml(company, row.id) {
+                            Ok(Some(xml)) => {
+                                ui.ctx().copy_text(xml);
+                                self.message = "Optional voucher XML copied".into();
+                            }
+                            Ok(None) => {
+                                self.message = "Optional voucher no longer available".into()
+                            }
+                            Err(error) => self.failure(error),
+                        }
+                    }
                     ui.end_row();
                 }
             });

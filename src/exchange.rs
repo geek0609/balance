@@ -395,6 +395,7 @@ pub struct ImportPlan {
     stock_counts: Vec<stock_counts::ImportedCount>,
     stock_journals: Vec<stock_journals::ImportedJournal>,
     cancelled_vouchers: Vec<cancelled::ImportedCancelled>,
+    optional_vouchers: Vec<cancelled::ImportedOptional>,
     orders: Vec<orders::ImportedOrder>,
     stock_preview: Option<StockImportPreview>,
     settlements: Vec<ImportedSettlement>,
@@ -467,6 +468,9 @@ impl ImportPlan {
     }
     pub fn stock_count_count(&self) -> usize {
         self.stock_counts.len()
+    }
+    pub fn optional_voucher_count(&self) -> usize {
+        self.optional_vouchers.len()
     }
     pub fn cancelled_voucher_count(&self) -> usize {
         self.cancelled_vouchers.len()
@@ -619,6 +623,7 @@ impl ImportPlan {
                 || !self.stock_counts.is_empty()
                 || !self.stock_journals.is_empty()
                 || !self.cancelled_vouchers.is_empty()
+                || !self.optional_vouchers.is_empty()
                 || !self.orders.is_empty()
                 || !self.settlements.is_empty()
                 || !self.bill_notes.is_empty())
@@ -638,6 +643,7 @@ pub struct ImportCounts {
     pub stock_counts: usize,
     pub stock_journals: usize,
     pub cancelled_vouchers: usize,
+    pub optional_vouchers: usize,
     pub orders: usize,
     pub stock_matches: usize,
     pub settlements: usize,
@@ -868,17 +874,18 @@ fn save_metadata(
     let mut stmt = conn.prepare_cached(
         "SELECT kind, guid, remote_id, master_id, voucher_key FROM imported_record_metadata
          WHERE company_id = ?1 AND (
-             kind = ?2 OR (?3 AND kind = ?4)
-             OR (?5 AND kind IN ('voucher', 'stocknote', 'order', 'stockreturn', 'stockcount', 'stockjournal'))
+             kind = ?2 OR (?3 AND kind IN (?4, ?5))
+             OR (?6 AND kind IN ('voucher', 'stocknote', 'order', 'stockreturn', 'stockcount', 'stockjournal'))
          )",
     )?;
     let rows = stmt.query_map(
         params![
             company,
             kind,
-            cancelled::is_posted_kind(kind),
+            cancelled::is_posted_kind(kind) || cancelled::is_inactive_kind(kind),
             cancelled::KIND,
-            kind == cancelled::KIND
+            cancelled::OPTIONAL_KIND,
+            cancelled::is_inactive_kind(kind)
         ],
         |r| {
             Ok((
@@ -4264,6 +4271,7 @@ impl Store {
             stock_counts: Vec::new(),
             stock_journals: Vec::new(),
             cancelled_vouchers: Vec::new(),
+            optional_vouchers: Vec::new(),
             orders: Vec::new(),
             stock_preview: None,
             settlements: Vec::new(),
@@ -5433,6 +5441,7 @@ impl Store {
             .map(|name| normalized(&name))
             .collect::<HashSet<_>>();
         let mut cancelled_headers = cancelled::existing_headers(&self.conn, company_id)?;
+        let mut optional_payloads = HashSet::new();
         for (source_order, node) in nodes()
             .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("VOUCHER"))
             .enumerate()
@@ -5468,9 +5477,26 @@ impl Store {
                     continue;
                 }
                 Ok(cancelled::Status::Optional) => {
-                    plan.issues.push(format!(
-                        "{label}: optional vouchers require review before import"
-                    ));
+                    match cancelled::ImportedOptional::parse(node, metadata) {
+                        Ok(record) => {
+                            register_metadata(
+                                cancelled::OPTIONAL_KIND,
+                                &label,
+                                &record.header.metadata,
+                                &mut seen_metadata,
+                                &mut plan.issues,
+                            );
+                            if record.duplicate(&self.conn, company_id)?
+                                || (record.unkeyed()
+                                    && !optional_payloads.insert(record.payload.clone()))
+                            {
+                                plan.issues
+                                    .push(format!("{label}: this optional voucher already exists"));
+                            }
+                            plan.optional_vouchers.push(record);
+                        }
+                        Err(error) => plan.issues.push(format!("{label}: {error}")),
+                    }
                     continue;
                 }
                 Err(error) => {
@@ -6342,6 +6368,7 @@ impl Store {
             && plan.stock_counts.is_empty()
             && plan.stock_journals.is_empty()
             && plan.cancelled_vouchers.is_empty()
+            && plan.optional_vouchers.is_empty()
             && plan.orders.is_empty()
             && plan.settlements.is_empty()
             && plan.bill_notes.is_empty()
@@ -6424,6 +6451,9 @@ impl Store {
         plan.check_period_lock(&conn)?;
         for record in &plan.cancelled_vouchers {
             cancelled::write(conn, plan.company_id, record)?;
+        }
+        for record in &plan.optional_vouchers {
+            record.write(conn, plan.company_id)?;
         }
         for (id, metadata) in &plan.existing_location_metadata {
             let exists: bool = conn.query_row(
@@ -7472,6 +7502,7 @@ impl Store {
                 stock_counts: plan.stock_counts.len(),
                 stock_journals: plan.stock_journals.len(),
                 cancelled_vouchers: plan.cancelled_vouchers.len(),
+                optional_vouchers: plan.optional_vouchers.len(),
                 settlements: plan.settlement_count(),
                 bill_notes: plan.bill_note_count(),
                 advances: plan.advance_count(),
@@ -11757,6 +11788,7 @@ mod tests {
             stock_counts: Vec::new(),
             stock_journals: Vec::new(),
             cancelled_vouchers: Vec::new(),
+            optional_vouchers: Vec::new(),
             orders: Vec::new(),
             stock_preview: None,
             settlements: Vec::new(),

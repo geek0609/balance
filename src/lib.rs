@@ -64,7 +64,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 106;
+const SCHEMA_VERSION: i64 = 107;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -461,6 +461,7 @@ impl Store {
             "stock_journal_allocations",
             "stock_journal_reversals",
             "cancelled_vouchers",
+            "optional_vouchers",
             "invoice_reversals",
             "invoice_reversal_stock",
             "cost_centres",
@@ -1091,7 +1092,7 @@ impl Store {
             }
             tx.commit()?;
         }
-        if version < 106 {
+        if version < 107 {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let current: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
             if current < 95 {
@@ -1138,6 +1139,10 @@ impl Store {
             if current < 106 {
                 cancelled_vouchers::migrate(&tx)?;
                 tx.pragma_update(None, "user_version", 106)?;
+            }
+            if current < 107 {
+                cancelled_vouchers::migrate_optional(&tx)?;
+                tx.pragma_update(None, "user_version", 107)?;
             }
             tx.commit()?;
         }
