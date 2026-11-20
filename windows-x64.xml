@@ -5,12 +5,12 @@
     <link>https://github.com/geek0609/balance/releases</link>
     <description>Updates for installed Windows copies of Balance</description>
     <item>
-      <title>Balance 0.1.0-alpha.2.ci.75.1</title>
-      <pubDate>Fri, 20 Nov 2026 08:37:20 GMT</pubDate>
-      <sparkle:version>1007501</sparkle:version>
-      <sparkle:shortVersionString>0.1.0-alpha.2.ci.75.1</sparkle:shortVersionString>
-      <enclosure url="https://github.com/geek0609/balance/releases/download/v0.1.0-alpha.2.ci.75.1/balance-0.1.0-alpha.2.ci.75.1-windows-x64-setup.exe" length="6987530" type="application/octet-stream"
-        sparkle:os="windows-x64" sparkle:edSignature="iE1JHOTwfqPOb1f6gFMuBdkUgxhznPA8AMtowv8HR4Qrez9I+oBFPnC5EvUliEwoJ82MRlmaw7fqXyR0dEQjBg=="
+      <title>Balance 0.1.0-alpha.2.ci.76.1</title>
+      <pubDate>Fri, 20 Nov 2026 08:47:54 GMT</pubDate>
+      <sparkle:version>1007601</sparkle:version>
+      <sparkle:shortVersionString>0.1.0-alpha.2.ci.76.1</sparkle:shortVersionString>
+      <enclosure url="https://github.com/geek0609/balance/releases/download/v0.1.0-alpha.2.ci.76.1/balance-0.1.0-alpha.2.ci.76.1-windows-x64-setup.exe" length="6995744" type="application/octet-stream"
+        sparkle:os="windows-x64" sparkle:edSignature="4ew9hQc2785UJliBOdD7BNd5HngAhuB/3BbHnUoNmdJjmX/HGriZQ3lmAAUMnjjK+jPHlqT2jhtDp8Sf/g1NDw=="
         sparkle:installerArguments="/SILENT /SP- /NORESTART" />
     </item>
   </channel>
