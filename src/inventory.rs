@@ -2911,9 +2911,13 @@ impl Store {
         let mut raw = Vec::<(chrono::NaiveDate, u8, i64, String, i64)>::new();
         let mut stmt = self.conn.prepare(&format!(
             "{STOCK_LOCATION_BRANCH}
-             SELECT a.id, a.date, a.quantity, a.reason, loc.name, b.name FROM stock_adjustments a
+             SELECT a.id, a.date, a.quantity, a.reason, loc.name, b.name,
+                    j.voucher_type, j.reference FROM stock_adjustments a
              JOIN stock_locations loc ON loc.id = a.location_id AND loc.company_id = a.company_id
              LEFT JOIN stock_batches b ON b.id = a.batch_id
+             LEFT JOIN stock_journal_allocations sj ON sj.adjustment_id = a.id
+             LEFT JOIN stock_journal_entries je ON je.id = sj.entry_id
+             LEFT JOIN stock_journals j ON j.id = je.journal_id
              WHERE a.company_id = ?1 AND a.item_id = ?4
                AND (?2 IS NULL OR a.location_id IN (SELECT id FROM branch))"
         ))?;
@@ -2926,20 +2930,21 @@ impl Store {
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
             ))
         })?;
         for row in rows {
-            let (id, date, qty, reason, location, batch) = row?;
-            raw.push((
-                parse_date(&date)?,
-                0,
-                id,
-                format!(
-                    "Adjustment at {location}, batch {}: {reason}",
-                    batch.as_deref().unwrap_or("unbatched")
-                ),
-                qty,
-            ));
+            let (id, date, qty, reason, location, batch, journal_type, journal_ref) = row?;
+            let batch = batch.as_deref().unwrap_or("unbatched");
+            let description = match journal_type.zip(journal_ref) {
+                Some((kind, reference)) => {
+                    let side = if qty < 0 { "source" } else { "destination" };
+                    format!("{kind} {reference}: {side} at {location}, batch {batch}")
+                }
+                None => format!("Adjustment at {location}, batch {batch}: {reason}"),
+            };
+            raw.push((parse_date(&date)?, 0, id, description, qty));
         }
         let mut stmt = self.conn.prepare(&format!(
             "{STOCK_LOCATION_BRANCH}

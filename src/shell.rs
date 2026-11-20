@@ -186,6 +186,14 @@ pub(crate) const NAV: &[NavSection] = &[
                 "physical count stocktake verification",
             ),
             nav(
+                Page::StockJournals,
+                "â‡„",
+                "Stock journals",
+                "Stock journals",
+                "Warehouse movements and production from imported vouchers",
+                "stock journal warehouse transfer consumption production by-products import",
+            ),
+            nav(
                 Page::Manufacturing,
                 "🏭",
                 "Manufacturing",
@@ -1119,6 +1127,7 @@ impl App {
             Page::CashFlow => self.cash_flow_page(ui, company),
             Page::Stock => self.stock_page(ui, company),
             Page::StockCounts => self.stock_counts_page(ui, company),
+            Page::StockJournals => self.stock_journals_page(ui, company),
             Page::StockNotes => self.stock_notes_page(ui, company),
             Page::Valuation => self.valuation_page(ui, company),
             Page::Manufacturing => self.manufacturing_page(ui, company),
@@ -2066,7 +2075,7 @@ mod tests {
         pages.sort_by_key(|p| format!("{p:?}"));
         pages.dedup();
         assert_eq!(pages.len(), total);
-        assert_eq!(total, 27);
+        assert_eq!(total, 28);
     }
 
     #[test]

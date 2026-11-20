@@ -43,6 +43,7 @@ pub struct ReceiptCostEntry {
 #[derive(Debug, Clone)]
 pub enum ActualCostIssue {
     MissingReceiptCost { date: NaiveDate, receipt_id: i64 },
+    MissingJournalCost { date: NaiveDate, journal_id: i64 },
     InsufficientStock { date: NaiveDate, source: String },
     PendingStockIssue,
 }
@@ -53,6 +54,12 @@ impl std::fmt::Display for ActualCostIssue {
                 write!(
                     f,
                     "Receipt {receipt_id} on {date} needs an acquisition cost"
+                )
+            }
+            Self::MissingJournalCost { date, journal_id } => {
+                write!(
+                    f,
+                    "Stock journal {journal_id} on {date} needs an acquisition cost"
                 )
             }
             Self::InsufficientStock { date, source } => {
@@ -362,6 +369,10 @@ enum IssueOrigin {
 #[derive(Debug)]
 enum Movement {
     Receipt(Option<i64>),
+    JournalReceipt {
+        journal_id: i64,
+        amount: Option<i128>,
+    },
     Purchase(i64),
     Issue {
         origin: IssueOrigin,
@@ -386,7 +397,7 @@ struct Event {
 impl Event {
     fn order(&self) -> (NaiveDate, u8, i64, bool, i64) {
         let priority = match &self.movement {
-            Movement::Receipt(_) => 0,
+            Movement::Receipt(_) | Movement::JournalReceipt { .. } => 0,
             Movement::Purchase(_) => 1,
             Movement::SaleReturn {
                 same_day_adjustment: Some(source),
@@ -517,11 +528,30 @@ fn calculate(
     };
     for event in events {
         match &event.movement {
-            Movement::Receipt(_) | Movement::Purchase(_) => {
+            Movement::Receipt(_) | Movement::JournalReceipt { .. } | Movement::Purchase(_) => {
                 let value = match (&event.movement, track_cost) {
                     (_, false) => 0,
                     (Movement::Receipt(Some(value)) | Movement::Purchase(value), true) => {
                         i128::from(*value)
+                    }
+                    (
+                        Movement::JournalReceipt {
+                            amount: Some(value),
+                            ..
+                        },
+                        true,
+                    ) => *value,
+                    (
+                        Movement::JournalReceipt {
+                            journal_id,
+                            amount: None,
+                        },
+                        true,
+                    ) => {
+                        return Ok(Err(ActualCostIssue::MissingJournalCost {
+                            date: event.date,
+                            journal_id: *journal_id,
+                        }))
                     }
                     _ => {
                         return Ok(Err(ActualCostIssue::MissingReceiptCost {
@@ -657,9 +687,83 @@ fn ageing_breakdown(
     }
 }
 
+fn journal_events(
+    conn: &Connection,
+    company: i64,
+    end: NaiveDate,
+    events: &mut HashMap<i64, Vec<Event>>,
+) -> Result<()> {
+    struct ItemMovement {
+        date: NaiveDate,
+        adjustment: i64,
+        quantity: i128,
+        issued: bool,
+        receipt_cost: Option<i128>,
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT j.id, j.date, e.item_id, e.quantity, e.amount, (
+             SELECT MIN(a.adjustment_id) FROM stock_journal_allocations a WHERE a.entry_id = e.id
+         )
+         FROM stock_journals j JOIN stock_journal_entries e ON e.journal_id = j.id
+         WHERE j.company_id = ?1 AND j.date <= ?2",
+    )?;
+    let mut rows = stmt.query(params![company, end.to_string()])?;
+    let mut movements = HashMap::<(i64, i64), ItemMovement>::new();
+    while let Some(row) = rows.next()? {
+        let journal = row.get(0)?;
+        let item = row.get(2)?;
+        let quantity = row.get::<_, i64>(3)?;
+        let adjustment = row.get::<_, i64>(5)?;
+        let movement = match movements.entry((journal, item)) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(ItemMovement {
+                date: parse_date(&row.get::<_, String>(1)?)?,
+                adjustment,
+                quantity: 0,
+                issued: false,
+                receipt_cost: Some(0),
+            }),
+        };
+        movement.adjustment = movement.adjustment.min(adjustment);
+        movement.quantity += i128::from(quantity);
+        if quantity < 0 {
+            movement.issued = true;
+        } else {
+            let cost = row.get::<_, Option<i64>>(4)?;
+            movement.receipt_cost = movement
+                .receipt_cost
+                .zip(cost)
+                .map(|(sum, cost)| sum + i128::from(cost));
+        }
+    }
+    for ((journal_id, item), saved) in movements {
+        let movement = match saved.quantity.cmp(&0) {
+            std::cmp::Ordering::Equal => continue,
+            std::cmp::Ordering::Less => Movement::AdjustmentOut,
+            std::cmp::Ordering::Greater => Movement::JournalReceipt {
+                journal_id,
+                amount: if saved.issued {
+                    None
+                } else {
+                    saved.receipt_cost
+                },
+            },
+        };
+        events.entry(item).or_default().push(Event {
+            date: saved.date,
+            source_id: saved.adjustment,
+            quantity: saved.quantity.abs(),
+            movement,
+        });
+    }
+    Ok(())
+}
+
 fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64, Vec<Event>>> {
     let mut events = HashMap::<i64, Vec<Event>>::new();
     let retained_costs = return_events(conn, company, end, &mut events)?;
+    journal_events(conn, company, end, &mut events)?;
     {
         let mut stmt = conn.prepare(
             "SELECT a.id, a.item_id, a.date, a.quantity, (
@@ -669,6 +773,7 @@ fn events(conn: &Connection, company: i64, end: NaiveDate) -> Result<HashMap<i64
              LEFT JOIN stock_note_lines l ON l.adjustment_id = a.id
              LEFT JOIN stock_notes n ON n.id = l.note_id AND n.company_id = a.company_id
              WHERE a.company_id = ?1
+             AND NOT EXISTS(SELECT 1 FROM stock_journal_allocations j WHERE j.adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM invoice_reversal_stock r WHERE r.adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM stock_note_lines r WHERE r.reversal_adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM stock_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)
@@ -927,6 +1032,7 @@ impl Store {
              JOIN stock_locations l ON l.id = a.location_id AND l.company_id = a.company_id
              LEFT JOIN stock_batches b ON b.id = a.batch_id
              WHERE a.company_id = ?1 AND a.quantity > 0 AND (?2 IS NULL OR a.id = ?2)
+             AND NOT EXISTS(SELECT 1 FROM stock_journal_allocations j WHERE j.adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM invoice_reversal_stock r WHERE r.adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM stock_note_lines r WHERE r.reversal_adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM stock_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)
@@ -967,6 +1073,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let date: String = tx.query_row(
             "SELECT a.date FROM stock_adjustments a WHERE a.company_id = ?1 AND a.id = ?2 AND a.quantity > 0
+             AND NOT EXISTS(SELECT 1 FROM stock_journal_allocations j WHERE j.adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM invoice_reversal_stock r WHERE r.adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM stock_note_lines r WHERE r.reversal_adjustment_id = a.id)
              AND NOT EXISTS(SELECT 1 FROM stock_return_lines r WHERE r.adjustment_id = a.id OR r.reversal_adjustment_id = a.id)
@@ -1099,12 +1206,13 @@ impl Store {
                 None,
             )? {
                 Ok(pool) => (Some(pool), None, true),
-                Err(cost_issue @ ActualCostIssue::MissingReceiptCost { .. }) => {
-                    match calculate(&mut item_events, Calculation::AgeingQuantities, None)? {
-                        Ok(pool) => (Some(pool), Some(cost_issue), false),
-                        Err(quantity_issue) => (None, Some(quantity_issue), false),
-                    }
-                }
+                Err(
+                    cost_issue @ (ActualCostIssue::MissingReceiptCost { .. }
+                    | ActualCostIssue::MissingJournalCost { .. }),
+                ) => match calculate(&mut item_events, Calculation::AgeingQuantities, None)? {
+                    Ok(pool) => (Some(pool), Some(cost_issue), false),
+                    Err(quantity_issue) => (None, Some(quantity_issue), false),
+                },
                 Err(issue) => (None, Some(issue), false),
             };
             let breakdown = if let Some(pool) = pool {

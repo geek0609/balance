@@ -34,6 +34,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 mod orders;
 mod stock_counts;
+mod stock_journals;
 mod stock_notes;
 mod stock_rejections;
 mod trade_defaults;
@@ -391,6 +392,7 @@ pub struct ImportPlan {
     stock_notes: Vec<stock_notes::ImportedStockNote>,
     stock_returns: Vec<stock_rejections::ImportedRejection>,
     stock_counts: Vec<stock_counts::ImportedCount>,
+    stock_journals: Vec<stock_journals::ImportedJournal>,
     orders: Vec<orders::ImportedOrder>,
     stock_preview: Option<StockImportPreview>,
     settlements: Vec<ImportedSettlement>,
@@ -425,6 +427,7 @@ impl ImportPlan {
             .chain(self.stock_notes.iter().map(|row| row.date.as_str()))
             .chain(self.stock_returns.iter().map(|row| row.date.as_str()))
             .chain(self.stock_counts.iter().map(|row| row.date.as_str()))
+            .chain(self.stock_journals.iter().map(|row| row.date.as_str()))
             .chain(self.orders.iter().map(|row| row.date.as_str()))
             .chain(self.settlements.iter().map(|row| row.date.as_str()))
             .chain(self.bill_notes.iter().map(|row| row.date.as_str()))
@@ -462,6 +465,9 @@ impl ImportPlan {
     }
     pub fn stock_count_count(&self) -> usize {
         self.stock_counts.len()
+    }
+    pub fn stock_journal_count(&self) -> usize {
+        self.stock_journals.len()
     }
     pub fn stock_match_count(&self) -> usize {
         self.stock_preview
@@ -606,6 +612,7 @@ impl ImportPlan {
                 || !self.stock_notes.is_empty()
                 || !self.stock_returns.is_empty()
                 || !self.stock_counts.is_empty()
+                || !self.stock_journals.is_empty()
                 || !self.orders.is_empty()
                 || !self.settlements.is_empty()
                 || !self.bill_notes.is_empty())
@@ -623,6 +630,7 @@ pub struct ImportCounts {
     pub stock_notes: usize,
     pub stock_returns: usize,
     pub stock_counts: usize,
+    pub stock_journals: usize,
     pub orders: usize,
     pub stock_matches: usize,
     pub settlements: usize,
@@ -1128,7 +1136,7 @@ fn opening_cost_or_issue(
     }
 }
 
-fn opening_location(
+fn xml_stock_location(
     requested: &str,
     known: &HashMap<String, Option<i64>>,
 ) -> Option<(String, Option<i64>)> {
@@ -4194,6 +4202,7 @@ impl Store {
             stock_notes: Vec::new(),
             stock_returns: Vec::new(),
             stock_counts: Vec::new(),
+            stock_journals: Vec::new(),
             orders: Vec::new(),
             stock_preview: None,
             settlements: Vec::new(),
@@ -4234,7 +4243,7 @@ impl Store {
                             || local_name(p).eq_ignore_ascii_case("COLLECTION"))
                 })
         }) {
-            if ![
+            let supported = [
                 "GROUP",
                 "LEDGER",
                 "VOUCHER",
@@ -4245,8 +4254,9 @@ impl Store {
             ]
             .iter()
             .any(|name| local_name(node).eq_ignore_ascii_case(name))
-                && meaningful(node)
-            {
+                || (local_name(node).eq_ignore_ascii_case("VOUCHERTYPE")
+                    && stock_journals::type_name(node).is_some());
+            if !supported && meaningful(node) {
                 plan.issues
                     .push(format!("{} records are not supported", local_name(node)));
             }
@@ -5057,7 +5067,7 @@ impl Store {
                     .or_else(|| top_location.clone())
                     .unwrap_or_default();
                 let (location, existing_location_id) =
-                    match opening_location(&requested_location, &known_locations) {
+                    match xml_stock_location(&requested_location, &known_locations) {
                         Some(location) => location,
                         None => {
                             plan.issues.push(format!(
@@ -5067,7 +5077,7 @@ impl Store {
                         }
                     };
                 if let Some(expected) = &top_location {
-                    if !opening_location(expected, &known_locations)
+                    if !xml_stock_location(expected, &known_locations)
                         .is_some_and(|(name, _)| normalized(&name) == normalized(&location))
                     {
                         plan.issues
@@ -5146,7 +5156,7 @@ impl Store {
                 if let Some(quantity) = top_opening.filter(|quantity| *quantity != 0) {
                     let request = top_location.as_deref().unwrap_or("Main");
                     let (location, existing_location_id) =
-                        opening_location(request, &known_locations).unwrap_or_else(|| {
+                        xml_stock_location(request, &known_locations).unwrap_or_else(|| {
                             plan.issues
                                 .push(format!("{label}: stock location {request} is unavailable"));
                             (request.to_owned(), None)
@@ -5354,6 +5364,13 @@ impl Store {
                 stock_note_references.insert(row?);
             }
         }
+        let journal_types = nodes()
+            .filter(|node| {
+                node.is_element() && local_name(*node).eq_ignore_ascii_case("VOUCHERTYPE")
+            })
+            .filter_map(stock_journals::type_name)
+            .map(|name| normalized(&name))
+            .collect::<HashSet<_>>();
         for (source_order, node) in nodes()
             .filter(|n| n.is_element() && local_name(*n).eq_ignore_ascii_case("VOUCHER"))
             .enumerate()
@@ -5368,6 +5385,16 @@ impl Store {
             let order_kind = voucher_type.as_deref().and_then(orders::kind);
             let rejection_kind = voucher_type.as_deref().and_then(stock_rejections::kind);
             let physical_stock = voucher_type.as_deref().is_some_and(stock_counts::kind);
+            let journal_type = voucher_type
+                .clone()
+                .or_else(|| {
+                    node.attributes()
+                        .find(|attr| attr.name().eq_ignore_ascii_case("VCHTYPE"))
+                        .map(|attr| attr.value().trim().to_owned())
+                })
+                .filter(|name| {
+                    stock_journals::kind(name) || journal_types.contains(&normalized(name))
+                });
             register_metadata(
                 if stock_kind.is_some() {
                     "stocknote"
@@ -5377,6 +5404,8 @@ impl Store {
                     "stockreturn"
                 } else if physical_stock {
                     "stockcount"
+                } else if journal_type.is_some() {
+                    "stockjournal"
                 } else {
                     "voucher"
                 },
@@ -5448,6 +5477,23 @@ impl Store {
                     &mut plan.issues,
                 ) {
                     Ok(rejection) => plan.stock_returns.push(rejection),
+                    Err(error) => plan.issues.push(format!("{label}: {error}")),
+                }
+                continue;
+            }
+            if let Some(journal_type) = journal_type {
+                match stock_journals::parse(
+                    node,
+                    source_order,
+                    journal_type,
+                    &label,
+                    metadata,
+                    &invoice_items,
+                    &known_locations,
+                    &invoice_batches,
+                    &mut plan.issues,
+                ) {
+                    Ok(journal) => plan.stock_journals.push(journal),
                     Err(error) => plan.issues.push(format!("{label}: {error}")),
                 }
                 continue;
@@ -6181,9 +6227,9 @@ impl Store {
         }
         for node in nodes().filter(|n| {
             n.is_element()
-                && ["VOUCHERTYPE", "STOCKCATEGORY"]
-                    .iter()
-                    .any(|tag| local_name(*n).eq_ignore_ascii_case(tag))
+                && (local_name(*n).eq_ignore_ascii_case("STOCKCATEGORY")
+                    || (local_name(*n).eq_ignore_ascii_case("VOUCHERTYPE")
+                        && stock_journals::type_name(*n).is_none()))
         }) {
             plan.issues
                 .push(format!("{} records are not supported", local_name(node)));
@@ -6195,6 +6241,7 @@ impl Store {
             && plan.stock_notes.is_empty()
             && plan.stock_returns.is_empty()
             && plan.stock_counts.is_empty()
+            && plan.stock_journals.is_empty()
             && plan.orders.is_empty()
             && plan.settlements.is_empty()
             && plan.bill_notes.is_empty()
@@ -6219,6 +6266,7 @@ impl Store {
             && (!plan.stock_notes.is_empty()
                 || !plan.stock_returns.is_empty()
                 || !plan.stock_counts.is_empty()
+                || !plan.stock_journals.is_empty()
                 || !plan.orders.is_empty()
                 || plan.invoices.iter().any(|invoice| invoice.order.is_some())
                 || plan
@@ -6942,6 +6990,7 @@ impl Store {
             Note(&'a stock_notes::ImportedStockNote),
             Return(&'a stock_rejections::ImportedRejection),
             Count(&'a stock_counts::ImportedCount),
+            Journal(&'a stock_journals::ImportedJournal),
         }
         impl<'a> StockEvent<'a> {
             fn key(&self, source_sequence: bool) -> (&'a str, bool, usize) {
@@ -6957,16 +7006,18 @@ impl Store {
                         row.source_order,
                     ),
                     Self::Count(row) => (&row.date, false, row.source_order),
+                    Self::Journal(row) => (&row.date, false, row.source_order),
                 }
             }
         }
-        let source_sequence = !plan.stock_counts.is_empty();
+        let source_sequence = !plan.stock_counts.is_empty() || !plan.stock_journals.is_empty();
         let mut by_date = plan
             .stock_notes
             .iter()
             .map(StockEvent::Note)
             .chain(plan.stock_returns.iter().map(StockEvent::Return))
             .chain(plan.stock_counts.iter().map(StockEvent::Count))
+            .chain(plan.stock_journals.iter().map(StockEvent::Journal))
             .collect::<Vec<_>>();
         by_date.sort_by_key(|event| event.key(source_sequence));
         let mut stock_events = by_date.into_iter().peekable();
@@ -6998,6 +7049,9 @@ impl Store {
                             plan.company_id,
                             returned,
                         )?);
+                    }
+                    StockEvent::Journal(journal) => {
+                        stock_journals::write(conn, plan.company_id, journal, created_batches)?;
                     }
                     StockEvent::Count(count) => {
                         stock_preview.matches.extend(tracking.match_documents(
@@ -7313,6 +7367,7 @@ impl Store {
                 orders: plan.orders.len(),
                 stock_matches: stock_preview.matches.len(),
                 stock_counts: plan.stock_counts.len(),
+                stock_journals: plan.stock_journals.len(),
                 settlements: plan.settlement_count(),
                 bill_notes: plan.bill_note_count(),
                 advances: plan.advance_count(),
@@ -11596,6 +11651,7 @@ mod tests {
             stock_notes: Vec::new(),
             stock_returns: Vec::new(),
             stock_counts: Vec::new(),
+            stock_journals: Vec::new(),
             orders: Vec::new(),
             stock_preview: None,
             settlements: Vec::new(),

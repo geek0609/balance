@@ -38,6 +38,7 @@ mod payroll_ui;
 mod recurring_ui;
 mod shell;
 mod stock_count_ui;
+mod stock_journal_ui;
 mod stock_note_ui;
 mod stock_policy_ui;
 mod stock_transit_ui;
@@ -71,6 +72,7 @@ enum Page {
     Import,
     Stock,
     StockCounts,
+    StockJournals,
     StockNotes,
     Valuation,
     Manufacturing,
@@ -266,6 +268,7 @@ struct App {
     invoice_source: Option<InvoiceSource>,
     order_screen: OrderScreen,
     stock_count_screen: StockCountScreen,
+    stock_journal_filter: String,
     stock_note_screen: StockNoteScreen,
     cost_screen: CostScreen,
     valuation_screen: ValuationScreen,
@@ -626,6 +629,7 @@ impl App {
             invoice_source: None,
             order_screen: OrderScreen::default(),
             stock_count_screen: StockCountScreen::default(),
+            stock_journal_filter: String::new(),
             stock_note_screen: StockNoteScreen::default(),
             cost_screen: CostScreen::default(),
             valuation_screen: ValuationScreen::default(),
@@ -768,6 +772,7 @@ impl App {
         self.invoice_source = None;
         self.order_screen = OrderScreen::default();
         self.stock_count_screen = StockCountScreen::default();
+        self.stock_journal_filter.clear();
         self.stock_note_screen = StockNoteScreen::default();
         self.cost_screen = CostScreen::default();
         self.valuation_screen = ValuationScreen::default();
@@ -5215,14 +5220,16 @@ impl App {
                 || plan.stock_note_count() > 0
                 || plan.stock_return_count() > 0
                 || plan.stock_count_count() > 0
+                || plan.stock_journal_count() > 0
                 || plan.stock_match_count() > 0
             {
                 ui.label(format!(
-                    "{} orders, {} stock notes, {} stock returns, {} physical counts and {} tracking matches",
+                    "{} orders, {} stock notes, {} stock returns, {} physical counts, {} stock journals and {} tracking matches",
                     plan.order_count(),
                     plan.stock_note_count(),
                     plan.stock_return_count(),
                     plan.stock_count_count(),
+                    plan.stock_journal_count(),
                     plan.stock_match_count()
                 ));
             }
@@ -5255,8 +5262,8 @@ impl App {
                 match self.store.apply_xml_import(plan) {
                     Ok(counts) => {
                         self.message = format!(
-                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} orders, {} stock notes, {} stock returns, {} physical counts, {} tracking matches, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
-                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.orders, counts.stock_notes, counts.stock_returns, counts.stock_counts, counts.stock_matches, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
+                            "Imported {} account groups, {} ledgers, {} opening bills, {} opening advances, {} opening amounts on account, {} vouchers, {} invoices, {} orders, {} stock notes, {} stock returns, {} physical counts, {} stock journals, {} tracking matches, {} settlements, {} bill-linked notes, {} advances, {} advance applications, {} named credits, {} credit applications, {} credit refunds, {} units, {} stock groups, {} locations and {} items",
+                            counts.groups, counts.ledgers, counts.opening_bills, counts.opening_advances, counts.opening_on_account, counts.vouchers, counts.invoices, counts.orders, counts.stock_notes, counts.stock_returns, counts.stock_counts, counts.stock_journals, counts.stock_matches, counts.settlements, counts.bill_notes, counts.advances, counts.advance_applications, counts.note_credits, counts.credit_applications, counts.note_refunds, counts.units, counts.stock_groups, counts.locations, counts.items
                         );
                         self.import_preview = None;
                     }

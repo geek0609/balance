@@ -139,11 +139,12 @@ pub(super) fn parse(
                     .filter(|value| !value.is_empty())
                     .or_else(|| direct_text(entry, field).filter(|value| !value.is_empty()))
             };
-            let location = named("GODOWNNAME").unwrap_or_else(|| "Main".into());
+            let requested = named("GODOWNNAME").unwrap_or_default();
+            let (location, existing_location_id) = xml_stock_location(&requested, locations)
+                .ok_or_else(|| {
+                    Error::Validation(format!("Stock location {requested} is unavailable"))
+                })?;
             let location_key = normalized(&location);
-            let existing_location_id = *locations.get(&location_key).ok_or_else(|| {
-                Error::Validation(format!("Stock location {location} is unavailable"))
-            })?;
             let batch = stock_notes::tracking(named("BATCHNAME"));
             let batch_key = batch.as_deref().map(normalized);
             if !seen.insert((item_key.clone(), location_key, batch_key.clone())) {
