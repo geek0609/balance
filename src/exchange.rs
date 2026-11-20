@@ -17,7 +17,9 @@ use crate::inventory::{
 };
 use crate::opening_bills::OpeningBillDraft;
 use crate::settlement_discounts::SettlementDiscount;
-use crate::stock_units::{self, CompoundUnit, UnitMeasure};
+use crate::stock_units::{
+    self, index_measure, resolve_compound, saved_measures, CompoundUnit, UnitMeasure,
+};
 use crate::taxes::InvoiceTaxLine;
 use crate::{
     check_new_bill_voucher, insert_voucher_draft, parse_amount, parse_date, Category, Error,
@@ -3855,59 +3857,8 @@ fn find_stock_unit(conn: &Connection, company: i64, symbol: &str) -> Result<Opti
     Ok(found)
 }
 
-type Measures = HashMap<String, Arc<UnitMeasure>>;
 type InvoiceStockItems = HashMap<String, (Option<i64>, Arc<UnitMeasure>)>;
 
-fn resolve_compound(
-    symbol: &str,
-    compound: &CompoundUnit,
-    known: &Measures,
-) -> Result<Option<UnitMeasure>> {
-    let (Some(primary), Some(tail)) = (
-        known.get(&normalized(&compound.primary)),
-        known.get(&normalized(&compound.tail)),
-    ) else {
-        return Ok(None);
-    };
-    UnitMeasure::compound(symbol, primary, tail, compound.factor).map(Some)
-}
-
-fn index_measure(known: &mut Measures, measure: UnitMeasure) -> Result<()> {
-    let symbol = normalized(&measure.symbol);
-    let canonical = normalized(&measure.canonical);
-    if known.contains_key(&symbol) || known.contains_key(&canonical) {
-        return Err(Error::Validation(format!(
-            "Unit {} is ambiguous",
-            measure.symbol
-        )));
-    }
-    let measure = Arc::new(measure);
-    known.insert(symbol, Arc::clone(&measure));
-    known.insert(canonical, measure);
-    Ok(())
-}
-
-fn saved_measures(units: &[crate::inventory::StockUnit]) -> Result<Measures> {
-    let mut ordered = units.iter().collect::<Vec<_>>();
-    // A compound's referenced units are inserted before the compound itself.
-    ordered.sort_by_key(|unit| unit.id);
-    let mut known = Measures::new();
-    for unit in ordered {
-        let measure = match &unit.compound {
-            None => UnitMeasure::simple(&unit.symbol, unit.decimal_places),
-            Some(compound) => resolve_compound(&unit.symbol, compound, &known)?
-                .filter(|measure| measure.precision == unit.decimal_places)
-                .ok_or_else(|| {
-                    Error::Validation(format!(
-                        "Stored unit {} has invalid components",
-                        unit.symbol
-                    ))
-                })?,
-        };
-        index_measure(&mut known, measure)?;
-    }
-    Ok(known)
-}
 fn find_stock_group(conn: &Connection, company: i64, name: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare("SELECT id, name FROM stock_groups WHERE company_id = ?1")?;
     let mut found = None;
@@ -6823,6 +6774,50 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compound_aliases_resolve_without_blocking_unrelated_imports() {
+        let mut store = Store::memory().unwrap();
+        let company = store.create_company("Compound aliases").unwrap();
+        let units = br#"<ENVELOPE><BODY><DATA><MESSAGE>
+            <UNIT><NAME>Box</NAME><ISSIMPLEUNIT>Yes</ISSIMPLEUNIT></UNIT>
+            <UNIT><NAME>pcs</NAME><ISSIMPLEUNIT>Yes</ISSIMPLEUNIT></UNIT>
+            <UNIT><NAME>Retail box</NAME><ISSIMPLEUNIT>No</ISSIMPLEUNIT>
+                <BASEUNITS>Box</BASEUNITS><ADDITIONALUNITS>pcs</ADDITIONALUNITS>
+                <CONVERSION>12</CONVERSION></UNIT>
+        </MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let plan = store.preview_xml_import(company, units).unwrap();
+        store.apply_xml_import(&plan).unwrap();
+        assert!(store
+            .create_stock_unit(company, "Box of 12 pcs", "Duplicate", 0)
+            .is_err());
+        store
+            .create_stock_item(company, "Parts", "Box of 12 pcs")
+            .unwrap();
+        assert_eq!(store.stock_items(company).unwrap()[0].unit, "pcs");
+
+        // Earlier builds could save a simple unit with the compound's generated name.
+        store
+            .conn
+            .execute(
+                "INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places)
+             VALUES (?1, 'Box of 12 pcs', 'Historical symbol', 0)",
+                [company],
+            )
+            .unwrap();
+        let group = br#"<ENVELOPE><BODY><DATA><MESSAGE>
+            <STOCKGROUP><NAME>Equipment</NAME></STOCKGROUP>
+        </MESSAGE></DATA></BODY></ENVELOPE>"#;
+        let plan = store.preview_xml_import(company, group).unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        store.apply_xml_import(&plan).unwrap();
+        store
+            .create_stock_item(company, "Named stock", "Box of 12 pcs")
+            .unwrap();
+        let items = store.stock_items(company).unwrap();
+        assert_eq!(items[0].unit, "Box of 12 pcs");
+        assert_eq!(items[1].unit, "pcs");
+    }
 
     #[test]
     fn imports_billed_quantities_independently_of_stock_movements() {

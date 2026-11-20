@@ -1576,22 +1576,18 @@ pub(crate) fn check_quantity_precision(
     }
     Ok(())
 }
-fn find_unit(conn: &Connection, company_id: i64, symbol: &str) -> Result<Option<i64>> {
-    let mut stmt = conn.prepare("SELECT id, symbol FROM stock_units WHERE company_id = ?1")?;
-    let mut found = None;
-    for row in stmt.query_map([company_id], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-    })? {
-        let (id, name) = row?;
-        if name.trim().to_lowercase() == symbol.trim().to_lowercase() {
-            if found.is_some() {
-                return Err(Error::Validation("Unit name is ambiguous".into()));
-            }
-            found = Some(id);
-        }
-    }
-    Ok(found)
+fn find_unit(store: &Store, company_id: i64, symbol: &str) -> Result<Option<i64>> {
+    let units = store.stock_units(company_id)?;
+    let measures = crate::stock_units::saved_measures(&units)?;
+    let Some(measure) = measures.get(&crate::stock_units::unit_key(symbol)) else {
+        return Ok(None);
+    };
+    Ok(units
+        .iter()
+        .find(|unit| unit.symbol == measure.symbol)
+        .map(|unit| unit.id))
 }
+
 pub(crate) fn create_stock_item_on_connection(
     conn: &Connection,
     company_id: i64,
@@ -2417,11 +2413,14 @@ impl Store {
                 "Units currently support at most three decimal places".into(),
             ));
         }
-        if find_unit(&self.conn, company_id, symbol)?.is_some() {
+        let tx = self.conn.unchecked_transaction()?;
+        if find_unit(self, company_id, symbol)?.is_some() {
             return Err(Error::Validation("Unit already exists".into()));
         }
-        self.conn.execute("INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) VALUES (?1, ?2, ?3, ?4)", params![company_id, symbol, formal_name.trim(), decimal_places])?;
-        Ok(self.conn.last_insert_rowid())
+        tx.execute("INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) VALUES (?1, ?2, ?3, ?4)", params![company_id, symbol, formal_name.trim(), decimal_places])?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
     }
     pub fn stock_groups(&self, company_id: i64) -> Result<Vec<StockGroup>> {
         let mut stmt = self.conn.prepare(
@@ -2488,7 +2487,7 @@ impl Store {
         let name = required(name, "Stock item name")?;
         let unit = required(unit, "Unit")?;
         let tx = self.conn.unchecked_transaction()?;
-        let unit_id = if let Some(id) = find_unit(&tx, company_id, unit)? {
+        let unit_id = if let Some(id) = find_unit(self, company_id, unit)? {
             id
         } else {
             tx.execute("INSERT INTO stock_units(company_id, symbol, formal_name, decimal_places) VALUES (?1, ?2, ?2, 3)", params![company_id, unit])?;

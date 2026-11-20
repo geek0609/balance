@@ -2,6 +2,10 @@
 use crate::{inventory::parse_quantity, required, Error, Result};
 use rusqlite::{params, Connection};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompoundUnit {
@@ -74,7 +78,14 @@ pub(crate) fn insert_compound(
     Ok(unit)
 }
 
-fn name_key(name: &str) -> String {
+pub(crate) fn unit_key(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn quantity_name_key(name: &str) -> String {
     name.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -104,7 +115,7 @@ impl UnitMeasure {
             precision,
             parts: vec![UnitPart {
                 symbol: symbol.to_owned(),
-                names: vec![name_key(symbol)],
+                names: vec![quantity_name_key(symbol)],
                 factor: Decimal::ONE,
             }],
         }
@@ -116,7 +127,7 @@ impl UnitMeasure {
             || tail
                 .parts
                 .iter()
-                .any(|part| part.names.contains(&name_key(primary_symbol)))
+                .any(|part| part.names.contains(&quantity_name_key(primary_symbol)))
         {
             return Err(Error::Validation(
                 "Compound unit components must be distinct and the primary unit simple".into(),
@@ -141,9 +152,9 @@ impl UnitMeasure {
             symbol.to_owned()
         };
         let mut names = vec![
-            name_key(primary_symbol),
-            name_key(&canonical),
-            name_key(&symbol),
+            quantity_name_key(primary_symbol),
+            quantity_name_key(&canonical),
+            quantity_name_key(&symbol),
         ];
         names.sort_unstable();
         names.dedup();
@@ -175,7 +186,7 @@ impl UnitMeasure {
     }
 
     pub fn factor_for(&self, suffix: &str) -> Result<Decimal> {
-        let suffix = name_key(suffix);
+        let suffix = quantity_name_key(suffix);
         if suffix.is_empty() {
             return Ok(self.parts[0].factor);
         }
@@ -221,7 +232,7 @@ impl UnitMeasure {
         } else if let Ok(factor) = self.factor_for(suffix) {
             parse(number)?.checked_mul(factor).ok_or_else(invalid)?
         } else {
-            let normalized = name_key(value);
+            let normalized = quantity_name_key(value);
             let mut remaining = normalized.as_str();
             let mut total = Decimal::ZERO;
             let mut next_part = 0;
@@ -268,4 +279,75 @@ impl UnitMeasure {
             })?;
         Ok(if negative { -quantity } else { quantity })
     }
+}
+
+pub(crate) type Measures = HashMap<String, Arc<UnitMeasure>>;
+
+pub(crate) fn resolve_compound(
+    symbol: &str,
+    compound: &CompoundUnit,
+    known: &Measures,
+) -> Result<Option<UnitMeasure>> {
+    let (Some(primary), Some(tail)) = (
+        known.get(&unit_key(&compound.primary)),
+        known.get(&unit_key(&compound.tail)),
+    ) else {
+        return Ok(None);
+    };
+    UnitMeasure::compound(symbol, primary, tail, compound.factor).map(Some)
+}
+
+pub(crate) fn index_measure(known: &mut Measures, measure: UnitMeasure) -> Result<()> {
+    let symbol = unit_key(&measure.symbol);
+    let canonical = unit_key(&measure.canonical);
+    if known.contains_key(&symbol) || known.contains_key(&canonical) {
+        return Err(Error::Validation(format!(
+            "Unit {} is ambiguous",
+            measure.symbol
+        )));
+    }
+    let measure = Arc::new(measure);
+    known.insert(symbol, Arc::clone(&measure));
+    known.insert(canonical, measure);
+    Ok(())
+}
+
+pub(crate) fn saved_measures(units: &[crate::inventory::StockUnit]) -> Result<Measures> {
+    let mut ordered = units.iter().collect::<Vec<_>>();
+    // A compound's referenced units are inserted before the compound itself.
+    ordered.sort_by_key(|unit| unit.id);
+    let symbols: HashSet<_> = units.iter().map(|unit| unit_key(&unit.symbol)).collect();
+    if symbols.len() != units.len() {
+        return Err(Error::Validation(
+            "Stored unit symbols are ambiguous".into(),
+        ));
+    }
+    let mut aliases = HashSet::new();
+    let mut known = Measures::new();
+    for unit in ordered {
+        let measure = match &unit.compound {
+            None => UnitMeasure::simple(&unit.symbol, unit.decimal_places),
+            Some(compound) => resolve_compound(&unit.symbol, compound, &known)?
+                .filter(|measure| measure.precision == unit.decimal_places)
+                .ok_or_else(|| {
+                    Error::Validation(format!(
+                        "Stored unit {} has invalid components",
+                        unit.symbol
+                    ))
+                })?,
+        };
+        let symbol = unit_key(&measure.symbol);
+        let canonical = unit_key(&measure.canonical);
+        let measure = Arc::new(measure);
+        known.insert(symbol, Arc::clone(&measure));
+        // Existing symbols remain authoritative when a generated alias collides.
+        if !symbols.contains(&canonical) {
+            if aliases.insert(canonical.clone()) {
+                known.insert(canonical, measure);
+            } else {
+                known.remove(&canonical);
+            }
+        }
+    }
+    Ok(known)
 }
