@@ -79,13 +79,13 @@ pub(super) struct InvoiceOrders {
 }
 
 #[derive(Debug, Clone, Default)]
-struct OrderFields {
-    reference: Option<String>,
-    expected_on: Option<String>,
+pub(super) struct OrderFields {
+    pub reference: Option<String>,
+    pub expected_on: Option<String>,
 }
 
 impl OrderFields {
-    fn read(node: Node<'_, '_>, parent: &Self) -> Result<Self> {
+    pub(super) fn read(node: Node<'_, '_>, parent: &Self) -> Result<Self> {
         let number = direct_text(node, "ORDERNO").filter(|value| !value.is_empty());
         let alias = direct_text(node, "BASICORDERREF").filter(|value| !value.is_empty());
         let mut reference = source_ref(number.clone());
@@ -96,7 +96,7 @@ impl OrderFields {
         let explicit_date = due_date(node)?;
         if reference.is_none() && explicit_date.is_some() {
             return Err(Error::Validation(
-                "Invoice order due date requires an order reference".into(),
+                "A delivery due date requires an order reference".into(),
             ));
         }
         let expected_on = explicit_date.or_else(|| {
@@ -157,7 +157,7 @@ impl InvoiceOrders {
         company: i64,
         draft: &InvoiceDraft,
         source: &ImportedInvoice,
-    ) -> Result<Vec<Option<crate::orders::InvoiceOrderSource<'_>>>> {
+    ) -> Result<Vec<Option<crate::orders::OrderAllocation<'_>>>> {
         let date = parse_date(&draft.date)?;
         let mut order_ids = HashMap::new();
         let mut resolve = |reference: &str| -> Result<i64> {
@@ -222,7 +222,7 @@ impl InvoiceOrders {
                         ));
                     }
                 }
-                ordered.push(Some(crate::orders::InvoiceOrderSource {
+                ordered.push(Some(crate::orders::OrderAllocation {
                     order_id,
                     expected_on,
                 }));
@@ -1328,6 +1328,228 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn one_delivery_can_supply_two_orders_and_unlinked_stock() {
+        use crate::invoice_returns::StockReturnDraft;
+        use crate::stock_reservations::StockReservationDraft;
+        use crate::stock_returns::StockReturnLineDraft;
+
+        let (mut store, company, _, item, location, first) = scheduled_sale();
+        let second = other_sale_order(&mut store, company);
+        for order in [first, second] {
+            store
+                .reserve_order_stock(
+                    company,
+                    order,
+                    &StockReservationDraft {
+                        item_id: item,
+                        location_id: location,
+                        batch_id: None,
+                        quantity: 2000,
+                        reason: "For dispatch".into(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let delivery = r#"<VOUCHER><DATE>20260403</DATE><VOUCHERTYPENAME>Delivery Note</VOUCHERTYPENAME>
+          <VOUCHERNUMBER>ONE-DISPATCH</VOUCHERNUMBER><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME>
+          <BASICORDERREF>SCHEDULE</BASICORDERREF><ORDERDUEDATE>20260412</ORDERDUEDATE>
+          <INVENTORYENTRIES.LIST><STOCKITEMNAME>Part</STOCKITEMNAME>
+            <ACTUALQTY>-4 pcs</ACTUALQTY><TRACKINGNUMBER>SHARED</TRACKINGNUMBER>
+            <BATCHALLOCATIONS.LIST><GODOWNNAME>Main</GODOWNNAME><ACTUALQTY>-1 pcs</ACTUALQTY>
+            </BATCHALLOCATIONS.LIST>
+            <BATCHALLOCATIONS.LIST><GODOWNNAME>Main</GODOWNNAME><ACTUALQTY>-2 pcs</ACTUALQTY>
+              <ORDERNO>OTHER-ORDER</ORDERNO>
+            </BATCHALLOCATIONS.LIST>
+            <BATCHALLOCATIONS.LIST><GODOWNNAME>Main</GODOWNNAME><ACTUALQTY>-1 pcs</ACTUALQTY>
+              <ORDERNO>Not Applicable</ORDERNO>
+            </BATCHALLOCATIONS.LIST>
+          </INVENTORYENTRIES.LIST></VOUCHER>"#;
+        let wrong = delivery.replace("OTHER-ORDER", "MISSING");
+        let plan = store
+            .preview_xml_import(company, &envelope(&wrong))
+            .unwrap();
+        assert!(!plan.can_apply());
+        assert!(store.stock_notes(company, None).unwrap().is_empty());
+        let plan = store
+            .preview_xml_import(company, &envelope(delivery))
+            .unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        store.apply_xml_import(&plan).unwrap();
+
+        let note = store.stock_notes(company, None).unwrap().remove(0);
+        assert_eq!(note.order_id, None);
+        let lines = store.stock_note_lines(company, note.id).unwrap();
+        assert_eq!(
+            lines.iter().map(|line| line.order_id).collect::<Vec<_>>(),
+            [Some(first), Some(second), None]
+        );
+        assert_eq!(lines[1].order_reference.as_deref(), Some("OTHER-ORDER"));
+        for order in [first, second] {
+            assert_eq!(
+                store.stock_notes(company, Some(order)).unwrap()[0].id,
+                note.id
+            );
+        }
+        assert_eq!(remaining(&store, company, first), [2000, 1000]);
+        assert_eq!(remaining(&store, company, second), [1000]);
+        assert_eq!(
+            store.order_detail(company, first).unwrap().reservations[0].remaining,
+            1000
+        );
+        assert_eq!(
+            store.order_detail(company, second).unwrap().reservations[0].remaining,
+            0
+        );
+
+        let invoice_xml = split_sale(
+            "20260404",
+            "BILL-B",
+            "",
+            &[(
+                "<ORDERNO>OTHER-ORDER</ORDERNO><TRACKINGNUMBER>SHARED</TRACKINGNUMBER>",
+                1,
+            )],
+        );
+        let plan = store
+            .preview_xml_import(company, &envelope(&invoice_xml))
+            .unwrap();
+        assert!(plan.can_apply(), "{:?}", plan.issues());
+        store.apply_xml_import(&plan).unwrap();
+        let invoice = store.invoices(company).unwrap().remove(0);
+        assert_eq!(invoice.order_ids, [second]);
+        assert_eq!(
+            store
+                .stock_note_lines(company, note.id)
+                .unwrap()
+                .iter()
+                .map(|line| line.billed)
+                .collect::<Vec<_>>(),
+            [0, 1000, 0]
+        );
+
+        let first_return = store
+            .post_stock_return(
+                company,
+                note.id,
+                "2026-04-05",
+                "RETURN-A",
+                "Return a dispatched item",
+                &[StockReturnLineDraft {
+                    note_line: lines[0].id,
+                    quantity: 1000,
+                }],
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, first), [2000, 2000]);
+        assert_eq!(remaining(&store, company, second), [1000]);
+
+        let source = store.invoice_return_sources(company, invoice.id).unwrap()[0].source;
+        let credit = store
+            .post_stock_return_from_invoice(
+                company,
+                invoice.id,
+                "2026-04-06",
+                "RETURN-B",
+                "Return an invoiced item",
+                &[StockReturnDraft {
+                    source,
+                    quantity: 1000,
+                }],
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, first), [2000, 2000]);
+        assert_eq!(remaining(&store, company, second), [2000]);
+        store
+            .reverse_invoice_credit(
+                company,
+                credit,
+                "2026-04-07",
+                "UNDO-B",
+                "Restore billed stock",
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, first), [2000, 2000]);
+        assert_eq!(remaining(&store, company, second), [1000]);
+        store
+            .reverse_stock_return(
+                company,
+                first_return,
+                "2026-04-07",
+                "Restore dispatched stock",
+            )
+            .unwrap();
+        assert_eq!(remaining(&store, company, first), [2000, 1000]);
+
+        let mut draft = store.invoice_draft(company, invoice.id).unwrap();
+        draft.reference = "SEPARATE-BILL".into();
+        draft.date = "2026-04-08".into();
+        draft.bill_reference = None;
+        draft.bill_splits.clear();
+        draft.lines[0].quantity = 1000;
+        draft.lines[0].billed_quantity = None;
+        let billed = store
+            .invoice_stock_notes(company, &[lines[2].id], &draft)
+            .unwrap();
+        let unlinked = store
+            .invoices(company)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == billed)
+            .unwrap();
+        assert!(unlinked.order_ids.is_empty());
+        assert!(store
+            .order_detail(company, first)
+            .unwrap()
+            .invoices
+            .is_empty());
+        assert_eq!(
+            store.order_detail(company, second).unwrap().invoices.len(),
+            1
+        );
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            4000
+        );
+
+        store
+            .reverse_invoice(
+                company,
+                billed,
+                "2026-04-09",
+                "UNDO-UNLINKED",
+                "Cancel separate bill",
+            )
+            .unwrap();
+        store
+            .reverse_invoice(
+                company,
+                invoice.id,
+                "2026-04-09",
+                "UNDO-BILLED",
+                "Cancel tracked bill",
+            )
+            .unwrap();
+        store
+            .reverse_stock_note(company, note.id, "2026-04-10", "Cancel dispatch")
+            .unwrap();
+        assert_eq!(remaining(&store, company, first), [2000, 2000]);
+        assert_eq!(remaining(&store, company, second), [3000]);
+        assert_eq!(
+            store
+                .stock_register(company, item, None, None)
+                .unwrap()
+                .closing_quantity,
+            8000
+        );
     }
 
     #[test]

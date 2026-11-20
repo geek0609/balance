@@ -456,18 +456,12 @@ impl App {
             return Ok(());
         };
 
-        if let Some(order) = note.order_id {
-            if ui.link(format!("View linked order {order}")).clicked() {
-                self.order_screen.select(order);
-                self.page = Page::Orders;
-                self.message.clear();
-            }
-        }
         if !note.narration.is_empty() {
             ui.label(&note.narration);
         }
 
         let lines = self.store.stock_note_lines(company, note.id)?;
+        let has_orders = lines.iter().any(|line| line.order_id.is_some());
         egui::Grid::new(("stock-note-lines", note.id))
             .striped(true)
             .show(ui, |ui| {
@@ -482,6 +476,9 @@ impl App {
                     "Unit price",
                 ] {
                     ui.strong(heading);
+                }
+                if has_orders {
+                    ui.strong("Order");
                 }
                 ui.end_row();
                 for line in &lines {
@@ -508,6 +505,15 @@ impl App {
                         ui.label("—");
                     }
                     ui.label(format_amount(line.values.unit_price));
+                    if let (Some(order), Some(reference)) = (line.order_id, &line.order_reference) {
+                        if ui.link(reference).clicked() {
+                            self.order_screen.select(order);
+                            self.page = Page::Orders;
+                            self.message.clear();
+                        }
+                    } else if has_orders {
+                        ui.label("—");
+                    }
                     ui.end_row();
                 }
             });
@@ -719,6 +725,9 @@ impl App {
                 let key = (allocation.allocation_id, line.id);
                 let entry = form.quantities.entry(key).or_default();
                 ui.horizontal_wrapped(|ui| {
+                    if let Some(reference) = &line.order_reference {
+                        ui.label(format!("Order {reference}"));
+                    }
                     ui.label(format!(
                         "{} · {} · {} · {} available, {} billed pending (#{}), in {}",
                         line.item,
@@ -907,7 +916,11 @@ impl App {
                 }
                 ui.end_row();
                 for line in lines.iter().filter(|line| line.unbilled() > 0) {
-                    ui.label(&line.item);
+                    if let Some(reference) = &line.order_reference {
+                        ui.label(format!("{} · Order {reference}", line.item));
+                    } else {
+                        ui.label(&line.item);
+                    }
                     ui.label(&line.location);
                     ui.label(line.batch.as_deref().unwrap_or("Unbatched"));
                     ui.label(format!(
@@ -984,7 +997,11 @@ impl App {
                 .filter(|line| line.unbilled() > 0)
             {
                 let mut form = InvoiceLineForm::new();
-                form.stock_note_line = Some((line.id, note.reference.clone()));
+                let source = line.order_reference.as_deref().map_or_else(
+                    || note.reference.clone(),
+                    |order| format!("{} · Order {order}", note.reference),
+                );
+                form.stock_note_line = Some((line.id, source));
                 form.item = Some(line.values.item_id);
                 form.location = Some(line.values.location_id);
                 form.batch = line.values.batch_id;

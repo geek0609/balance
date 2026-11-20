@@ -382,17 +382,30 @@ impl Store {
         if let Some(date) = &note.reversed_on {
             let _ = write!(html, "<br><strong>Reversed {}</strong>", escape(date));
         }
-        html.push_str("</p><table><thead><tr><th>Item</th><th>Location</th><th>Batch</th><th class=\"num\">Quantity</th></tr></thead><tbody>");
+        let has_orders = lines.iter().any(|line| line.order_id.is_some());
+        html.push_str("</p><table><thead><tr><th>Item</th><th>Location</th><th>Batch</th><th class=\"num\">Quantity</th>");
+        if has_orders {
+            html.push_str("<th>Order</th>");
+        }
+        html.push_str("</tr></thead><tbody>");
         for line in lines {
             let _ = write!(
                 html,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{} {}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{} {}</td>",
                 escape(&line.item),
                 escape(&line.location),
                 escape(line.batch.as_deref().unwrap_or("Unbatched")),
                 format_quantity(i128::from(line.values.quantity)),
                 escape(&line.unit),
             );
+            if has_orders {
+                let _ = write!(
+                    html,
+                    "<td>{}</td>",
+                    escape(line.order_reference.as_deref().unwrap_or(""))
+                );
+            }
+            html.push_str("</tr>");
         }
         html.push_str("</tbody></table>");
         if !note.narration.is_empty() {

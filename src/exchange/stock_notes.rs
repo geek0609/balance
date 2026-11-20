@@ -11,7 +11,6 @@ pub(super) struct ImportedStockNote {
     pub kind: InvoiceKind,
     party_id: Option<i64>,
     narration: String,
-    order_reference: Option<String>,
     lines: Vec<NoteLine>,
     metadata: SourceMetadata,
 }
@@ -24,8 +23,7 @@ struct NoteLine {
     precision: u8,
     allocation: ImportedStockAllocation,
     value: Option<i64>,
-    order_reference: Option<String>,
-    order_due_on: Option<String>,
+    order: orders::OrderFields,
 }
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -75,8 +73,7 @@ struct NoteStock<'a> {
     items: &'a InvoiceStockItems,
     locations: &'a HashMap<String, Option<i64>>,
     batches: &'a HashMap<(String, String), i64>,
-    order_reference: Option<String>,
-    order_due_on: Option<String>,
+    order: orders::OrderFields,
 }
 
 impl NoteStock<'_> {
@@ -97,6 +94,7 @@ impl NoteStock<'_> {
                 "ISDEEMEDPOSITIVE",
                 "GODOWNNAME",
                 "TRACKINGNUMBER",
+                "BASICORDERREF",
                 "ORDERNO",
                 "ORDERDUEDATE",
                 "BATCHALLOCATIONS.LIST",
@@ -133,6 +131,7 @@ impl NoteStock<'_> {
         } else {
             batches
         };
+        let item_order = orders::OrderFields::read(node, &self.order)?;
         let mut planned = Vec::new();
         for entry in rows {
             if entry != node {
@@ -146,6 +145,7 @@ impl NoteStock<'_> {
                         "BILLEDQTY",
                         "AMOUNT",
                         "TRACKINGNUMBER",
+                        "BASICORDERREF",
                         "ORDERNO",
                         "ORDERDUEDATE",
                     ],
@@ -153,19 +153,11 @@ impl NoteStock<'_> {
                     issues,
                 );
             }
-            let order_reference = orders::source_ref(
-                direct_text(entry, "ORDERNO")
-                    .or_else(|| direct_text(node, "ORDERNO"))
-                    .or_else(|| self.order_reference.clone()),
-            );
-            let order_due_on = orders::due_date(entry)?
-                .or(orders::due_date(node)?)
-                .or_else(|| self.order_due_on.clone());
-            if order_due_on.is_some() && order_reference.is_none() {
-                return Err(Error::Validation(
-                    "Stock note order due date requires an order reference".into(),
-                ));
-            }
+            let order = if entry == node {
+                item_order.clone()
+            } else {
+                orders::OrderFields::read(entry, &item_order)?
+            };
             let location = direct_text(entry, "GODOWNNAME")
                 .filter(|value| !value.is_empty())
                 .or_else(|| header_location.clone())
@@ -218,8 +210,7 @@ impl NoteStock<'_> {
                     ),
                 },
                 value: stored_value(entry)?,
-                order_reference,
-                order_due_on,
+                order,
             });
         }
         if planned
@@ -343,9 +334,7 @@ pub(super) fn parse(
         items,
         locations,
         batches,
-        order_reference: direct_text(node, "ORDERNO")
-            .or_else(|| direct_text(node, "BASICORDERREF")),
-        order_due_on: orders::due_date(node)?,
+        order: orders::OrderFields::read(node, &orders::OrderFields::default())?,
     };
     let mut lines = Vec::new();
     for entry in node
@@ -380,15 +369,6 @@ pub(super) fn parse(
             "Stock note needs at least one inventory line".into(),
         ));
     }
-    let order_reference = lines[0].order_reference.clone();
-    if lines.iter().any(|line| {
-        line.order_reference.as_deref().map(normalized)
-            != order_reference.as_deref().map(normalized)
-    }) {
-        return Err(Error::Validation(
-            "A stock note can fulfil one order".into(),
-        ));
-    }
     Ok(ImportedStockNote {
         date: xml_date(&invoice_field(node, "DATE")?)?,
         reference: invoice_field(node, "VOUCHERNUMBER")?,
@@ -396,7 +376,6 @@ pub(super) fn parse(
         kind,
         party_id: *party_id,
         narration: direct_text(node, "NARRATION").unwrap_or_default(),
-        order_reference,
         lines,
         metadata,
     })
@@ -432,14 +411,27 @@ impl NewTracking {
                 note.party
             )));
         }
-        let order_id = note
-            .order_reference
-            .as_deref()
-            .map(|reference| orders::linked_order(conn, company, party, note.kind, reference))
-            .transpose()?;
+        let mut ordered = Vec::with_capacity(note.lines.len());
+        let mut order_ids = HashMap::new();
         let mut lines = Vec::with_capacity(note.lines.len());
         let mut costs = Vec::with_capacity(note.lines.len());
         for line in &note.lines {
+            let source = if let Some(reference) = &line.order.reference {
+                let key = normalized(reference);
+                let order_id = match order_ids.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => *entry.insert(
+                        orders::linked_order(conn, company, party, note.kind, reference)?,
+                    ),
+                };
+                Some(crate::orders::OrderAllocation {
+                    order_id,
+                    expected_on: line.order.expected_on.as_deref(),
+                })
+            } else {
+                None
+            };
+            ordered.push(source);
             let item_id = resolve_imported_item(
                 conn,
                 company,
@@ -469,6 +461,16 @@ impl NewTracking {
             });
             costs.push(line.value);
         }
+        let order_id = ordered
+            .first()
+            .copied()
+            .flatten()
+            .map(|source| source.order_id)
+            .filter(|&id| {
+                ordered
+                    .iter()
+                    .all(|source| source.is_some_and(|source| source.order_id == id))
+            });
         let draft = StockNoteDraft {
             kind: note.kind,
             date: note.date.clone(),
@@ -478,18 +480,8 @@ impl NewTracking {
             narration: note.narration.clone(),
             lines,
         };
-        let dates: Vec<_> = note
-            .lines
-            .iter()
-            .map(|line| line.order_due_on.as_deref())
-            .collect();
-        let id = crate::stock_notes::write_stock_note(
-            conn,
-            company,
-            &draft,
-            Some(&costs),
-            Some(&dates),
-        )?;
+        let id =
+            crate::stock_notes::write_stock_note(conn, company, &draft, Some(&costs), &ordered)?;
         save_metadata(conn, company, "stocknote", id, &note.metadata)?;
         let mut stmt =
             conn.prepare("SELECT id FROM stock_note_lines WHERE note_id = ?1 ORDER BY id")?;
@@ -581,9 +573,10 @@ impl NewTracking {
              JOIN invoices i ON i.id = l.invoice_id AND i.company_id = n.company_id
                   AND i.kind = n.kind AND i.party_ledger_id = n.party_ledger_id
              JOIN vouchers v ON v.id = i.voucher_id
+             LEFT JOIN stock_note_order_sources src ON src.note_line_id = nl.id
              WHERE nl.id = ?1 AND a.quantity = 0
                AND NOT EXISTS(SELECT 1 FROM invoice_order_sources o
-                              WHERE o.allocation_id = a.id AND o.order_id IS NOT n.order_id)
+                              WHERE o.allocation_id = a.id AND o.order_id IS NOT src.order_id)
                AND NOT EXISTS(SELECT 1 FROM invoice_reversals r WHERE r.invoice_id = i.id)
              ORDER BY v.date, i.id, a.id",
         )?;

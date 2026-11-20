@@ -1455,7 +1455,7 @@ pub(crate) enum StockInvoicePosting<'a> {
     Order(i64),
     Import {
         original_postings: Option<&'a [Posting]>,
-        order_allocations: Option<&'a [Option<crate::orders::InvoiceOrderSource<'a>>]>,
+        order_allocations: Option<&'a [Option<crate::orders::OrderAllocation<'a>>]>,
     },
 }
 

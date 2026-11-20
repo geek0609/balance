@@ -5,6 +5,7 @@ use crate::stock_notes::{self, InvoiceQuantityShare, StockNoteLineDraft};
 use crate::{parse_date, required, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use std::collections::BTreeMap;
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -344,8 +345,9 @@ impl Store {
         let source = stock_notes::get_note(&tx, company, note)?;
         let lines = {
             let mut stmt = tx.prepare(
-                "SELECT l.id, src.item_id, src.location_id, src.batch_id, l.quantity, src.unit_price
+                "SELECT l.id, src.item_id, src.location_id, src.batch_id, l.quantity, src.unit_price, o.order_id
                  FROM stock_return_lines l JOIN stock_note_lines src ON src.id = l.note_line_id
+                 LEFT JOIN stock_note_order_sources o ON o.note_line_id = src.id
                  WHERE l.return_id = ?1 ORDER BY l.id",
             )?;
             let result = stmt
@@ -359,12 +361,22 @@ impl Store {
                             quantity: row.get(4)?,
                             unit_price: row.get(5)?,
                         },
+                        row.get::<_, Option<i64>>(6)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             result
         };
-        if let Some(order) = source.order_id {
+        let mut orders = BTreeMap::<_, Vec<_>>::new();
+        for (_, line, order) in &lines {
+            if let Some(order) = order {
+                orders
+                    .entry(*order)
+                    .or_default()
+                    .push((line.item_id, line.quantity));
+            }
+        }
+        for (&order, quantities) in &orders {
             crate::orders::check_fulfilment(
                 &tx,
                 company,
@@ -373,11 +385,11 @@ impl Store {
                 source.party_ledger_id,
                 date,
                 crate::orders::FulfilmentChange::ReverseReturn,
-                lines.iter().map(|(_, line)| (line.item_id, line.quantity)),
+                quantities.iter().copied(),
             )?;
         }
         let movement_reason = format!("Return {reference} reversal: {reason}");
-        for (line_id, line) in lines {
+        for (line_id, line, _) in lines {
             if source.kind == InvoiceKind::Sale {
                 require_available(&tx, company, date, &line)?;
             }
@@ -398,7 +410,7 @@ impl Store {
             "UPDATE stock_returns SET reversed_on = ?1, reversal_reason = ?2 WHERE id = ?3",
             params![date.to_string(), reason, id],
         )?;
-        if let Some(order) = source.order_id {
+        for order in orders.into_keys() {
             crate::stock_reservations::check_order_coverage(&tx, order)?;
         }
         tx.commit()?;

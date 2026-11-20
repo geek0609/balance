@@ -536,19 +536,9 @@ pub(crate) fn migrate_invoice_allocations(conn: &Connection) -> Result<()> {
             SELECT a.id, legacy.invoice_id, legacy.order_id
             FROM invoice_order_links legacy JOIN invoice_lines l ON l.invoice_id = legacy.invoice_id
             JOIN invoice_line_allocations a ON a.line_id = l.id
-            WHERE NOT EXISTS(SELECT 1 FROM invoice_order_allocations source WHERE source.allocation_id = a.id);
-         DROP VIEW invoice_orders;
-         CREATE VIEW invoice_orders AS
-            SELECT invoice_id, order_id FROM invoice_order_links
-            UNION
-            SELECT l.invoice_id, source.order_id FROM invoice_order_allocations source
-            JOIN invoice_line_allocations a ON a.id = source.allocation_id
-            JOIN invoice_lines l ON l.id = a.line_id
-            UNION
-            SELECT h.invoice_id, n.order_id FROM stock_note_billing_history h
-            JOIN stock_notes n ON n.id = h.note_id WHERE n.order_id IS NOT NULL;",
+            WHERE NOT EXISTS(SELECT 1 FROM invoice_order_allocations source WHERE source.allocation_id = a.id);",
     )?;
-    crate::invoice_stock_links::rebuild_order_progress(conn, true)
+    Ok(())
 }
 
 fn remove_unused_line(conn: &Connection, order: i64, item: i64) -> Result<bool> {
@@ -557,8 +547,9 @@ fn remove_unused_line(conn: &Connection, order: i64, item: i64) -> Result<bool> 
            AND NOT EXISTS(SELECT 1 FROM order_line_closures c WHERE c.order_line_id = ol.id)
            AND NOT EXISTS(SELECT 1 FROM stock_reservations r WHERE r.order_line_id = ol.id)
            AND NOT EXISTS(
-               SELECT 1 FROM stock_notes n JOIN stock_note_lines nl ON nl.note_id = n.id
-               WHERE n.order_id = ol.order_id AND nl.item_id = ol.item_id
+               SELECT 1 FROM stock_note_order_sources src
+               JOIN stock_note_lines nl ON nl.id = src.note_line_id
+               WHERE src.order_id = ol.order_id AND nl.item_id = ol.item_id
            )
            AND NOT EXISTS(
                SELECT 1 FROM invoice_order_sources i
@@ -586,15 +577,18 @@ fn check_order_stock_release_date(conn: &Connection, order: i64, date: NaiveDate
          JOIN vouchers v ON v.id = r.reversal_voucher_id
          WHERE link.order_id = ?1
          UNION ALL
-         SELECT reversed_on FROM stock_notes WHERE order_id = ?1 AND reversed_on IS NOT NULL
+         SELECT DISTINCT n.reversed_on FROM stock_note_order_sources src
+         JOIN stock_notes n ON n.id = src.note_id
+         WHERE src.order_id = ?1 AND n.reversed_on IS NOT NULL
          UNION ALL
-         SELECT r.date FROM stock_returns r JOIN stock_notes n ON n.id = r.note_id WHERE n.order_id = ?1
+         SELECT DISTINCT r.date FROM stock_return_lines l JOIN stock_returns r ON r.id = l.return_id
+         JOIN stock_note_order_sources src ON src.note_line_id = l.note_line_id
+         WHERE src.order_id = ?1
          UNION ALL
          SELECT DISTINCT r.date FROM invoice_stock_return_history r
-         LEFT JOIN stock_note_lines nl ON nl.id = r.delivery_line
-         LEFT JOIN stock_notes n ON n.id = nl.note_id
+         LEFT JOIN stock_note_order_sources src ON src.note_line_id = r.delivery_line
          LEFT JOIN invoice_order_sources i ON i.allocation_id = r.allocation_id AND r.delivery_line IS NULL
-         WHERE COALESCE(n.order_id, i.order_id) = ?1",
+         WHERE COALESCE(src.order_id, i.order_id) = ?1",
     )?;
     for row in stmt.query_map([order], |row| row.get::<_, String>(0))? {
         if date < parse_date(&row?)? {
@@ -673,7 +667,7 @@ pub(crate) fn validate_order_invoice_source(
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct InvoiceOrderSource<'a> {
+pub(crate) struct OrderAllocation<'a> {
     pub order_id: i64,
     pub expected_on: Option<&'a str>,
 }
@@ -681,7 +675,7 @@ pub(crate) struct InvoiceOrderSource<'a> {
 pub(crate) fn attach_imported_invoice_orders(
     conn: &Connection,
     invoice: i64,
-    sources: &[Option<InvoiceOrderSource<'_>>],
+    sources: &[Option<OrderAllocation<'_>>],
 ) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, l.item_id, a.quantity FROM invoice_line_allocations a

@@ -62,7 +62,7 @@ pub mod taxes;
 pub mod terms;
 pub mod valuation;
 
-const SCHEMA_VERSION: i64 = 99;
+const SCHEMA_VERSION: i64 = 100;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -516,6 +516,7 @@ impl Store {
             "order_lot_assignments",
             "order_lot_returns",
             "invoice_order_allocations",
+            "stock_note_order_allocations",
             "opening_bills",
             "invoice_credit_notes",
             "invoice_credit_lines",
@@ -1079,7 +1080,7 @@ impl Store {
             }
             tx.commit()?;
         }
-        if version < 99 {
+        if version < 100 {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let current: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
             if current < 95 {
@@ -1098,6 +1099,10 @@ impl Store {
             if current < 99 {
                 orders::migrate_invoice_allocations(&tx)?;
                 tx.pragma_update(None, "user_version", 99)?;
+            }
+            if current < 100 {
+                stock_notes::migrate_order_allocations(&tx)?;
+                tx.pragma_update(None, "user_version", 100)?;
             }
             tx.commit()?;
         }

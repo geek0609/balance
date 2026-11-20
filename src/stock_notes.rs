@@ -4,10 +4,11 @@ use crate::inventory::{
     check_quantity_precision, check_stock_batch, check_stock_location,
     insert_invoice_on_connection, ledger_category, line_amount, InvoiceDraft, InvoiceKind,
 };
+use crate::orders::{FulfilmentChange, OrderAllocation};
 use crate::{parse_date, required, Category, Error, Result, Store};
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -165,6 +166,39 @@ pub(crate) fn migrate_combined_billing(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_order_allocations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS stock_note_order_allocations(
+            note_line_id INTEGER PRIMARY KEY REFERENCES stock_note_lines(id),
+            order_id INTEGER NOT NULL REFERENCES orders(id),
+            expected_on TEXT
+         );
+         CREATE INDEX IF NOT EXISTS stock_note_order_allocations_order ON stock_note_order_allocations(order_id);
+         DROP VIEW IF EXISTS stock_note_order_sources;
+         CREATE VIEW stock_note_order_sources AS
+            SELECT l.id AS note_line_id, l.note_id, src.order_id
+            FROM stock_note_order_allocations src JOIN stock_note_lines l ON l.id = src.note_line_id
+            UNION ALL
+            SELECT l.id, n.id, n.order_id
+            FROM stock_notes n JOIN stock_note_lines l ON l.note_id = n.id
+            WHERE n.order_id IS NOT NULL
+              AND NOT EXISTS(SELECT 1 FROM stock_note_order_allocations src WHERE src.note_line_id = l.id);
+         DROP VIEW invoice_orders;
+         CREATE VIEW invoice_orders AS
+            SELECT invoice_id, order_id FROM invoice_order_links
+            UNION
+            SELECT invoice_id, order_id FROM invoice_order_sources
+            UNION
+            SELECT il.invoice_id, src.order_id FROM stock_note_invoice_lines link
+            JOIN invoice_lines il ON il.id = link.invoice_line_id
+            JOIN stock_note_order_sources src ON src.note_line_id = link.note_line_id
+            UNION
+            SELECT link.invoice_id, src.order_id FROM invoice_stock_link_history link
+            JOIN stock_note_order_sources src ON src.note_line_id = link.note_line_id;",
+    )?;
+    crate::invoice_stock_links::rebuild_order_progress(conn, true)
+}
+
 #[derive(Debug, Clone)]
 pub struct StockNoteLineDraft {
     pub item_id: i64,
@@ -242,6 +276,8 @@ pub struct StockNoteLine {
     pub returned: i64,
     pub returned_after_invoice: i64,
     pub source_tracking: Option<String>,
+    pub order_id: Option<i64>,
+    pub order_reference: Option<String>,
 }
 
 impl StockNoteLine {
@@ -309,7 +345,7 @@ pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<V
         "SELECT l.id, l.item_id, l.location_id, l.batch_id, l.quantity, l.unit_price,
                 i.name, i.unit, loc.name, b.name, COALESCE(q.billed, 0), COALESCE(ret.returned, 0),
                 COALESCE((SELECT SUM(rq.returned) FROM invoice_returned_quantities rq WHERE rq.delivery_line = l.id), 0),
-                t.reference
+                t.reference, src.order_id, o.reference
          FROM stock_note_lines l JOIN stock_notes n ON n.id = l.note_id
          JOIN stock_items i ON i.id = l.item_id AND i.company_id = n.company_id
          JOIN stock_locations loc ON loc.id = l.location_id AND loc.company_id = n.company_id
@@ -317,6 +353,8 @@ pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<V
          LEFT JOIN stock_note_billed_quantities q ON q.note_line_id = l.id
          LEFT JOIN stock_note_returned_quantities ret ON ret.note_line_id = l.id
          LEFT JOIN imported_stock_note_tracking t ON t.note_line_id = l.id
+         LEFT JOIN stock_note_order_sources src ON src.note_line_id = l.id
+         LEFT JOIN orders o ON o.id = src.order_id
          WHERE n.company_id = ?1 AND n.id = ?2 ORDER BY l.id",
     )?;
     let rows = stmt
@@ -338,6 +376,8 @@ pub(crate) fn note_lines(conn: &Connection, company: i64, note: i64) -> Result<V
                 returned: row.get(11)?,
                 returned_after_invoice: row.get(12)?,
                 source_tracking: row.get(13)?,
+                order_id: row.get(14)?,
+                order_reference: row.get(15)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -623,7 +663,7 @@ pub(crate) fn write_stock_note(
     company: i64,
     draft: &StockNoteDraft,
     receipt_costs: Option<&[Option<i64>]>,
-    expected_dates: Option<&[Option<&str>]>,
+    order_sources: &[Option<OrderAllocation<'_>>],
 ) -> Result<i64> {
     let date = parse_date(&draft.date)?;
     let reference = required(&draft.reference, "Note reference")?;
@@ -631,12 +671,15 @@ pub(crate) fn write_stock_note(
     {
         return Err(Error::Validation("Add at least one stock line".into()));
     }
-    if expected_dates.is_some_and(|dates| {
-        dates.len() != draft.lines.len()
-            || (draft.order_id.is_none() && dates.iter().any(Option::is_some))
-    }) {
+    if order_sources.len() != draft.lines.len()
+        || draft.order_id.is_some_and(|order| {
+            order_sources
+                .iter()
+                .any(|source| source.map(|source| source.order_id) != Some(order))
+        })
+    {
         return Err(Error::Validation(
-            "Stock note delivery dates require matching order lines".into(),
+            "Stock note sources do not match its lines".into(),
         ));
     }
     if !matches!(
@@ -646,18 +689,6 @@ pub(crate) fn write_stock_note(
         return Err(Error::Validation(
             "The party must be an asset or liability ledger".into(),
         ));
-    }
-    if let Some(order) = draft.order_id {
-        crate::orders::check_fulfilment(
-            conn,
-            company,
-            order,
-            draft.kind,
-            draft.party_ledger_id,
-            date,
-            crate::orders::FulfilmentChange::NewDocument,
-            draft.lines.iter().map(|line| (line.item_id, line.quantity)),
-        )?;
     }
     let mut buckets = HashSet::new();
     for line in &draft.lines {
@@ -671,22 +702,42 @@ pub(crate) fn write_stock_note(
         check_stock_location(conn, company, line.location_id)?;
         check_stock_batch(conn, company, line.item_id, line.batch_id)?;
     }
-    let assignments = draft
-        .order_id
-        .map(|order| {
-            crate::order_lots::plan(
-                conn,
-                order,
-                draft.lines.iter().enumerate().map(|(index, line)| {
-                    (
-                        line.item_id,
-                        line.quantity,
-                        expected_dates.and_then(|dates| dates[index]),
-                    )
-                }),
-            )
-        })
-        .transpose()?;
+    let mut order_lines = BTreeMap::<_, Vec<_>>::new();
+    for (index, source) in order_sources.iter().enumerate() {
+        if let Some(source) = source {
+            order_lines
+                .entry(source.order_id)
+                .or_default()
+                .push((index, source.expected_on));
+        }
+    }
+    let mut assignments = vec![Vec::new(); draft.lines.len()];
+    for (&order, lines) in &order_lines {
+        crate::orders::check_fulfilment(
+            conn,
+            company,
+            order,
+            draft.kind,
+            draft.party_ledger_id,
+            date,
+            FulfilmentChange::NewDocument,
+            lines.iter().map(|&(index, _)| {
+                let line = &draft.lines[index];
+                (line.item_id, line.quantity)
+            }),
+        )?;
+        let planned = crate::order_lots::plan(
+            conn,
+            order,
+            lines.iter().map(|&(index, expected)| {
+                let line = &draft.lines[index];
+                (line.item_id, line.quantity, expected)
+            }),
+        )?;
+        for (&(index, _), lots) in lines.iter().zip(planned) {
+            assignments[index] = lots;
+        }
+    }
     let inserted = conn.execute(
         "INSERT INTO stock_notes(company_id, kind, party_ledger_id, order_id, reference,
              reference_key, date, narration)
@@ -712,10 +763,11 @@ pub(crate) fn write_stock_note(
     let note = conn.last_insert_rowid();
     let reason = format!("{} {} (#{note})", note_label(draft.kind), reference);
     for (index, line) in draft.lines.iter().enumerate() {
-        if let Some(order) = draft.order_id.filter(|_| draft.kind == InvoiceKind::Sale) {
+        let source = order_sources[index];
+        if let Some(source) = source.filter(|_| draft.kind == InvoiceKind::Sale) {
             crate::stock_reservations::consume_reservations(
                 conn,
-                order,
+                source.order_id,
                 line.item_id,
                 line.location_id,
                 line.batch_id,
@@ -736,10 +788,16 @@ pub(crate) fn write_stock_note(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![note, line.item_id, line.location_id, line.batch_id, line.quantity, line.unit_price, movement],
         )?;
-        if let Some(assignments) = &assignments {
+        if let Some(source) = source {
+            let note_line = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stock_note_order_allocations(note_line_id, order_id, expected_on)
+                 VALUES (?1, ?2, ?3)",
+                params![note_line, source.order_id, source.expected_on],
+            )?;
             crate::order_lots::write(
                 conn,
-                crate::order_lots::Source::NoteLine(conn.last_insert_rowid()),
+                crate::order_lots::Source::NoteLine(note_line),
                 &assignments[index],
             )?;
         }
@@ -753,7 +811,7 @@ pub(crate) fn write_stock_note(
             }
         }
     }
-    if let Some(order) = draft.order_id {
+    for order in order_lines.into_keys() {
         crate::stock_reservations::check_order_coverage(conn, order)?;
     }
     Ok(note)
@@ -762,7 +820,9 @@ pub(crate) fn write_stock_note(
 impl Store {
     pub fn stock_notes(&self, company: i64, order: Option<i64>) -> Result<Vec<StockNote>> {
         let mut stmt = self.conn.prepare(&format!(
-            "{NOTES} AND (?2 IS NULL OR n.order_id = ?2) ORDER BY n.date DESC, n.id DESC"
+            "{NOTES} AND (?2 IS NULL OR EXISTS(
+                 SELECT 1 FROM stock_note_order_sources src WHERE src.note_id = n.id AND src.order_id = ?2
+             )) ORDER BY n.date DESC, n.id DESC"
         ))?;
         let rows = stmt.query_and_then(params![company, order], read_note)?;
         rows.collect()
@@ -791,8 +851,26 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let dates = (!expected_dates.is_empty()).then_some(expected_dates);
-        let note = write_stock_note(&tx, company, draft, None, dates)?;
+        if !expected_dates.is_empty()
+            && (expected_dates.len() != draft.lines.len()
+                || (draft.order_id.is_none() && expected_dates.iter().any(Option::is_some)))
+        {
+            return Err(Error::Validation(
+                "Stock note delivery dates require matching order lines".into(),
+            ));
+        }
+        let sources: Vec<_> = draft
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                draft.order_id.map(|order_id| OrderAllocation {
+                    order_id,
+                    expected_on: expected_dates.get(index).copied().flatten(),
+                })
+            })
+            .collect();
+        let note = write_stock_note(&tx, company, draft, None, &sources)?;
         tx.commit()?;
         Ok(note)
     }
@@ -866,20 +944,24 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let lines = note_lines(&tx, company, id)?;
-        let expected: HashMap<_, _> = lines
-            .iter()
-            .map(|line| (line.values.bucket(), line.id))
-            .collect();
+        let mut expected = HashMap::new();
+        for line in lines.iter().filter(|line| line.unbilled() > 0) {
+            expected
+                .entry(line.values.bucket())
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(line.id));
+        }
         let sources = draft
             .lines
             .iter()
             .map(|line| {
-                expected
-                    .get(&(line.item_id, line.location_id, line.batch_id))
-                    .copied()
-                    .ok_or_else(|| {
-                        Error::Validation("Use lines from the selected stock note".into())
-                    })
+                match expected.get(&(line.item_id, line.location_id, line.batch_id)) {
+                    Some(Some(id)) => Ok(*id),
+                    Some(None) => Err(Error::Validation(
+                        "Select the source stock note line when stock allocations share an item, location and batch".into(),
+                    )),
+                    None => Err(Error::Validation("Use unbilled lines from the selected stock note".into())),
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         let invoice = bill_stock_notes(&tx, company, &sources, draft)?;

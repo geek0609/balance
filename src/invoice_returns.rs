@@ -1027,10 +1027,9 @@ pub(crate) fn reverse_movements(
 ) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
         "SELECT ret.id, ret.kind, ret.item_id, ret.location_id, ret.batch_id, ret.quantity,
-                COALESCE(n.order_id, link.order_id), i.party_ledger_id
+                COALESCE(src.order_id, link.order_id), i.party_ledger_id
          FROM invoice_stock_return_history ret JOIN invoices i ON i.id = ret.invoice_id
-         LEFT JOIN stock_note_lines src ON src.id = ret.delivery_line
-         LEFT JOIN stock_notes n ON n.id = src.note_id
+         LEFT JOIN stock_note_order_sources src ON src.note_line_id = ret.delivery_line
          LEFT JOIN invoice_order_sources link ON link.allocation_id = ret.allocation_id AND ret.delivery_line IS NULL
          WHERE ret.company_id = ?1 AND ret.voucher_id = ?2 ORDER BY ret.id",
     )?;
